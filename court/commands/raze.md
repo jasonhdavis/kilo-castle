@@ -7,9 +7,9 @@ Quest: $ARGUMENTS
 Follow the Raze Protocol:
 1. **Target Identification & Merge Verification**:
    - For a single Quest:
-     `python3 .court/engine/cli.py raze <id>`
+     `court raze <id>`
    - For batch / all ready quests:
-     `python3 .court/engine/cli.py raze all`
+     `court raze all`
    - This deterministic CLI command:
      a) Verifies the Quest branch is merged into `castle` (or completed Scout report is stored).
      b) Fast-forwards / syncs the worktree branch with `castle` (`git merge castle --ff-only`) and confirms `git status --porcelain` is clean so that `ahead: 0, behind: 0` (zero drift, no warning triangles in UI).
@@ -23,4 +23,4 @@ Follow the Raze Protocol:
    - Never delete or stop the worktree directory directly — worktree removal is always M'Lord's manual action in the Agent Manager UI.
 
 3. **Report to M'Lord**:
-   - Run `python3 .court/engine/cli.py teardown-list` to display all active worktrees resting cleanly in Ashes awaiting M'Lord's final manual deletion.
+   - Run `court teardown-list` to display all active worktrees resting cleanly in Ashes awaiting M'Lord's final manual deletion.

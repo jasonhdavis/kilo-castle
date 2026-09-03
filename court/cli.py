@@ -295,14 +295,224 @@ def cmd_verify(args):
     print("\n".join(report_lines))
 
 
+def cmd_verify_merged(args):
+    court_root = store.get_court_root()
+    quest = store.load(args.quest_id, court_root=court_root)
+    branch = quest.branch or quest.worktree or ""
+    if not branch:
+        print(f"ERROR: {quest.id} has no branch or worktree set", file=sys.stderr)
+        sys.exit(1)
+
+    repo_root = court_root.parent
+    status = git_ops.check_merged_status(branch, target_ref="castle", base_ref="castle", cwd=repo_root)
+    print(f"Merge check for {quest.id} ({branch}):")
+    print(f"  - is_merged_into_castle: {status.get('is_merged_in_target') or status.get('is_merged_in_base')}")
+    print(f"  - unmerged_commits: {status.get('unmerged_commits_count', 0)}")
+    print(f"  - clean_worktree: {status.get('clean_worktree')}")
+    if status.get("uncommitted_files"):
+        print(f"  - uncommitted_files ({len(status['uncommitted_files'])}):")
+        for uf in status["uncommitted_files"][:5]:
+            print(f"      {uf}")
+    print(f"  - recommendation: {status.get('recommendation')}")
+
+    if args.sync and status.get("worktree") and Path(status["worktree"]).exists():
+        wt_path = Path(status["worktree"])
+        sync_res = git_ops._run(["git", "merge", "castle", "--ff-only"], wt_path)
+        if sync_res.get("ok"):
+            print(f"  - synced_to_castle: OK (fast-forwarded)")
+        else:
+            print(f"  - synced_to_castle: FAILED ({sync_res.get('stderr')})")
+
+
+def cmd_raze(args):
+    import json
+    court_root = store.get_court_root()
+    repo_root = court_root.parent
+    am_path = repo_root / ".kilo" / "agent-manager.json"
+    am_data = {}
+    if am_path.exists():
+        try:
+            am_data = json.loads(am_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    am_wts = am_data.get("worktrees", {})
+    am_sessions = am_data.get("sessions", {})
+    ashes_section_id = None
+    for sec_id, sec_data in am_data.get("sections", {}).items():
+        if sec_data.get("name") == "Ashes":
+            ashes_section_id = sec_id
+            break
+
+    target_ids = []
+    if args.quest_id.lower() in ("all", "all-ready", "ready"):
+        target_ids = [q.id for q in store.list_all(court_root=court_root) if q.status in ("GATE", "READY_FOR_TEARDOWN", "REVIEW")]
+    else:
+        target_ids = [args.quest_id]
+
+    if not target_ids:
+        print("(no candidate quests found to raze)")
+        return
+
+    for qid in target_ids:
+        try:
+            quest = store.load(qid, court_root=court_root)
+        except Exception as e:
+            print(f"Skipping {qid}: {e}")
+            continue
+
+        branch = quest.branch or ""
+        wt_path_str = quest.worktree or ""
+        found_wt_id = None
+        found_wt_path = None
+        found_session_id = None
+
+        for wid, wdata in am_wts.items():
+            if wdata.get("branch") == branch or (wt_path_str and (wdata.get("path") == wt_path_str or wid == wt_path_str)):
+                found_wt_id = wid
+                found_wt_path = wdata.get("path")
+                break
+
+        if found_wt_id:
+            for sid, sdata in am_sessions.items():
+                if sdata.get("worktreeId") == found_wt_id:
+                    found_session_id = sid
+                    break
+
+        wt_exists = bool(found_wt_path and Path(found_wt_path).exists())
+
+        if not wt_exists and not found_wt_id:
+            if quest.status == "READY_FOR_TEARDOWN" and args.archive_pruned:
+                dst = store.archive(quest.id, court_root=court_root)
+                print(f"🪦 {quest.id}: Worktree already pruned from disk/AM -> Archived to {dst}")
+                continue
+            elif quest.status == "READY_FOR_TEARDOWN":
+                print(f"ℹ️ {quest.id}: Worktree already pruned from disk/AM (ready to archive: court archive {quest.id})")
+                continue
+
+        status = git_ops.check_merged_status(found_wt_path or branch, target_ref="castle", base_ref="castle", cwd=repo_root)
+        is_merged = status.get("is_merged_in_target") or status.get("is_merged_in_base")
+
+        if wt_exists and found_wt_path:
+            p = Path(found_wt_path)
+            st_res = git_ops._run(["git", "status", "--porcelain"], p)
+            if st_res.get("ok") and st_res.get("stdout"):
+                print(f"⚠️ {quest.id}: Worktree {found_wt_path} is dirty with uncommitted changes! Clean before razing.")
+                continue
+
+            ff_res = git_ops._run(["git", "merge", "castle", "--ff-only"], p)
+            if not ff_res.get("ok"):
+                if is_merged:
+                    git_ops._run(["git", "reset", "--hard", "castle"], p)
+
+        if quest.status != "READY_FOR_TEARDOWN":
+            quest.append_history(quest.status, "READY_FOR_TEARDOWN", "Razed: verified merged, synced to castle (ahead: 0, behind: 0), queued for teardown in Ashes")
+            quest.status = "READY_FOR_TEARDOWN"
+            store.save(quest, court_root=court_root)
+            print(f"✅ Advanced {quest.id} -> READY_FOR_TEARDOWN")
+
+        print(f"🔥 Razed {quest.id}:")
+        print(f"   - Branch: {branch}")
+        print(f"   - Worktree: {found_wt_id} ({found_wt_path})")
+        print(f"   - Session ID: {found_session_id or quest.serf_session_id or 'None'}")
+        print(f"   - Ashes Section ID: {ashes_section_id}")
+        if found_session_id and ashes_section_id:
+            print(f"   👉 Move command: agent_manager move sessionID: {found_session_id} sectionID: {ashes_section_id}")
+
+
 def cmd_teardown_list(args):
-    quests = [q for q in store.list_all() if q.status == "READY_FOR_TEARDOWN"]
+    import json
+    court_root = store.get_court_root()
+    repo_root = court_root.parent
+    am_path = repo_root / ".kilo" / "agent-manager.json"
+    am_data = {}
+    if am_path.exists():
+        try:
+            am_data = json.loads(am_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    am_wts = am_data.get("worktrees", {})
+    ashes_section_id = None
+    for sec_id, sec_data in am_data.get("sections", {}).items():
+        if sec_data.get("name") == "Ashes":
+            ashes_section_id = sec_id
+            break
+
+    quests = [q for q in store.list_all(court_root=court_root) if q.status == "READY_FOR_TEARDOWN"]
     if not quests:
         print("(nothing queued for teardown)")
         return
-    print("Worktrees ready for M'Lord to manually prune in Agent Manager:")
+
+    active_in_ashes = []
+    active_other_lane = []
+    already_pruned = []
+
     for q in quests:
-        print(f"  - {q.id}: branch={q.branch or '-'} worktree={q.worktree or '-'}")
+        branch = q.branch or ""
+        found_wt_id = None
+        found_wt_info = None
+        for wid, wdata in am_wts.items():
+            if wdata.get("branch") == branch or wid == q.worktree:
+                found_wt_id = wid
+                found_wt_info = wdata
+                break
+
+        if not found_wt_id or not found_wt_info or not Path(found_wt_info.get("path", "")).exists():
+            already_pruned.append(q)
+            continue
+
+        wt_path = found_wt_info.get("path", "")
+        sec_id = found_wt_info.get("sectionId", "")
+
+        diff_res = git_ops._run(["git", "-C", wt_path, "rev-list", "--left-right", "--count", f"castle...{branch}"], repo_root)
+        behind, ahead = "0", "0"
+        if diff_res.get("ok") and diff_res.get("stdout"):
+            parts = diff_res["stdout"].split()
+            if len(parts) == 2:
+                behind, ahead = parts[0], parts[1]
+
+        st_res = git_ops._run(["git", "-C", wt_path, "status", "--porcelain"], repo_root)
+        dirty_count = len(st_res.get("stdout", "").splitlines()) if st_res.get("stdout") else 0
+
+        info = {
+            "quest": q,
+            "wt_id": found_wt_id,
+            "path": wt_path,
+            "sec_id": sec_id,
+            "behind": behind,
+            "ahead": ahead,
+            "dirty_count": dirty_count,
+        }
+
+        if sec_id == ashes_section_id:
+            active_in_ashes.append(info)
+        else:
+            active_other_lane.append(info)
+
+    print("=" * 76)
+    print(f"🪦 THE COURT TEARDOWN LIST — WORKTREES AWAITING DELETION IN ASHES")
+    print("=" * 76)
+
+    if active_in_ashes:
+        print(f"\n🔥 Resting in Ashes Section (Safe for M'Lord to delete in Agent Manager UI) ({len(active_in_ashes)}):")
+        for item in active_in_ashes:
+            q = item["quest"]
+            aligned = "✅ Aligned (0 drift)" if item["behind"] == "0" and item["ahead"] == "0" and item["dirty_count"] == 0 else f"⚠️ Drift (behind={item['behind']}, ahead={item['ahead']}, dirty={item['dirty_count']})"
+            print(f"   * {q.id}: {item['wt_id']} ({item['path']}) [{aligned}]")
+
+    if active_other_lane:
+        print(f"\n⚠️ In READY_FOR_TEARDOWN but not yet moved to Ashes ({len(active_other_lane)}):")
+        for item in active_other_lane:
+            q = item["quest"]
+            print(f"   * {q.id}: {item['wt_id']} ({item['path']}) [Section: {item['sec_id']}]")
+
+    if already_pruned:
+        print(f"\n📦 Already Pruned from Agent Manager / Disk ({len(already_pruned)} Quests ready to archive):")
+        for q in already_pruned:
+            print(f"   * {q.id} (branch={q.branch or '-'})")
+
+    print("\n" + "=" * 76)
 
 
 def cmd_archive(args):
@@ -549,6 +759,18 @@ def build_parser():
     p_verify.add_argument("--test-cmd", default=None)
     p_verify.add_argument("--timeout", type=int, default=600)
     p_verify.set_defaults(func=cmd_verify)
+
+    # verify-merged
+    p_verify_merged = sub.add_parser("verify-merged", help="Verify if Quest branch is merged into castle")
+    p_verify_merged.add_argument("quest_id")
+    p_verify_merged.add_argument("--sync", action="store_true", help="Fast-forward worktree to castle if merged")
+    p_verify_merged.set_defaults(func=cmd_verify_merged)
+
+    # raze
+    p_raze = sub.add_parser("raze", help="Raze a Quest: verify merge, sync diffs to castle (ahead: 0, behind: 0), queue for Ashes")
+    p_raze.add_argument("quest_id", help="Quest ID or 'all'")
+    p_raze.add_argument("--archive-pruned", action="store_true", default=True, help="Auto-archive already-pruned quests")
+    p_raze.set_defaults(func=cmd_raze)
 
     # teardown-list
     p_teardown = sub.add_parser("teardown-list", help="List worktrees ready for M'Lord to prune")

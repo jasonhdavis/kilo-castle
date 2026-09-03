@@ -135,3 +135,10 @@ Synthesize the CLI output into a concise Cog Ship Voyage Report for M'Lord and c
 whether the convoy is ready to promote `castle` -> `main`. This is read-only reporting —
 `/cog ship` never merges or advances Quest status itself; it is typically run as the final
 step of `/collect` and again on demand before a `castle` -> `main` promotion decision.
+
+### 9. Raze & Teardown Protocol (`/raze`, `/teardown`)
+When a Quest is merged and promoted into `castle` (or a completed Scout spike):
+1. **Deterministic Verification & Diff Alignment**: Run `court raze <id>` (or `court raze all`). This command verifies merge status into `castle`, fast-forwards/syncs the worktree branch with `castle` (`git merge castle --ff-only`), and verifies zero uncommitted files so `ahead: 0, behind: 0` (zero drift, no warning triangles in Agent Manager).
+2. **Move to Ashes**: Move the worktree session to the **Ashes** section (`agent_manager` `move`). Never move ghost/broken directories or unrelated worktrees to Ashes.
+3. **Archive Already-Pruned Quests**: If a Quest's worktree was already pruned/deleted in previous milestones, auto-archive it (`court archive <id>`) to keep active teardown lists truthful.
+4. **Manual Deletion Notice**: Never delete or stop the worktree directory directly — worktree removal is always M'Lord's manual action in the Agent Manager UI. Run `court teardown-list` to present all cleanly aligned worktrees resting in Ashes.

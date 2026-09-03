@@ -1,12 +1,26 @@
 ---
-description: Move completed or obsolete worktrees to Ashes section and queue for manual teardown
+description: Move a completed/merged Quest worktree to Agent Manager Ashes section after merge and diff alignment
 agent: steward
 ---
 Quest: $ARGUMENTS
 
 Follow the Raze Protocol:
-1. Identify the target Quest (`court show <id>`).
-2. Verify that the Quest is in `READY_FOR_TEARDOWN` or has been approved for deprecation.
-3. Move the worktree in Agent Manager to the **Ashes** section (`agent_manager` `move`) as a visual cue.
-4. If M'Lord confirms deletion, surface the worktree path for manual teardown in the Agent Manager UI.
-5. Note: The Steward NEVER forcibly deletes worktrees out from under Agent Manager; pruning is confirmed in the UI.
+1. **Target Identification & Merge Verification**:
+   - For a single Quest:
+     `court raze <id>`
+   - For batch / all ready quests:
+     `court raze all`
+   - This deterministic CLI command:
+     a) Verifies the Quest branch is merged into `castle` (or completed Scout report is stored).
+     b) Fast-forwards / syncs the worktree branch with `castle` (`git merge castle --ff-only`) and confirms `git status --porcelain` is clean so that `ahead: 0, behind: 0` (zero drift, no warning triangles in UI).
+     c) Advances Quest status to `READY_FOR_TEARDOWN`.
+     d) Auto-archives any Quests whose worktrees were already deleted/pruned from disk and Agent Manager (`court archive <id>`).
+
+2. **Move to Ashes Section in Agent Manager**:
+   - Inspect the `raze` command output for the worktree's session ID and the Ashes section ID (`sec-...`).
+   - Move the worktree session to the Ashes section using `agent_manager` `move`.
+   - Never move broken, ghost, or unrelated worktrees to Ashes.
+   - Never delete or stop the worktree directory directly — worktree removal is always M'Lord's manual action in the Agent Manager UI.
+
+3. **Report to M'Lord**:
+   - Run `court teardown-list` to display all active worktrees resting cleanly in Ashes awaiting M'Lord's final manual deletion.

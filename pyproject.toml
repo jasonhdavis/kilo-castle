@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kilo-castle"
+version = "0.1.0"
+description = "Deterministic multi-agent orchestration framework for Kilo Code with Git worktrees and Court hierarchy"
+readme = "README.md"
+authors = [
+    { name = "Jason Davis" }
+]
+license = { text = "MIT" }
+keywords = ["kilo", "ai-agents", "orchestration", "git-worktrees", "multi-agent", "developer-tools"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+court = "court.cli:main"
+kilo-castle = "court.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["court", "court.*"]
+
+[tool.setuptools.package-data]
+court = [
+    "templates/*.md",
+    "commands/*.md",
+    "prompts/*.md",
+    "assets/*",
+]

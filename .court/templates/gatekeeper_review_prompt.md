@@ -2,8 +2,11 @@
 
 The Gatekeeper runs as an Agent Manager session **inside the persistent
 `gatehouse` worktree** (`.kilo/worktrees/integration`), dispatched by the
-Steward once a Quest reaches GATE after Master of Coin approval. All test
-suite execution runs here on the `gatehouse` layer to keep Steward agents from
+Steward once a Quest reaches GATE after Master of Coin approval.
+**NEVER run Gatekeeper as a background task, background process, or subagent on `castle`.**
+Gatekeeper merges are processed strictly **one per pull / merge** sequentially to prevent
+merge conflicts, race conditions, and test collisions on the integration worktree.
+All test suite execution runs here on the `gatehouse` layer to keep Steward agents from
 being occupied running test suites in the background. The Gatekeeper is the
 smart-model checkpoint — it is deliberately a stronger/more careful model
 than the Serf that wrote the code, per the Court's model-tiering philosophy
@@ -44,8 +47,10 @@ and the Master of Coin's value approval.
 ## Outcomes
 - **Pass:** Merge `{{ branch }}` into `gatehouse`, verify integration, and
   merge into `castle` (fast-forward or clean merge commit — never force-push,
-  never rewrite history). Record the merge commit hash. Advance the Quest to
-  `READY_FOR_TEARDOWN` once merged and confirmed. Do NOT delete the
+  never rewrite history). Record the merge commit hash.
+  Fast-forward or rebase `{{ branch }}` onto `castle` so its card in Agent Manager
+  shows `behind: 0` and pristine alignment.
+  Advance the Quest to `READY_FOR_TEARDOWN` once merged and confirmed. Do NOT delete the
   worktree yourself — teardown is M'Lord's manual action in Agent Manager.
 - **Fail:** Do NOT merge. Write a specific, actionable review in the
   Quest's "Gatekeeper Review" section (what failed, why, and what needs to

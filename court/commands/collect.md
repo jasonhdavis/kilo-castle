@@ -18,6 +18,7 @@ Follow the Collect Protocol:
        court advance <id> GATE --note "Collected: Master of Coin approved value; dispatched to Gatekeeper"
        ```
      - Dispatch the **Gatekeeper** inside the persistent `gatehouse` worktree (`.kilo/worktrees/integration` or `.kilo/worktrees/gatehouse`) using `.court/templates/gatekeeper_review_prompt.md`.
+     **NEVER run Gatekeeper in a background task or on castle.** Process candidates **strictly one per pull / merge**, sequentially.
      - Record `gatekeeper_session_id` and `gatekeeper_model`.
    - **Case B: Value Deficient / Incomplete / Wasteful:**
      - Return the Quest to `WORKING`:
@@ -34,8 +35,13 @@ Follow the Collect Protocol:
      ```
    - Move the worktree to Agent Manager's **Ashes** section as a visual cue.
 
-4. **Report to M'Lord:**
-   - Summarize all collected Quests:
-     - 🏰 **Merged into Castle** (`READY_FOR_TEARDOWN`)
+4. **Report to M'Lord (Cog Ship Deployment Convoy Summary):**
+   - Run the Cog Ship rollup (`/cog ship`) to combine the Bard/Coffers/Atone/Murmur
+     rollups for every Quest just merged into `castle`:
+     ```bash
+     court ship
+     ```
+   - Summarize the pipeline status:
+     - 🏰 **Merged into Castle** (`READY_FOR_TEARDOWN`) + Cog Ship convoy summary
      - 🛡️ **Under Gatekeeper Testing on Gatehouse** (`GATE`)
      - ↩️ **Returned to Working** (`WORKING`)

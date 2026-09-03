@@ -54,6 +54,62 @@ Instead of relying on fragile chat history or allowing a single LLM session to w
 
 ---
 
+## The Steward's Council (/plot) — Turning Desire into Confirmed Blueprint
+
+`/plot` is not a command to write a specification — it is **Council**.
+
+M'Lord brings an ambition, complaint, opportunity, Scout Report, or half-formed scheme before the Steward. The Steward does not immediately levy Serfs and hope they interpret the intent correctly. The Steward first plots the realm: discovering what is already known, exposing what remains undecided, and bringing only genuine matters of judgment before M'Lord.
+
+```
+👑 Intent
+      │
+      ▼
+🏰 /plot — Steward convenes Council
+      │
+      ├── surveys the realm (code, docs, tests, existing Quests)
+      ├── charts dependent matters (The Decision Tree)
+      ├── settles discoverable facts
+      ├── brings judgments to Audience (The Frontier)
+      └── conducts Trial by Example
+      │
+      ▼
+📜 The Plot — Steward reads the settled understanding
+      │
+      ▼
+👑 M'Lord gives royal assent
+      │
+      ▼
+✅ Confirmed Plot (OPEN -> PLANNED)
+      │
+      ▼
+📜 Quest Remit & Expected Tribute
+      │
+      ▼
+⚔️ Dispatch (/charter -> /dispatch)
+```
+
+> **The Council Workflow**:
+> **Survey the realm. Convene Council. Hear M'Lord. Confirm the Plot. Then levy the work.**
+
+### Core Council Principles
+
+1. **The Tree & The Audience Frontier**:
+   Before questioning M'Lord, the Steward charts the matter as a dependency tree. Dependent matters are never brought to Audience until their prerequisites are settled. Ripe, unblocked decisions form the **Audience Frontier**.
+2. **Survey Before Asking**:
+   The Steward searches the codebase, docs, tests, git history, and `.court/` before asking M'Lord discoverable repository facts.
+3. **Bring Concrete Recommendations**:
+   Instead of open-ended asking ("how should this work?"), the Steward presents the matter, the stakes, a recommended ruling (Humble Opinion), grounds, and alternatives.
+4. **Private vs. Full Council**:
+   - **Private Council**: 1 question at a time (for voice interfaces, high-consequence architecture, or ambiguous initiatives).
+   - **Full Council**: 1–3 ripe questions at a time (for terminal/chat, ranked by leverage).
+5. **Challenge False Names & Trial by Example**:
+   - Ambiguous domain terms ("account", "campaign", "ready", "complete") are clarified before writing code.
+   - Abstract agreements are tested against concrete edge cases, error modes, and boundary conditions before confirmation.
+6. **Confirmation & Sealing**:
+   Council continues until the Decision Tree is exhausted and no material matter remains in Audience. The Steward presents `# 📜 The Plot` (Intent, Decrees, Bounds of Realm, Findings, Consequences, Delayed Judgments, Victory Criteria). Upon royal assent, the Plot is sealed, transitioning the Quest from `OPEN` $\rightarrow$ `PLANNED`.
+
+---
+
 ## The Scout Reconnaissance Pipeline (Pioneering Methods Without Polluting Production)
 
 The transition from a Proof-of-Concept to production code is often painful when agents try to weld exploratory scripts directly into core services. Castle enforces a strict separation:

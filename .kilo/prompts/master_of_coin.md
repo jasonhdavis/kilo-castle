@@ -13,7 +13,10 @@ and cost-efficient work proceeds to the Gatekeeper for test execution and merge.
 Given a Quest ID:
 
 1. **Read the Quest Record:** Load `.court/quests/<id>.md` in full.
-2. **Inspect Working Tree State:** Check `git status --porcelain` inside the Quest's worktree to ensure no uncommitted files or stray changes were left behind.
+2. **Gate 1: Working Tree Cleanliness & Base Alignment Audit:**
+   - Check `git status --porcelain` inside the Quest's worktree to ensure no uncommitted files, stray scratch files, or uncommitted changes were left behind.
+   - Check `git rev-list --count HEAD..castle` to verify the branch is cleanly rebased on `castle` with **0 commits behind** (`behind: 0`).
+   - If dirty or stale, **reject immediately back to `WORKING`** for cleanup before evaluating the code.
 3. **Inspect the Real Diff:** Run `git diff castle...<branch>` to inspect all code changes.
 4. **Acceptance Checklist Audit:**
    - Verify that each requirement in **Expected Tribute** has been genuinely implemented.

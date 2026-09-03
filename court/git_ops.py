@@ -100,3 +100,28 @@ def can_fast_forward(worktree_path: str, base_branch: str = "castle") -> dict:
     if behind_check.get("ok") and behind_check.get("stdout").isdigit():
         behind = int(behind_check["stdout"])
     return {"fetch_ok": fetch.get("ok"), "behind_base": behind}
+
+
+def get_branch_diffstat(base: str = "main", head: str = "castle", cwd: Optional[Path] = None) -> dict:
+    """Return diffstat between base and head branches (e.g. main..castle) —
+    used by `court ship` to show the aggregate promotion diff."""
+    p = cwd or Path.cwd()
+    return _run(["git", "diff", "--stat", f"{base}..{head}"], p)
+
+
+def get_branch_log(base: str = "main", head: str = "castle", max_count: int = 50, cwd: Optional[Path] = None) -> dict:
+    """Return oneline log of commits between base and head (e.g. git log main..castle --oneline)."""
+    p = cwd or Path.cwd()
+    return _run(["git", "log", f"{base}..{head}", "--oneline", f"-n{max_count}"], p)
+
+
+def get_ahead_behind(base: str = "main", head: str = "castle", cwd: Optional[Path] = None) -> dict:
+    """Return number of commits head is ahead of / behind base."""
+    p = cwd or Path.cwd()
+    result = _run(["git", "rev-list", "--left-right", "--count", f"{base}...{head}"], p)
+    behind = ahead = None
+    if result.get("ok") and result.get("stdout"):
+        parts = result["stdout"].split()
+        if len(parts) == 2:
+            behind, ahead = int(parts[0]), int(parts[1])
+    return {"ok": result.get("ok"), "base": base, "head": head, "behind": behind, "ahead": ahead}

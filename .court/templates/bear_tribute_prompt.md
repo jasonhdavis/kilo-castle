@@ -30,6 +30,13 @@ Your concrete, technical recommendation for the immediate next steps to advance 
 
 ---
 
+### Mandatory Agent Compliance Step (Clean Tree & Base Alignment)
+Before rendering your tribute and persisting your report:
+1. **Working Tree Cleanliness**: Run `git status --porcelain` to verify your working tree has no uncommitted leftovers or scratch files. Stage and commit all intended deliverables.
+2. **Rebase-to-Parent Alignment**: Rebase or fast-forward onto `castle` (`git rebase castle` or `git merge castle --ff-only`). Ensure your branch is cleanly aligned with `castle`'s current tip (0 commits behind `castle`) so the git tree and Agent Manager remain pristine with zero phantom diffs.
+
+---
+
 ### Mandatory Durable Completion Requirement
 In addition to your response message, you MUST persist your complete 5-section report into durable storage:
 ```bash

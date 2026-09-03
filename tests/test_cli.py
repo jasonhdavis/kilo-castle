@@ -135,3 +135,20 @@ Recommend adding automatic key deprecation cron.
     show_epic_out = capsys.readouterr().out
     assert "# Child Quests" in show_epic_out
     assert "Q003-Auth-Cleanup" in show_epic_out
+
+    # 12. ship (Cog Ship deployment convoy summary)
+    main(["advance", "Q001-Core-Jwt-Rotation", "GATE", "--note", "test setup"])
+    capsys.readouterr()
+    main(["advance", "Q001-Core-Jwt-Rotation", "READY_FOR_TEARDOWN", "--note", "Merged for ship test"])
+    capsys.readouterr()
+
+    main(["ship"])
+    ship_out = capsys.readouterr().out
+    assert "COG SHIP DEPLOYMENT CONVOY" in ship_out
+    assert "Q001-Core-Jwt-Rotation" in ship_out
+    assert "THE BARD'S CHRONICLE" in ship_out
+    assert "We refactored JWT rotation" in ship_out
+    assert "THE COFFERS LEDGER" in ship_out
+    assert "THE SERF PENANCE" in ship_out
+    assert "THE HUMBLE OPINIONS" in ship_out
+    assert "COG SHIP DEPLOYMENT SUMMARY COMPLETE" in ship_out

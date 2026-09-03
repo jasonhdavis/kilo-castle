@@ -23,9 +23,10 @@ Tribute claims.
 
 ## What to inspect
 
-1. **Working Tree & Untracked Files Audit**
-   - Check `git status --porcelain` inside `{{ worktree }}`.
-   - Flag any uncommitted modifications, stray files, or uncommitted work.
+1. **Gate 1: Working Tree Cleanliness & Base Alignment Audit**
+   - Run `git status --porcelain` inside `{{ worktree }}`. Flag any uncommitted modifications, stray files, scratch caches, or uncommitted work.
+   - Run `git rev-list --count HEAD..castle` to verify the branch is cleanly rebased on `castle` with **0 commits behind** (`behind: 0`).
+   - If dirty uncommitted files or stale behind-drift exists, **reject immediately to `WORKING`** for agent cleanup before auditing code.
 
 2. **Expected Tribute Line-by-Line Audit**
    - Check the branch diff (`git diff castle...{{ branch }}` or equivalent).

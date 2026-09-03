@@ -29,6 +29,11 @@ without losing any committed work.
 - Commit your work as you go on this worktree's tree-structured branch (`{{ branch }}`).
   Do not merge, do not touch `gatehouse`/`castle`/`main` yourself.
 
+## Mandatory Agent Compliance Step (Clean Tree & Base Alignment)
+Before rendering your tribute and declaring your work done:
+1. **Working Tree Cleanliness**: Run `git status --porcelain` to verify your working tree has no uncommitted leftovers or scratch files. Stage and commit all intended deliverables.
+2. **Rebase-to-Parent Alignment**: Rebase or fast-forward onto `castle` (`git rebase castle` or `git merge castle --ff-only`). Ensure your branch is cleanly aligned with `castle`'s current tip (0 commits behind `castle`) so the git tree and Agent Manager remain pristine with zero phantom diffs.
+
 ## Expected Tribute (you must produce ALL of this before declaring done)
 {{ expected_tribute }}
 

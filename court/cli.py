@@ -11,12 +11,14 @@ Usage examples:
     court rollup --section ballad --epic Q012
     court rollup --section penance --all
     court edict "Focus on QStash reliability and reduce Neon compute hours"
+    court ship --epic Q012
 """
 from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
+from typing import Optional
 
 from court import git_ops, store
 from court.models import KINDS, SECTIONS, STATUSES, Quest, now_iso
@@ -339,6 +341,96 @@ def cmd_edict(args):
             print("(no royal edicts recorded; add with: court edict 'Your priority')")
 
 
+def cmd_ship(args):
+    """Cog Ship: the convoy of tribute entering the castle. Deterministically
+    combines the Bard/Coffers/Atone/Murmur rollups for the Quest convoy plus
+    the raw base..head git promotion vector (e.g. main..castle)."""
+    court_root = store.get_court_root()
+    base_branch = getattr(args, "base", "main")
+    head_branch = getattr(args, "head", "castle")
+
+    manifest = store.rollup_ship_manifest(
+        app=args.app,
+        epic=args.epic,
+        status=args.status,
+        include_archive=args.all,
+        court_root=court_root,
+    )
+    quests = manifest["quests"]
+
+    repo_root = court_root.parent
+    ab = git_ops.get_ahead_behind(base_branch, head_branch, cwd=repo_root)
+    log_res = git_ops.get_branch_log(base_branch, head_branch, max_count=30, cwd=repo_root)
+    diff_res = git_ops.get_branch_diffstat(base_branch, head_branch, cwd=repo_root)
+
+    print("=" * 76)
+    print(f"🚢 COG SHIP DEPLOYMENT CONVOY — TRIBUTE ENTERING THE CASTLE ({len(quests)} Quests)")
+    print("=" * 76)
+
+    if ab.get("ok"):
+        ahead = ab.get("ahead", 0)
+        behind = ab.get("behind", 0)
+        print(f"\n🏰 Branch Promotion Vector: {head_branch} -> {base_branch}")
+        print(f"   * Status: {head_branch} is {ahead} commits ahead, {behind} commits behind {base_branch}")
+        if log_res.get("ok") and log_res.get("stdout"):
+            log_lines = log_res["stdout"].splitlines()
+            print(f"\n📦 Shipped Commits on {head_branch} ahead of {base_branch}:")
+            for line in log_lines[:20]:
+                print(f"   - {line}")
+            if len(log_lines) > 20:
+                print(f"   ... ({len(log_lines) - 20} more commits)")
+        if diff_res.get("ok") and diff_res.get("stdout"):
+            print(f"\n📊 Aggregate Diffstat ({base_branch}..{head_branch}):")
+            for line in diff_res["stdout"].splitlines()[-5:]:
+                print(f"   {line}")
+    else:
+        print(f"\n🏰 Branch Promotion Vector: {head_branch} (ready for deployment)")
+
+    if quests:
+        print(f"\n📋 Quests in Deployment Convoy ({len(quests)}):")
+        for q in quests:
+            parent_info = f" [Epic: {q.parent_epic}]" if q.parent_epic else ""
+            print(f"   * {q.id} ({q.app}): {q.title} [{q.status}]{parent_info}")
+    else:
+        print("\n(no quests currently in READY_FOR_TEARDOWN or DONE matching filters)")
+
+    if manifest["ballads"]:
+        print("\n" + "-" * 76)
+        print(f"📜 THE BARD'S CHRONICLE — Narrative & Transformations ({len(manifest['ballads'])} Ballads)")
+        print("-" * 76)
+        for q, b in manifest["ballads"]:
+            print(f"\n### {q.id}: {q.title} ({q.app})")
+            print(b)
+
+    if manifest["tributes"]:
+        print("\n" + "-" * 76)
+        print(f"💰 THE COFFERS LEDGER — Provable Deliverables & Commits ({len(manifest['tributes'])} Tributes)")
+        print("-" * 76)
+        for q, t in manifest["tributes"]:
+            print(f"\n### {q.id}: {q.title} ({q.app})")
+            print(t)
+
+    if manifest["penances"]:
+        print("\n" + "-" * 76)
+        print(f"⚖️ THE SERF PENANCE — Technical Debt & Remediations ({len(manifest['penances'])} Penances)")
+        print("-" * 76)
+        for q, p_ in manifest["penances"]:
+            print(f"\n### {q.id}: {q.title} ({q.app})")
+            print(p_)
+
+    if manifest["opinions"]:
+        print("\n" + "-" * 76)
+        print(f"💡 THE HUMBLE OPINIONS — Field Intelligence & Next Quests ({len(manifest['opinions'])} Opinions)")
+        print("-" * 76)
+        for q, o in manifest["opinions"]:
+            print(f"\n### {q.id}: {q.title} ({q.app})")
+            print(o)
+
+    print("\n" + "=" * 76)
+    print("🏰 COG SHIP DEPLOYMENT SUMMARY COMPLETE")
+    print("=" * 76)
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="court",
@@ -448,6 +540,16 @@ def build_parser():
     p_edict.add_argument("--file", default=None, help="Read edict from file")
     p_edict.add_argument("--append", action="store_true", default=True, help="Append to existing edicts")
     p_edict.set_defaults(func=cmd_edict)
+
+    # ship
+    p_ship = sub.add_parser("ship", help="Cog Ship: generate the full deployment convoy summary (/bard, /coffers, /atone, /murmur)")
+    p_ship.add_argument("--app", default=None, help="Filter by app domain")
+    p_ship.add_argument("--epic", default=None, help="Filter by parent Epic ID")
+    p_ship.add_argument("--status", default=None, help="Filter by status (default: READY_FOR_TEARDOWN,DONE)")
+    p_ship.add_argument("--base", default="main", help="Target production branch (default: main)")
+    p_ship.add_argument("--head", default="castle", help="Source staging branch (default: castle)")
+    p_ship.add_argument("--all", action="store_true", help="Include archived Quests")
+    p_ship.set_defaults(func=cmd_ship)
 
     return p
 

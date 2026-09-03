@@ -68,3 +68,57 @@ def test_store_hierarchy(tmp_path):
 
     assert len(hierarchy["scouts"]) == 1
     assert hierarchy["scouts"][0].id == "Q014-Ai-Search"
+
+
+def test_rollup_ship_manifest(tmp_path):
+    court_root = tmp_path / ".court"
+
+    tribute_body = """### 1. Ballad
+Shipped the auth refactor cleanly.
+
+### 2. Tribute
+- Added 2 tests, all passing.
+
+### 3. Penance
+Deferred Redis failover edge case.
+
+### 4. Audience
+None required.
+
+### 5. Humble Opinion
+Recommend a follow-up cleanup Quest.
+"""
+    done_quest = Quest(
+        id="Q020-Auth-Cleanup",
+        title="Auth Cleanup",
+        kind="quest",
+        app="auth",
+        concern="cleanup",
+        status="READY_FOR_TEARDOWN",
+    )
+    done_quest.set_section("Tribute Rendered", tribute_body)
+
+    open_quest = Quest(
+        id="Q021-Auth-Other",
+        title="Auth Other Work",
+        kind="quest",
+        app="auth",
+        concern="other",
+        status="WORKING",
+    )
+
+    store.save(done_quest, court_root=court_root)
+    store.save(open_quest, court_root=court_root)
+
+    manifest = store.rollup_ship_manifest(court_root=court_root)
+    assert len(manifest["quests"]) == 1
+    assert manifest["quests"][0].id == "Q020-Auth-Cleanup"
+    assert len(manifest["ballads"]) == 1
+    assert "Shipped the auth refactor cleanly" in manifest["ballads"][0][1]
+    assert len(manifest["tributes"]) == 1
+    assert len(manifest["penances"]) == 1
+    assert len(manifest["opinions"]) == 1
+
+    # WORKING quest excluded by default; included when status filter widened
+    manifest_all = store.rollup_ship_manifest(status="WORKING,READY_FOR_TEARDOWN", court_root=court_root)
+    assert len(manifest_all["quests"]) == 2

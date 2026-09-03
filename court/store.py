@@ -243,3 +243,58 @@ def save_edicts(content: str, court_root: Optional[Path] = None) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content.strip() + "\n", encoding="utf-8")
     return p
+
+
+def rollup_ship_manifest(
+    app: Optional[str] = None,
+    epic: Optional[str] = None,
+    status: Optional[str] = None,
+    include_archive: bool = False,
+    court_root: Optional[Path] = None,
+) -> dict:
+    """Extract and aggregate all four rollups (ballad, tribute, penance, opinion)
+    for Quests in the Cog Ship deployment convoy — the tribute entering the castle
+    ahead of promoting `castle` into `main`.
+    Defaults to Quests with status READY_FOR_TEARDOWN or DONE if status is not specified.
+    """
+    if status is None:
+        target_statuses = {"READY_FOR_TEARDOWN", "DONE"}
+    else:
+        target_statuses = {s.strip().upper() for s in status.split(",")}
+
+    all_quests = list_all(include_archive=include_archive, court_root=court_root)
+    if app:
+        all_quests = [q for q in all_quests if q.app.lower() == app.lower()]
+    if epic:
+        epic_norm = epic.lower().lstrip("q").partition("-")[0]
+        all_quests = [
+            q for q in all_quests
+            if q.parent_epic.lower().lstrip("q").partition("-")[0] == epic_norm
+            or q.id.lower().lstrip("q").partition("-")[0] == epic_norm
+        ]
+
+    convoy_quests = [q for q in all_quests if q.status in target_statuses]
+
+    manifest = {
+        "quests": convoy_quests,
+        "ballads": [],
+        "tributes": [],
+        "penances": [],
+        "opinions": [],
+    }
+
+    for q in convoy_quests:
+        b = q.extract_tribute_subsection("ballad")
+        if b:
+            manifest["ballads"].append((q, b))
+        t = q.extract_tribute_subsection("tribute")
+        if t:
+            manifest["tributes"].append((q, t))
+        p_ = q.extract_tribute_subsection("penance")
+        if p_:
+            manifest["penances"].append((q, p_))
+        o = q.extract_tribute_subsection("opinion")
+        if o:
+            manifest["opinions"].append((q, o))
+
+    return manifest

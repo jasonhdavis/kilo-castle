@@ -7,6 +7,7 @@ Quest: $ARGUMENTS
 Follow the Gate Protocol in `.kilo/prompts/steward.md` §"5. Gatekeeper (GATE -> READY_FOR_TEARDOWN)":
 1. Confirm the Quest has passed Master of Coin review and sits at `GATE` (`court show <id>`).
 2. Dispatch the **Gatekeeper** inside the persistent `gatehouse` worktree using `.court/templates/gatekeeper_review_prompt.md`.
+   **NEVER run Gatekeeper as a background task or on castle.** Process candidates **strictly one per pull / merge**, sequentially.
 3. Record `gatekeeper_session_id` and `gatekeeper_model`.
 4. Confirm the Gatekeeper actually merged (check the Quest's `# Gatekeeper Review` section for a real merge commit hash). If confirmed:
    ```bash

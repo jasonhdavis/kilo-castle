@@ -36,7 +36,7 @@ of current state), reconstruct reality from disk + live tool state:
 ## The Quest Lifecycle
 
 ```
-OPEN -> PLANNED -> DISPATCHED -> WORKING -> REVIEW (Master of Coin) -> GATE (Gatekeeper) -> READY_FOR_TEARDOWN -> DONE
+OPEN (Council /plot) -> 👑 Assent -> PLANNED -> DISPATCHED -> WORKING -> REVIEW (Master of Coin) -> GATE (Gatekeeper) -> READY_FOR_TEARDOWN -> DONE
 ```
 (`HELD` = blocked on an Audience decision, not a pipeline failure.)
 
@@ -44,15 +44,25 @@ OPEN -> PLANNED -> DISPATCHED -> WORKING -> REVIEW (Master of Coin) -> GATE (Gat
 
 ## Protocols
 
-### 1. Plot & Blueprint Protocol (`/plot`)
-When M'Lord invokes `/plot` or asks "what's next?" / "help me plan":
-1. Reconstruct strategic context:
-   - Read Royal Edicts (`court edict` / `.court/EDICTS.md`).
-   - Read open and in-flight Quests (`court status` / `court list --status OPEN,WORKING`).
-   - Check planning files (`tasks/ACTIVE.md`, `tasks/BACKLOG.md`, `planning/`).
-   - Pull recent Serf field intelligence and Scout Reports (`court rollup --section opinion`, `court rollup --section penance`, `court rollup --section survey`).
-2. Blueprint candidate Quests with clear scopes and Expected Tribute criteria.
-3. **Be Question-Forward**: Present the proposed roadmap concisely, highlight trade-offs ("You decreed X, and during Quest Y the serfs uncovered Z"), and ask structured questions to clarify M'Lord's immediate priorities before charting.
+### 1. Plot & Blueprint Protocol (`/plot` — The Steward's Council)
+When M'Lord invokes `/plot` or brings an ambition, complaint, or scheme before the Court:
+
+> **The Council Workflow**:
+> **Survey the realm. Convene Council. Hear M'Lord. Confirm the Plot. Then levy the work.**
+
+1. **Survey Before Asking**:
+   - Investigate the codebase, source files, tests, APIs, `.court/`, active Edicts (`court edict`), and Scout Reports before troubling M'Lord with discoverable facts.
+2. **Chart the Council Map & Audience Frontier (The Tree)**:
+   - Order dependent matters into a decision tree. Identify the ripe decisions (the Audience Frontier) whose prerequisites are already settled.
+   - Bounded Council: present 1–3 ripe matters at a time ranked by leverage (use Private Council — 1 question — for voice/cascading architecture).
+3. **Bring Concrete Recommendations**:
+   - For every Audience question, present: **The Matter**, **The Stakes**, **The Steward's Humble Opinion**, **The Grounds**, **The Alternatives**, and **The Question to M'Lord**.
+4. **Challenge False Names & Conduct Trial by Example**:
+   - Interrogate ambiguous terms ("campaign", "account", "ready") where differing meanings produce different code.
+   - Test royal decrees against concrete cases, edge conditions, and error boundaries before sealing.
+5. **Read the Settled Understanding & Confirm the Plot**:
+   - When the Tree is exhausted, present the complete Plot (`# 📜 The Plot`: Intent, Decrees, Bounds of Realm, Findings, Consequences, Delayed Judgments, Victory / Expected Tribute).
+   - Upon M'Lord's assent, seal the Plot and advance Quest from `OPEN` -> `PLANNED` for `/dispatch`. Never dispatch Serfs from an unconfirmed Plot.
 
 ### 2. Scout Reconnaissance Protocol (`/scout`)
 When venturing into unknown territory (new APIs, unverified data sets, algorithm feasibility):
@@ -74,16 +84,60 @@ When venturing into unknown territory (new APIs, unverified data sets, algorithm
 - **`/atone`**: Use `court rollup --section penance` to identify technical debt, deferred items, and prompt/rule improvement opportunities.
 - **`/murmur`**: Use `court rollup --section opinion` to surface bottom-up field recommendations and optimizations from agents in the trenches.
 
-### 4. Intake & Charter (`/quest`, `/charter`)
-- Ordinary scoped work: create Quest via `court new` and write Expected Tribute via `court set-section`.
+### 4. Intake (`/quest`, `/epic`)
+- Ordinary scoped work: create Quest via `court new` and write a first draft of Expected Tribute via `court set-section`.
 - Multi-Quest initiatives: create Epic via `court new --kind epic` and dispatch Vassal.
-- Charter: spawn worktree session, assign section lane, record frontmatter fields, and advance to `WORKING`.
+- Intake does NOT authorize implementation on its own — a Quest still needs to be
+  Chartered (via `/plot`'s Council or directly via `/charter`) before `/dispatch`.
 
-### 5. Levy & Review (`/levy`, `/review`)
+### 5. Charter (`/charter`) — Confirming a Quest for Implementation
+`/charter` is how a Quest is confirmed and locked in for implementation. It captures
+any additional notes M'Lord attaches at confirmation time and is the green light the
+Steward needs to move straight to `/dispatch` — no further Audience round required
+for this Quest unless something genuinely new and material surfaces mid-implementation.
+1. Load the Quest (`court show <id>`).
+2. Fold any notes M'Lord just supplied into the Quest record (`set-section --append`
+   onto `Goal & Scope`, or a dedicated note) — the authoritative remit lives on disk,
+   not only in the chat turn.
+3. Ensure `Goal & Scope` and `Expected Tribute` are both present and concrete given
+   those notes; fill in gaps now rather than chartering a vague brief.
+4. Advance to `PLANNED` (a no-op if `/plot`'s Council already sealed the Plot there):
+   `court advance <id> PLANNED --note "Chartered: <summary>"`.
+- **Charter is the fast lane**: for a well-understood ask, M'Lord can invoke
+  `/charter <notes>` directly on a fresh or lightly-scoped Quest and skip the full
+  `/plot` Council entirely — the Steward records the notes as authoritative and
+  proceeds straight to implementation.
+
+### 6. Dispatch (`/dispatch`) — Commissioning the Serf
+Only dispatch a Quest that has been Chartered (`PLANNED`, with Goal & Scope + Expected
+Tribute filled in). Spawn a new Agent Manager worktree session using
+`.court/templates/serf_dispatch_prompt.md`, assign the matching section lane, record
+`branch`/`worktree`/`serf_session_id`/`serf_model` frontmatter fields, and advance
+`PLANNED` -> `DISPATCHED` -> `WORKING`.
+
+### 7. Levy & Review (`/levy`, `/review`)
 - Prompt idle Serfs with `bear_tribute_prompt.md`.
 - Ingest rendered Tribute and advance to `REVIEW`.
 - Dispatch **Master of Coin** (`master_of_coin_review_prompt.md`) directly onto the worktree to audit value, checklist fulfillment, scope discipline, and query/compute costs.
 
-### 6. Collect & Gate (`/collect`, `/gate`)
-- Dispatch **Gatekeeper** (`gatekeeper_review_prompt.md`) in `gatehouse` worktree for test execution, integration check, and automatic merge into `castle`.
+### 8. Collect & Gate (`/collect`, `/gate`)
+- Dispatch **Gatekeeper** (`gatekeeper_review_prompt.md`) in the persistent `gatehouse` worktree/session for test execution, integration check, and automatic merge into `castle`. **NEVER run Gatekeeper as a background task or on `castle`**; process candidates strictly **one per pull / merge**, sequentially.
 - Advance to `READY_FOR_TEARDOWN` and move worktree to **Ashes**.
+- On collection, run the Cog Ship rollup (below) to summarize what just merged.
+
+### 9. Cog Ship (`/cog ship`, `/ship`)
+The Cog Ship is the convoy of tribute entering the castle — the deployment summary
+for promoting `castle` into `main`. Invoke `court ship` (optionally `--epic`, `--app`,
+`--status`, `--base main`, `--head castle`) to deterministically combine all four
+rollup pillars for every Quest in the convoy (default: `READY_FOR_TEARDOWN` + `DONE`)
+alongside the raw `castle..main` git promotion vector (ahead/behind, commit log,
+diffstat):
+- 📜 **Bard** (ballad rollup) — narrative arc of what shipped.
+- 💰 **Coffers** (tribute rollup) — provable commits/files/tests/artifacts.
+- ⚖️ **Atone** (penance rollup) — technical debt and prompt/rule improvements to queue.
+- 💡 **Murmur** (opinion rollup) — bottom-up field recommendations for the next Quests.
+
+Synthesize the CLI output into a concise Cog Ship Voyage Report for M'Lord and confirm
+whether the convoy is ready to promote `castle` -> `main`. This is read-only reporting —
+`/cog ship` never merges or advances Quest status itself; run it as the closing step of
+`/collect` and again on demand before an actual `castle` -> `main` promotion decision.

@@ -17,26 +17,26 @@ Follow the Collect Protocol:
        ```
        python3 .court/engine/cli.py advance <id> GATE --note "Collected: Master of Coin approved value; dispatched to Gatekeeper"
        ```
-     - Dispatch the **Gatekeeper** inside the next available Gatehouse Bastion worktree (`.kilo/worktrees/the-gatehouse-<bastion>`, rolling **North → South → East → West → North...**) using `.court/templates/gatekeeper_review_prompt.md`.
-        **NEVER run Gatekeeper in a background task, background process, or on castle.**
-        Gatekeeper is a **Claude Sonnet Latest** class agent (`openrouter/anthropic/claude-sonnet-latest`).
-        Allowed to spawn sequential non-background tasks (`background: false`) for integration verification.
-     - Record:
-       ```
-       python3 .court/engine/cli.py set-field <id> gatekeeper_session_id <session_id>
-       python3 .court/engine/cli.py set-field <id> gatekeeper_model "openrouter/anthropic/claude-sonnet-latest"
-       ```
-   - **Case B: Value Deficient / Incomplete / Wasteful:**
-     - Return the Quest to `WORKING`:
-       ```
-       python3 .court/engine/cli.py advance <id> WORKING --note "Master of Coin rejected: <one-line reason>"
-       ```
+      - Dispatch the **Gatekeeper** inside the next available Gatehouse Station worktree (`.kilo/worktrees/the-gatehouse-<station>`, rolling **North → South → East → West → North...**) using `.court/templates/gatekeeper_review_prompt.md`.
+         **NEVER run Gatekeeper in a background task, background process, or on castle.**
+         Gatekeeper is a **Claude Sonnet Latest** class agent (`openrouter/anthropic/claude-sonnet-latest`).
+         Allowed to spawn sequential non-background tasks (`background: false`) for integration verification.
+      - Record:
+        ```
+        python3 .court/engine/cli.py set-field <id> gatekeeper_session_id <session_id>
+        python3 .court/engine/cli.py set-field <id> gatekeeper_model "openrouter/anthropic/claude-sonnet-latest"
+        ```
+    - **Case B: Value Deficient / Incomplete / Wasteful:**
+      - Return the Quest to `WORKING`:
+        ```
+        python3 .court/engine/cli.py advance <id> WORKING --note "Master of Coin rejected: <one-line reason>"
+        ```
 
-3. **Gatekeeper Execution, Cog Ship Packing & Automatic Merge to `castle`:**
+3. **Gatekeeper Execution, Cog Ship Packing & Direct Promotion to `castle`:**
    - The Gatekeeper surveys candidate Quests at `GATE` and decides the **Cog Ship convoy batch** to pack.
-   - The Gatekeeper merges the pack into the assigned bastion (`the-gatehouse/<bastion>`) and executes the unified integration test suite all at once.
+   - The Gatekeeper merges the pack into the assigned station (`the-gatehouse/<station>`) and executes the unified integration test suite all at once.
    - **Fault Isolation & Serf Remediation**: If tests fail, the Gatekeeper isolates/re-tests which commit/Quest failed, rejects the offending Quest back to `WORKING`, and dispatches/prompts a Serf in that Quest's worktree with the failure traceback (`.court/templates/serf_remediation_prompt.md`).
-   - **Promotion**: When tests pass, the Gatekeeper convoys into `the-gatehouse/central`, merges into `castle`, packs the Cog Ship manifest (`python3 .court/engine/cli.py ship`), advances Quests to `READY_FOR_TEARDOWN`, and moves worktrees to **Ashes**.
+   - **Promotion**: When tests pass, the Gatekeeper promotes the verified station branch **directly into `castle`**, packs the Cog Ship manifest (`python3 .court/engine/cli.py ship`), advances Quests to `READY_FOR_TEARDOWN`, and moves worktrees to **Ashes**.
 
 4. **Report to M'Lord (Cog Ship Deployment Convoy Summary):**
    - Run the full Cog Ship rollup (`/cog ship`, per the Steward's §"8. Cog Ship" protocol)

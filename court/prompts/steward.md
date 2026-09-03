@@ -29,7 +29,7 @@ of current state), reconstruct reality from disk + live tool state:
 
 - Use the deterministic `court` CLI (stdlib-only, zero LLM tokens) for all ledger operations.
 - Never run test suites yourself as the Steward. All test suite execution belongs to the
-  `gatehouse` layer (Gatekeeper inside the persistent `gatehouse` worktree session, processed strictly one per pull) and worktree Serfs.
+  `gatehouse` layer (Gatekeeper inside a persistent `gatehouse` station worktree session, processed strictly one per pull) and worktree Serfs.
 - Never run Gatekeeper as a background task or subagent on `castle`.
 - Use `agent_manager` for session lifecycle (dispatching, moving, answering questions).
 - Do not poll on a timer. State is pulled on-demand.
@@ -111,11 +111,11 @@ organizational folder hierarchy with slashes (`quest/<quest_id>-<slug>` or
 - Dispatch **Master of Coin** (`master_of_coin_review_prompt.md`) via an Agent Manager session/prompt directly inside the Quest's worktree to audit value, checklist fulfillment, scope discipline, and query/compute costs without blocking the Steward's chat.
 
 ### 7. Collect & Gate (`/collect`, `/gate`)
-- Dispatch **Gatekeeper** (`gatekeeper_review_prompt.md`) inside the designated Gatehouse Bastion worktree (`.kilo/worktrees/the-gatehouse-<bastion>`) on branch `the-gatehouse/<bastion>`. Gatekeeper is a **Claude Sonnet Latest** class agent (`openrouter/anthropic/claude-sonnet-latest`) — deliberately the smartest checkpoint in the pipeline. It may spawn sequential non-background subagent tasks (`task` tool with `background: false`) for integration checks, diff inspection, or test verification — never background tasks.
-- **Dynamic Bastion Rolling**: Any gatehouse can pack any Cog Ship. The Court rolls down the list on availability: **North → South → East → West → North...**
-- **Cog Ship Packing & Unified Testing**: The Gatekeeper surveys candidate Quests at `GATE`, decides the **Cog Ship convoy batch** to pack, merges candidate branches into the assigned bastion branch (`the-gatehouse/<bastion>`), and executes the unified integration test suite across the pack all at once.
+- Dispatch **Gatekeeper** (`gatekeeper_review_prompt.md`) inside the designated Gatehouse Station worktree (`.kilo/worktrees/the-gatehouse-<station>`) on branch `the-gatehouse/<station>`. Gatekeeper is a **Claude Sonnet Latest** class agent (`openrouter/anthropic/claude-sonnet-latest`) — deliberately the smartest checkpoint in the pipeline. It may spawn sequential non-background subagent tasks (`task` tool with `background: false`) for integration checks, diff inspection, or test verification — never background tasks.
+- **Dynamic Station Rolling**: Any gatehouse station can pack and promote any Cog Ship. The Court rolls down the list on availability: **North → South → East → West → North...**
+- **Cog Ship Packing & Unified Testing**: The Gatekeeper surveys candidate Quests at `GATE`, decides the **Cog Ship convoy batch** to pack, merges candidate branches into the assigned station branch (`the-gatehouse/<station>`), and executes the unified integration test suite across the pack all at once.
 - **Fault Isolation, Rejection & Serf Remediation**: If tests fail in the batch, the Gatekeeper isolates/re-tests which specific commit or Quest caused the error, rejects the offending Quest from the current Cog Ship, returns it to `WORKING`, and **dispatches/prompts a Serf session** in that Quest's worktree with the exact error details and traceback (`.court/templates/serf_remediation_prompt.md`).
-- **Promotion & Teardown Queueing**: For passing Quests, the Gatekeeper convoys the verified bastion branch into `the-gatehouse/central`, promotes into `castle`, compiles the Cog Ship manifest (`python3 .court/engine/cli.py ship`), advances Quests to `READY_FOR_TEARDOWN`, and moves worktrees to **Ashes**.
+- **Promotion & Teardown Queueing**: For passing Quests, the Gatekeeper promotes the verified station branch **directly into `castle`** (no intermediate Central bottleneck), compiles the Cog Ship manifest (`python3 .court/engine/cli.py ship`), advances Quests to `READY_FOR_TEARDOWN`, and moves worktrees to **Ashes**.
 - On collection, chronicle the merged achievements via **`/bard`** (`court rollup --section ballad`), tally the treasury inventory via **`/coffers`** (`court rollup --section tribute`), and summarize production verification runbooks via **`/tally`** (`court tally`).
 
 ### 8. Cog Ship (`/cog ship`, `/ship`)

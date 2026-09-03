@@ -180,13 +180,11 @@ main                    (production root trunk)
   ^
 castle                  (staging root trunk for main; attached to localhost)
   ^
-the-gatehouse/central   (persistent rolling staging trunk & central union)
-  ^
-  Gatehouse Bastions folder (Dynamic Rolling Availability: North -> South -> East -> West):
-    - the-gatehouse/north     (Parallel Cog Ship staging bastion)
-    - the-gatehouse/south     (Parallel Cog Ship staging bastion)
-    - the-gatehouse/east      (Parallel Cog Ship staging bastion)
-    - the-gatehouse/west      (Parallel Cog Ship staging bastion)
+  Gatehouse Stations folder (Autonomous Direct-Promotion Stations; Dynamic Rolling: North -> South -> East -> West):
+    - the-gatehouse/north     (Autonomous Cog Ship staging station)
+    - the-gatehouse/south     (Autonomous Cog Ship staging station)
+    - the-gatehouse/east      (Autonomous Cog Ship staging station)
+    - the-gatehouse/west      (Autonomous Cog Ship staging station)
   ^
   agent worktrees, structured in tree format:
     - epics:              epic/<epic_id>-<slug>
@@ -201,7 +199,7 @@ the-gatehouse/central   (persistent rolling staging trunk & central union)
 - **`Feature`**: Net-new production functionality; verified against component + integration tests.
 - **`Optimization`**: Refactoring, performance, query optimization; full broad test suite.
 - **`Investigation`**: Spikes, POCs, exploratory research (Scouts); **never auto-merges into `gatehouse`**.
-- **`GATEHOUSE`**: Staging worktrees (`the-gatehouse/central`, `the-gatehouse/north`, `the-gatehouse/south`, `the-gatehouse/east`, `the-gatehouse/west`).
+- **`GATEHOUSE`**: Staging worktrees (`the-gatehouse/north`, `the-gatehouse/south`, `the-gatehouse/east`, `the-gatehouse/west`).
 - **`Ashes`**: Completed worktrees queued for manual teardown.
 
 ---

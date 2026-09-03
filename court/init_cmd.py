@@ -121,13 +121,11 @@ main                    (production root trunk)
   ^
 castle                  (staging root trunk for main; attached to localhost)
   ^
-the-gatehouse/central   (persistent rolling staging trunk & central union)
-  ^
-  Gatehouse Bastions folder (Dynamic Rolling: North -> South -> East -> West):
-    - the-gatehouse/north     (Parallel Cog Ship staging bastion)
-    - the-gatehouse/south     (Parallel Cog Ship staging bastion)
-    - the-gatehouse/east      (Parallel Cog Ship staging bastion)
-    - the-gatehouse/west      (Parallel Cog Ship staging bastion)
+  Gatehouse Stations folder (Autonomous Direct-Promotion Stations; Dynamic Rolling: North -> South -> East -> West):
+    - the-gatehouse/north     (Autonomous Cog Ship staging station)
+    - the-gatehouse/south     (Autonomous Cog Ship staging station)
+    - the-gatehouse/east      (Autonomous Cog Ship staging station)
+    - the-gatehouse/west      (Autonomous Cog Ship staging station)
   ^
   Organizational branch folders:
     - Epics folder:               epic/<epic_id>-<slug>
@@ -138,38 +136,37 @@ the-gatehouse/central   (persistent rolling staging trunk & central union)
 
 **FORBIDDEN**: Flat hyphens like `quest-q062-...` or `the-gatehouse-2`. Every branch must begin with its proper folder prefix (`epic/`, `quest/`, `scout/`, or `the-gatehouse/`).
 
-### The Five Gatehouse Bastions & Multi-Convoy Pipeline
+### The Four Autonomous Gatehouse Stations & Direct-Promotion Pipeline
 
-To maximize throughput and prevent bottlenecks, the staging layer is organized into **Five Gatehouse Bastions** converging into `the-gatehouse/central`:
+To maximize throughput and prevent bottlenecks or double-gating, the staging layer is organized into **Four Autonomous Gatehouse Stations** nested under the `the-gatehouse/` folder:
 
-**Dynamic Availability Rolling (No Domain Silos)**:
-Gatehouses are **not** restricted by domain. **Any gatehouse can pack any Cog Ship.** When candidate Quests at `GATE` are ready for batch integration, the Court simply rolls down the list to whichever regional bastion is currently idle/available: **North → South → East → West → North...**
+**Dynamic Availability Rolling (No Domain Silos & No Central Bottleneck)**:
+Gatehouses are **not** restricted by domain. **Any gatehouse station can pack, test, approve, and promote any Cog Ship directly into `castle`.** There is no intermediate `central` gatehouse — having a central bottleneck would create serial merge contention and double-gating. When candidate Quests at `GATE` are ready for batch integration, the Court simply rolls down the list to whichever regional station is currently idle/available: **North → South → East → West → North...**
 
-1. **`the-gatehouse/north`** (`.kilo/worktrees/the-gatehouse-north`): North Bastion — packs and tests candidate Cog Ships on availability.
-2. **`the-gatehouse/south`** (`.kilo/worktrees/the-gatehouse-south`): South Bastion — packs and tests candidate Cog Ships on availability.
-3. **`the-gatehouse/east`** (`.kilo/worktrees/the-gatehouse-east`): East Bastion — packs and tests candidate Cog Ships on availability.
-4. **`the-gatehouse/west`** (`.kilo/worktrees/the-gatehouse-west`): West Bastion — packs and tests candidate Cog Ships on availability.
-5. **`the-gatehouse/central`** (`.kilo/worktrees/the-gatehouse-central`): Central Grand Gatehouse & rolling staging trunk. Receives verified Cog Ships convoyed in from North, South, East, and West, performs final unified staging integration, and executes the promotion into `castle`.
+1. **`the-gatehouse/north`** (`.kilo/worktrees/the-gatehouse-north`): North Station — autonomous Cog Ship staging, testing, fault isolation, and direct promotion to `castle`.
+2. **`the-gatehouse/south`** (`.kilo/worktrees/the-gatehouse-south`): South Station — autonomous Cog Ship staging, testing, fault isolation, and direct promotion to `castle`.
+3. **`the-gatehouse/east`** (`.kilo/worktrees/the-gatehouse-east`): East Station — autonomous Cog Ship staging, testing, fault isolation, and direct promotion to `castle`.
+4. **`the-gatehouse/west`** (`.kilo/worktrees/the-gatehouse-west`): West Station — autonomous Cog Ship staging, testing, fault isolation, and direct promotion to `castle`.
 
 ---
 
 ## Division of Labor
 
 **Gatekeeper Execution Environment, Cog Ship Mandate & Remediation Protocol:**
-- **Dedicated Agent Manager Session on `the-gatehouse/<bastion>`**: The Gatekeeper MUST ALWAYS run as an Agent Manager session inside a persistent Gatehouse bastion worktree (`.kilo/worktrees/the-gatehouse-<bastion>`). **NEVER run Gatekeeper as a background task, background process, or subagent on `castle`.**
+- **Dedicated Agent Manager Session on `the-gatehouse/<station>`**: The Gatekeeper MUST ALWAYS run as an Agent Manager session inside a persistent Gatehouse station worktree (`.kilo/worktrees/the-gatehouse-north`, `the-gatehouse-south`, `the-gatehouse-east`, `the-gatehouse-west`). **NEVER run Gatekeeper as a background task, background process, or subagent on `castle`.**
 - **Model Tiering**: Deliberately a **Claude Sonnet Latest** class agent (`openrouter/anthropic/claude-sonnet-latest`), standing as the smartest checkpoint in the pipeline.
-- **Sequential Non-Background Tasks Permitted**: The Gatekeeper inside a Gatehouse bastion is explicitly allowed to spawn **sequential non-background subagent tasks** (`task` tool with `background: false`) for integration checks, diff inspection, or test verification. Background tasks are forbidden.
-- **Cog Ship Packing & Single Unified Merge/Test**: Gatekeeper does NOT perform redundant line-by-line manual code re-audits on individual Quests (Master of Coin already approved scope and value in `REVIEW`). Gatekeeper surveys Quests waiting at `GATE`, decides the **Cog Ship convoy batch** to pack, merges candidate branches into the assigned bastion branch (`the-gatehouse/<bastion>`), and executes the unified integration test suite across the pack all at once.
+- **Sequential Non-Background Tasks Permitted**: The Gatekeeper inside a Gatehouse station is explicitly allowed to spawn **sequential non-background subagent tasks** (`task` tool with `background: false`) for integration checks, diff inspection, or test verification. Background tasks are forbidden.
+- **Cog Ship Packing & Single Unified Merge/Test**: Gatekeeper does NOT perform redundant line-by-line manual code re-audits on individual Quests (Master of Coin already approved scope and value in `REVIEW`). Gatekeeper surveys Quests waiting at `GATE`, decides the **Cog Ship convoy batch** to pack, merges candidate branches into the assigned station branch (`the-gatehouse/<station>`), and executes the unified integration test suite across the pack all at once.
 - **Fault Isolation, Commit Rejection & Re-testing**: If tests fail during the unified run, Gatekeeper isolates/re-tests which specific commit or Quest caused the failure, **rejects the offending commit/Quest** from the current Cog Ship, and rolls back its merge. The clean passing pack continues forward.
 - **Serf Remediation Dispatch**: For any rejected Quest, Gatekeeper writes the exact failure traceback into `# Gatekeeper Review`, returns the Quest to `WORKING`, and **dispatches/prompts a Serf session in the Quest's worktree** with the exact error details and remediation instructions.
-- **Convoy to Central & Promotion**: Passing Cog Ships are convoyed into `the-gatehouse/central`, promoted into `castle`, compiled into the deployment manifest (`court ship`), and advanced to `READY_FOR_TEARDOWN`.
+- **Direct Promotion to Castle**: Passing Cog Ships are promoted **directly into `castle`**, compiled into the deployment manifest (`court ship`), and advanced to `READY_FOR_TEARDOWN`.
 
 | Stage | Runs | Scope | Notes |
 |---|---|---|---|
 | Scout Worktree | The Scout (spikes / POCs) | Verification that spike runs | **Never merges to gatehouse.** Generates 5-part Scout Report. |
 | Serf Worktree -> `gatehouse` | Worktree Serf, pre-merge | Scoped to affected components | Cheap local checks. Before rendering Tribute: `git status --porcelain` clean + rebase/fast-forward onto `castle` (`behind: 0`). |
-| Inside `gatehouse`, per convoy | Gatekeeper (in bastion worktree) | Unified batch integration & test execution | Single merge & test across Cog Ship convoy. Fault isolation & Serf remediation on failure. |
-| `gatehouse` -> `castle` (promotion) | Gatekeeper / staging session | Promotion into castle via `the-gatehouse/central` | Promotes clean verified Cog Ships. |
+| Inside `gatehouse`, per convoy | Gatekeeper (in station worktree) | Unified batch integration & test execution | Single merge & test across Cog Ship convoy. Fault isolation & Serf remediation on failure. |
+| `gatehouse` -> `castle` (promotion) | Gatekeeper / staging session | Direct promotion into `castle` | Promotes clean verified Cog Ships directly into castle. |
 | `castle` -> `main` (release) | `court ship` / `/cog ship` deployment convoy summary, then M'Lord | Read-only rollup + human/live QA | No redundant automated full-suite rerun on `castle`. |
 
 ---
@@ -178,7 +175,7 @@ Gatehouses are **not** restricted by domain. **Any gatehouse can pack any Cog Sh
 
 | Section / Tag | What goes here | Test scope | Promotion rule |
 |---|---|---|---|
-| **GATEHOUSE** | The `gatehouse` staging worktrees (`the-gatehouse/central`, `north`, `south`, `east`, `west`). | Full suite before promoting to `castle`. | Promotes to `castle` as one reviewed step. |
+| **GATEHOUSE** | The `gatehouse` staging worktrees (`the-gatehouse/north`, `south`, `east`, `west`). | Full suite before promoting to `castle`. | Promotes directly to `castle` as one reviewed step. |
 | **Bug fix** | Narrow, scoped bug fixes. | Affected component tests only. | Merge to `gatehouse` once scoped tests pass + review. |
 | **Feature** | Net-new production functionality. | Affected component tests + integration. | Merge to `gatehouse` once tests pass + review. |
 | **Optimization** | Refactoring, performance, query optimization. | Full tests for touched components. | Merge to `gatehouse` once broad tests pass + review. |

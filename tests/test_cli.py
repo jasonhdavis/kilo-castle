@@ -32,10 +32,17 @@ def test_cli_new_show_advance_status(tmp_path, monkeypatch, capsys):
     assert "id: Q001-Core-Jwt-Rotation" in out
     assert "Fix token rotation race condition" in out
 
-    # 4. advance
+    # 4. advance (single & batch)
     main(["advance", "Q001-Core-Jwt-Rotation", "WORKING", "--note", "Serf dispatched"])
     out = capsys.readouterr().out
     assert "Q001-Core-Jwt-Rotation: WORKING" in out
+
+    main(["advance", "Q001-Core-Jwt-Rotation,Q001-Core-Jwt-Rotation", "REVIEW", "--note", "Batch advance test"])
+    out = capsys.readouterr().out
+    assert "Q001-Core-Jwt-Rotation: REVIEW" in out
+
+    main(["advance", "Q001-Core-Jwt-Rotation", "WORKING", "--note", "Reset to working"])
+    capsys.readouterr()
 
     # 5. set-field
     main(["set-field", "Q001-Core-Jwt-Rotation", "serf_model", "Gemini 3.7 Flash"])
@@ -65,13 +72,18 @@ We refactored JWT rotation to eliminate the token race.
 ### 2. Tribute
 - Added 3 test cases in tests/test_jwt.py (100% pass)
 
-### 3. Penance
+### 3. Tally
+- Navigate to /api/v1/auth/token/refresh
+- Pass expired access token with valid refresh token
+- Expect 200 OK with new JWT token
+
+### 4. Penance
 Skipped testing Redis cluster failover edge case.
 
-### 4. Audience
+### 5. Audience
 None required.
 
-### 5. Humble Opinion
+### 6. Humble Opinion
 Recommend adding automatic key deprecation cron.
 """
     main(["set-section", "Q001-Core-Jwt-Rotation", "Tribute Rendered", "--content", tribute_body])
@@ -81,6 +93,16 @@ Recommend adding automatic key deprecation cron.
     out = capsys.readouterr().out
     assert "COURT ROLLUP — BALLAD" in out
     assert "We refactored JWT rotation" in out
+
+    main(["rollup", "--section", "tally"])
+    out = capsys.readouterr().out
+    assert "COURT ROLLUP — TALLY" in out
+    assert "Navigate to /api/v1/auth/token/refresh" in out
+
+    main(["tally"])
+    out = capsys.readouterr().out
+    assert "THE COURT TALLY — PRODUCTION & UI VERIFICATION RUNBOOKS" in out
+    assert "Navigate to /api/v1/auth/token/refresh" in out
 
     main(["rollup", "--section", "penance"])
     out = capsys.readouterr().out
@@ -149,6 +171,7 @@ Recommend adding automatic key deprecation cron.
     assert "THE BARD'S CHRONICLE" in ship_out
     assert "We refactored JWT rotation" in ship_out
     assert "THE COFFERS LEDGER" in ship_out
+    assert "THE TALLY RUNBOOK" in ship_out
     assert "THE SERF PENANCE" in ship_out
     assert "THE HUMBLE OPINIONS" in ship_out
     assert "COG SHIP DEPLOYMENT SUMMARY COMPLETE" in ship_out

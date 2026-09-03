@@ -106,6 +106,42 @@ Build ExtractService in apps/marketplace/services/extract_service.py
     assert "apps/marketplace/services/extract_service.py" in q.extract_tribute_subsection("plot")
 
 
+def test_tribute_and_tally_subsection_extraction():
+    q = Quest(id="Q002-Test-Tribute", title="Tribute Test")
+    report = """### 1. Ballad
+Implemented user profile view.
+
+### 2. Tribute
+- Modified apps/users/views.py (+45 lines)
+- Commits: a1b2c3d
+- Tests: 12 passed in 1.2s
+
+### 3. Tally
+- Navigate to `/users/profile/`
+- Click edit profile and update display name
+- Verify new name is rendered on dashboard
+
+### 4. Penance
+Skipped avatar upload caching.
+
+### 5. Audience
+None required.
+
+### 6. Humble Opinion
+Advance to review.
+"""
+    q.set_section("Tribute Rendered", report)
+
+    assert "Implemented user profile view" in q.extract_tribute_subsection("ballad")
+    assert "Modified apps/users/views.py" in q.extract_tribute_subsection("tribute")
+    assert "Navigate to `/users/profile/`" in q.extract_tribute_subsection("tally")
+    assert "Navigate to `/users/profile/`" in q.extract_tribute_subsection("verification")
+    assert "Navigate to `/users/profile/`" in q.extract_tribute_subsection("production verification")
+    assert "Skipped avatar upload caching" in q.extract_tribute_subsection("penance")
+    assert "None required" in q.extract_tribute_subsection("audience")
+    assert "Advance to review" in q.extract_tribute_subsection("opinion")
+
+
 def test_status_transition_and_history():
     q = Quest(id="Q001-Test-Status", title="Test Status", app="test", concern="status")
     q.set_status("PLANNED", "Ready for dispatch")

@@ -1,6 +1,6 @@
 # Bear Tribute / Report to the King — Serf Prompt Template
 
-Send this prompt to an active Serf session when requesting a full progress report, audit, or end-of-stage Tribute handoff.
+Send this prompt to an active Serf session (`agent_manager` `prompt`) when requesting a full progress report, audit, or end-of-stage Tribute handoff.
 
 ---
 
@@ -16,8 +16,13 @@ A narrative summary of work completed, problem context uncovered, architectural 
 Provable, tangible work product delivered. You must include:
 - **Files Touched / Created**: Exact file paths with line counts or diff stat.
 - **Git Commits**: Any commits created on `{{ branch }}` with hashes and messages (or explicit statement of uncommitted working tree changes).
-- **Tests Run & Results**: Exact test commands executed and their literal exit status / tail output (no paraphrasing).
+- **Tests Run & Results**: Exact pytest / test commands executed and their literal exit status / tail output (no paraphrasing).
 - **Artifacts & Proof**: Data payloads, migrations, endpoints, or reports produced.
+- **The Tally (Production & UI Verification Runbook)**:
+  - **Exact URLs & UI Navigation Paths**: Specific URLs and click paths for human/QA verification (e.g. `/products/4993`, `/crm/prospecting/prospects/`, `/?tab=triggers`).
+  - **Input Parameters & Filters**: Exact query parameters, dropdown filters, or form inputs to test.
+  - **Example Commands & Workflows**: Exact CLI commands or scripts to run.
+  - **Expected Visual & Behavioral Outcomes**: Expected UI elements, badges, states, values, or behaviors to observe to prove proper implementation.
 
 ### 3. Penance
 Honest self-flagellation regarding what you failed to accomplish, half-finished, took shortcuts on, deferred, or where your confidence is shaky. Do not hide defects or paper over uncertainty with confident prose.
@@ -40,6 +45,6 @@ Before rendering your tribute and persisting your report:
 ### Mandatory Durable Completion Requirement
 In addition to your response message, you MUST persist your complete 5-section report into durable storage:
 ```bash
-court set-section {{ quest_id }} "Tribute Rendered" --file <path_to_report>
+python3 .court/engine/cli.py set-section {{ quest_id }} "Tribute Rendered" --file <path_to_report>
 ```
 (or write it directly into `.court/quests/{{ quest_id }}.md` under `# Tribute Rendered`). This ensures the Steward and Court read your rendered completion directly from disk without relying on ephemeral chat turns.

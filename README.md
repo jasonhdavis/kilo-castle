@@ -49,7 +49,7 @@ Instead of relying on fragile chat history or allowing a single LLM session to w
 | **🌲 Scout** | Reconnaissance agent for proof-of-concept investigations on non-merging `scout/*` branches. Probes APIs, tests feasibility with throwaway scripts in `tasks/artifacts/`, and generates the 5-part Scout Report. | Fast / Cost-Efficient (e.g. Gemini 3.7 Flash) |
 | **🔨 Serf** | Disposable coding agent assigned to a single isolated Git worktree. Builds clean, production-ready code against approved blueprints. Dismissed and replaced if confused. | Fast / Cost-Efficient (e.g. Gemini 3.7 Flash) |
 | **🪙 Master of Coin** | Dispatched during `REVIEW` **before** testing and merging. Audits the rendered Tribute directly on the worktree for criteria satisfaction, scope discipline, and query/compute cost efficiency. | Fast / Cost-Efficient (e.g. Gemini 3.7 Flash) |
-| **🛡️ Gatekeeper** | Lives inside the persistent `gatehouse` integration worktree. Dispatched during `GATE`. Independently re-verifies the diff, executes the test suite, and merges into `gatehouse` and `castle`. | Frontier Reasoning (e.g. Claude 3.7 Sonnet) |
+| **🛡️ Gatekeeper** | Lives inside the persistent `the-gatehouse` bastions. Dispatched during `GATE`. Decides the Cog Ship convoy pack, runs unified integration test suites across the pack all at once, isolates/re-tests and rejects failing commits with Serf remediation, and promotes verified Cog Ships into `castle`. | Frontier Reasoning (e.g. Claude 3.7 Sonnet) |
 | **📜 Vassal** | Dispatched only for large, multi-Quest **Epics**. Decomposes initiatives into child Quests, coordinates dependencies, and compresses fleet status upward. | Fast / Frontier |
 
 ---
@@ -166,7 +166,7 @@ Each section maps directly to dedicated slash commands and CLI rollups:
 ```
 
 1. **📜 `/bard` (Ballad)**: Weaves narrative summaries across an Epic or App into a cohesive executive story of challenges encountered, architecture decisions, and transformed features.
-2. **💰 `/coffers` (Tribute)**: Collects the hard deliverables across Quests: git commits, line diff stats, passed test exit codes, new endpoints, and data payloads.
+2. **💰 `/coffers` (Tribute)**: Collects the hard deliverables across Quests: git commits, line diff stats, passed test exit codes, new endpoints, data payloads, and **The Tally** (production & UI verification runbooks).
 3. **🪨 `/atone` (Penance)**: Aggregates agent self-flagellations on shortcuts taken, deferred edge cases, and shaky confidence to automatically generate technical debt backlogs and prompt/rule improvement items.
 4. **👑 `/audience` (Audience)**: Surfaces pending trade-offs and questions requiring M'Lord's authority.
 5. **👂 `/murmur` (Humble Opinion)**: Clusters bottom-up suggestions from agents in the trenches on emergent optimizations and next architectural moves.
@@ -176,11 +176,17 @@ Each section maps directly to dedicated slash commands and CLI rollups:
 ## Branch Topology & Agent Manager Lanes
 
 ```
-main                    (production)
+main                    (production root trunk)
   ^
-castle                  (staging for main; attached to localhost)
+castle                  (staging root trunk for main; attached to localhost)
   ^
-gatehouse               (persistent rolling integration branch; test execution layer)
+the-gatehouse/central   (persistent rolling staging trunk & central union)
+  ^
+  Gatehouse Bastions folder (Dynamic Rolling Availability: North -> South -> East -> West):
+    - the-gatehouse/north     (Parallel Cog Ship staging bastion)
+    - the-gatehouse/south     (Parallel Cog Ship staging bastion)
+    - the-gatehouse/east      (Parallel Cog Ship staging bastion)
+    - the-gatehouse/west      (Parallel Cog Ship staging bastion)
   ^
   agent worktrees, structured in tree format:
     - epics:              epic/<epic_id>-<slug>
@@ -195,7 +201,7 @@ gatehouse               (persistent rolling integration branch; test execution l
 - **`Feature`**: Net-new production functionality; verified against component + integration tests.
 - **`Optimization`**: Refactoring, performance, query optimization; full broad test suite.
 - **`Investigation`**: Spikes, POCs, exploratory research (Scouts); **never auto-merges into `gatehouse`**.
-- **`GATEHOUSE`**: Staging merge target worktree.
+- **`GATEHOUSE`**: Staging worktrees (`the-gatehouse/central`, `the-gatehouse/north`, `the-gatehouse/south`, `the-gatehouse/east`, `the-gatehouse/west`).
 - **`Ashes`**: Completed worktrees queued for manual teardown.
 
 ---
@@ -234,7 +240,8 @@ Inside Kilo Code, interact naturally with the Steward:
 | `/gate <id>` | Dispatch Gatekeeper to test and merge a specific Quest |
 | `/bear-tribute` | Prompt an active Serf to render its 5-part completion report |
 | `/bard` | Synthesize narrative ballads across Quests into a release story |
-| `/coffers` | Aggregate provable deliverables (commits, line counts, endpoints, passed tests) |
+| `/coffers` | Aggregate provable deliverables (commits, line counts, endpoints, passed tests, and production verification runbooks) |
+| `/tally` | Extract and summarize production verification runbooks and UI navigation paths across Quests |
 | `/atone` | Aggregate agent penance to uncover tech debt and prompt flaws |
 | `/murmur` | Surface bottom-up field recommendations from the agents |
 | `/audience` | Surface pending decisions requiring M'Lord's judgment |

@@ -225,10 +225,16 @@ def cmd_status(args):
 
 
 def cmd_advance(args):
-    quest = store.load(args.quest_id)
-    quest.set_status(args.status, args.note or "")
-    store.save(quest)
-    print(f"{quest.id}: {quest.status}")
+    court_root = store.get_court_root()
+    raw_ids = args.quest_id.split(",") if "," in args.quest_id else [args.quest_id]
+    for q_id in raw_ids:
+        q_id = q_id.strip()
+        if not q_id:
+            continue
+        quest = store.load(q_id, court_root=court_root)
+        quest.set_status(args.status, args.note or "")
+        store.save(quest, court_root=court_root)
+        print(f"{quest.id}: {quest.status}")
 
 
 def cmd_log(args):
@@ -324,6 +330,26 @@ def cmd_rollup(args):
         print(content)
 
 
+def cmd_tally(args):
+    results = store.rollup_section(
+        section_name="tally",
+        app=args.app,
+        epic=args.epic,
+        status=args.status,
+        include_archive=args.all,
+    )
+    if not results:
+        print("(no rendered production verification runbooks/tallies found matching filters)")
+        return
+
+    print("=" * 76)
+    print(f"🔍 THE COURT TALLY — PRODUCTION & UI VERIFICATION RUNBOOKS ({len(results)} Quests)")
+    print("=" * 76)
+    for quest, content in results:
+        print(f"\n### {quest.id}: {quest.title} ({quest.app}) [{quest.status}]")
+        print(content)
+
+
 def cmd_edict(args):
     current = store.load_edicts()
     if args.content or args.file:
@@ -409,6 +435,14 @@ def cmd_ship(args):
         for q, t in manifest["tributes"]:
             print(f"\n### {q.id}: {q.title} ({q.app})")
             print(t)
+
+    if manifest["tallies"]:
+        print("\n" + "-" * 76)
+        print(f"🔍 THE TALLY RUNBOOK — Production Verification & UI Paths ({len(manifest['tallies'])} Tallies)")
+        print("-" * 76)
+        for q, v in manifest["tallies"]:
+            print(f"\n### {q.id}: {q.title} ({q.app})")
+            print(v)
 
     if manifest["penances"]:
         print("\n" + "-" * 76)
@@ -527,12 +561,20 @@ def build_parser():
 
     # rollup
     p_rollup = sub.add_parser("rollup", help="Extract and roll up specific tribute sections across Quests")
-    p_rollup.add_argument("--section", required=True, choices=["ballad", "tribute", "penance", "audience", "opinion"], help="Tribute subsection to extract")
+    p_rollup.add_argument("--section", required=True, choices=["ballad", "tribute", "tally", "penance", "audience", "opinion"], help="Tribute subsection to extract")
     p_rollup.add_argument("--app", default=None, help="Filter by app domain")
     p_rollup.add_argument("--epic", default=None, help="Filter by parent Epic ID")
     p_rollup.add_argument("--status", default=None, help="Filter by status (comma-separated)")
     p_rollup.add_argument("--all", action="store_true", help="Include archived Quests")
     p_rollup.set_defaults(func=cmd_rollup)
+
+    # tally
+    p_tally = sub.add_parser("tally", help="Extract and summarize production verification runbooks and UI paths across Quests (/tally)")
+    p_tally.add_argument("--app", default=None, help="Filter by app domain")
+    p_tally.add_argument("--epic", default=None, help="Filter by parent Epic ID")
+    p_tally.add_argument("--status", default=None, help="Filter by status (comma-separated)")
+    p_tally.add_argument("--all", action="store_true", help="Include archived Quests")
+    p_tally.set_defaults(func=cmd_tally)
 
     # edict
     p_edict = sub.add_parser("edict", help="View or add royal edicts and strategic priorities")

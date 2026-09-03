@@ -279,6 +279,7 @@ def rollup_ship_manifest(
         "quests": convoy_quests,
         "ballads": [],
         "tributes": [],
+        "tallies": [],
         "penances": [],
         "opinions": [],
     }
@@ -290,6 +291,9 @@ def rollup_ship_manifest(
         t = q.extract_tribute_subsection("tribute")
         if t:
             manifest["tributes"].append((q, t))
+        v = q.extract_tribute_subsection("tally")
+        if v:
+            manifest["tallies"].append((q, v))
         p_ = q.extract_tribute_subsection("penance")
         if p_:
             manifest["penances"].append((q, p_))

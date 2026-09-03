@@ -4,6 +4,6 @@ agent: steward
 ---
 Arguments: $ARGUMENTS
 
-Alias for `/cog ship`. Run `court ship $ARGUMENTS` and present the combined
-Bard/Coffers/Atone/Murmur deployment convoy summary to M'Lord, per the Cog Ship
+Alias for `/cog ship`. Run `python3 .court/engine/cli.py ship $ARGUMENTS` and present the
+combined Bard/Coffers/Tally/Atone/Murmur deployment convoy summary to M'Lord, per the Cog Ship
 Protocol in `.kilo/prompts/steward.md`.

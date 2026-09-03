@@ -10,13 +10,13 @@ Follow the Scout Reconnaissance Protocol:
    - Assign to section `Investigation` and kind `scout`.
    - Create Quest:
      ```bash
-     court new --app <app> --concern <concern> --title "<title>" --section "Investigation" --kind "scout" --goal "<goal>"
+     python3 .court/engine/cli.py new --app <app> --concern <concern> --title "<title>" --section "Investigation" --kind "scout" --goal "<goal>"
      ```
 2. **Charter the Scout:**
    - Branch format: `scout/<id>-<slug>`.
    - Dispatch an Agent Manager worktree session using `.court/templates/scout_dispatch_prompt.md`.
    - Move worktree to the `Investigation` section in Agent Manager.
-   - Record fields via `court set-field` and advance to `WORKING`.
+   - Record fields via `python3 .court/engine/cli.py set-field` and advance to `WORKING`.
 3. **Scout Constraints & Deliverables:**
    - Scout writes throwaway scripts and fixtures to `tasks/artifacts/` (NO production service code).
    - Scout renders the 5-part Scout Report (**The Survey**, **The Map**, **The Dangers**, **The Tribute**, **The Plot**).

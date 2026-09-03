@@ -1,11 +1,18 @@
 ---
-description: Dismiss a stalled or confused Serf and dispatch a fresh Serf into the SAME worktree
+description: Dismiss a stalled/confused Serf and dispatch a fresh one into the same worktree
 agent: steward
 ---
-Target: $ARGUMENTS
+Target: $ARGUMENTS (a Quest id, or directly a session id)
 
-Follow the Dismiss Protocol:
-1. Stop the stalled session in Agent Manager (`agent_manager` stop).
-2. Retain the existing worktree and branch intact.
-3. Dispatch a fresh Serf into the SAME worktree with corrected context.
-4. Log the replacement in `.court/quests/<id>.md`.
+Follow `.kilo/prompts/steward.md` §"3. Monitor (WORKING)"'s dismissal steps
+exactly:
+1. `agent_manager` `stop` on the stalled session (worktree/branch survive
+   this untouched).
+2. Check `agent_manager` `list` for that worktree — it may already carry a
+   usable second session slot.
+3. If the tool has no way to attach a new session to the existing worktree
+   yourself, say so plainly and ask M'lord to open a fresh session tab on
+   that worktree in the Agent Manager UI. Do NOT create a second
+   worktree/branch as a workaround — that forks the Quest's implementation.
+4. Log it: `python3 .court/engine/cli.py log <quest_id> "Dismissed serf X, dispatched fresh serf Y"`
+   and add a one-line entry to `.court/LEDGER.md`'s "Serf/Vassal churn log".

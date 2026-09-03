@@ -20,18 +20,30 @@ without losing any committed work.
 - Read `AGENTS.md` (repo root) and follow the branch/worktree/testing rules
   there exactly — especially the scoped-vs-full test rule for this Quest's
   section (**{{ section }}**).
-- Read project rules and coding standards before writing code. Grep for
-  existing patterns before inventing new ones.
+- Read `RULES.md`/`.kilocode/rules/RUELES.md` for Django/Bootstrap/query-cost
+  conventions before writing code. Grep for existing patterns before
+  inventing new ones.
 - Stay inside the stated scope. If you discover the work is bigger than this
   Quest's scope, or that it depends on/duplicates another in-flight Quest,
   **stop and report that as a blocker** — do not silently expand scope or
   duplicate work.
-- Commit your work as you go on this worktree's tree-structured branch (`{{ branch }}`).
+- Commit your work as you go on this worktree's organizational folder branch (`{{ branch }}`).
   Do not merge, do not touch `gatehouse`/`castle`/`main` yourself.
+
+## Production Database Inspection (ROQ)
+- If you need to inspect live production data, verify live schema/distributions, or extract realistic test fixtures, use the **Read-Only Query harness** (`scripts/identity_audit/roq.py`):
+  ```bash
+  ROLE=web python scripts/identity_audit/roq.py <path-to-sql-file> [--csv out.csv]
+  ```
+- Read-only inspection against production is always allowed without asking first.
+- `roq.py` connects direct/un-pooled and enforces read-only safety at the Postgres session level (`SET default_transaction_read_only = on`, verified with a failing write probe).
+- Prefer aggregate SQL in `.sql` files over Python loops when inspecting large tables.
+- For one-off read-only Python scripts, import and reuse `get_readonly_cursor()` from `scripts.identity_audit.roq`.
+- **Never** execute unapproved writes or use `scripts/identity_audit/roqw.py` without explicit Audience authorization from M'Lord.
 
 ## Mandatory Agent Compliance Step (Clean Tree & Base Alignment)
 Before rendering your tribute and declaring your work done:
-1. **Working Tree Cleanliness**: Run `git status --porcelain` to verify your working tree has no uncommitted leftovers or scratch files. Stage and commit all intended deliverables.
+1. **Working Tree Cleanliness**: Run `git status --porcelain` to verify your working tree has no uncommitted leftovers or scratch files (e.g. `data/model_cache/`, temp CSVs/dumps). Stage and commit all intended deliverables.
 2. **Rebase-to-Parent Alignment**: Rebase or fast-forward onto `castle` (`git rebase castle` or `git merge castle --ff-only`). Ensure your branch is cleanly aligned with `castle`'s current tip (0 commits behind `castle`) so the git tree and Agent Manager remain pristine with zero phantom diffs.
 
 ## Expected Tribute (you must produce ALL of this before declaring done)
@@ -45,6 +57,11 @@ Specifically, your handoff message to the Steward must follow the **Report to th
    - Git commits created on `{{ branch }}`
    - Exact test commands run and real exit status / tail output
    - Concrete artifacts, endpoints, or data payloads generated
+   - **The Tally (Production & UI Verification Runbook)**:
+     - Exact URLs and UI navigation paths for human/QA verification (e.g. `/products/4993`, `/crm/prospecting/prospects/`, `/?tab=triggers`).
+     - Specific query parameters, filters, or form inputs to test.
+     - Specific commands, scripts, or examples to execute to verify execution.
+     - Expected UI elements, badges, states, values, or visual outcomes to observe.
 3. **Penance**: Honest self-flagellation on what you failed to accomplish, half-finished, took shortcuts on, deferred, or where confidence is low.
 4. **Audience**: Explicit requests for decisions requiring M'Lord's judgment or authority (do NOT decide these yourself, do NOT contact M'Lord directly). State "None required" if none.
 5. **Humble Opinion**: Your recommended next steps to continue moving the Quest forward.
@@ -52,7 +69,7 @@ Specifically, your handoff message to the Steward must follow the **Report to th
 ### Mandatory Durable Completion Requirement
 In addition to your response message, you MUST write your full 5-part completion report into durable state before completing your task. Execute:
 ```bash
-court set-section {{ quest_id }} "Tribute Rendered" --file <path_to_saved_report>
+python3 .court/engine/cli.py set-section {{ quest_id }} "Tribute Rendered" --file <path_to_saved_report>
 ```
 (or write it directly into `.court/quests/{{ quest_id }}.md` under `# Tribute Rendered`). This ensures the Steward and Court can read your completion directly from disk without relying on ephemeral chat turns.
 

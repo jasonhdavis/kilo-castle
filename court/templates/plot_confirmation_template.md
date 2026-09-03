@@ -35,7 +35,7 @@ M'Lord, here is the realm as I now understand you intend it.
 - [ ] {{ acceptance_criterion_2 }}
 - [ ] {{ acceptance_criterion_3 }}
 - [ ] Full scoped test suite passes cleanly.
-- [ ] Report to the King / Bear Tribute submitted strictly conforming to Ballad, Tribute, Penance, Audience, Humble Opinion.
+- [ ] Report to the King / Bear Tribute submitted strictly conforming to 5-part contract (Ballad, Tribute with Tally, Penance, Audience, Humble Opinion).
 
 ---
 

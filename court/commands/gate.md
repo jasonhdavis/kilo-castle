@@ -1,18 +1,24 @@
 ---
-description: Dispatch Gatekeeper to run test suite on gatehouse layer and merge into castle
+description: Dispatch Gatekeeper to pack Cog Ship, execute batch integration tests on gatehouse, isolate/reject errors with Serf remediation, and merge into castle
 agent: steward
 ---
-Quest: $ARGUMENTS
+Quest(s): $ARGUMENTS
 
-Follow the Gate Protocol in `.kilo/prompts/steward.md` §"5. Gatekeeper (GATE -> READY_FOR_TEARDOWN)":
-1. Confirm the Quest has passed Master of Coin review and sits at `GATE` (`court show <id>`).
-2. Dispatch the **Gatekeeper** inside the persistent `gatehouse` worktree using `.court/templates/gatekeeper_review_prompt.md`.
-   **NEVER run Gatekeeper as a background task or on castle.** Process candidates **strictly one per pull / merge**, sequentially.
-3. Record `gatekeeper_session_id` and `gatekeeper_model`.
-4. Confirm the Gatekeeper actually merged (check the Quest's `# Gatekeeper Review` section for a real merge commit hash). If confirmed:
-   ```bash
-   court advance <id> READY_FOR_TEARDOWN --note "Merged into castle; queued for teardown in Ashes"
-   ```
-5. Move the worktree to Agent Manager's **Ashes** section as a visual cue.
+Follow `.kilo/prompts/steward.md` §"7. Collect & Gate (`/collect`, `/gate`)":
+1. Confirm candidate Quest(s) have passed Master of Coin review and sit at `GATE`
+   (`python3 .court/engine/cli.py list --status GATE`).
+2. Dispatch/prompt the **Gatekeeper** inside the next available Gatehouse Bastion worktree session
+   (`.kilo/worktrees/the-gatehouse-<bastion>`, rolling **North → South → East → West → North...**) using `.court/templates/gatekeeper_review_prompt.md`.
+   **NEVER run Gatekeeper as a background task, background process, or on castle.**
+   Gatekeeper is a **Claude Sonnet Latest** class agent (`openrouter/anthropic/claude-sonnet-latest`).
+   Allowed to spawn sequential non-background tasks (`background: false`) for integration verification.
+3. **Gatekeeper Protocol Execution**:
+   - Gatekeeper decides the **Cog Ship convoy batch** to pack from `GATE`.
+   - Gatekeeper merges the candidate branches into the assigned bastion (`the-gatehouse/<bastion>`) and executes the unified integration test suite all at once.
+   - **Fault Isolation & Rejection**: If tests fail, Gatekeeper isolates/re-tests which specific commit or Quest caused the failure, rejects the offending Quest back to `WORKING`, and dispatches/prompts a Serf in that Quest's worktree with the failure traceback (`.court/templates/serf_remediation_prompt.md`).
+   - **Promotion**: For passing Quests, Gatekeeper convoys into `the-gatehouse/central`, promotes to `castle`, compiles the Cog Ship manifest (`python3 .court/engine/cli.py ship`), advances Quests to `READY_FOR_TEARDOWN`, and moves worktrees to **Ashes**.
+4. Record Gatekeeper session metadata:
+   `python3 .court/engine/cli.py set-field <id> gatekeeper_session_id <session_id>`
+   and `python3 .court/engine/cli.py set-field <id> gatekeeper_model "openrouter/anthropic/claude-sonnet-latest"`.
 
 "Ship it" means this normal Gate progression — never skip REVIEW or GATE regardless of phrasing.

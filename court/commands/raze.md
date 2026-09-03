@@ -1,12 +1,23 @@
 ---
-description: Move completed or obsolete worktrees to Ashes section and queue for manual teardown
+description: Queue a completed or obsolete Quest worktree for teardown and move it into the Ashes section
 agent: steward
 ---
 Quest: $ARGUMENTS
 
 Follow the Raze Protocol:
-1. Identify the target Quest (`court show <id>`).
-2. Verify that the Quest is in `READY_FOR_TEARDOWN` or has been approved for deprecation.
-3. Move the worktree in Agent Manager to the **Ashes** section (`agent_manager` `move`) as a visual cue.
-4. If M'Lord confirms deletion, surface the worktree path for manual teardown in the Agent Manager UI.
-5. Note: The Steward NEVER forcibly deletes worktrees out from under Agent Manager; pruning is confirmed in the UI.
+1. **Target Identification:**
+   - If a Quest ID is provided ($ARGUMENTS), inspect with `python3 .court/engine/cli.py show <id>`.
+   - If no arguments provided, run `python3 .court/engine/cli.py teardown-list` and scan `agent_manager` (`action: "list"`).
+
+2. **Raze & Move to Ashes:**
+   - Advance Quest status:
+     ```
+     python3 .court/engine/cli.py advance <id> READY_FOR_TEARDOWN --note "Razed: queued for teardown and moved to Ashes"
+     ```
+   - Find the **Ashes** section in `agent_manager` (`action: "list"`).
+   - Move the worktree session to the **Ashes** section:
+     `agent_manager` with `{ "action": "move", "sessionID": "<session_id>", "sectionID": "<ashes_section_id>" }`.
+   - Never delete or stop the worktree directory directly — worktree removal is always M'Lord's manual action in the Agent Manager UI.
+
+3. **Report to M'Lord:**
+   - Display the list of all worktrees resting in the **Ashes** section awaiting M'Lord's final manual deletion.

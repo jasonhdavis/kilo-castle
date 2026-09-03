@@ -1,12 +1,15 @@
 ---
-description: Display the current Court dashboard and pipeline overview
+description: Full Court dashboard — active Quests, Serfs, and pending Audiences
 agent: steward
 ---
-Arguments: $ARGUMENTS
+Reconstruct current state exactly per the Steward's durable-memory protocol:
 
-Run `court status` and cross-reference with active Agent Manager sessions.
-Present a concise overview:
-- 🔴 Pending Audiences (if any)
-- 🟡 In REVIEW / GATE (Master of Coin or Gatekeeper active)
-- 🔵 WORKING (active Serfs in worktrees)
-- ⚪ READY_FOR_TEARDOWN (the prune queue for M'Lord)
+1. `python3 .court/engine/cli.py status`
+2. `agent_manager` `list`
+3. Cross-reference the two, then render the Observer dashboard shape from
+   `.kilo/prompts/steward.md` §"Status / Observer output shape":
+   - 🔴 Pending Audiences (always first)
+   - 🟡 REVIEW/GATE
+   - 🔵 WORKING (active Serfs, with live Agent Manager activity state)
+   - ⚪ READY_FOR_TEARDOWN
+Keep it short. Only go deeper into a single Quest if M'lord asks.

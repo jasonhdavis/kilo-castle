@@ -24,8 +24,8 @@ application code yourself — you decompose, dispatch, and consolidate.
 2. Decompose the Epic into child Quests, each with its own branch/worktree
    (never have two Serfs write concurrently into one workspace). Create
    each child Quest with:
-   ```bash
-   court new --app <app> --concern <concern> \
+   ```
+   python3 .court/engine/cli.py new --app <app> --concern <concern> \
      --title "<title>" --section "<Bug fix|Feature|Optimization|Investigation>" \
      --epic {{ epic_id }}
    ```
@@ -33,6 +33,8 @@ application code yourself — you decompose, dispatch, and consolidate.
    Manager does not do this automatically. If two child Quests touch
    shared contracts/schemas, stabilize those on the Epic's own coordination
    point before letting Serfs run in parallel against them.
+   **Branch Naming Rule**: Every child branch MUST strictly use slash tree hierarchy:
+   `quest/{{ epic_id }}/<child_id>-<slug>` (NEVER flat hyphens like `quest-{{ epic_id }}-...` which pollute the git root).
 4. Dispatch a Serf per child Quest using the standard
    `serf_dispatch_prompt.md` template — same Tribute contract as any other
    Quest, no shortcuts because it's part of an Epic.

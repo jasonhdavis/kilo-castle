@@ -4,22 +4,22 @@ agent: steward
 ---
 Quest & Notes: $ARGUMENTS
 
-Follow the Charter Protocol in `.kilo/prompts/steward.md` §"5. Charter":
+Follow the Charter Protocol in `.kilo/prompts/steward.md` §"4. Charter":
 
-1. Load the Quest: `court show <id>`.
+1. Load the Quest: `python3 .court/engine/cli.py show <id>`.
 2. If M'Lord supplied any additional notes or context in `$ARGUMENTS` beyond what's
    already recorded on the Quest, fold them into the Quest record now — append to
    `Goal & Scope` (or a dedicated note) via:
-   ```bash
-   court set-section <id> "Goal & Scope" --append --content "M'Lord's Charter Notes: <notes>"
+   ```
+   python3 .court/engine/cli.py set-section <id> "Goal & Scope" --append --content "M'Lord's Charter Notes: <notes>"
    ```
    so the authoritative remit lives on disk, not only in this chat turn.
 3. Verify `Goal & Scope` and `Expected Tribute` are both present and concrete given
    those notes. If either is missing or too thin, fill it in now yourself — do not
    charter a Quest with a vague or unusable brief.
 4. Advance the Quest:
-   ```bash
-   court advance <id> PLANNED --note "Chartered: <one-line summary of notes/decision>"
+   ```
+   python3 .court/engine/cli.py advance <id> PLANNED --note "Chartered: <one-line summary of notes/decision>"
    ```
    (If the Quest already reached `PLANNED` via `/plot`'s own Council confirmation,
    this is a status no-op — just log the additional notes.)

@@ -12,6 +12,26 @@ def test_quest_initialization_defaults():
     assert "Goal & Scope" in q.body_sections
 
 
+def test_scout_branch_generation():
+    scout = Quest(
+        id="Q005-Marketplace-Fingerprint",
+        title="Store Fingerprint POC",
+        kind="scout",
+        app="marketplace",
+        concern="fingerprint",
+    )
+    assert scout.tree_branch == "scout/q005-marketplace-fingerprint"
+
+    investigation_quest = Quest(
+        id="Q006-Marketplace-Brand",
+        title="Brand Observation",
+        section="Investigation",
+        app="marketplace",
+        concern="brand",
+    )
+    assert investigation_quest.tree_branch == "scout/q006-marketplace-brand"
+
+
 def test_epic_and_child_tree_branches():
     epic = Quest(id="Q010-Auth-Migration", title="Auth Migration", kind="epic", app="auth", concern="migration")
     assert epic.tree_branch == "epic/q010-auth-migration"
@@ -56,6 +76,34 @@ def test_markdown_serialization_and_deserialization():
     assert parsed.branch == "quest/q001-platform-auth"
     assert parsed.body_sections["Goal & Scope"] == "Implement user authentication with JWT."
     assert parsed.body_sections["Expected Tribute"] == "- [ ] Auth service tests pass"
+
+
+def test_scout_report_subsection_extraction():
+    q = Quest(id="Q005-Test-Scout", title="Scout Test", kind="scout")
+    report = """### 1. The Survey
+Feasibility is 9/10. High viability for production.
+
+### 2. The Map
+Endpoint: POST /api/v2/extract
+Schema: { store_id: str, tags: list[str] }
+
+### 3. The Dangers
+Hidden 60 RPM rate limit on upstream supplier.
+
+### 4. The Tribute
+- tasks/artifacts/poc_output.json
+- tasks/artifacts/mock_fixtures.json
+
+### 5. The Plot
+Build ExtractService in apps/marketplace/services/extract_service.py
+"""
+    q.set_section("Tribute Rendered", report)
+
+    assert "Feasibility is 9/10" in q.extract_tribute_subsection("survey")
+    assert "POST /api/v2/extract" in q.extract_tribute_subsection("map")
+    assert "Hidden 60 RPM rate limit" in q.extract_tribute_subsection("dangers")
+    assert "poc_output.json" in q.extract_tribute_subsection("tribute")
+    assert "apps/marketplace/services/extract_service.py" in q.extract_tribute_subsection("plot")
 
 
 def test_status_transition_and_history():

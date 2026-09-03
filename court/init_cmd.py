@@ -21,6 +21,7 @@ for all Quests and Epics — surviving across ephemeral agent sessions.
 .court/
 ├── README.md              Canonical court architecture doc.
 ├── LEDGER.md              Steward's standing decisions and notes.
+├── EDICTS.md              Royal decrees and strategic priorities.
 ├── quests/                 Active and completed Quests (Q0NN-App-Concern.md).
 ├── epics/                  Multi-quest Epic initiatives.
 ├── archive/                Archived Quests and Epics.
@@ -30,10 +31,11 @@ for all Quests and Epics — surviving across ephemeral agent sessions.
 ## Role Hierarchy
 
 - **M'Lord**: Human owner and final authority.
-- **Steward**: Orchestrator and Observer agent. Drives the pipeline and triage.
+- **Steward**: Orchestrator, strategic planner, and Observer agent. Drives the pipeline and triage.
 - **Master of Coin**: Audits value delivery, acceptance criteria fulfillment, and resource costs in `REVIEW`.
 - **Gatekeeper**: Runs test suites on the `gatehouse` layer and merges into `castle` in `GATE`.
 - **Serf**: Disposable coding agent assigned to a single Quest worktree.
+- **Scout**: Reconnaissance agent for proof-of-concept investigations (non-merging `scout/*` branch).
 - **Vassal**: Coordinates child Quests for multi-Quest Epics.
 
 ## Pipeline Lifecycle
@@ -50,6 +52,7 @@ court status                        # Show current dashboard
 court new --app <app> --concern <slug> --title "<title>" --section "<section>"
 court show <id>                     # Inspect quest record
 court advance <id> <STATUS>         # Advance stage
+court rollup --section <type>       # Siphon tribute sections across fleet
 court teardown-list                 # View worktrees ready to prune
 ```
 """
@@ -89,6 +92,7 @@ gatehouse               (persistent rolling integration branch; test execution l
     - epics:              epic/<epic_id>-<slug>
     - epic child quests:  quest/<epic_id>/<quest_id>-<slug>
     - standalone quests:  quest/<quest_id>-<slug>
+    - scout spikes:       scout/<quest_id>-<slug> (non-merging; exploratory POCs)
 ```
 
 `gatehouse` is the integration merge target. Changes promote from `gatehouse` -> `castle`
@@ -100,6 +104,7 @@ once the test suite passes on `gatehouse`.
 
 | Stage | Runs | Scope | Notes |
 |---|---|---|---|
+| Scout Worktree | The Scout (spikes / POCs) | Verification that spike runs | **Never merges to gatehouse.** Generates 5-part Scout Report. |
 | Serf Worktree -> `gatehouse` | Worktree Serf, pre-merge | Scoped to affected components | Cheap local checks |
 | Inside `gatehouse`, per merge | Gatekeeper (in `gatehouse` worktree) | Independent test suite re-verification | Steward never runs tests in background |
 | `gatehouse` -> `castle` (promotion) | Gatekeeper / staging session | Full suite run on `gatehouse` before promoting | Single mandatory full-suite gate |
@@ -115,7 +120,7 @@ once the test suite passes on `gatehouse`.
 | **Bug fix** | Narrow, scoped bug fixes. | Affected component tests only. | Merge to `gatehouse` once scoped tests pass + review. |
 | **Feature** | Net-new production functionality. | Affected component tests + integration. | Merge to `gatehouse` once tests pass + review. |
 | **Optimization** | Refactoring, performance, query optimization. | Full tests for touched components. | Merge to `gatehouse` once broad tests pass + review. |
-| **Investigation** | Spikes, POCs, exploratory research. | Verification that spike script runs. | Never auto-merges into `gatehouse`. |
+| **Investigation** | Spikes, POCs, exploratory research (Scouts). | Verification that spike script runs. | **Never auto-merges into `gatehouse`.** Produces Scout Report for M'Lord to blueprint production Quests. |
 | **Ashes** | Completed / merged worktrees. | N/A | Safe for manual pruning by M'Lord. |
 """
 
@@ -189,8 +194,9 @@ def run_init(target_dir: Optional[Path] = None, force: bool = False) -> dict:
     print("\nKilo Castle initialization complete!")
     print("Next steps:")
     print("  1. Create a Quest: court new --app core --concern my-feature --title 'My Feature' --section 'Feature'")
-    print("  2. Check status:   court status")
-    print("  3. Use slash commands inside Kilo: /charter, /levy, /collect, /status")
+    print("  2. Launch a Scout: /scout core prototype-auth 'Test OAuth2 feasibility'")
+    print("  3. Check status:   court status")
+    print("  4. Use slash commands inside Kilo: /charter, /levy, /collect, /status, /plot, /scout")
 
     return {
         "court_dir": court_dir,

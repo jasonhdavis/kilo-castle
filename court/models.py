@@ -1,5 +1,5 @@
 """
-Quest/Epic markdown model: flat frontmatter + fixed section body, parsed and
+Quest/Epic/Scout markdown model: flat frontmatter + fixed section body, parsed and
 serialized without third-party dependencies (stdlib only).
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ STATUSES = (
     "HELD",  # Blocked on an Audience decision; not a pipeline failure state.
 )
 
-KINDS = ("quest", "epic")
+KINDS = ("quest", "epic", "scout")
 
 # Agent Manager standard sections / lanes.
 SECTIONS = ("Bug fix", "Feature", "Optimization", "Investigation")
@@ -109,7 +109,7 @@ class Quest:
 
     @property
     def tree_branch(self) -> str:
-        """Standardized tree-structured branch name matching epic/quest hierarchy."""
+        """Standardized tree-structured branch name matching epic/quest/scout hierarchy."""
         short_id = self.id.split("-")[0].lower()
         slug_parts = []
         if self.app:
@@ -120,6 +120,11 @@ class Quest:
 
         if self.kind == "epic":
             return f"epic/{short_id}-{slug}"
+        if self.kind == "scout" or self.section == "Investigation":
+            if self.parent_epic:
+                parent_short = self.parent_epic.split("-")[0].lower()
+                return f"scout/{parent_short}/{short_id}-{slug}"
+            return f"scout/{short_id}-{slug}"
         if self.parent_epic:
             parent_short = self.parent_epic.split("-")[0].lower()
             return f"quest/{parent_short}/{short_id}-{slug}"
@@ -201,12 +206,16 @@ class Quest:
         self.updated_at = now_iso()
 
     def extract_tribute_subsection(self, target_section: str) -> str:
-        """Extract a specific subsection from Tribute Rendered (ballad, tribute, penance, audience, opinion)."""
+        """Extract a specific subsection from Tribute Rendered:
+        - Serf Reports: ballad, tribute, penance, audience, opinion
+        - Scout Reports: survey, map, dangers, tribute, plot
+        """
         raw = self.body_sections.get("Tribute Rendered", "").strip()
         if not raw:
             return ""
 
         canonical_map = {
+            # Serf standard
             "ballad": "ballad",
             "tribute": "tribute",
             "penance": "penance",
@@ -214,6 +223,19 @@ class Quest:
             "opinion": "opinion",
             "humble opinion": "opinion",
             "humble_opinion": "opinion",
+            # Scout standard
+            "survey": "survey",
+            "the survey": "survey",
+            "map": "map",
+            "the map": "map",
+            "dangers": "dangers",
+            "the dangers": "dangers",
+            "the tribute": "tribute",
+            "plot": "plot",
+            "the plot": "plot",
+            # Cross-mappings
+            "ballad": "ballad",
+            "summary": "survey",
         }
         target = target_section.lower().strip()
         target_canonical = canonical_map.get(target, target)
@@ -240,7 +262,6 @@ class Quest:
         if target_canonical in subsections:
             return subsections[target_canonical]
 
-        # If asking for tribute and no structured breakdown was found, return raw
         if target_canonical == "tribute" and not subsections:
             return raw
 

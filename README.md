@@ -10,11 +10,10 @@
 
 Instead of relying on fragile chat history or allowing a single LLM session to wander across an entire codebase, Castle introduces:
 1. **Durable Markdown Persistence**: Quests and Epics tracked on disk in `.court/` with frontmatter and monotonic global IDs — zero token burn to read state.
-2. **Role Hierarchy**: Strict separation between the orchestrator (**Steward**), disposable implementers (**Serfs**), value auditors (**Master of Coin**), and integration checkpoints (**Gatekeeper**).
-3. **The Tribute Completion Contract**: Mandatory 5-part structured handoff (**Ballad**, **Tribute**, **Penance**, **Audience**, **Humble Opinion**) written durably to disk.
-4. **Tribute Rollup & Intelligence Layer**: Deterministic extraction of fleet progress (`/bard`, `/coffers`), technical debt & prompt feedback (`/atone`), bottom-up field recommendations (`/murmur`), and interactive roadmapping (`/plot`).
-5. **Isolated Git Worktree Topology**: Tree-structured branches (`quest/<id>-<slug>`) flowing through staging lanes (`gatehouse` $\rightarrow$ `castle` $\rightarrow$ `main`).
-6. **Model Tiering**: Fast, cost-efficient models in the trenches; frontier reasoning models at the gate.
+2. **Role Hierarchy**: Strict separation between the orchestrator (**Steward**), disposable implementers (**Serfs**), reconnaissance explorers (**Scouts**), value auditors (**Master of Coin**), and integration checkpoints (**Gatekeeper**).
+3. **The Tribute & Scout Completion Contracts**: Mandatory structured handoffs written durably to disk.
+4. **Isolated Git Worktree Topology**: Tree-structured branches (`quest/<id>-<slug>`, `scout/<id>-<slug>`) flowing through staging lanes (`gatehouse` $\rightarrow$ `castle` $\rightarrow$ `main`).
+5. **Model Tiering**: Fast, cost-efficient models in the trenches; frontier reasoning models at the gate.
 
 ---
 
@@ -28,16 +27,17 @@ Instead of relying on fragile chat history or allowing a single LLM session to w
        🏰 The Steward                 👑 Audience
   (Orchestrator / Planner)        (Decisions requiring M'Lord)
                 │
-                ├─────────────────────────────┐
-                ▼                             ▼
-       🪙 Master of Coin              🛡️ Gatekeeper
-   (Value & Resource Audit)       (Test Suite & Merge Gate)
-                │                             │
-                ▼                             ▼
-        🔨 Serf Worktrees              🏰 Castle (Staging)
-     (Disposable Implementers)                 │
-                                              ▼
-                                         🚀 Main (Prod)
+                ├─────────────────────────────┬─────────────────────────────┐
+                ▼                             ▼                             ▼
+       🌲 The Scout                  🪙 Master of Coin              🛡️ Gatekeeper
+  (POC / Reconnaissance)         (Value & Resource Audit)       (Test Suite & Merge Gate)
+        │                                     │                             │
+        ▼                                     ▼                             ▼
+  Scout Worktrees                     🔨 Serf Worktrees              🏰 Castle (Staging)
+ (Throwaway Scripts)              (Disposable Implementers)                 │
+        │                                                                   ▼
+        └──────────────► /plot ─────────────────────────────────────►  🚀 Main (Prod)
+                  (Blueprint Quests)
 ```
 
 ### The Roles
@@ -46,34 +46,51 @@ Instead of relying on fragile chat history or allowing a single LLM session to w
 |---|---|---|
 | **👑 M'Lord** | The human owner. The only source of genuine product authority, scope changes, and irreversible decisions. | Human |
 | **🏰 Steward** | The primary orchestrator and strategic planner you interact with. Triages tasks into Quests, writes dispatch contracts, monitors active work, blue prints next steps (`/plot`), and synthesizes fleet rollups. | Fast / Resident (e.g. Gemini 3.7 Flash) |
-| **🔨 Serf** | Disposable coding agent assigned to a single isolated Git worktree. Does **not** own the worktree — if it hallucinates or stalls, the Steward dismisses it and dispatches a fresh Serf into the *same* worktree. | Fast / Cost-Efficient (e.g. Gemini 3.7 Flash) |
+| **🌲 Scout** | Reconnaissance agent for proof-of-concept investigations on non-merging `scout/*` branches. Probes APIs, tests feasibility with throwaway scripts in `tasks/artifacts/`, and generates the 5-part Scout Report. | Fast / Cost-Efficient (e.g. Gemini 3.7 Flash) |
+| **🔨 Serf** | Disposable coding agent assigned to a single isolated Git worktree. Builds clean, production-ready code against approved blueprints. Dismissed and replaced if confused. | Fast / Cost-Efficient (e.g. Gemini 3.7 Flash) |
 | **🪙 Master of Coin** | Dispatched during `REVIEW` **before** testing and merging. Audits the rendered Tribute directly on the worktree for criteria satisfaction, scope discipline, and query/compute cost efficiency. | Fast / Cost-Efficient (e.g. Gemini 3.7 Flash) |
 | **🛡️ Gatekeeper** | Lives inside the persistent `gatehouse` integration worktree. Dispatched during `GATE`. Independently re-verifies the diff, executes the test suite, and merges into `gatehouse` and `castle`. | Frontier Reasoning (e.g. Claude 3.7 Sonnet) |
 | **📜 Vassal** | Dispatched only for large, multi-Quest **Epics**. Decomposes initiatives into child Quests, coordinates dependencies, and compresses fleet status upward. | Fast / Frontier |
 
 ---
 
-## The Quest Lifecycle
+## The Scout Reconnaissance Pipeline (Pioneering Methods Without Polluting Production)
+
+The transition from a Proof-of-Concept to production code is often painful when agents try to weld exploratory scripts directly into core services. Castle enforces a strict separation:
 
 ```
-OPEN ──► PLANNED ──► DISPATCHED ──► WORKING ──► REVIEW (Master of Coin) ──► GATE (Gatekeeper) ──► READY_FOR_TEARDOWN ──► DONE
-                       ▲                │         │                             │
-                       │                └─────────┼─────────────────────────────┘
-                       │                          │  (Rejections return to WORKING)
-                       │                          ▼
-                       └──────────────────────── HELD (Awaiting Audience Decision)
+[1. RECONNAISSANCE]
+/scout <app> <concern> "<goal>"
+       │
+       ▼
+🌲 Scout Branch (`scout/<id>-<slug>` in Investigation lane)
+Agent: The Scout (Spikes, scratch scripts in `tasks/artifacts/`, web fetches, API probes)
+       │
+       ▼
+📜 5-Part Scout Report (Durable Markdown)
+   ├─ 🧭 1. The Survey: Executive viability verdict, core discoveries & confidence score
+   ├─ 🗺️ 2. The Map: Charted terrain, endpoints, payload schemas & data tiers
+   ├─ ⚠️ 3. The Dangers: Minefield map, hidden rate limits, edge cases & cost traps
+   ├─ 🧪 4. The Tribute: Scratch scripts, realistic test fixtures & benchmarks
+   └─ 📐 5. The Plot: Proposed production service architecture & candidate Quests
+       │
+[2. VALUE EXTRACTION GATE]
+M'Lord + Steward: /plot
+Review Scout Report ──► Determine Vision ──► Blueprint Production Quest(s)
+       │
+       ▼
+[3. PRODUCTION IMPLEMENTATION]
+🏰 Production Quest (`quest/<id>-<slug>` in Feature / Optimization lane)
+Serf builds clean, modular service code strictly against the Scout's Blueprint + Fixtures
+Master of Coin Audits ──► Gatekeeper Tests on Gatehouse ──► Merge to Castle
+(The Scout branch is razed to Ashes — never merged wholesale into staging)
 ```
-
-- **`WORKING`**: The Serf writes code and commits exclusively on its tree branch (`quest/q001-slug`).
-- **`REVIEW`**: Master of Coin audits the real diff and acceptance checklist. Returns to `WORKING` if incomplete or wasteful.
-- **`GATE`**: Gatekeeper executes integration test suites on the `gatehouse` layer and merges into `castle`.
-- **`READY_FOR_TEARDOWN`**: Merged worktree is moved to **Ashes** section for manual pruning in Agent Manager.
 
 ---
 
 ## The Tribute Contract & Intelligence Rollups
 
-A plain "done" from a coding agent is never accepted. Before advancing to review, every Serf must render a formal 5-part report persisted to disk under `# Tribute Rendered`.
+A plain "done" from a coding agent is never accepted. Before advancing to review, every Serf and Scout must render a formal report persisted to disk under `# Tribute Rendered`.
 
 Each section maps directly to dedicated slash commands and CLI rollups:
 
@@ -100,13 +117,6 @@ Each section maps directly to dedicated slash commands and CLI rollups:
 
 ---
 
-## Strategic Blueprinting & Roadmapping (`/plot` & `/edict`)
-
-- **`/plot`**: Interactive blueprinting command. The Steward consults M'Lord in a **question-forward** dialogue, synthesizing Royal Edicts, active planning files, backlog items, and recent Serf intelligence (`/atone` and `/murmur`) to propose and scope the next candidate Quests.
-- **`/edict`**: Record M'Lord's strategic decrees and high-level priorities directly into `.court/EDICTS.md` to guide future blueprinting.
-
----
-
 ## Branch Topology & Agent Manager Lanes
 
 ```
@@ -120,14 +130,15 @@ gatehouse               (persistent rolling integration branch; test execution l
     - epics:              epic/<epic_id>-<slug>
     - epic child quests:  quest/<epic_id>/<quest_id>-<slug>
     - standalone quests:  quest/<quest_id>-<slug>
+    - scout spikes:       scout/<quest_id>-<slug> (non-merging exploratory POCs)
 ```
 
 ### Agent Manager Sections
 
 - **`Bug fix`**: Scoped fixes; verified against affected component tests.
-- **`Feature`**: Net-new functionality; verified against component + integration tests.
+- **`Feature`**: Net-new production functionality; verified against component + integration tests.
 - **`Optimization`**: Refactoring, performance, query optimization; full broad test suite.
-- **`Investigation`**: Spikes, POCs, exploratory research; never auto-merges into `gatehouse`.
+- **`Investigation`**: Spikes, POCs, exploratory research (Scouts); **never auto-merges into `gatehouse`**.
 - **`GATEHOUSE`**: Staging merge target worktree.
 - **`Ashes`**: Completed worktrees queued for manual teardown.
 
@@ -150,13 +161,6 @@ cd /path/to/your/project
 court init
 ```
 
-This automatically scaffolds:
-- `.court/` (ledger, quest store, and dispatch prompt templates)
-- `.court/EDICTS.md` (royal decrees store)
-- `.kilo/commands/` (`/charter`, `/levy`, `/collect`, `/raze`, `/gate`, `/review`, `/bear-tribute`, `/audience`, `/status`, `/bard`, `/coffers`, `/atone`, `/murmur`, `/plot`, `/edict`)
-- `.kilo/prompts/` (`steward.md`, `master_of_coin.md`, `gatekeeper.md`)
-- `AGENTS.md` (canonical branch topology and division of labor instructions)
-
 ### 3. Daily Workflow with Kilo Slash Commands
 
 Inside Kilo Code, interact naturally with the Steward:
@@ -164,8 +168,9 @@ Inside Kilo Code, interact naturally with the Steward:
 | Command | Action |
 |---|---|
 | `/plot` | Interactive blueprinting: consults M'Lord on priorities, planning docs, and next Quests |
+| `/scout <app> <concern> "<goal>"` | Dispatch an exploratory Scout for POC reconnaissance on a `scout/*` branch |
 | `/edict <text>` | Record a strategic decree or priority from M'Lord |
-| `/status` | Display Court dashboard (Audiences, In-Review, Active Serfs, Teardown queue) |
+| `/status` | Display Court dashboard (Audiences, In-Review, Active Serfs/Scouts, Teardown queue) |
 | `/charter <id>` | Commission a Quest (create worktree, tree branch, section lane, dispatch Serf) |
 | `/levy` | Scan the Court for idle Serfs and route rendered Tributes to Master of Coin |
 | `/review <id>` | Dispatch Master of Coin to audit value and resource efficiency |
@@ -178,52 +183,6 @@ Inside Kilo Code, interact naturally with the Steward:
 | `/murmur` | Surface bottom-up field recommendations from the agents |
 | `/audience` | Surface pending decisions requiring M'Lord's judgment |
 | `/raze <id>` | Move a merged worktree to Ashes for teardown |
-
----
-
-## Deterministic CLI Reference
-
-The `court` CLI is 100% Python standard library with zero external runtime dependencies:
-
-```bash
-# Create a new Quest
-court new --app api --concern auth-jwt-rotation \
-  --title "Rotate JWT secret keys" \
-  --section "Bug fix" \
-  --goal "Fix token rotation race condition" \
-  --tribute "- [ ] All auth tests pass"
-
-# Rollup & Intelligence extraction
-court rollup --section ballad --epic Q012    # Extract ballads across an Epic
-court rollup --section tribute --status DONE # Extract deliverables for done Quests
-court rollup --section penance --all         # Extract technical debt & skipped items
-court rollup --section opinion               # Extract field recommendations
-
-# Royal Edicts
-court edict "Prioritize worker resilience and reduce database compute hours"
-court edict                                  # View active decrees
-
-# Inspect and manage
-court status                                 # Show Court state dashboard
-court list                                   # List all active Quests
-court show Q001                              # View full Quest markdown
-court advance Q001 WORKING                   # Transition pipeline status
-court set-field Q001 branch "fix/jwt"         # Update frontmatter field
-court set-section Q001 "Expected Tribute" --file /tmp/tribute.md
-court teardown-list                          # Show worktrees ready to prune
-court archive Q001                           # Move Quest to archive
-```
-
----
-
-## Contributing & Development
-
-```bash
-git clone https://github.com/jasonhdavis/kilo-castle.git
-cd kilo-castle
-pip install -e ".[dev]"
-pytest
-```
 
 ---
 

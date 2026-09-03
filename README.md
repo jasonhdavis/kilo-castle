@@ -12,8 +12,9 @@ Instead of relying on fragile chat history or allowing a single LLM session to w
 1. **Durable Markdown Persistence**: Quests and Epics tracked on disk in `.court/` with frontmatter and monotonic global IDs — zero token burn to read state.
 2. **Role Hierarchy**: Strict separation between the orchestrator (**Steward**), disposable implementers (**Serfs**), value auditors (**Master of Coin**), and integration checkpoints (**Gatekeeper**).
 3. **The Tribute Completion Contract**: Mandatory 5-part structured handoff (**Ballad**, **Tribute**, **Penance**, **Audience**, **Humble Opinion**) written durably to disk.
-4. **Isolated Git Worktree Topology**: Tree-structured branches (`quest/<id>-<slug>`) flowing through staging lanes (`gatehouse` $\rightarrow$ `castle` $\rightarrow$ `main`).
-5. **Model Tiering**: Fast, cost-efficient models in the trenches; frontier reasoning models at the gate.
+4. **Tribute Rollup & Intelligence Layer**: Deterministic extraction of fleet progress (`/bard`, `/coffers`), technical debt & prompt feedback (`/atone`), bottom-up field recommendations (`/murmur`), and interactive roadmapping (`/plot`).
+5. **Isolated Git Worktree Topology**: Tree-structured branches (`quest/<id>-<slug>`) flowing through staging lanes (`gatehouse` $\rightarrow$ `castle` $\rightarrow$ `main`).
+6. **Model Tiering**: Fast, cost-efficient models in the trenches; frontier reasoning models at the gate.
 
 ---
 
@@ -25,7 +26,7 @@ Instead of relying on fragile chat history or allowing a single LLM session to w
                 ┌──────────────┴──────────────┐
                 ▼                             ▼
        🏰 The Steward                 👑 Audience
-  (Orchestrator / Observer)       (Decisions requiring M'Lord)
+  (Orchestrator / Planner)        (Decisions requiring M'Lord)
                 │
                 ├─────────────────────────────┐
                 ▼                             ▼
@@ -44,7 +45,7 @@ Instead of relying on fragile chat history or allowing a single LLM session to w
 | Role | Responsibilities | Default Model Tier |
 |---|---|---|
 | **👑 M'Lord** | The human owner. The only source of genuine product authority, scope changes, and irreversible decisions. | Human |
-| **🏰 Steward** | The primary orchestrator and observer agent you interact with. Triages tasks into Quests, writes dispatch contracts, monitors active work, and routes completions. | Fast / Resident (e.g. Gemini 3.7 Flash) |
+| **🏰 Steward** | The primary orchestrator and strategic planner you interact with. Triages tasks into Quests, writes dispatch contracts, monitors active work, blue prints next steps (`/plot`), and synthesizes fleet rollups. | Fast / Resident (e.g. Gemini 3.7 Flash) |
 | **🔨 Serf** | Disposable coding agent assigned to a single isolated Git worktree. Does **not** own the worktree — if it hallucinates or stalls, the Steward dismisses it and dispatches a fresh Serf into the *same* worktree. | Fast / Cost-Efficient (e.g. Gemini 3.7 Flash) |
 | **🪙 Master of Coin** | Dispatched during `REVIEW` **before** testing and merging. Audits the rendered Tribute directly on the worktree for criteria satisfaction, scope discipline, and query/compute cost efficiency. | Fast / Cost-Efficient (e.g. Gemini 3.7 Flash) |
 | **🛡️ Gatekeeper** | Lives inside the persistent `gatehouse` integration worktree. Dispatched during `GATE`. Independently re-verifies the diff, executes the test suite, and merges into `gatehouse` and `castle`. | Frontier Reasoning (e.g. Claude 3.7 Sonnet) |
@@ -70,19 +71,39 @@ OPEN ──► PLANNED ──► DISPATCHED ──► WORKING ──► REVIEW (
 
 ---
 
-## The Tribute Contract (Report to the King)
+## The Tribute Contract & Intelligence Rollups
 
-A plain "done" from a coding agent is never accepted. Before advancing to review, every Serf must render a formal 5-part report persisted to disk:
+A plain "done" from a coding agent is never accepted. Before advancing to review, every Serf must render a formal 5-part report persisted to disk under `# Tribute Rendered`.
 
-1. **Ballad**: Narrative summary of work accomplished, problem context uncovered, and architectural choices made.
-2. **Tribute**: Provable work product delivered:
-   - Changed/created files with diff stats.
-   - Git commit hashes on branch.
-   - Exact test commands run and literal exit codes/tail output.
-   - Produced artifacts, endpoints, or data payloads.
-3. **Penance**: Honest agent self-flagellation on what was half-done, deferred, shortcuts taken, or where confidence is shaky.
-4. **Audience**: Explicit requests for decisions or authority required from M'Lord.
-5. **Humble Opinion**: The agent's concrete recommendations for next steps.
+Each section maps directly to dedicated slash commands and CLI rollups:
+
+```
+                    ┌────────────────────────────────────────────────────────┐
+                    │               # Tribute Rendered                       │
+                    └────────────────────────────────────────────────────────┘
+                                                 │
+          ┌───────────────────┬──────────────────┼───────────────────┬───────────────────┐
+          ▼                   ▼                  ▼                   ▼                   ▼
+    1. Ballad            2. Tribute         3. Penance          4. Audience        5. Humble Opinion
+          │                   │                  │                   │                   │
+          ▼                   ▼                  ▼                   ▼                   ▼
+       📜 /bard           💰 /coffers        🪨 /atone          👑 /audience        👂 /murmur
+   (Narrative Arc &    (Provable Code &   (Tech Debt & Meta-   (Decisions for      (Bottom-Up Field
+    Release Story)       Asset Ledger)     Prompt Feedback)        M'Lord)           Intelligence)
+```
+
+1. **📜 `/bard` (Ballad)**: Weaves narrative summaries across an Epic or App into a cohesive executive story of challenges encountered, architecture decisions, and transformed features.
+2. **💰 `/coffers` (Tribute)**: Collects the hard deliverables across Quests: git commits, line diff stats, passed test exit codes, new endpoints, and data payloads.
+3. **🪨 `/atone` (Penance)**: Aggregates agent self-flagellations on shortcuts taken, deferred edge cases, and shaky confidence to automatically generate technical debt backlogs and prompt/rule improvement items.
+4. **👑 `/audience` (Audience)**: Surfaces pending trade-offs and questions requiring M'Lord's authority.
+5. **👂 `/murmur` (Humble Opinion)**: Clusters bottom-up suggestions from agents in the trenches on emergent optimizations and next architectural moves.
+
+---
+
+## Strategic Blueprinting & Roadmapping (`/plot` & `/edict`)
+
+- **`/plot`**: Interactive blueprinting command. The Steward consults M'Lord in a **question-forward** dialogue, synthesizing Royal Edicts, active planning files, backlog items, and recent Serf intelligence (`/atone` and `/murmur`) to propose and scope the next candidate Quests.
+- **`/edict`**: Record M'Lord's strategic decrees and high-level priorities directly into `.court/EDICTS.md` to guide future blueprinting.
 
 ---
 
@@ -131,7 +152,8 @@ court init
 
 This automatically scaffolds:
 - `.court/` (ledger, quest store, and dispatch prompt templates)
-- `.kilo/commands/` (`/charter`, `/levy`, `/collect`, `/raze`, `/gate`, `/review`, `/bear-tribute`, `/audience`, `/status`)
+- `.court/EDICTS.md` (royal decrees store)
+- `.kilo/commands/` (`/charter`, `/levy`, `/collect`, `/raze`, `/gate`, `/review`, `/bear-tribute`, `/audience`, `/status`, `/bard`, `/coffers`, `/atone`, `/murmur`, `/plot`, `/edict`)
 - `.kilo/prompts/` (`steward.md`, `master_of_coin.md`, `gatekeeper.md`)
 - `AGENTS.md` (canonical branch topology and division of labor instructions)
 
@@ -141,6 +163,8 @@ Inside Kilo Code, interact naturally with the Steward:
 
 | Command | Action |
 |---|---|
+| `/plot` | Interactive blueprinting: consults M'Lord on priorities, planning docs, and next Quests |
+| `/edict <text>` | Record a strategic decree or priority from M'Lord |
 | `/status` | Display Court dashboard (Audiences, In-Review, Active Serfs, Teardown queue) |
 | `/charter <id>` | Commission a Quest (create worktree, tree branch, section lane, dispatch Serf) |
 | `/levy` | Scan the Court for idle Serfs and route rendered Tributes to Master of Coin |
@@ -148,6 +172,10 @@ Inside Kilo Code, interact naturally with the Steward:
 | `/collect` | Collect approved Tributes, run tests on `gatehouse`, and merge to `castle` |
 | `/gate <id>` | Dispatch Gatekeeper to test and merge a specific Quest |
 | `/bear-tribute` | Prompt an active Serf to render its 5-part completion report |
+| `/bard` | Synthesize narrative ballads across Quests into a release story |
+| `/coffers` | Aggregate provable deliverables (commits, line counts, endpoints, passed tests) |
+| `/atone` | Aggregate agent penance to uncover tech debt and prompt flaws |
+| `/murmur` | Surface bottom-up field recommendations from the agents |
 | `/audience` | Surface pending decisions requiring M'Lord's judgment |
 | `/raze <id>` | Move a merged worktree to Ashes for teardown |
 
@@ -165,15 +193,25 @@ court new --app api --concern auth-jwt-rotation \
   --goal "Fix token rotation race condition" \
   --tribute "- [ ] All auth tests pass"
 
+# Rollup & Intelligence extraction
+court rollup --section ballad --epic Q012    # Extract ballads across an Epic
+court rollup --section tribute --status DONE # Extract deliverables for done Quests
+court rollup --section penance --all         # Extract technical debt & skipped items
+court rollup --section opinion               # Extract field recommendations
+
+# Royal Edicts
+court edict "Prioritize worker resilience and reduce database compute hours"
+court edict                                  # View active decrees
+
 # Inspect and manage
-court status                         # Show Court state dashboard
-court list                           # List all active Quests
-court show Q001                      # View full Quest markdown
-court advance Q001 WORKING           # Transition pipeline status
-court set-field Q001 branch "fix/jwt" # Update frontmatter field
+court status                                 # Show Court state dashboard
+court list                                   # List all active Quests
+court show Q001                              # View full Quest markdown
+court advance Q001 WORKING                   # Transition pipeline status
+court set-field Q001 branch "fix/jwt"         # Update frontmatter field
 court set-section Q001 "Expected Tribute" --file /tmp/tribute.md
-court teardown-list                  # Show worktrees ready to prune
-court archive Q001                   # Move Quest to archive
+court teardown-list                          # Show worktrees ready to prune
+court archive Q001                           # Move Quest to archive
 ```
 
 ---

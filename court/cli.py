@@ -8,11 +8,9 @@ Usage examples:
     court status
     court show Q001
     court advance Q001 WORKING --note "Serf dispatched"
-    court set-field Q001 branch quest/q001-api-auth-jwt-rotation
-    court set-section Q001 "Expected Tribute" --file /tmp/tribute.md
-    court verify Q001 --test-cmd "pytest tests/api"
-    court teardown-list
-    court archive Q001
+    court rollup --section ballad --epic Q012
+    court rollup --section penance --all
+    court edict "Focus on QStash reliability and reduce Neon compute hours"
 """
 from __future__ import annotations
 
@@ -191,6 +189,43 @@ def cmd_archive(args):
     print(f"Archived -> {dst}")
 
 
+def cmd_rollup(args):
+    results = store.rollup_section(
+        section_name=args.section,
+        app=args.app,
+        epic=args.epic,
+        status=args.status,
+        include_archive=args.all,
+    )
+    if not results:
+        print(f"(no rendered {args.section} found matching filters)")
+        return
+
+    print("=" * 72)
+    print(f"COURT ROLLUP — {args.section.upper()} ({len(results)} Quests)")
+    print("=" * 72)
+    for quest, content in results:
+        print(f"\n### {quest.id} ({quest.title}) [{quest.status}]")
+        print(content)
+
+
+def cmd_edict(args):
+    current = store.load_edicts()
+    if args.content or args.file:
+        new_text = Path(args.file).read_text(encoding="utf-8") if args.file else args.content
+        if args.append and current:
+            updated = current + "\n\n" + f"- **{now_iso()[:10]}**: {new_text.strip()}"
+        else:
+            updated = f"# Royal Edicts & Decrees\n\n- **{now_iso()[:10]}**: {new_text.strip()}"
+        store.save_edicts(updated)
+        print(f"Updated .court/EDICTS.md")
+    else:
+        if current:
+            print(current)
+        else:
+            print("(no royal edicts recorded; add with: court edict 'Your priority')")
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="court",
@@ -278,6 +313,22 @@ def build_parser():
     p_archive = sub.add_parser("archive", help="Move a Quest/Epic file into .court/archive/")
     p_archive.add_argument("quest_id")
     p_archive.set_defaults(func=cmd_archive)
+
+    # rollup
+    p_rollup = sub.add_parser("rollup", help="Extract and roll up specific tribute sections across Quests")
+    p_rollup.add_argument("--section", required=True, choices=["ballad", "tribute", "penance", "audience", "opinion"], help="Tribute subsection to extract")
+    p_rollup.add_argument("--app", default=None, help="Filter by app domain")
+    p_rollup.add_argument("--epic", default=None, help="Filter by parent Epic ID")
+    p_rollup.add_argument("--status", default=None, help="Filter by status (comma-separated)")
+    p_rollup.add_argument("--all", action="store_true", help="Include archived Quests")
+    p_rollup.set_defaults(func=cmd_rollup)
+
+    # edict
+    p_edict = sub.add_parser("edict", help="View or add royal edicts and strategic priorities")
+    p_edict.add_argument("content", nargs="?", default=None, help="Edict text to record")
+    p_edict.add_argument("--file", default=None, help="Read edict from file")
+    p_edict.add_argument("--append", action="store_true", default=True, help="Append to existing edicts")
+    p_edict.set_defaults(func=cmd_edict)
 
     return p
 

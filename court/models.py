@@ -199,3 +199,49 @@ class Quest:
         else:
             self.body_sections[section_name] = content.strip()
         self.updated_at = now_iso()
+
+    def extract_tribute_subsection(self, target_section: str) -> str:
+        """Extract a specific subsection from Tribute Rendered (ballad, tribute, penance, audience, opinion)."""
+        raw = self.body_sections.get("Tribute Rendered", "").strip()
+        if not raw:
+            return ""
+
+        canonical_map = {
+            "ballad": "ballad",
+            "tribute": "tribute",
+            "penance": "penance",
+            "audience": "audience",
+            "opinion": "opinion",
+            "humble opinion": "opinion",
+            "humble_opinion": "opinion",
+        }
+        target = target_section.lower().strip()
+        target_canonical = canonical_map.get(target, target)
+
+        subsections: dict[str, str] = {}
+        current_key = None
+        buf: list[str] = []
+
+        for line in raw.splitlines():
+            m = re.match(r"^#{1,4}\s+(?:\d+[\.\)]\s+)?([A-Za-z\s_-]+)$", line.strip())
+            if m:
+                heading = m.group(1).lower().strip()
+                if heading in canonical_map:
+                    if current_key is not None:
+                        subsections[current_key] = "\n".join(buf).strip()
+                    current_key = canonical_map[heading]
+                    buf = []
+                    continue
+            buf.append(line)
+
+        if current_key is not None:
+            subsections[current_key] = "\n".join(buf).strip()
+
+        if target_canonical in subsections:
+            return subsections[target_canonical]
+
+        # If asking for tribute and no structured breakdown was found, return raw
+        if target_canonical == "tribute" and not subsections:
+            return raw
+
+        return ""

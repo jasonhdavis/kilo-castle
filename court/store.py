@@ -6,6 +6,7 @@ Directory layout:
     .court/epics/     Epic Quests (Q0NN-App-Concern.md, kind=epic)
     .court/archive/   Archived Quests/Epics (still readable)
     .court/templates/ Prompt dispatch and review templates
+    .court/EDICTS.md  Royal decrees and strategic priorities
 """
 from __future__ import annotations
 
@@ -52,6 +53,10 @@ def get_archive_dir(court_root: Optional[Path] = None) -> Path:
 
 def get_templates_dir(court_root: Optional[Path] = None) -> Path:
     return (court_root or get_court_root()) / "templates"
+
+
+def get_edicts_path(court_root: Optional[Path] = None) -> Path:
+    return (court_root or get_court_root()) / "EDICTS.md"
 
 
 def all_state_dirs(court_root: Optional[Path] = None) -> Iterable[Path]:
@@ -138,7 +143,6 @@ def list_all(include_archive: bool = False, court_root: Optional[Path] = None) -
             try:
                 out.append(Quest.from_markdown(p.read_text(encoding="utf-8")))
             except Exception as e:
-                # Log warning to stderr without crashing listing
                 print(f"WARNING: failed to parse {p}: {e}")
     return sorted(out, key=lambda q: q.id)
 
@@ -153,3 +157,50 @@ def archive(quest_id: str, court_root: Optional[Path] = None) -> Path:
     dst = archive_d / src.name
     src.rename(dst)
     return dst
+
+
+def rollup_section(
+    section_name: str,
+    app: Optional[str] = None,
+    epic: Optional[str] = None,
+    status: Optional[str] = None,
+    include_archive: bool = False,
+    court_root: Optional[Path] = None,
+) -> list[tuple[Quest, str]]:
+    """Roll up a specific tribute subsection across Quests matching filters."""
+    quests = list_all(include_archive=include_archive, court_root=court_root)
+    if app:
+        quests = [q for q in quests if q.app.lower() == app.lower()]
+    if epic:
+        epic_norm = epic.lower().lstrip("q").partition("-")[0]
+        quests = [
+            q for q in quests
+            if q.parent_epic.lower().lstrip("q").partition("-")[0] == epic_norm
+            or q.id.lower().lstrip("q").partition("-")[0] == epic_norm
+        ]
+    if status:
+        status_set = {s.strip().upper() for s in status.split(",")}
+        quests = [q for q in quests if q.status in status_set]
+
+    results = []
+    for q in quests:
+        content = q.extract_tribute_subsection(section_name)
+        if content:
+            results.append((q, content))
+    return results
+
+
+def load_edicts(court_root: Optional[Path] = None) -> str:
+    """Load the contents of .court/EDICTS.md."""
+    p = get_edicts_path(court_root)
+    if p.exists():
+        return p.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def save_edicts(content: str, court_root: Optional[Path] = None) -> Path:
+    """Save content to .court/EDICTS.md."""
+    p = get_edicts_path(court_root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content.strip() + "\n", encoding="utf-8")
+    return p

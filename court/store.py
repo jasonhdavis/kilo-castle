@@ -190,6 +190,45 @@ def rollup_section(
     return results
 
 
+def get_hierarchy(include_archive: bool = False, court_root: Optional[Path] = None) -> dict:
+    """Returns a structured hierarchy:
+    - epics: list of (epic_quest, list_of_child_quests)
+    - standalone: list of quests without parent_epic (not epic, not scout/investigation)
+    - scouts: list of scout/investigation quests
+    """
+    quests = list_all(include_archive=include_archive, court_root=court_root)
+    epics = [q for q in quests if q.kind == "epic"]
+    scouts = [q for q in quests if q.kind == "scout" or q.section == "Investigation"]
+
+    epic_map: dict[str, list[Quest]] = {e.id: [] for e in epics}
+    epic_short_map: dict[str, str] = {e.id.split("-")[0].lower(): e.id for e in epics}
+
+    standalone: list[Quest] = []
+    for q in quests:
+        if q.kind == "epic":
+            continue
+        if q.kind == "scout" or q.section == "Investigation":
+            continue
+        if q.parent_epic:
+            parent_key = q.parent_epic.strip()
+            parent_short = parent_key.split("-")[0].lower()
+            if parent_key in epic_map:
+                epic_map[parent_key].append(q)
+            elif parent_short in epic_short_map:
+                epic_map[epic_short_map[parent_short]].append(q)
+            else:
+                standalone.append(q)
+        else:
+            standalone.append(q)
+
+    epic_pairs = [(e, epic_map.get(e.id, [])) for e in epics]
+    return {
+        "epics": epic_pairs,
+        "standalone": standalone,
+        "scouts": scouts,
+    }
+
+
 def load_edicts(court_root: Optional[Path] = None) -> str:
     """Load the contents of .court/EDICTS.md."""
     p = get_edicts_path(court_root)

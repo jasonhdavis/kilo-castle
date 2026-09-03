@@ -98,3 +98,40 @@ Recommend adding automatic key deprecation cron.
     main(["edict"])
     out = capsys.readouterr().out
     assert "Focus on authentication hardening" in out
+
+    # 11. tree and status --tree
+    main([
+        "new",
+        "--kind", "epic",
+        "--app", "auth",
+        "--concern", "refactor",
+        "--title", "Auth Refactor Initiative",
+    ])
+    capsys.readouterr()
+
+    main([
+        "new",
+        "--app", "auth",
+        "--concern", "cleanup",
+        "--title", "Auth Cleanup Task",
+        "--epic", "Q002-Auth-Refactor",
+    ])
+    capsys.readouterr()
+
+    main(["tree"])
+    tree_out = capsys.readouterr().out
+    assert "THE COURT — Quest & Epic Hierarchy" in tree_out
+    assert "🏰 EPICS" in tree_out
+    assert "Q002-Auth-Refactor" in tree_out
+    assert "Q003-Auth-Cleanup" in tree_out
+    assert "⚔️ STANDALONE QUESTS" in tree_out
+    assert "Q001-Core-Jwt-Rotation" in tree_out
+
+    main(["status", "--tree"])
+    status_tree_out = capsys.readouterr().out
+    assert "THE COURT — Quest & Epic Hierarchy" in status_tree_out
+
+    main(["show", "Q002-Auth-Refactor"])
+    show_epic_out = capsys.readouterr().out
+    assert "# Child Quests" in show_epic_out
+    assert "Q003-Auth-Cleanup" in show_epic_out

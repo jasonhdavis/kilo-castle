@@ -54,13 +54,46 @@ def cmd_new(args):
     print(quest.to_markdown())
 
 
+STATUS_GLYPHS = {
+    "OPEN": "📋",
+    "PLANNED": "📝",
+    "DISPATCHED": "🚀",
+    "WORKING": "⚙️",
+    "REVIEW": "🪙",
+    "GATE": "🛡️",
+    "READY_FOR_TEARDOWN": "🪦",
+    "DONE": "✅",
+    "HELD": "⏸️",
+}
+
+
 def cmd_show(args):
-    quest = store.load(args.quest_id)
+    court_root = store.get_court_root()
+    quest = store.load(args.quest_id, court_root=court_root)
     print(quest.to_markdown())
+    if quest.kind == "epic":
+        hierarchy = store.get_hierarchy(include_archive=False, court_root=court_root)
+        for epic, children in hierarchy["epics"]:
+            if epic.id == quest.id or epic.id.split("-")[0].lower() == quest.id.split("-")[0].lower():
+                if children:
+                    completed = sum(1 for c in children if c.status in ("READY_FOR_TEARDOWN", "DONE"))
+                    print(f"\n# Child Quests ({completed}/{len(children)} Complete)\n")
+                    for j, child in enumerate(children):
+                        is_last = (j == len(children) - 1)
+                        pfx = "└── " if is_last else "├── "
+                        glyph = STATUS_GLYPHS.get(child.status, "•")
+                        serf = f"serf={child.serf_session_id}" if child.serf_session_id else ""
+                        branch = f"branch={child.branch}" if child.branch else ""
+                        meta = " ".join(filter(None, [branch, serf]))
+                        meta_str = f" ({meta})" if meta else ""
+                        print(f"{pfx}{glyph} [{child.status}] {child.id}{meta_str}")
+                        print(f"{'    ' if is_last else '│   '}    {child.title}")
+                break
 
 
 def cmd_list(args):
-    quests = store.list_all(include_archive=args.all)
+    court_root = store.get_court_root()
+    quests = store.list_all(include_archive=args.all, court_root=court_root)
     if args.status:
         quests = [q for q in quests if q.status == args.status]
     if args.app:
@@ -72,8 +105,88 @@ def cmd_list(args):
         print(f"{q.id:38} [{q.status:19}] {q.section:12} {q.title[:60]}")
 
 
+def render_tree_view(court_root: Optional[Path] = None, include_archive: bool = False) -> str:
+    root = court_root or store.get_court_root()
+    hierarchy = store.get_hierarchy(include_archive=include_archive, court_root=root)
+    epics = hierarchy["epics"]
+    standalone = hierarchy["standalone"]
+    scouts = hierarchy["scouts"]
+
+    lines = [
+        "=" * 72,
+        "THE COURT — Quest & Epic Hierarchy",
+        "=" * 72,
+    ]
+
+    if epics:
+        lines.append(f"\n🏰 EPICS ({len(epics)})")
+        for i, (epic, children) in enumerate(epics):
+            is_last_epic = (i == len(epics) - 1) and not standalone and not scouts
+            prefix = "└── " if is_last_epic else "├── "
+            indent = "    " if is_last_epic else "│   "
+
+            completed_count = sum(1 for c in children if c.status in ("READY_FOR_TEARDOWN", "DONE"))
+            total_count = len(children)
+            progress = f"({completed_count}/{total_count} Quests Complete)" if total_count else "(No child Quests)"
+            glyph = STATUS_GLYPHS.get(epic.status, "•")
+
+            lines.append(f"{prefix}{glyph} [{epic.status}] {epic.id} {progress}")
+            lines.append(f"{indent}    {epic.title}")
+
+            for j, child in enumerate(children):
+                is_last_child = (j == len(children) - 1)
+                c_prefix = "└── " if is_last_child else "├── "
+                c_glyph = STATUS_GLYPHS.get(child.status, "•")
+                c_serf = f"serf={child.serf_session_id}" if child.serf_session_id else ""
+                c_branch = f"branch={child.branch}" if child.branch else ""
+                meta = " ".join(filter(None, [c_branch, c_serf]))
+                meta_str = f" ({meta})" if meta else ""
+                lines.append(f"{indent}{c_prefix}{c_glyph} [{child.status}] {child.id}{meta_str}")
+                lines.append(f"{indent}{'    ' if is_last_child else '│   '}    {child.title}")
+
+    if standalone:
+        lines.append(f"\n⚔️ STANDALONE QUESTS ({len(standalone)})")
+        for i, q in enumerate(standalone):
+            is_last = (i == len(standalone) - 1) and not scouts
+            prefix = "└── " if is_last else "├── "
+            indent = "    " if is_last else "│   "
+            glyph = STATUS_GLYPHS.get(q.status, "•")
+            serf = f"serf={q.serf_session_id}" if q.serf_session_id else ""
+            branch = f"branch={q.branch}" if q.branch else ""
+            meta = " ".join(filter(None, [branch, serf]))
+            meta_str = f" ({meta})" if meta else ""
+            lines.append(f"{prefix}{glyph} [{q.status}] {q.id} [{q.section}]{meta_str}")
+            lines.append(f"{indent}    {q.title}")
+
+    if scouts:
+        lines.append(f"\n🔭 SCOUTS & INVESTIGATIONS ({len(scouts)})")
+        for i, q in enumerate(scouts):
+            is_last = (i == len(scouts) - 1)
+            prefix = "└── " if is_last else "├── "
+            indent = "    " if is_last else "│   "
+            glyph = STATUS_GLYPHS.get(q.status, "•")
+            serf = f"serf={q.serf_session_id}" if q.serf_session_id else ""
+            branch = f"branch={q.branch}" if q.branch else ""
+            meta = " ".join(filter(None, [branch, serf]))
+            meta_str = f" ({meta})" if meta else ""
+            lines.append(f"{prefix}{glyph} [{q.status}] {q.id}{meta_str}")
+            lines.append(f"{indent}    {q.title}")
+
+    return "\n".join(lines)
+
+
+def cmd_tree(args):
+    court_root = store.get_court_root()
+    print(render_tree_view(court_root=court_root, include_archive=args.all))
+
+
 def cmd_status(args):
-    quests = store.list_all(include_archive=False)
+    court_root = store.get_court_root()
+    if getattr(args, "tree", False):
+        print(render_tree_view(court_root=court_root, include_archive=False))
+        return
+
+    quests = store.list_all(include_archive=False, court_root=court_root)
     if not quests:
         print("The Court is empty. No active Quests or Epics.")
         return
@@ -267,7 +380,13 @@ def build_parser():
 
     # status
     p_status = sub.add_parser("status", help="Full court dashboard")
+    p_status.add_argument("--tree", action="store_true", help="Display hierarchical quest tree dashboard")
     p_status.set_defaults(func=cmd_status)
+
+    # tree
+    p_tree = sub.add_parser("tree", help="Display hierarchical Quest and Epic tree")
+    p_tree.add_argument("--all", action="store_true", help="include archived Quests and Epics")
+    p_tree.set_defaults(func=cmd_tree)
 
     # advance
     p_advance = sub.add_parser("advance", help="Change a Quest's pipeline stage")

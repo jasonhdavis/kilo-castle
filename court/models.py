@@ -20,12 +20,36 @@ STATUSES = (
     "READY_FOR_TEARDOWN",
     "DONE",
     "HELD",  # Blocked on an Audience decision; not a pipeline failure state.
+    "PUNISHED",  # Master of Coin rejected the audit; Quest+worktree frozen, successor chartered.
 )
 
 KINDS = ("quest", "epic", "scout")
 
 # Agent Manager standard sections / lanes.
 SECTIONS = ("Bug fix", "Feature", "Optimization", "Investigation")
+
+
+def validate_branch_name(branch: str) -> tuple[bool, str]:
+    """Validate that a branch name follows the organizational folder hierarchy
+    (forward-slash namespaces, see AGENTS.md) rather than a flat hyphenated
+    name that fails to fold into a collapsible group in Git GUI tools."""
+    if not branch:
+        return True, ""
+    if branch in ("main", "castle") or branch.startswith("the-gatehouse"):
+        return True, ""
+    if branch.startswith(("epic/", "quest/", "scout/", "the-gatehouse/")):
+        return True, ""
+    if branch.startswith(("quest-", "scout-", "epic-")):
+        parts = branch.split("-", 1)
+        return False, (
+            f"Flat branch name '{branch}' violates folder hierarchy. "
+            f"Use organizational folder slash namespace like '{parts[0]}/{parts[1]}' instead."
+        )
+    return False, (
+        f"Branch '{branch}' must use organizational folder prefix "
+        f"('epic/...', 'quest/...', 'scout/...', or 'the-gatehouse/...')."
+    )
+
 
 # Frontmatter field order on disk.
 FRONTMATTER_FIELDS = (
@@ -38,6 +62,12 @@ FRONTMATTER_FIELDS = (
     "section",
     "tags",
     "status",
+    "cogship_id",
+    "cogship_station",
+    "cogship_promoted_commit",
+    "task_file",
+    "pillory_of",
+    "pilloried_by",
     "branch",
     "worktree",
     "serf_session_id",
@@ -56,6 +86,7 @@ DEFAULT_BODY_SECTIONS = (
     "Expected Tribute",
     "Tribute Rendered",
     "Master of Coin Review",
+    "Judgement of the Condemned",
     "Gatekeeper Review",
     "Audience Log",
     "History",
@@ -82,6 +113,12 @@ class Quest:
     section: str = ""
     tags: str = ""
     status: str = "OPEN"
+    cogship_id: str = ""
+    cogship_station: str = ""
+    cogship_promoted_commit: str = ""
+    task_file: str = ""
+    pillory_of: str = ""  # set on a successor Quest: id of the Punished predecessor it replaces
+    pilloried_by: str = ""  # set on a Punished Quest: id of the successor Quest chartered in its place
     branch: str = ""
     worktree: str = ""
     serf_session_id: str = ""

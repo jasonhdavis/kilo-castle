@@ -20,15 +20,23 @@ without losing any committed work.
 - Read `AGENTS.md` (repo root) and follow the branch/worktree/testing rules
   there exactly — especially the scoped-vs-full test rule for this Quest's
   section (**{{ section }}**).
-- Read `RULES.md`/`.kilocode/rules/RUELES.md` for Django/Bootstrap/query-cost
-  conventions before writing code. Grep for existing patterns before
-  inventing new ones.
+- Read project rules and coding standards before writing code. Grep for
+  existing patterns before inventing new ones.
 - Stay inside the stated scope. If you discover the work is bigger than this
   Quest's scope, or that it depends on/duplicates another in-flight Quest,
   **stop and report that as a blocker** — do not silently expand scope or
   duplicate work.
 - Commit your work as you go on this worktree's organizational folder branch (`{{ branch }}`).
   Do not merge, do not touch `gatehouse`/`castle`/`main` yourself.
+
+## Immediate Mandatory First Step In This Worktree
+Agent Manager sometimes sanitizes forward slashes to hyphens when it creates a worktree
+branch (`quest/<id>-<slug>` becomes `quest-<id>-<slug>`). Before doing anything else:
+1. Run `git branch -m {{ branch }}` to restore the canonical slash-folder branch name if it
+   was sanitized on creation.
+2. Run `git merge castle --ff-only` to confirm you start this Quest with zero commits behind
+   `castle` (`behind: 0`). If this is not a clean fast-forward, `castle` has moved in a way
+   that needs a real merge — stop and reconcile before writing any code.
 
 ## Production Database Inspection (ROQ)
 - If you need to inspect live production data, verify live schema/distributions, or extract realistic test fixtures, use the **Read-Only Query harness** (`scripts/identity_audit/roq.py`):
@@ -73,7 +81,23 @@ python3 .court/engine/cli.py set-section {{ quest_id }} "Tribute Rendered" --fil
 ```
 (or write it directly into `.court/quests/{{ quest_id }}.md` under `# Tribute Rendered`). This ensures the Steward and Court can read your completion directly from disk without relying on ephemeral chat turns.
 
-A plain "done" or "should be working now" is not an acceptable handoff and will be returned to WORKING without review.
+## Mandatory Self-Advance to REVIEW (do this LAST, immediately before you stop)
+Rendering your Tribute is NOT the end of the handoff — a Quest sitting fully done in
+`WORKING` with nobody flipping its status is invisible to the Steward's `/levy` triage.
+Immediately after the Tribute section is persisted, and only after you have re-confirmed
+zero drift (re-run `git rev-list --count HEAD..castle` — if it is no longer `0` because
+`castle` moved while you worked, do ONE more `git merge castle` and re-check before
+proceeding; do not advance while behind `castle`), run:
+```bash
+python3 .court/engine/cli.py advance {{ quest_id }} REVIEW --note "Tribute rendered, deferred rebase complete."
+```
+This is the one action that actually moves the Quest out of `WORKING` into `REVIEW` —
+nothing else does it for you, and the Steward's `/levy` triage will not summon the Master
+of Coin on a Quest that never self-advanced, no matter how complete its Tribute is.
+
+A plain "done" or "should be working now" is not an acceptable handoff and will be returned
+to WORKING without review. Neither is a fully-rendered Tribute sitting under a Quest still
+marked `WORKING` — that is an incomplete handoff missing its final step.
 
 ## When you are blocked (not done, not failing — stuck)
 Report the blocker plainly: what you tried, what happened, what you think

@@ -17,7 +17,7 @@ Follow the Levy Protocol:
        ```
        python3 .court/engine/cli.py advance <id> REVIEW --note "Levied: Tribute submitted to Master of Coin"
        ```
-     - Dispatch the **Master of Coin** (`.court/templates/master_of_coin_review_prompt.md`, default model **Gemini 3.7 Flash**) to audit the Tribute directly on the Quest's worktree for value, criteria satisfaction, and Neon compute costs (`RULES.md`).
+     - Dispatch the **Master of Coin** (`.court/templates/master_of_coin_review_prompt.md`, default model **Gemini 3.7 Flash**) to audit the Tribute directly on the Quest's worktree for value, criteria satisfaction, and database compute costs (`RULES.md`).
      - Record:
        ```
        python3 .court/engine/cli.py set-field <id> master_of_coin_session_id <session_id>

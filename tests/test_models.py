@@ -163,3 +163,80 @@ def test_set_section_append_and_replace():
 
     q.set_section("Goal & Scope", "Replaced", mode="replace")
     assert q.body_sections["Goal & Scope"] == "Replaced"
+
+
+def test_punished_status_is_recognized():
+    assert "PUNISHED" in STATUSES
+    q = Quest(id="Q040-Test-Punished", title="Punished Quest", app="test", concern="punished")
+    q.set_status("PUNISHED", "Master of Coin rejected this audit")
+    assert q.status == "PUNISHED"
+    assert "PUNISHED" in q.body_sections["History"]
+
+
+def test_judgement_of_the_condemned_section_present_by_default():
+    q = Quest(id="Q041-Test-Judgement", title="Judgement Quest", app="test", concern="judgement")
+    assert "Judgement of the Condemned" in q.body_sections
+    # Existing canonical section names must not have been renamed away.
+    assert "Goal & Scope" in q.body_sections
+    assert "Master of Coin Review" in q.body_sections
+    assert "Gatekeeper Review" in q.body_sections
+
+
+def test_new_frontmatter_fields_roundtrip_through_markdown():
+    q = Quest(
+        id="Q042-Test-Cogship",
+        title="Cog Ship Fields",
+        app="test",
+        concern="cogship",
+        status="PUNISHED",
+        cogship_id="cogship-003",
+        cogship_station="the-gatehouse/north",
+        cogship_promoted_commit="abc1234",
+        task_file="tasks/apps/test/plan.md",
+        pillory_of="Q039-Test-Predecessor",
+        pilloried_by="Q043-Test-Successor",
+    )
+    q.set_section(
+        "Judgement of the Condemned",
+        "- **Reason:** Missing tests\n- **Decrees Issued:** Reuse the service layer",
+    )
+
+    md = q.to_markdown()
+    assert "cogship_id: cogship-003" in md
+    assert "cogship_station: the-gatehouse/north" in md
+    assert "cogship_promoted_commit: abc1234" in md
+    assert "task_file: tasks/apps/test/plan.md" in md
+    assert "pillory_of: Q039-Test-Predecessor" in md
+    assert "pilloried_by: Q043-Test-Successor" in md
+    assert "# Judgement of the Condemned" in md
+    assert "Missing tests" in md
+
+    parsed = Quest.from_markdown(md)
+    assert parsed.status == "PUNISHED"
+    assert parsed.cogship_id == "cogship-003"
+    assert parsed.cogship_station == "the-gatehouse/north"
+    assert parsed.cogship_promoted_commit == "abc1234"
+    assert parsed.task_file == "tasks/apps/test/plan.md"
+    assert parsed.pillory_of == "Q039-Test-Predecessor"
+    assert parsed.pilloried_by == "Q043-Test-Successor"
+    assert "Missing tests" in parsed.body_sections["Judgement of the Condemned"]
+
+
+def test_validate_branch_name():
+    from court.models import validate_branch_name
+
+    assert validate_branch_name("") == (True, "")
+    assert validate_branch_name("castle")[0] is True
+    assert validate_branch_name("main")[0] is True
+    assert validate_branch_name("the-gatehouse/north")[0] is True
+    assert validate_branch_name("quest/q001-platform-auth")[0] is True
+    assert validate_branch_name("epic/q010-auth-migration")[0] is True
+    assert validate_branch_name("scout/q005-marketplace-fingerprint")[0] is True
+
+    ok, err = validate_branch_name("quest-q084-flat-name")
+    assert ok is False
+    assert "quest/q084-flat-name" in err
+
+    ok, err = validate_branch_name("totally-unrecognized")
+    assert ok is False
+    assert "organizational folder prefix" in err

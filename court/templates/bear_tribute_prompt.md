@@ -48,3 +48,17 @@ In addition to your response message, you MUST persist your complete 5-section r
 python3 .court/engine/cli.py set-section {{ quest_id }} "Tribute Rendered" --file <path_to_report>
 ```
 (or write it directly into `.court/quests/{{ quest_id }}.md` under `# Tribute Rendered`). This ensures the Steward and Court read your rendered completion directly from disk without relying on ephemeral chat turns.
+
+### Mandatory Self-Advance to REVIEW (do this LAST, immediately before you stop)
+Persisting the Tribute file is NOT the end of this handoff. If this Quest's work is
+genuinely complete (not a mid-flight progress check), re-confirm zero drift first —
+re-run `git rev-list --count HEAD..castle`; if `castle` moved while you were rendering
+this report, do ONE more `git merge castle` and re-check before proceeding — then run:
+```bash
+python3 .court/engine/cli.py advance {{ quest_id }} REVIEW --note "Tribute rendered, deferred rebase complete."
+```
+This is the one action that moves the Quest out of `WORKING` into `REVIEW`. A complete
+Tribute section sitting under a Quest still marked `WORKING` is an incomplete handoff —
+the Steward's `/levy` triage will not summon the Master of Coin on it no matter how
+thorough the report is. If this report is a mid-Quest progress check rather than a
+completion, skip this step and say so explicitly instead.

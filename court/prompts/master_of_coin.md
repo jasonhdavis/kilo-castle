@@ -23,8 +23,8 @@ Given a Quest ID:
 5. **Value Delivery & Scope Discipline Audit:**
    - Confirm that changes strictly align with **Goal & Scope**.
    - Reject scope creep, unnecessary dependencies, speculative abstractions, or gold-plated refactoring that adds maintenance burden without business value.
-6. **Compute & Neon Database Economics Audit (RULES.md):**
-   - Check against query anti-patterns that drive up Neon CU-hours:
+6. **Compute & Database Economics Audit (RULES.md):**
+   - Check against query anti-patterns that drive up database compute costs:
      - No looping queries or per-item `.save()`/`.create()` calls.
      - Mandatory `select_related()` / `prefetch_related()` on traversed relationships.
      - Mandatory `bulk_create()` / `bulk_update()` for multi-row writes.

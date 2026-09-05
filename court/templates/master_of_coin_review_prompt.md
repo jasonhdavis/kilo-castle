@@ -38,8 +38,8 @@ Tribute claims.
    - Reject unneeded refactoring, gold-plating, or speculative abstractions that add
      maintenance overhead without direct business value.
 
-4. **Compute & Neon Database Cost Audit (RULES.md)**
-   - Check for Neon CU-hour waste and high-cost query anti-patterns:
+4. **Compute & Database Cost Audit (RULES.md)**
+   - Check for database compute waste and high-cost query anti-patterns:
      - No N+1 queries or per-item `.save()` / `create()` inside loops.
      - Proper use of `select_related()` / `prefetch_related()`.
      - Batch writes via `bulk_create()` / `bulk_update()` for multi-row operations.
@@ -54,6 +54,21 @@ Tribute claims.
 6. **Pattern & UI Standards Audit**
    - Verify compliance with Volt Pro / Bootstrap conventions ("grep first, invent never").
    - Ensure no duplicated service logic that should have been reconciled.
+
+7. **Duplication & Architecture Check**
+   - Before approving, grep the codebase for a pre-existing implementation of the same
+     capability this Quest just built. Did the codebase already possess this — an existing
+     service, model, or code path that does the same thing?
+   - If a genuine duplicate exists, this is a judgment call for the pillory
+     (`.kilo/commands/pillory.md`), not a routine "fix and return to WORKING" — identify
+     the existing asset by exact path and name it in your Decrees as the code path the
+     successor Quest must reuse instead of shipping a third parallel implementation.
+
+8. **Task File Honesty**
+   - If the Quest references an external planning/task document (a `task_file` frontmatter
+     field, if set), open it and reconcile its checkboxes/claims against what's *actually*
+     true on disk and in the diff. Do not trust a checklist that says "done" without
+     confirming the corresponding code change genuinely exists.
 
 ## Outcomes
 
@@ -73,6 +88,10 @@ Tribute claims.
   python3 .court/engine/cli.py set-section {{ quest_id }} "Master of Coin Review" --content "<specific value/efficiency failures and required fixes>"
   python3 .court/engine/cli.py advance {{ quest_id }} WORKING --note "Master of Coin rejected: <one-line reason>"
   ```
+  If the deficiency is a genuine judgment call — a duplication finding, the wrong
+  architecture, or scope that shouldn't be salvaged in place — rather than something
+  fixable by the same Serf in the same worktree, consider a full pillory
+  (`.kilo/commands/pillory.md`) instead of a routine return to `WORKING`.
 
 - **Ambiguous / Needs M'Lord's Decision:**
   Report the specific trade-off or architectural decision back to the Steward. The Steward

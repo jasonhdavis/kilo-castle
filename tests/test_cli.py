@@ -1,4 +1,5 @@
 import os
+import subprocess
 from pathlib import Path
 from court.cli import main
 from court import store
@@ -175,3 +176,101 @@ Recommend adding automatic key deprecation cron.
     assert "THE SERF PENANCE" in ship_out
     assert "THE HUMBLE OPINIONS" in ship_out
     assert "COG SHIP DEPLOYMENT SUMMARY COMPLETE" in ship_out
+
+
+def _init_git_repo(repo_dir: Path, branch: str = "castle") -> None:
+    subprocess.run(["git", "init", "-q", "-b", branch, str(repo_dir)], check=True)
+    subprocess.run(["git", "-C", str(repo_dir), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo_dir), "config", "user.name", "Test"], check=True)
+    (repo_dir / "README.md").write_text("test repo\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo_dir), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo_dir), "commit", "-q", "-m", "initial"], check=True)
+
+
+def test_cli_engine_port_commands(tmp_path, monkeypatch, capsys):
+    """Exercise the newly-ported engine subcommands (pillory, stamp, audit,
+    rebase, diff) against a temp Court repo fixture, reusing the same
+    COURT_DIR/chdir pattern as the rest of this file."""
+    _init_git_repo(tmp_path, branch="castle")
+    monkeypatch.setenv("COURT_DIR", str(tmp_path / ".court"))
+    monkeypatch.chdir(tmp_path)
+
+    main(["init"])
+    capsys.readouterr()
+
+    main([
+        "new",
+        "--app", "core",
+        "--concern", "engine-port",
+        "--title", "Engine Port Quest",
+        "--section", "Bug fix",
+    ])
+    capsys.readouterr()
+
+    quest_id = "Q001-Core-Engine-Port"
+
+    # audit: single quest, text and JSON modes.
+    main(["audit", quest_id])
+    audit_out = capsys.readouterr().out
+    assert f"Audit Report for {quest_id}" in audit_out
+
+    main(["audit", quest_id, "--json"])
+    audit_json_out = capsys.readouterr().out
+    assert '"quest_id": "Q001-Core-Engine-Port"' in audit_json_out
+
+    # audit: batch mode over all quests.
+    main(["audit"])
+    audit_all_out = capsys.readouterr().out
+    assert "THE WARD — WORKTREE & TRIBUTE AUDIT" in audit_all_out
+
+    # rebase: no worktree resolvable -> skipped, not a crash.
+    main(["rebase", quest_id])
+    rebase_out = capsys.readouterr().out
+    assert quest_id in rebase_out
+    assert "no resolvable worktree" in rebase_out or "skipped" in rebase_out
+
+    # diff: no worktree resolvable -> clean error exit, not a crash.
+    try:
+        main(["diff", quest_id])
+    except SystemExit as e:
+        assert e.code != 0
+    capsys.readouterr()
+
+    # stamp: allocate a fresh Cog Ship id across one quest.
+    main(["stamp", quest_id])
+    stamp_out = capsys.readouterr().out
+    assert "cogship-001" in stamp_out
+    stamped = store.load(quest_id, court_root=tmp_path / ".court")
+    assert stamped.cogship_id == "cogship-001"
+
+    # pillory: no proof of landing found -> Quest is punished.
+    main(["pillory", quest_id, "--reason", "Missing tests", "--decrees", "Reuse the service layer"])
+    pillory_out = capsys.readouterr().out
+    assert "PUNISHED" in pillory_out
+    punished = store.load(quest_id, court_root=tmp_path / ".court")
+    assert punished.status == "PUNISHED"
+    assert "Missing tests" in punished.body_sections["Judgement of the Condemned"]
+
+    # status dashboard should now show the PUNISHED quest.
+    main(["status"])
+    status_out = capsys.readouterr().out
+    assert "[PUNISHED]" in status_out
+
+    # timber: cross-references worktrees/quests; must not crash even with no
+    # Agent Manager state file present.
+    main(["timber"])
+    timber_out = capsys.readouterr().out
+    assert "PHYSICAL GIT WORKTREES" in timber_out
+
+    # ward: compliance patrol summary; --check-fresh is optional and must
+    # degrade gracefully when unconfigured.
+    main(["ward", "--check-fresh"])
+    ward_out = capsys.readouterr().out
+    assert "THE WARD — COMPLIANCE PATROL" in ward_out
+    assert "unavailable" in ward_out or "optional" in ward_out.lower()
+
+    # fix-branches: dry-run must not crash against a repo with only
+    # already-canonical branches.
+    main(["fix-branches", "--dry-run"])
+    fix_out = capsys.readouterr().out
+    assert "BRANCH REALIGNMENT" in fix_out

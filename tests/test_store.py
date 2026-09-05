@@ -1,4 +1,5 @@
 import pytest
+import subprocess
 from pathlib import Path
 from court.models import Quest
 from court import store
@@ -122,3 +123,121 @@ Recommend a follow-up cleanup Quest.
     # WORKING quest excluded by default; included when status filter widened
     manifest_all = store.rollup_ship_manifest(status="WORKING,READY_FOR_TEARDOWN", court_root=court_root)
     assert len(manifest_all["quests"]) == 2
+
+
+def _init_git_repo(repo_dir: Path, branch: str = "castle") -> None:
+    """Minimal git repo with one commit on `branch`, for auto-commit tests."""
+    subprocess.run(["git", "init", "-q", "-b", branch, str(repo_dir)], check=True)
+    subprocess.run(["git", "-C", str(repo_dir), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo_dir), "config", "user.name", "Test"], check=True)
+    (repo_dir / "README.md").write_text("test repo\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo_dir), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo_dir), "commit", "-q", "-m", "initial"], check=True)
+
+
+def test_save_default_matches_plain_write_byte_for_byte(tmp_path):
+    """Default `save()` (auto_commit=False) must remain identical to the
+    historical plain-write behavior for every existing caller."""
+    court_root = tmp_path / ".court"
+    q = Quest(id="Q001-Test-Plain", title="Plain Save", app="test", concern="plain")
+
+    p1 = store.save(q, court_root=court_root)
+    content_a = p1.read_text(encoding="utf-8")
+
+    # Calling again with only the new kwargs at their defaults must be a no-op
+    # difference from a caller's perspective.
+    p2 = store.save(q, court_root=court_root, auto_commit=False, commit_msg=None)
+    content_b = p2.read_text(encoding="utf-8")
+
+    assert p1 == p2
+    assert content_a == content_b
+
+
+def test_commit_allowed_here_guard_blocks_wrong_branch(tmp_path):
+    """`auto_commit=True` must refuse to write when the current checkout is
+    neither a protected trunk nor the Quest's own branch."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    _init_git_repo(repo_dir, branch="some-unrelated-branch")
+
+    court_root = repo_dir / ".court"
+    q = Quest(
+        id="Q002-Test-Guard",
+        title="Guarded Save",
+        app="test",
+        concern="guard",
+        branch="quest/q002-test-guard",
+    )
+
+    p = store.save(q, court_root=court_root, auto_commit=True, commit_msg="test: guard")
+    assert not p.exists()  # refused before writing to disk
+
+
+def test_commit_allowed_here_guard_allows_protected_trunk(tmp_path):
+    """`auto_commit=True` succeeds (and actually commits) from a protected
+    trunk branch (castle/main/the-gatehouse/*)."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    _init_git_repo(repo_dir, branch="castle")
+
+    court_root = repo_dir / ".court"
+    q = Quest(id="Q003-Test-Trunk", title="Trunk Save", app="test", concern="trunk")
+
+    p = store.save(q, court_root=court_root, auto_commit=True, commit_msg="test: trunk save")
+    assert p.exists()
+
+    log = subprocess.run(
+        ["git", "-C", str(repo_dir), "log", "--oneline", "-1"],
+        capture_output=True, text=True, check=True,
+    )
+    assert "test: trunk save" in log.stdout
+
+
+def test_commit_allowed_here_guard_allows_own_branch(tmp_path):
+    """`auto_commit=True` succeeds when the current checkout matches the
+    Quest's own registered branch (a Serf editing its own Quest)."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    _init_git_repo(repo_dir, branch="quest/q004-test-own-branch")
+
+    court_root = repo_dir / ".court"
+    q = Quest(
+        id="Q004-Test-Own",
+        title="Own Branch Save",
+        app="test",
+        concern="own",
+        branch="quest/q004-test-own-branch",
+    )
+
+    p = store.save(q, court_root=court_root, auto_commit=True, commit_msg="test: own branch save")
+    assert p.exists()
+
+
+def test_stamp_cogship_allocates_and_persists(tmp_path):
+    court_root = tmp_path / ".court"
+    q1 = Quest(id="Q010-Test-Cog1", title="Cog Quest 1", app="test", concern="cog1")
+    q2 = Quest(id="Q011-Test-Cog2", title="Cog Quest 2", app="test", concern="cog2")
+    store.save(q1, court_root=court_root)
+    store.save(q2, court_root=court_root)
+
+    stamped_id = store.stamp_cogship([q1, q2], court_root=court_root)
+    assert stamped_id == "cogship-001"
+    assert q1.cogship_id == "cogship-001"
+    assert q2.cogship_id == "cogship-001"
+
+    reloaded = store.load("Q010-Test-Cog1", court_root=court_root)
+    assert reloaded.cogship_id == "cogship-001"
+
+    # A second batch allocates the next monotonic id.
+    q3 = Quest(id="Q012-Test-Cog3", title="Cog Quest 3", app="test", concern="cog3")
+    store.save(q3, court_root=court_root)
+    stamped_id_2 = store.stamp_cogship([q3], court_root=court_root)
+    assert stamped_id_2 == "cogship-002"
+
+
+def test_normalize_cogship_id():
+    assert store.normalize_cogship_id("2") == "cogship-002"
+    assert store.normalize_cogship_id("cogship-7") == "cogship-007"
+    assert store.normalize_cogship_id("cogship_012") == "cogship-012"
+    assert store.normalize_cogship_id("") is None
+    assert store.normalize_cogship_id(None) is None

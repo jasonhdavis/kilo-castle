@@ -29,6 +29,15 @@ without losing any committed work.
 - Commit your work as you go on this worktree's tree-structured branch (`{{ branch }}`).
   Do not merge, do not touch `gatehouse`/`castle`/`main` yourself.
 
+## Immediate Mandatory First Step In This Worktree
+Agent Manager sometimes sanitizes forward slashes to hyphens when it creates a worktree
+branch (`quest/<id>-<slug>` becomes `quest-<id>-<slug>`). Before doing anything else:
+1. Run `git branch -m {{ branch }}` to restore the canonical slash-folder branch name if it
+   was sanitized on creation.
+2. Run `git merge castle --ff-only` to confirm you start this Quest with zero commits behind
+   `castle` (`behind: 0`). If this is not a clean fast-forward, `castle` has moved in a way
+   that needs a real merge — stop and reconcile before writing any code.
+
 ## Mandatory Agent Compliance Step (Clean Tree & Base Alignment)
 Before rendering your tribute and declaring your work done:
 1. **Working Tree Cleanliness**: Run `git status --porcelain` to verify your working tree has no uncommitted leftovers or scratch files. Stage and commit all intended deliverables.
@@ -56,7 +65,23 @@ court set-section {{ quest_id }} "Tribute Rendered" --file <path_to_saved_report
 ```
 (or write it directly into `.court/quests/{{ quest_id }}.md` under `# Tribute Rendered`). This ensures the Steward and Court can read your completion directly from disk without relying on ephemeral chat turns.
 
-A plain "done" or "should be working now" is not an acceptable handoff and will be returned to WORKING without review.
+## Mandatory Self-Advance to REVIEW (do this LAST, immediately before you stop)
+Rendering your Tribute is NOT the end of the handoff — a Quest sitting fully done in
+`WORKING` with nobody flipping its status is invisible to the Steward's `/levy` triage.
+Immediately after the Tribute section is persisted, and only after you have re-confirmed
+zero drift (re-run `git rev-list --count HEAD..castle` — if it is no longer `0` because
+`castle` moved while you worked, do ONE more `git merge castle` and re-check before
+proceeding; do not advance while behind `castle`), run:
+```bash
+court advance {{ quest_id }} REVIEW --note "Tribute rendered, deferred rebase complete."
+```
+This is the one action that actually moves the Quest out of `WORKING` into `REVIEW` —
+nothing else does it for you, and the Steward's `/levy` triage will not summon the Master
+of Coin on a Quest that never self-advanced, no matter how complete its Tribute is.
+
+A plain "done" or "should be working now" is not an acceptable handoff and will be returned
+to WORKING without review. Neither is a fully-rendered Tribute sitting under a Quest still
+marked `WORKING` — that is an incomplete handoff missing its final step.
 
 ## When you are blocked (not done, not failing — stuck)
 Report the blocker plainly: what you tried, what happened, what you think

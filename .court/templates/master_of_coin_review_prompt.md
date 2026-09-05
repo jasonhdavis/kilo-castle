@@ -50,6 +50,21 @@ Tribute claims.
    - Verify compliance with repository architectural patterns and UI component guidelines ("grep first, invent never").
    - Ensure no duplicated service or domain logic that should have been reconciled.
 
+6. **Duplication & Architecture Check**
+   - Before approving, grep the codebase for a pre-existing implementation of the same
+     capability this Quest just built. Did the codebase already possess this — an existing
+     service, model, or code path that does the same thing?
+   - If a genuine duplicate exists, this is a judgment call for the pillory
+     (`.kilo/commands/pillory.md`), not a routine "fix and return to WORKING" — identify
+     the existing asset by exact path and name it in your Decrees as the code path the
+     successor Quest must reuse instead of shipping a third parallel implementation.
+
+7. **Task File Honesty**
+   - If the Quest references an external planning/task document (a `task_file` frontmatter
+     field, if set), open it and reconcile its checkboxes/claims against what's *actually*
+     true on disk and in the diff. Do not trust a checklist that says "done" without
+     confirming the corresponding code change genuinely exists.
+
 ## Outcomes
 
 - **Pass (Value Approved):**
@@ -68,6 +83,10 @@ Tribute claims.
   court set-section {{ quest_id }} "Master of Coin Review" --content "<specific value/efficiency failures and required fixes>"
   court advance {{ quest_id }} WORKING --note "Master of Coin rejected: <one-line reason>"
   ```
+  If the deficiency is a genuine judgment call — a duplication finding, the wrong
+  architecture, or scope that shouldn't be salvaged in place — rather than something
+  fixable by the same Serf in the same worktree, consider a full pillory
+  (`.kilo/commands/pillory.md`) instead of a routine return to `WORKING`.
 
 - **Ambiguous / Needs M'Lord's Decision:**
   Report the specific trade-off or architectural decision back to the Steward. The Steward

@@ -43,7 +43,7 @@ When your reconnaissance is complete, you must render a comprehensive **Scout Re
 ### 3. ⚠️ The Dangers
 - **The Minefield Map**: Concrete gotchas, hidden rate limits, token expiration quirks, and pagination traps.
 - **Dirty Data & Edge Cases**: Malformed values, missing fields, non-ASCII characters, and unstandardized schemas.
-- **Cost & Compute Traps**: Token burn drivers, database query costs (Neon CU-hours), latency bottlenecks, or memory spikes.
+- **Cost & Compute Traps**: Token burn drivers, database query costs, latency bottlenecks, or memory spikes.
 
 ### 4. 🧪 The Tribute
 - **Tangible Artifacts Delivered**:
@@ -57,7 +57,7 @@ When your reconnaissance is complete, you must render a comprehensive **Scout Re
   - Target service module path (e.g., `apps/<app>/services/<service_name>.py`).
   - Proposed model schema or JSON vector storage.
   - Query optimization and batching strategy (`bulk_create`, chunk sizes, connection reuse).
-  - Worker / async execution strategy (QStash, leases, timeouts).
+  - Worker / async execution strategy (background job queue, leases, timeouts).
 - **Candidate Production Quests**: Recommended next Quests (`Feature` or `Optimization` lane) for M'Lord to charter.
 
 ---

@@ -10,10 +10,11 @@
 
 Instead of relying on fragile chat history or allowing a single LLM session to wander across an entire codebase, Castle introduces:
 1. **Durable Markdown Persistence**: Quests and Epics tracked on disk in `.court/` with frontmatter and monotonic global IDs — zero token burn to read state.
-2. **Role Hierarchy**: Strict separation between the orchestrator (**Steward**), disposable implementers (**Serfs**), reconnaissance explorers (**Scouts**), value auditors (**Master of Coin**), and integration checkpoints (**Gatekeeper**).
+2. **Role Hierarchy**: Strict separation between the orchestrator (**Steward**), disposable implementers (**Serfs**), reconnaissance explorers (**Scouts**), value auditors (**Master of Coin**), integration checkpoints (**Gatekeeper**), and a dedicated log-patrol role (**Warden**).
 3. **The Tribute & Scout Completion Contracts**: Mandatory structured handoffs written durably to disk.
 4. **Isolated Git Worktree Topology**: Tree-structured branches (`quest/<id>-<slug>`, `scout/<id>-<slug>`) flowing through staging lanes (`gatehouse` $\rightarrow$ `castle` $\rightarrow$ `main`).
 5. **Model Tiering**: Fast, cost-efficient models in the trenches; frontier reasoning models at the gate.
+6. **The Pillory**: A genuine value/scope/duplication rejection freezes a Quest as `PUNISHED` with Decrees for a chartered successor, instead of returning it to `WORKING` — see `.court/README.md` for the full side-state model and its mechanical-rejection carve-out.
 
 ---
 
@@ -51,6 +52,7 @@ Instead of relying on fragile chat history or allowing a single LLM session to w
 | **🪙 Master of Coin** | Dispatched during `REVIEW` **before** testing and merging. Audits the rendered Tribute directly on the worktree for criteria satisfaction, scope discipline, and query/compute cost efficiency. | Fast / Cost-Efficient (e.g. Gemini 3.7 Flash) |
 | **🛡️ Gatekeeper** | Lives inside the persistent `the-gatehouse` bastions. Dispatched during `GATE`. Decides the Cog Ship convoy pack, runs unified integration test suites across the pack all at once, isolates/re-tests and rejects failing commits with Serf remediation, and promotes verified Cog Ships into `castle`. | Frontier Reasoning (e.g. Claude 3.7 Sonnet) |
 | **📜 Vassal** | Dispatched only for large, multi-Quest **Epics**. Decomposes initiatives into child Quests, coordinates dependencies, and compresses fleet status upward. | Fast / Frontier |
+| **🏹 Warden** | Patrols production logs and error trackers on a non-merging `ward/*` branch. Files 5-part Warden Reports (Survey, Stack Trace, Impact, Root Cause Diagnosis, Proposed Fix) for the Steward to charter into `Bug fix` Quests. Diagnoses only — never writes remediation code. | Fast / Cost-Efficient |
 
 ---
 
@@ -244,6 +246,9 @@ Inside Kilo Code, interact naturally with the Steward:
 | `/murmur` | Surface bottom-up field recommendations from the agents |
 | `/audience` | Surface pending decisions requiring M'Lord's judgment |
 | `/raze <id>` | Move a merged worktree to Ashes for teardown |
+| `/goad <id>` | Nudge an idle or exited Serf session, or diagnose whether it actually finished |
+| `/pillory <id>` | Freeze a Quest as `PUNISHED` with Decrees for a chartered successor (judgment-call rejection) |
+| `/ward` | Display the Warden's log-patrol dashboard, or dispatch a fresh patrol session |
 
 ---
 

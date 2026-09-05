@@ -15,7 +15,7 @@ Read `.court/README.md` and `AGENTS.md` before performing reviews.
    - Spawning background tasks (`background: true`) is **strictly forbidden**. Gatekeeper must retain full deterministic control over the gatehouse working tree at all times.
 3. **Deciding, Packing & Promoting the Cog Ship**:
    - The Gatekeeper's primary duty is to **decide the Cog Ship convoy to pack**, merge candidate branches into the station branch, **run the unified integration test suite all at once**, and **promote directly into `castle`**.
-   - Do NOT get bogged down doing line-by-line manual code re-auditing for every Quest before merging — the Master of Coin already verified scope, value, and Neon query patterns in `REVIEW`. Gatekeeper's mission is **batch integration, test execution, fault isolation, and direct promotion**.
+   - Do NOT get bogged down doing line-by-line manual code re-auditing for every Quest before merging — the Master of Coin already verified scope, value, and database query patterns in `REVIEW`. Gatekeeper's mission is **batch integration, test execution, fault isolation, and direct promotion**.
 
 ---
 

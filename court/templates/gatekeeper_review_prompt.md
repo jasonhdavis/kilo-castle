@@ -9,6 +9,18 @@ The Gatekeeper's explicit duty is **Autonomous Cog Ship Convoy Packing, Batch In
 3. If test errors or regressions occur, isolate/re-test which specific commit/Quest introduced the failure, reject that Quest from the current Cog Ship, advance it to `WORKING`, and dispatch/prompt a Serf in that Quest's worktree with the exact error traceback.
 4. Promote verified Cog Ships **directly into `castle`** (no double-gating or central intermediary), pack the deployment manifest (`python3 .court/engine/cli.py ship`), and advance passing Quests to `READY_FOR_TEARDOWN`.
 
+**Mechanical rejection, not a judgment call.** When the Gatekeeper rejects a Quest from a
+Cog Ship, that rejection stays strictly in the Gatekeeper's own lane: it is a same-worktree,
+fresh-Serf-session fix for a merge regression or failing test — a small, mechanical problem
+in a known place. This is NOT the same thing as a full **pillory** judgment (freezing a
+Quest as condemned with Decrees for a chartered successor), which is reserved exclusively
+for a review/audit role deciding the work itself is the wrong value, scope, or a duplicate of
+something that already exists (see `.kilo/commands/pillory.md`). The Gatekeeper never
+pillories a Quest; its only rejection outcome is the same-worktree remediation path
+documented standalone in `.kilo/commands/reject_tribute.md`. If a batch failure looks like
+an architecture or value problem rather than a mechanical regression, report it back to the
+Steward instead of deciding it yourself.
+
 Fill in `{{ }}` placeholders when dispatching targeted batches, or omit them when the Gatekeeper audits all Quests waiting at `GATE`.
 
 ---
@@ -25,7 +37,7 @@ All test suite execution and final integration belongs to this `gatehouse` layer
 
 ### Step 1: Decide the Cog Ship Pack
 1. Survey all Quests currently waiting at `GATE` (`python3 .court/engine/cli.py list --status GATE`).
-   *Note: Every Quest at `GATE` has already been vetted for scope, value, and Neon query patterns by the Master of Coin during `REVIEW`. Do NOT get bogged down doing line-by-line manual code re-audits — your primary mission is batch integration and automated test verification.*
+   *Note: Every Quest at `GATE` has already been vetted for scope, value, and database query patterns by the Master of Coin during `REVIEW`. Do NOT get bogged down doing line-by-line manual code re-audits — your primary mission is batch integration and automated test verification.*
 2. Select a coherent Cog Ship convoy batch to pack (e.g., all child Quests of an Epic, or a batch of candidate Quests {{ quest_ids }}).
 3. Roll to the next available station: **North → South → East → West → North...** (no domain silos; any station can pack, test, and promote any Cog Ship directly).
 4. Confirm the assigned station worktree (`.kilo/worktrees/the-gatehouse-{{ station | default("north") }}`) is synced with `castle` baseline (`git merge castle --ff-only`).
@@ -62,6 +74,12 @@ All test suite execution and final integration belongs to this `gatehouse` layer
    ```
 
 #### Case B: Test Failures / Regressions Occur in the Batch
+
+This is a mechanical fault, not a value/duplication judgment — follow the same-worktree
+`/reject_tribute` recipe (`.kilo/commands/reject_tribute.md`); the identical steps are
+inlined below because the Gatekeeper runs autonomously and does not use Steward slash
+commands. Never pillory a Quest for a batch test failure.
+
 1. **Do NOT panic or abandon the whole convoy, and do NOT manually review all code.**
 2. **Isolate & Re-test**:
    - Inspect the test traceback to determine which app/module failed.

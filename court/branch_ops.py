@@ -81,9 +81,9 @@ def resolve_canonical_branch_name(
         slug = m_child_q.group(3).lower()
 
         quest = find_quest_in_court(child_id, cwd=cwd)
-        if quest and quest.branch and quest.branch.startswith("quest/"):
+        if quest and quest.branch and quest.branch.startswith(f"quest/{epic_id}/"):
             return quest.branch, f"court_quest_frontmatter ({quest.id})"
-        elif quest and quest.tree_branch:
+        elif quest and quest.tree_branch and quest.tree_branch.startswith(f"quest/{epic_id}/"):
             return quest.tree_branch, f"court_quest_tree_branch ({quest.id})"
 
         return f"quest/{epic_id}/{child_id}-{slug}", "regex_child_quest"
@@ -95,9 +95,9 @@ def resolve_canonical_branch_name(
         slug = m_child_s.group(3).lower()
 
         quest = find_quest_in_court(child_id, cwd=cwd)
-        if quest and quest.branch and quest.branch.startswith("scout/"):
+        if quest and quest.branch and quest.branch.startswith(f"scout/{epic_id}/"):
             return quest.branch, f"court_scout_frontmatter ({quest.id})"
-        elif quest and quest.tree_branch:
+        elif quest and quest.tree_branch and quest.tree_branch.startswith(f"scout/{epic_id}/"):
             return quest.tree_branch, f"court_scout_tree_branch ({quest.id})"
 
         return f"scout/{epic_id}/{child_id}-{slug}", "regex_child_scout"
@@ -127,16 +127,17 @@ def resolve_canonical_branch_name(
 
         quest = find_quest_in_court(quest_id, cwd=cwd)
         if quest:
+            reason_suffix = "_fork" if fork_suffix else ""
             if quest.branch and quest.branch.startswith("quest/"):
                 b = quest.branch
                 if fork_suffix and not b.endswith(fork_suffix):
                     b = f"{b}{fork_suffix}"
-                return b, f"court_quest_frontmatter ({quest.id})"
+                return b, f"court_quest_frontmatter{reason_suffix} ({quest.id})"
             elif quest.tree_branch:
                 b = quest.tree_branch
                 if fork_suffix and not b.endswith(fork_suffix):
                     b = f"{b}{fork_suffix}"
-                return b, f"court_quest_tree_branch ({quest.id})"
+                return b, f"court_quest_tree_branch{reason_suffix} ({quest.id})"
 
         return f"quest/{quest_id}-{slug}", "regex_standalone_quest"
 

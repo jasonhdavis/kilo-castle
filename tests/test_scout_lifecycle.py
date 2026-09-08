@@ -4,6 +4,14 @@ when a production Quest whose frontmatter names a source Scout (`scout_of`)
 advances to WORKING, that source Scout should be auto-transitioned to
 READY_TO_RAZE, since its exploratory findings are already captured in its
 own Scout Report and it has served its purpose.
+
+Isolation contract (Q907 incident): every `store.save`/`store.load` call
+passes an explicit `court_root` pointing at a scratch TemporaryDirectory AND
+`COURT_DIR` is set in the environment (for `cli.cmd_advance`'s internal
+loads). The obsolete `store.QUESTS_DIR`/`EPICS_DIR`/`ARCHIVE_DIR` module
+attributes are computed `__getattr__` shims the engine never reads — setting
+them silently no-ops (or, worse, writes into the real .court when the env var
+is missing). This test must never shadow them.
 """
 import argparse
 import os
@@ -19,14 +27,14 @@ class TestScoutToQuestLifecycleTransition(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self._tmp.name)
-        self._orig_court_dir = os.environ.get("COURT_DIR")
-        os.environ["COURT_DIR"] = str(self.tmp_path / ".court")
         self.court_root = self.tmp_path / ".court"
+        self._orig_court_dir = os.environ.get("COURT_DIR")
+        os.environ["COURT_DIR"] = str(self.court_root)
         for d in (self.court_root / "quests", self.court_root / "epics", self.court_root / "archive"):
             d.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self):
-        if self._orig_court_dir:
+        if self._orig_court_dir is not None:
             os.environ["COURT_DIR"] = self._orig_court_dir
         else:
             os.environ.pop("COURT_DIR", None)

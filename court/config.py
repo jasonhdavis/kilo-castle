@@ -12,6 +12,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "models": {
         "serf": "GLM-5.3-Flash",
         "serf_provider": "openrouter",
+        "scout": "openrouter/z-ai/glm-5.3-flash",
         "master_of_coin": "openrouter/google/gemini-3.8-flash",
         "gatekeeper": "openrouter/google/gemini-3.8-flash",
         "steward": "openrouter/google/gemini-3.7-flash",

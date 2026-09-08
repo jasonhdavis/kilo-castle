@@ -16,10 +16,10 @@ This interrogation:
 1. Read `branch`/`worktree`/`master_of_coin_session_id` from `court show {{ quest_id }}`.
 2. **Reuse first:** if `master_of_coin_session_id` is set AND `agent_manager` (`action: "list"`) still shows that session live, send it this prompt via `agent_manager` `action: "prompt"`, `sessionID: "<master_of_coin_session_id>"`.
 3. **Spawn fresh only if reuse isn't possible:** start a **brand-new, dedicated** session bound to the Quest's branch:
-   `agent_manager` `start`, `mode: "worktree"`, `branchName: "{{ branch }}"`, `model: "Gemini 3.7 Flash"`, `provider: "openrouter"` (or qualified `openrouter/google/gemini-3.7-flash`). Record it:
+   `agent_manager` `start`, `mode: "worktree"`, `branchName: "{{ branch }}"`, `model: "Gemini 3.8 Flash"`, `provider: "openrouter"` (or qualified `openrouter/google/gemini-3.8-flash`). Record it:
    ```bash
    python3 -m court.cli set-field {{ quest_id }} master_of_coin_session_id <session_id>
-   python3 -m court.cli set-field {{ quest_id }} master_of_coin_model "openrouter/google/gemini-3.7-flash"
+   python3 -m court.cli set-field {{ quest_id }} master_of_coin_model "openrouter/google/gemini-3.8-flash"
    ```
 
 ---

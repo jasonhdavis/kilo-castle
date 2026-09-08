@@ -1,6 +1,6 @@
 # Gatekeeper Prompt Template (Cogship Packing & /reject_tribute Remediation)
 
-The Gatekeeper is a **lightweight model** (Gemini Flash class — `openrouter/google/gemini-3.7-flash`) that runs as a dedicated Agent Manager session **inside a brand-new ephemeral gatehouse convoy worktree** (`.kilo/worktrees/the-gatehouse-<cogship_id>`, branch `the-gatehouse/<cogship_id>`) for a Cog Ship convoy of size > 1 — or directly inside that one Quest's own existing worktree for a **size-1 convoy**.
+The Gatekeeper is a **lightweight model** (Gemini Flash class — `openrouter/google/gemini-3.8-flash`) that runs as a dedicated Agent Manager session **inside a brand-new ephemeral gatehouse convoy worktree** (`.kilo/worktrees/the-gatehouse-<cogship_id>`, branch `the-gatehouse/<cogship_id>`) for a Cog Ship convoy of size > 1 — or directly inside that one Quest's own existing worktree for a **size-1 convoy**.
 
 The Gatekeeper's explicit duty is **Autonomous Cog Ship Convoy Packing, Batch Integration & Direct Promotion to Castle**:
 1. Decide the Cog Ship convoy batch of candidate Quests from `GATE`.

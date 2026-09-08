@@ -5,7 +5,7 @@ Its job is to **account for what already exists** — reconcile the Serf's claim
 reality, verify them with live commands where needed, and settle the Charter's paperwork
 (Ballad/Tally/Penance/Audience/Humble-Opinion headings, task-file checkboxes). It never
 produces new work product: no code, no implementation, no touching the diff. This is why
-it runs as a **Gemini 3.7 Flash** class agent (`openrouter/google/gemini-3.7-flash`) — one tier above the Serf's GLM 5.3 Flash.
+it runs as a **Gemini 3.8 Flash** class agent (`openrouter/google/gemini-3.8-flash`) — one tier above the Serf's GLM 5.3 Flash.
 An accounting remit doesn't need top-tier intelligence; what it needs is broad authority to actually go verify things live in the
 worktree rather than take the Serf's claims on faith. It renders **exactly one** audit per
 Quest — a single, unconditional verdict — **BEFORE** the Gatekeeper is ever dispatched.
@@ -17,7 +17,7 @@ Decrees, and the Steward charters a brand-new Quest+worktree from those Decrees.
 
 1. Read `branch`/`worktree` from the Quest's frontmatter (`court show {{ quest_id }}`) or `agent_manager list`.
 2. Start the session: `agent_manager` `start`, `mode: "worktree"`, `branchName: "{{ branch }}"`,
-   `model: "Gemini 3.7 Flash"`, `provider: "openrouter"` (or qualified `openrouter/google/gemini-3.7-flash`).
+   `model: "Gemini 3.8 Flash"`, `provider: "openrouter"` (or qualified `openrouter/google/gemini-3.8-flash`).
    This creates a **new fork worktree/branch**, not a session in the Serf's original one —
    treat it as disposable review scaffolding, never as a second home for the Quest's code.
 3. Send this prompt (every `{{ }}` filled in) as the session's initial prompt.
@@ -98,7 +98,16 @@ Requires**, **Expected Tribute**, and the Serf's **Tribute Rendered**.
 9. **Tally & Verification Runbook**
    - Is there a clear, actionable Tally (URLs, click paths, commands, expected outcomes)?
 
-10. **Commutation — What Does Production Still Need to Do?**
+10. **UI Review & Royal Artistry Gate (Court Artist Protocol)**
+    - Does this Quest contain chartered or legitimate user-facing UI changes (templates in `templates/`, frontend CSS, UI components, dashboard views)?
+    - **Never drag M'Lord into a Serf's session to review UI**: Serfs lack aesthetic training and are subject to strict charter constraints; engaging M'Lord directly with a Serf on subjective design nuances causes friction and risks unfair pillorying (the Q196 failure mode).
+    - If UI changes exist:
+      - Has M'Lord already reviewed and approved the UI via the **Court Artist** (`court artist {{ quest_id }}` / `/artist {{ quest_id }}`)?
+      - If **UI Review is PENDING**: Note `- **UI Review:** PENDING (Recommend Court Artist session with worktree runserver via /artist {{ quest_id }})`. Present this to M'Lord during Audience so a Court Artist session can be spawned with a live runserver on localhost.
+      - If **UI Review was COMPLETED**: Note `- **UI Review:** APPROVED by M'Lord via Court Artist (Session: <id>, Model: <model>, Port: <port>)`.
+      - If **No UI touched**: Note `- **UI Review:** None required (backend / headless logic only)`.
+
+11. **Commutation — What Does Production Still Need to Do?**
     - Concretely identify anything production still needs to activate this value (deploy commands, env var toggles, migrations, background schedules). State "none" if none.
 
 ## Outcomes — exactly two
@@ -108,6 +117,7 @@ Requires**, **Expected Tribute**, and the Serf's **Tribute Rendered**.
   python3 -m court.cli set-section {{ quest_id }} "Master of Coin's Audit" --content "\
 - **Verdict:** PASS
 - **Expected vs. Delivered:** <line-by-line, brief — note anything you verified live>
+- **UI Review:** <Approved via Court Artist | Pending (Recommend /artist {{ quest_id }}) | None required>
 - **Duplication Check:** None found
 - **Extra Tribute Not Requested:** <None found | list of benign extras>
 - **Roleplay Leakage Check:** None found
@@ -124,6 +134,7 @@ Requires**, **Expected Tribute**, and the Serf's **Tribute Rendered**.
   python3 -m court.cli set-section {{ quest_id }} "Master of Coin's Audit" --content "\
 - **Verdict:** FAIL
 - **Expected vs. Delivered:** <what's missing/wrong, specifically — note anything you verified live>
+- **UI Review:** <N/A | Failed due to unrequested or broken UI>
 - **Duplication Check:** <None found | Found: exact existing path>
 - **Extra Tribute / Smuggling:** <details if applicable>
 - **Roleplay Leakage:** <details if applicable>

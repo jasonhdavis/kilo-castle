@@ -36,14 +36,14 @@ interrogation, logged as a dated entry in that Quest's own `## Audience Log`.
    `agent_manager` `action: "prompt"`, `sessionID: "<master_of_coin_session_id>"`.
 3. **Otherwise spawn a fresh, dedicated session** bound to the Quest's exact existing
    branch — `agent_manager` `start`, `mode: "worktree"`, `branchName: "<branch>"`,
-   `model: "Gemini 3.7 Flash"`, `provider: "openrouter"` — with the filled
+   `model: "Gemini 3.8 Flash"`, `provider: "openrouter"` — with the filled
    `.court/templates/master_of_coin_interrogate_prompt.md` as its initial prompt.
    **Never** hijack the Serf's own `serf_session_id`, and **never** run this as a
    `task` subagent on `castle`. Record the new session so future interrogations (and
    `/levy`) can reuse it:
    ```bash
    python3 -m court.cli set-field <quest_id> master_of_coin_session_id <session_id>
-   python3 -m court.cli set-field <quest_id> master_of_coin_model "openrouter/google/gemini-3.7-flash"
+   python3 -m court.cli set-field <quest_id> master_of_coin_model "openrouter/google/gemini-3.8-flash"
    ```
 4. **Relay the verified answer to M'Lord** once the session responds, including what
    was verified (not just the conclusion). The answer is already durable — the Master

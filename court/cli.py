@@ -47,9 +47,14 @@ WARD_REPORTS_DIR = WARD_DIR / "reports"
 _CFG = config.load_config()
 DEFAULT_SERF_MODEL = _CFG["models"].get("serf", "GLM-5.3-Flash")
 SERF_PROVIDER = _CFG["models"].get("serf_provider", "openrouter")
-DEFAULT_MOC_MODEL = _CFG["models"].get("master_of_coin", "openrouter/google/gemini-3.7-flash")
-DEFAULT_GATEKEEPER_MODEL = _CFG["models"].get("gatekeeper", "openrouter/google/gemini-3.7-flash")
+DEFAULT_MOC_MODEL = _CFG["models"].get("master_of_coin", "openrouter/google/gemini-3.8-flash")
+DEFAULT_GATEKEEPER_MODEL = _CFG["models"].get("gatekeeper", "openrouter/google/gemini-3.8-flash")
+DEFAULT_ARTIST_MODEL = _CFG["models"].get("artist", "GLM-5.3")
+ARTIST_PROVIDER = _CFG["models"].get("artist_provider", "openrouter")
 SERF_DISPATCH_TEMPLATE = ".court/templates/serf_dispatch_prompt.md"
+ARTIST_DISPATCH_TEMPLATE = ".court/templates/court_artist_prompt.md"
+REPO_ROOT = git_ops.get_repo_root()
+MANAGE_SERVERS_PATH = REPO_ROOT / ".kilo" / "manage_servers.sh"
 
 # Pipeline order for `court charter`'s idempotent advance-to-PLANNED (Q183).
 # Side-states (HELD/PUNISHED) are deliberately excluded: chartering never
@@ -1615,6 +1620,208 @@ def cmd_dispatch_complete(args):
     return cmd_dispatch(args)
 
 
+def _extract_target_routes(quest: Quest, worktree: Optional[Path] = None) -> list[str]:
+    """Extract live UI preview routes from the Quest's Tally or touched templates."""
+    routes: list[str] = []
+    tally = quest.extract_tribute_subsection("tally")
+    if tally:
+        for line in tally.splitlines():
+            found = re.findall(r"(?:https?://[^\s/]+)?(/[a-zA-Z0-9_\-./]+)", line)
+            for p in found:
+                p_clean = p.rstrip(").,;:*`'")
+                if p_clean.endswith((".py", ".md", ".json", ".sql", ".sh", ".csv", ".log", ".txt", ".png", ".jpg", ".svg")):
+                    continue
+                if p_clean.startswith(("/Users", "/home", "/var", "/tmp", "/etc", "/private", "/opt", "/venv")):
+                    continue
+                if len(p_clean) > 1 and p_clean not in routes:
+                    routes.append(p_clean)
+
+    if worktree and worktree.is_dir():
+        try:
+            res = subprocess.run(
+                ["git", "diff", "--name-only", "castle...HEAD"],
+                cwd=worktree,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if res.returncode == 0:
+                for line in res.stdout.splitlines():
+                    if line.startswith("templates/") and not routes:
+                        routes.append(f"/{quest.app}/" if quest.app else "/")
+                        break
+        except Exception:
+            pass
+
+    if not routes:
+        routes.append(f"/{quest.app}/" if quest.app else "/")
+
+    return routes
+
+
+def _ensure_worktree_server(
+    worktree: Path,
+    port_override: Optional[int] = None,
+    no_server: bool = False,
+) -> tuple[int, str, str]:
+    """Ensure a development server is running for a worktree.
+    Returns (port, runserver_url, status_description).
+    """
+    if port_override:
+        return port_override, f"http://localhost:{port_override}", "Manual port override"
+
+    port_file = worktree / ".worktree-port"
+    port = None
+
+    if not no_server and MANAGE_SERVERS_PATH.exists():
+        try:
+            subprocess.run(
+                ["bash", str(MANAGE_SERVERS_PATH), "start", str(worktree)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    if port_file.exists():
+        try:
+            port = int(port_file.read_text().strip())
+        except Exception:
+            pass
+
+    if not port and MANAGE_SERVERS_PATH.exists():
+        try:
+            res = subprocess.run(
+                ["bash", str(MANAGE_SERVERS_PATH), "get_port", str(worktree)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if res.returncode == 0 and res.stdout.strip().isdigit():
+                port = int(res.stdout.strip())
+        except Exception:
+            pass
+
+    if not port:
+        port = 8000
+
+    status = "Active" if not no_server else "Server startup skipped (--no-server)"
+    return port, f"http://localhost:{port}", status
+
+
+def cmd_artist(args):
+    """Spawn or prepare a dedicated Court Artist session with runserver for interactive UI review."""
+    quest = store.load(args.quest_id)
+    wt = git_ops.find_worktree_for_quest(quest)
+    if not wt or not wt.is_dir():
+        print(
+            f"ERROR: No active worktree found on disk for {quest.id} (branch: {quest.branch or '-'}). "
+            "A Court Artist session requires a live worktree to host the dev server and codebase.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    model = getattr(args, "model", None) or quest.artist_model or DEFAULT_ARTIST_MODEL
+    provider = getattr(args, "provider", None) or ARTIST_PROVIDER
+    port, runserver_url, server_status = _ensure_worktree_server(
+        wt,
+        port_override=getattr(args, "port", None),
+        no_server=getattr(args, "no_server", False),
+    )
+    routes = _extract_target_routes(quest, worktree=wt)
+
+    tmpl_path = REPO_ROOT / ARTIST_DISPATCH_TEMPLATE
+    if not tmpl_path.exists():
+        tmpl_path = Path(__file__).resolve().parent.parent / "templates" / "court_artist_prompt.md"
+
+    if tmpl_path.exists():
+        tmpl_text = tmpl_path.read_text(encoding="utf-8")
+    else:
+        tmpl_text = "You are the Court Artist for {{ quest_id }}. Worktree: {{ worktree }}. Runserver: {{ runserver_url }}"
+
+    routes_str = "\n".join(f"- {runserver_url}{r}" if not r.startswith("http") else f"- {r}" for r in routes)
+    prompt = (
+        tmpl_text
+        .replace("{{ quest_id }}", quest.id)
+        .replace("{{ quest_title }}", quest.title)
+        .replace("{{ worktree }}", str(wt))
+        .replace("{{ branch }}", quest.branch or "-")
+        .replace("{{ app }}", quest.app or "common")
+        .replace("{{ concern }}", quest.concern or "ui")
+        .replace("{{ runserver_url }}", runserver_url)
+        .replace("{{ port }}", str(port))
+        .replace("{{ target_routes }}", routes_str)
+    )
+
+    # Record model and Castle Ledger note
+    quest.artist_model = model
+    quest.log_ledger(
+        quest.status,
+        quest.status,
+        f"Court Artist summoned for UI review with model {model} (runserver on port {port})",
+    )
+    auto_commit = not getattr(args, "no_commit", False)
+    store.save(quest, auto_commit=auto_commit, commit_msg=f"court: summon artist for {quest.id}")
+
+    short_id = quest.id.split("-")[0]
+    task_desc = {
+        "name": f"{short_id} Court Artist",
+        "branchName": quest.branch,
+        "model": model,
+        "provider": provider,
+        "prompt": prompt,
+    }
+
+    if getattr(args, "prompt_only", False):
+        print(prompt)
+        return
+
+    if getattr(args, "json", False):
+        out = {
+            "quest_id": quest.id,
+            "title": quest.title,
+            "branch": quest.branch,
+            "worktree": str(wt),
+            "port": port,
+            "runserver_url": runserver_url,
+            "model": model,
+            "provider": provider,
+            "routes": routes,
+            "prompt": prompt,
+            "task": task_desc,
+        }
+        print(json.dumps(out, indent=2))
+        return
+
+    print("=" * 76)
+    print("🎨 COURT ARTIST SUMMONED — ROYAL UI REVIEW STUDIO")
+    print("=" * 76)
+    print(f"Quest:       {quest.id}")
+    print(f"Title:       {quest.title}")
+    print(f"Branch:      {quest.branch or '-'}")
+    print(f"Worktree:    {wt}")
+    print(f"Runserver:   {runserver_url} (Port {port}) [{server_status}]")
+    print(f"Model:       {model} ({provider})")
+    print()
+    print("Live Preview URLs:")
+    for r in routes:
+        url_line = f"{runserver_url}{r}" if not r.startswith("http") else r
+        print(f"  • {url_line}")
+    print()
+    print("Next Steps for M'Lord & Steward:")
+    print(f"  1. Launch the Court Artist session in Agent Manager:")
+    print(f"     agent_manager start (mode: 'worktree', branchName: '{quest.branch}', model: '{model}', name: '{short_id} Court Artist')")
+    print(f"     (Slash command: `/artist {quest.id}` spawns this automatically).")
+    print(f"  2. Open the live preview in your browser: {runserver_url}")
+    print("  3. Direct the Court Artist on layout, typography, colors, and design system compliance.")
+    print("  4. The Court Artist will edit templates live and prompt you to refresh.")
+    print("  5. When satisfied, the Court Artist signs the Tally and commits changes.")
+    print("=" * 76)
+
+
 def cmd_verify(args):
     quest = store.load(args.quest_id)
     if not quest.worktree:
@@ -1989,6 +2196,14 @@ def cmd_collect(args):
                 quest.id,
                 "no recorded Master of Coin's Audit content -- not yet reviewed; refusing to "
                 "pack unaudited tribute into a convoy (dispatch `/levy <id>` first)",
+            ))
+            continue
+        ui_status = quest.extract_ui_review_status()
+        if ui_status.upper().startswith("PENDING") and not getattr(args, "skip_ui_review", False):
+            skipped.append((
+                quest.id,
+                f"UI Review is PENDING ({ui_status}) — royal review required before collection "
+                f"(recommend `/artist {quest.id}` or pass `--skip-ui-review`)",
             ))
             continue
         audit = ward.audit_quest(quest, base_branch=base_branch)
@@ -3279,6 +3494,28 @@ def build_parser():
     p_dispatch_complete.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_dispatch_complete.set_defaults(func=cmd_dispatch_complete)
 
+    p_artist = sub.add_parser(
+        "artist",
+        help="Spawn or prepare a dedicated Court Artist session with runserver for interactive UI review",
+    )
+    p_artist.add_argument("quest_id", help="Quest ID (e.g. Q196)")
+    p_artist.add_argument(
+        "--model",
+        default=DEFAULT_ARTIST_MODEL,
+        help=f"Model for Court Artist (default: {DEFAULT_ARTIST_MODEL})",
+    )
+    p_artist.add_argument(
+        "--provider",
+        default=ARTIST_PROVIDER,
+        help=f"Provider for Court Artist model (default: {ARTIST_PROVIDER})",
+    )
+    p_artist.add_argument("--port", type=int, help="Override worktree runserver port")
+    p_artist.add_argument("--no-server", action="store_true", help="Skip starting the worktree dev server")
+    p_artist.add_argument("--no-commit", action="store_true", help="Do not autocommit quest updates")
+    p_artist.add_argument("--prompt-only", action="store_true", help="Print only the rendered Court Artist prompt")
+    p_artist.add_argument("--json", action="store_true", help="Output JSON format for agent_manager or scripts")
+    p_artist.set_defaults(func=cmd_artist)
+
     p_show = sub.add_parser("show", help="Print a Quest/Epic's full markdown or extracted section")
     p_show.add_argument("quest_id", help="Quest ID (e.g. Q182)")
     p_show.add_argument(
@@ -3413,6 +3650,8 @@ def build_parser():
     add_quest_selector(p_collect, batchable=True, filters=("status", "app", "epic"))
     p_collect.add_argument("--cogship", default=None, help="Existing Cog Ship ID to stamp (e.g. cogship-002); omit or pass 'new' to allocate the next id")
     p_collect.add_argument("--base", default="castle", help="Base branch for the compliance audit (default: castle)")
+    p_collect.add_argument("--skip-ui-review", action="store_true", help="Bypass pending UI review check when packing into Cog Ship")
+    p_collect.add_argument("--force", action="store_true", help="Force packing even if checks warn/fail")
     p_collect.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_collect.set_defaults(func=cmd_collect)
 

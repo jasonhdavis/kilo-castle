@@ -15,19 +15,21 @@ Follow the Collect Protocol (absorbing gate progression):
 > (or the full `/levy` chain); only Quests it has passed (now at `GATE`, or still `TRIBUTE_READY` with a
 > `## Master of Coin's Audit` section already on record — Step 1's audit below distinguishes the two) are
 > actually ready to be packed here.
+>
+> **Precondition — UI Review before Collection**: If a candidate Quest modified templates or UI views and its UI Review status is PENDING, the Steward's recommended / automatic action before collection is to summon the **Court Artist** (`/artist <id>`). The Serf is permitted to create the initial UI, but M'Lord and the Court Artist refine the UI/UX with the live worktree runserver before collection. `court collect` will refuse candidates whose UI Review is still PENDING unless `--skip-ui-review` is explicitly passed.
 
 1. **Pack the Convoy with One Composite Command** — `court collect` mechanizes the audit,
    Cog Ship stamp, and batch-advance-to-`GATE` in a single call, and REFUSES to pack any
    Quest with no recorded Master of Coin audit (the exact gap that let unaudited Tributes
-   slip straight to `GATE` in the past):
+   slip straight to `GATE` in the past), or with `UI Review: PENDING` on user-facing UI:
    ```bash
-   python3 -m court.cli collect [<quest_id_1>,<quest_id_2>...] [--status/--app/--epic] [--cogship <id>]
+   python3 -m court.cli collect [<quest_id_1>,<quest_id_2>...] [--status/--app/--epic] [--cogship <id>] [--skip-ui-review]
    ```
    - Omit `quest_ids` to auto-select every Master-of-Coin-approved candidate at
      `TRIBUTE_READY` (or narrow with `--status`/`--app`/`--epic`).
    - Automatically skips (with a stated reason) any Quest that is `PUNISHED`, has a dirty
-     working tree, has compliance violations, or has no `## Master of Coin's Audit` content
-     on record — route a value-deficient candidate back through `court pillory`, never
+     working tree, has compliance violations, has no `## Master of Coin's Audit` content
+     on record, or has `UI Review: PENDING` without royal review (run `/artist <id>` first, or pass `--skip-ui-review`) — route a value-deficient candidate back through `court pillory`, never
      `/reject_tribute`.
    - **Note (Q149, 2026-09-05):** bounded drift at `TRIBUTE_READY` is a warning, not a
      blocking violation — it accumulates naturally while a Quest waits its turn in the
@@ -54,12 +56,12 @@ Follow the Collect Protocol (absorbing gate progression):
        act as Gatekeeper. Tear the worktree down (Ashes/stop) once promoted; it is scoped to
        this one convoy only, not meant to persist for reuse.
      - **NEVER** run Gatekeeper as a background task, background process, or on castle.
-     - Gatekeeper is a **Gemini 3.7 Flash** class agent (`openrouter/google/gemini-3.7-flash`).
+     - Gatekeeper is a **Gemini 3.8 Flash** class agent (`openrouter/google/gemini-3.8-flash`).
      - Allowed to spawn sequential non-background tasks (`background: false`) for integration verification.
    - Record metadata:
      ```bash
      python3 -m court.cli set-field <id> gatekeeper_session_id <session_id>
-     python3 -m court.cli set-field <id> gatekeeper_model "openrouter/google/gemini-3.7-flash"
+     python3 -m court.cli set-field <id> gatekeeper_model "openrouter/google/gemini-3.8-flash"
      ```
    - **Unified Test Run & Fault Isolation**: Gatekeeper merges the Cog Ship pack into the target
      worktree (the solo Quest's own branch for a size-1 convoy, or the fresh ephemeral

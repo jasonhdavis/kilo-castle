@@ -102,12 +102,17 @@ python3 -m court.cli dispatch-complete <id> --session-id <ses_id> --branch <bran
 ### 6. Levy & Review (`/levy`)
 - Run `python3 -m court.cli levy` to audit working Quests and rebase them to zero drift.
 - When Tribute is rendered and zero drift reached, advance to `TRIBUTE_READY`.
-- Dispatch **Master of Coin** (`master_of_coin_review_prompt.md`) via a dedicated Agent Manager session in the Quest's worktree (`model: "Gemini 3.7 Flash"` / `openrouter/google/gemini-3.7-flash`).
+- Dispatch **Master of Coin** (`master_of_coin_review_prompt.md`) via a dedicated Agent Manager session in the Quest's worktree (`model: "Gemini 3.8 Flash"` / `openrouter/google/gemini-3.8-flash`).
 - Master of Coin verifies the claims live, fixes paperwork, identifies commutation steps, and advances to `GATE`.
+
+### 6b. Court Artist & UI Review (`/artist`)
+- If a Quest modified templates, styles, or user-facing views, summon the **Court Artist** (`/artist <id>`) before Gatehouse collection (`model: "GLM-5.3"` / `openrouter`).
+- Launches an interactive design review session with an active worktree runserver directly with M'Lord.
+- Court Artist edits templates live, updates the Tally, commits changes, and passes to `/collect`.
 
 ### 7. Collect & Gate (`/collect`)
 - Run `python3 -m court.cli collect` to audit Quests waiting at `GATE`, stamp a Cog Ship convoy (`cogship-NNN`), and prepare the Gatekeeper dispatch payload.
-- Dispatch **Gatekeeper** (`gatekeeper_review_prompt.md`, `model: "Gemini 3.7 Flash"` / `openrouter/google/gemini-3.7-flash`):
+- Dispatch **Gatekeeper** (`gatekeeper_review_prompt.md`, `model: "Gemini 3.8 Flash"` / `openrouter/google/gemini-3.8-flash`):
   - For convoy of size 1: runs directly in the Quest's own worktree.
   - For convoy of size > 1: runs in a brand-new ephemeral convoy worktree (`.kilo/worktrees/the-gatehouse-<cogship_id>`, branch `the-gatehouse/<cogship_id>`).
 - Gatekeeper runs the unified test suite across the pack. If test regressions occur, it isolates the offending Quest, rejects it via `/reject_tribute`, and dispatches a remediation Serf.

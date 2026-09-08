@@ -171,7 +171,7 @@ DEFAULT_KILO_CONFIG = {
         "gatekeeper": {
             "description": "Court Gatekeeper: mechanical batch integration, unified testing, and direct castle promotion agent on gatehouse branches",
             "mode": "primary",
-            "model": "openrouter/google/gemini-3.7-flash",
+            "model": "openrouter/google/gemini-3.8-flash",
             "prompt": (
                 "You are the Gatekeeper: the mechanical batch integration and test execution agent operating on the gatehouse layer.\n\n"
                 "Remit:\n"
@@ -185,7 +185,7 @@ DEFAULT_KILO_CONFIG = {
         "master_of_coin": {
             "description": "Court Master of Coin: administrative and accounting audit agent for Quests in TRIBUTE_READY",
             "mode": "primary",
-            "model": "openrouter/google/gemini-3.7-flash",
+            "model": "openrouter/google/gemini-3.8-flash",
             "permission": {
                 "task": "deny",
             },
@@ -198,6 +198,20 @@ DEFAULT_KILO_CONFIG = {
                 "- Narrow remit: no feature code, no bug fixes, no touching diff. Pillory on failure (court pillory).\n"
                 "- Commutation: name required production activation steps (deploy, migrations, env vars, tasks).\n"
                 "- Always sync verdict back: git push . HEAD:<real-branch>, advance to GATE."
+            ),
+        },
+        "artist": {
+            "description": "Court Artist: interactive UI/UX craftsman for front-end refinement directly with M'Lord",
+            "mode": "primary",
+            "model": "openrouter/z-ai/glm-5.3",
+            "prompt": (
+                "You are the Court Artist: the Royal Artisan and UI Craftsman. "
+                "You work in direct collaboration with M'Lord in this interactive session to preview, critique, "
+                "and polish frontend templates, layouts, and styles with an active worktree runserver.\n\n"
+                "Strict Constraints:\n"
+                "- ZERO ROLEPLAY LEAKAGE in templates, UI text, badge labels, or table headers.\n"
+                "- Follow design system conventions: grep first, invent never.\n"
+                "- Authority: edit templates, styles, and view context. Do not rewrite backend schemas or models without directive."
             ),
         },
     },
@@ -240,8 +254,9 @@ castle                  (staging root trunk for main; attached to localhost)
 ## Division of Labor
 
 - **Serf on Quest Worktrees**: Disposable workers implementing assigned Goal & Scope. Model: **GLM 5.3 Flash** (`openrouter/z-ai/glm-5.3-flash`).
-- **Master of Coin**: Audits value delivery in `TRIBUTE_READY` via dedicated worktree session. Broad verification authority (live read probes, paperwork rendering), narrow remit (no code fixes). Model: **Gemini 3.7 Flash** (`openrouter/google/gemini-3.7-flash`). Syncs verdict back with `git push . HEAD:<real-branch>`.
-- **Gatekeeper**: Ephemeral convoy integration & testing at `GATE`. Model: **Gemini 3.7 Flash** (`openrouter/google/gemini-3.7-flash`).
+- **Master of Coin**: Audits value delivery in `TRIBUTE_READY` via dedicated worktree session. Broad verification authority (live read probes, paperwork rendering), narrow remit (no code fixes). Model: **Gemini 3.8 Flash** (`openrouter/google/gemini-3.8-flash`). Syncs verdict back with `git push . HEAD:<real-branch>`.
+- **Gatekeeper**: Ephemeral convoy integration & testing at `GATE`. Model: **Gemini 3.8 Flash** (`openrouter/google/gemini-3.8-flash`).
+- **Court Artist**: Interactive UI/UX craftsman working directly with M'Lord on frontend styling with active runserver. Model: **GLM 5.3** (`openrouter/z-ai/glm-5.3`).
 - **Steward**: Resident orchestrator on `castle`. Does not run test suites directly; manages lifecycle, triage, and teardowns.
 
 ---

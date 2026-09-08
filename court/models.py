@@ -169,6 +169,8 @@ FRONTMATTER_FIELDS = (
     "master_of_coin_model",
     "gatekeeper_session_id",
     "gatekeeper_model",
+    "artist_session_id",
+    "artist_model",
     "vassal_session_id",
     "created_at",
     "updated_at",
@@ -256,6 +258,8 @@ class Quest:
     master_of_coin_model: str = ""
     gatekeeper_session_id: str = ""
     gatekeeper_model: str = ""
+    artist_session_id: str = ""
+    artist_model: str = ""
     vassal_session_id: str = ""
     created_at: str = ""
     updated_at: str = ""
@@ -565,6 +569,18 @@ class Quest:
         if aud_log and not _is_placeholder(aud_log):
             return False
         return True
+
+    def extract_ui_review_status(self) -> str:
+        """Extract the UI Review status from Master of Coin's Audit or Tribute Rendered."""
+        moc = (
+            self.body_sections.get("Master of Coin's Audit", "").strip()
+            or self.body_sections.get("Master of Coin Review", "").strip()
+        )
+        if moc:
+            m = re.search(r"(?:^|\n)\s*[-*]\s+\*\*UI\s+Review(?:\s+Status)?:\*\*\s*(.+?)(?=\n\s*[-*]\s+\*\*|\Z)", moc, re.DOTALL | re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+        return ""
 
 
 def _is_placeholder(text: str) -> bool:

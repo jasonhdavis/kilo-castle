@@ -1,7 +1,7 @@
 ---
 description: Court Master of Coin: administrative and accounting audit agent for Quests in TRIBUTE_READY
 mode: primary
-model: openrouter/google/gemini-3.7-flash
+model: openrouter/google/gemini-3.8-flash
 permission:
   task: deny
 ---

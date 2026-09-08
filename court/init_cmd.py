@@ -334,6 +334,18 @@ def run_init(target_dir: Optional[Path] = None, force: bool = False) -> dict:
     for t in copied_templates:
         print(f"  + Copied template: {t.relative_to(target)}")
 
+    # 3b. .court/engine/ (vendored engine copy for repositories supporting python3 .court/engine/cli.py)
+    engine_dir = court_dir / "engine"
+    copied_engine = []
+    if engine_dir.exists() or force:
+        engine_dir.mkdir(parents=True, exist_ok=True)
+        for py_file in COURT_PKG_DIR.glob("*.py"):
+            dst_py = engine_dir / py_file.name
+            if not dst_py.exists() or force:
+                shutil.copy2(py_file, dst_py)
+                copied_engine.append(dst_py)
+                print(f"  + Synced engine file: {dst_py.relative_to(target)}")
+
     # 4. .kilo/commands/
     commands_dir = target / ".kilo" / "commands"
     src_commands = COURT_PKG_DIR / "commands"

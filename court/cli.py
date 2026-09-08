@@ -489,6 +489,13 @@ def cmd_init(args):
     from court import init_cmd
     init_cmd.run_init(force=args.force)
 
+
+def cmd_update(args):
+    """Update and sync .court/engine/, templates, commands, prompts, and agents."""
+    from court import init_cmd
+    init_cmd.run_init(force=True)
+
+
 def cmd_ward(args):
     last_survey = _read_last_survey_timestamp()
     pending_reports = _list_pending_warden_reports()
@@ -3738,6 +3745,9 @@ def build_parser():
     p_init = sub.add_parser("init", help="initialize .court/, .kilo/commands/, .kilo/prompts/, and AGENTS.md in the repository")
     p_init.add_argument("--force", action="store_true", help="overwrite existing files")
     p_init.set_defaults(func=cmd_init)
+
+    p_update = sub.add_parser("update", help="Update .court/engine/, templates, commands, prompts, and agents from Kilo Castle")
+    p_update.set_defaults(func=cmd_update)
 
     p_ward = sub.add_parser("ward", help="Warden's hunting-grounds patrol: last survey, pending Warden Reports, and realm compliance health")
     p_ward.add_argument("--base", default="castle", help="Base branch to check drift against (default: castle)")

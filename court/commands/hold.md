@@ -5,7 +5,7 @@ agent: steward
 Quest: $ARGUMENTS
 
 ```
-python3 .court/engine/cli.py advance <id> HELD --note "<reason>"
+python3 -m court.cli advance <id> HELD --note "<reason>"
 ```
 `HELD` is a side-state, not a pipeline failure — use it when a Quest is
 blocked on M'lord's decision (an Audience) or an external dependency, not

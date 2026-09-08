@@ -5,7 +5,7 @@ agent: steward
 Arguments: $ARGUMENTS
 
 Follow the Coffers Protocol:
-1. Run `python3 .court/engine/cli.py rollup --section tribute $ARGUMENTS` to extract all rendered Tribute sections.
+1. Run `python3 -m court.cli rollup --section tribute $ARGUMENTS` to extract all rendered Tribute sections.
 2. Synthesize the deliverables into a structured treasury inventory:
    - **Git Commits & Hashes**
    - **Files Created & Modified (with line counts)**

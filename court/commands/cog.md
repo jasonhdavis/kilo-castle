@@ -10,24 +10,30 @@ Follow the Cog Ship Protocol:
 1. **Reconstruct the Incoming Fleet Manifest:**
    - Execute the deterministic deployment rollup:
      ```bash
-     python3 .court/engine/cli.py ship $ARGUMENTS
+     python3 -m court.cli ship $ARGUMENTS
      ```
    - If filtering by specific Epic or App:
      ```bash
-     python3 .court/engine/cli.py ship --epic <id>
-     python3 .court/engine/cli.py ship --app <app>
+     python3 -m court.cli ship --epic <id>
+     python3 -m court.cli ship --app <app>
      ```
 
 2. **Inspect the Git Promotion Vector (`castle` -> `main`):**
    - Review pending commits on `castle` ahead of `main` (`git log main..castle --oneline`).
    - Review aggregate file changes (`git diff --stat main..castle`).
 
-3. **Synthesize the 4 Rollup Pillars for M'Lord:**
+3. **Synthesize the 5 Rollup Pillars for M'Lord:**
    - 📜 **The Bard's Chronicle (`/bard`)**: Executive story of challenges, architecture decisions, and transformations shipped.
    - 💰 **The Coffers Ledger (`/coffers`)**: Provable inventory of commits, files created/modified, passed test suites, migrations, endpoints, and data artifacts.
+   - 🔍 **The Tally Runbook (`/tally`)**: Production & staging UI verification paths, routes, and expected outcomes.
    - ⚖️ **The Serf Penance (`/atone`)**: Actionable technical debt, shortcuts taken, and system/prompt improvement opportunities.
    - 💡 **The Humble Opinions (`/murmur`)**: Ground-level insights and proposed future Quests.
 
 4. **Present the Cog Ship Voyage Report & Readiness Checklist:**
    - Present the structured deployment summary to M'Lord with confidence score.
-   - If M'Lord approves promotion from `castle` to `main`, facilitate the clean merge / release tag.
+   - If M'Lord approves promotion from `castle` to `main`, facilitate the clean merge / release tag:
+     ```bash
+     # Rehearse the promotion with preflight checks only (no mutations):
+     python3 -m court.cli ship --confirm
+     ```
+   - `--confirm` runs preflight safety checks first (production checkout located, correct branch, clean tree, push fast-forward) and aborts with zero mutations if any fail; a conflicting merge is auto-aborted.

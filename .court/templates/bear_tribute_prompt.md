@@ -1,6 +1,6 @@
 # Bear Tribute / Report to the King — Serf Prompt Template
 
-Send this prompt to an active Serf session when requesting a full progress report, audit, or end-of-stage Tribute handoff.
+Send this prompt to an active Serf session (`agent_manager` `prompt`) when requesting a full progress report, audit, or end-of-stage Tribute handoff.
 
 ---
 
@@ -15,45 +15,41 @@ A narrative summary of work completed, problem context uncovered, architectural 
 ### 2. Tribute
 Provable, tangible work product delivered. You must include:
 - **Files Touched / Created**: Exact file paths with line counts or diff stat.
-- **Git Commits**: Any commits created on `{{ branch }}` with hashes and messages (or explicit statement of uncommitted working tree changes).
-- **Tests Run & Results**: Exact test commands executed and their literal exit status / tail output (no paraphrasing).
+- **Git Commits**: Any commits created on `{{ branch }}` with hashes and messages.
+- **Tests Run & Results**: Exact test commands executed and their literal exit status / tail output.
 - **Artifacts & Proof**: Data payloads, migrations, endpoints, or reports produced.
+- **The Tally (Production & UI Verification Runbook)**:
+  - Exact URLs & navigation paths for verification.
+  - Input parameters, filters, or form inputs to test.
+  - Example commands and workflows.
+  - Expected visual & behavioral outcomes.
 
 ### 3. Penance
-Honest self-flagellation regarding what you failed to accomplish, half-finished, took shortcuts on, deferred, or where your confidence is shaky. Do not hide defects or paper over uncertainty with confident prose.
+Honest self-flagellation regarding what you failed to accomplish, half-finished, took shortcuts on, deferred, or where your confidence is shaky. **Give a confidence-of-completion rating, 0-10, with your reasoning.**
 
 ### 4. Audience
-Specific questions or decisions that genuinely require M'Lord's judgment or authority (e.g., product trade-offs, irreversible migrations, scope changes). Do not decide these yourself. If none, state "None required."
+Specific questions or decisions that genuinely require M'Lord's judgment or authority. If none, state "None required."
 
 ### 5. Humble Opinion
-Your concrete, technical recommendation for the immediate next steps to advance or complete this Quest.
+Your concrete technical recommendation for the immediate next steps to advance or complete this Quest.
 
 ---
 
 ### Mandatory Agent Compliance Step (Clean Tree & Base Alignment)
 Before rendering your tribute and persisting your report:
-1. **Working Tree Cleanliness**: Run `git status --porcelain` to verify your working tree has no uncommitted leftovers or scratch files. Stage and commit all intended deliverables.
-2. **Rebase-to-Parent Alignment**: Rebase or fast-forward onto `castle` (`git rebase castle` or `git merge castle --ff-only`). Ensure your branch is cleanly aligned with `castle`'s current tip (0 commits behind `castle`) so the git tree and Agent Manager remain pristine with zero phantom diffs.
+1. **Working Tree Cleanliness**: Run `git status --porcelain` to verify your working tree has no uncommitted leftovers or scratch files.
+2. **Rebase-to-Parent Alignment**: Rebase or fast-forward onto `castle` (`git rebase castle` or `git merge castle --ff-only`). Ensure your branch is cleanly aligned with `castle`'s current tip (0 commits behind `castle`).
 
 ---
 
 ### Mandatory Durable Completion Requirement
-In addition to your response message, you MUST persist your complete 5-section report into durable storage:
+Persist your complete 5-section report into durable storage:
 ```bash
-court set-section {{ quest_id }} "Tribute Rendered" --file <path_to_report>
+python3 -m court.cli set-section {{ quest_id }} "Tribute Rendered" --file <path_to_report>
 ```
-(or write it directly into `.court/quests/{{ quest_id }}.md` under `# Tribute Rendered`). This ensures the Steward and Court read your rendered completion directly from disk without relying on ephemeral chat turns.
 
-### Mandatory Self-Advance to REVIEW (do this LAST, immediately before you stop)
-Persisting the Tribute file is NOT the end of this handoff. If this Quest's work is
-genuinely complete (not a mid-flight progress check), re-confirm zero drift first —
-re-run `git rev-list --count HEAD..castle`; if `castle` moved while you were rendering
-this report, do ONE more `git merge castle` and re-check before proceeding — then run:
+### Mandatory Self-Advance to TRIBUTE_READY (do this LAST, immediately before you stop)
+Re-confirm zero drift, then run:
 ```bash
-court advance {{ quest_id }} REVIEW --note "Tribute rendered, deferred rebase complete."
+python3 -m court.cli advance {{ quest_id }} TRIBUTE_READY --note "Tribute rendered, deferred rebase complete. Tribute Ready for Master of Coin."
 ```
-This is the one action that moves the Quest out of `WORKING` into `REVIEW`. A complete
-Tribute section sitting under a Quest still marked `WORKING` is an incomplete handoff —
-the Steward's `/levy` triage will not summon the Master of Coin on it no matter how
-thorough the report is. If this report is a mid-Quest progress check rather than a
-completion, skip this step and say so explicitly instead.

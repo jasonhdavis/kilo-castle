@@ -1,12 +1,19 @@
 """
-Filesystem storage and persistence for Quests and Epics under .court/.
+Filesystem operations for Quest/Epic ledger state under .court/.
 
 Directory layout:
-    .court/quests/    Active + completed Quests (Q001-App-Concern.md)
-    .court/epics/     Epic Quests (Q0NN-App-Concern.md, kind=epic)
-    .court/archive/   Archived Quests/Epics (still readable)
-    .court/templates/ Prompt dispatch and review templates
-    .court/EDICTS.md  Royal decrees and strategic priorities
+    .court/quests/     active + completed Quests (Q001-App-Concern.md +
+                       Q001-App-Concern.events.jsonl)
+    .court/epics/      Epic Quests (Q0NN-App-Concern.md, kind=epic)
+    .court/archive/    Quests moved out of the active ledger (still readable)
+    .court/templates/  prompt templates the Steward fills in when dispatching
+    .court/EDICTS.md   Royal decrees and strategic priorities
+
+Storage model: `<id>.md` is a derived, fully regenerated view. The append-only
+`<id>.events.jsonl` next to it is the actual source of truth; `save()`/`load()`/
+`list_all()` read/write through `eventlog.py`, folding the event log into a
+`Quest` on every read and appending only the fields/sections that changed on
+every write, instead of rewriting the whole record in place.
 """
 from __future__ import annotations
 
@@ -16,76 +23,25 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional
 
-from court import git_ops
-from court.models import Quest
+from .models import Quest, now_iso
+from . import git_ops
+from . import eventlog
 
 _ID_NUM_RE = re.compile(r"^Q(\d+)-")
 _COGSHIP_NUM_RE = re.compile(r"cogship[-_]?(\d+)", re.IGNORECASE)
 _COGSHIP_FM_RE = re.compile(r"^cogship_id:\s*(\S.*)$", re.MULTILINE)
 
-# Branches whose worktree is a shared/canonical checkout (the ledger of
-# record for batch/automation commands like `court levy`), as opposed to a
-# single Quest's own disposable worktree. Auto-commit from `store.save()` is
-# only ever safe from one of these, or from that exact Quest's own branch —
-# see `_commit_allowed_here()`.
-PROTECTED_TRUNK_BRANCHES = ("castle", "main")
-PROTECTED_BRANCH_PREFIXES = ("the-gatehouse/",)
+_current_branch_cache: Optional[str] = None
 
 
-def _is_protected_branch(branch: str) -> bool:
-    if branch in PROTECTED_TRUNK_BRANCHES:
-        return True
-    return any(branch.startswith(p) for p in PROTECTED_BRANCH_PREFIXES)
-
-
-def _current_repo_branch(repo_root: Path) -> str:
-    """Branch checked out at `repo_root` (the current worktree, or a
-    protected trunk). Recomputed on every call rather than cached, since a
-    single process may legitimately operate against more than one
-    `court_root`/repo (tests, multi-repo tooling)."""
-    res = git_ops._run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo_root)
-    return res.get("stdout", "").strip() if res.get("ok") else ""
-
-
-def _commit_allowed_here(quest: Quest, court_root: Optional[Path] = None) -> bool:
-    """Guard against cross-branch pollution: `save()`'s auto-commit path
-    commits from wherever this process is physically checked out
-    (`court_root.parent`) — the *current* worktree, not necessarily the
-    worktree of the Quest actually being saved. A multi-quest bulk command
-    (e.g. `court levy`, which iterates every WORKING Quest) run from inside
-    Quest A's own worktree would otherwise read Quest B's real tribute
-    correctly (via git-worktree branch matching) but then commit it onto
-    Quest A's *own* branch — because that's where this process happens to be
-    checked out. That silently poisons Quest A's branch with phantom "court:
-    save Q-B" commits that later produce real merge conflicts against the
-    protected trunk's legitimate forward progress on Quest B's file.
-
-    Auto-committing a Quest's file is only safe when the current checkout is
-    a protected trunk (`castle`, `main`, or a `the-gatehouse/<station>`
-    integration branch — the canonical ledger of record for batch/automation
-    commands) or that exact Quest's own registered branch (a Serf editing
-    its own Quest from its own worktree).
-    """
-    root = court_root or get_court_root()
-    repo_root = root.parent
-    current = _current_repo_branch(repo_root)
-    if not current:
-        # Can't determine the current branch (detached HEAD, git error, bare
-        # checkout) — fail closed rather than risk a silent cross-branch write.
-        return False
-    if _is_protected_branch(current):
-        return True
-    return bool(quest.branch) and current == quest.branch
-
-
-def get_court_root(start_path: Optional[Path] = None) -> Path:
+def get_court_root(start_path: Optional[Path | str] = None) -> Path:
     """Locate the .court root directory by searching upwards from start_path or cwd,
     or reading COURT_DIR from environment."""
     env_dir = os.environ.get("COURT_DIR")
     if env_dir:
         return Path(env_dir).resolve()
 
-    current = (start_path or Path.cwd()).resolve()
+    current = (Path(start_path) if start_path else Path.cwd()).resolve()
     for parent in [current, *current.parents]:
         court_candidate = parent / ".court"
         if court_candidate.is_dir():
@@ -124,34 +80,37 @@ def all_state_dirs(court_root: Optional[Path] = None) -> Iterable[Path]:
         yield d
 
 
-def next_number(court_root: Optional[Path] = None) -> int:
-    """Single global counter shared by Quests and Epics (deterministic scan
-    of every markdown filename currently on disk, including archive — never
-    reused even after archiving)."""
-    highest = 0
-    for d in all_state_dirs(court_root):
-        for p in d.glob("Q*.md"):
-            m = _ID_NUM_RE.match(p.stem)
-            if m:
-                highest = max(highest, int(m.group(1)))
-    return highest + 1
+def _current_repo_branch(repo_root: Optional[Path] = None) -> str:
+    """Branch checked out at repo_root (the current worktree or base trunk)."""
+    global _current_branch_cache
+    if repo_root is None:
+        if _current_branch_cache is None:
+            root = get_court_root().parent
+            res = git_ops._run(["git", "rev-parse", "--abbrev-ref", "HEAD"], root)
+            _current_branch_cache = res.get("stdout", "").strip() if res.get("ok") else ""
+        return _current_branch_cache
+    res = git_ops._run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo_root)
+    return res.get("stdout", "").strip() if res.get("ok") else ""
 
 
-def slugify_title(app: str, concern: str) -> str:
-    """Convert app and concern slugs into Title-Cased hyphenated string."""
-    parts = re.split(r"[\s_/-]+", f"{app} {concern}".strip())
-    parts = [p for p in parts if p]
-    return "-".join(p[:1].upper() + p[1:] for p in parts)
-
-
-def make_id(app: str, concern: str, number: Optional[int] = None, court_root: Optional[Path] = None) -> str:
-    n = number if number is not None else next_number(court_root)
-    return f"Q{n:03d}-{slugify_title(app, concern)}"
+def _commit_allowed_here(quest: Quest, court_root: Optional[Path] = None) -> bool:
+    """Guard against cross-branch pollution: auto-committing a Quest's file is
+    only safe when the current checkout is the base trunk (castle/main) or that
+    exact Quest's own registered branch."""
+    root = court_root or get_court_root()
+    repo_dir = root.parent
+    git_check = git_ops._run(["git", "rev-parse", "--is-inside-work-tree"], repo_dir)
+    if not git_check.get("ok") or git_check.get("stdout", "").strip() != "true":
+        return True
+    current = _current_repo_branch(repo_dir)
+    if not current:
+        return True
+    if current in ("castle", "main"):
+        return True
+    return bool(quest.branch) and current == quest.branch
 
 
 def normalize_cogship_id(value: Optional[str]) -> Optional[str]:
-    """Normalize a user-supplied Cog Ship identifier (a bare number, or any
-    string containing "cogship[-_]NNN") to the canonical "cogship-NNN" form."""
     if not value:
         return None
     v = str(value).strip()
@@ -169,18 +128,17 @@ def _scan_existing_cogship_numbers(court_root: Optional[Path] = None) -> int:
         for p in d.glob("Q*.md"):
             try:
                 text = p.read_text(encoding="utf-8")
-            except OSError:
+                m = _COGSHIP_FM_RE.search(text)
+                if m:
+                    norm = normalize_cogship_id(m.group(1))
+                    if norm:
+                        highest = max(highest, int(norm.split("-")[1]))
+            except Exception:
                 continue
-            for m in _COGSHIP_FM_RE.finditer(text):
-                n = normalize_cogship_id(m.group(1))
-                if n:
-                    highest = max(highest, int(n.split("-")[1]))
     return highest
 
 
 def next_cogship_id(court_root: Optional[Path] = None) -> str:
-    """Allocate the next monotonic Cog Ship id (cogship-NNN) by scanning
-    existing frontmatter across disk. Never reused, mirroring `next_number()`."""
     return f"cogship-{_scan_existing_cogship_numbers(court_root) + 1:03d}"
 
 
@@ -188,14 +146,10 @@ def stamp_cogship(
     quests: Iterable[Quest],
     cogship_id: Optional[str] = None,
     court_root: Optional[Path] = None,
-    auto_commit: bool = False,
+    auto_commit: bool = True,
     commit_msg: Optional[str] = None,
 ) -> str:
-    """Stamp a cogship_id onto a batch of Quest objects and persist them.
-
-    Refuses to stamp archived quests. If cogship_id is None, allocates a new
-    monotonic id (cogship-NNN) by scanning existing frontmatter across disk.
-    """
+    """Stamp a cogship_id onto a batch of Quest objects and persist them."""
     root = court_root or get_court_root()
     if cogship_id is None:
         cogship_id = next_cogship_id(root)
@@ -211,7 +165,7 @@ def stamp_cogship(
             raise ValueError(f"Cannot stamp {q.id}: not an active quest/epic file")
         prior = q.cogship_id or ""
         q.cogship_id = cogship_id
-        q.append_history(
+        q.log_ledger(
             q.status,
             q.status,
             f"Stamped onto {cogship_id}"
@@ -220,6 +174,28 @@ def stamp_cogship(
         msg = commit_msg or f"court: stamp {q.id} onto {cogship_id}"
         save(q, court_root=root, auto_commit=auto_commit, commit_msg=msg)
     return cogship_id
+
+
+def next_number(court_root: Optional[Path] = None) -> int:
+    """Single global counter shared by Quests and Epics."""
+    highest = 0
+    for d in all_state_dirs(court_root):
+        for p in d.glob("Q*.md"):
+            m = _ID_NUM_RE.match(p.stem)
+            if m:
+                highest = max(highest, int(m.group(1)))
+    return highest + 1
+
+
+def slugify_title(app: str, concern: str) -> str:
+    parts = re.split(r"[\s_/-]+", f"{app} {concern}".strip())
+    parts = [p for p in parts if p]
+    return "-".join(p[:1].upper() + p[1:] for p in parts)
+
+
+def make_id(app: str, concern: str, number: Optional[int] = None, court_root: Optional[Path] = None) -> str:
+    n = number if number is not None else next_number(court_root)
+    return f"Q{n:03d}-{slugify_title(app, concern)}"
 
 
 def path_for(quest: Quest, court_root: Optional[Path] = None) -> Path:
@@ -234,7 +210,6 @@ def find_path(quest_id: str, court_root: Optional[Path] = None) -> Optional[Path
         p = d / f"{quest_id}.md"
         if p.exists():
             return p
-    # Allow lookup by bare number (e.g. "12" or "Q012")
     bare = quest_id.lstrip("Qq")
     try:
         num = int(bare)
@@ -248,42 +223,52 @@ def find_path(quest_id: str, court_root: Optional[Path] = None) -> Optional[Path
     return None
 
 
+def _load_from_path(p: Path) -> Quest:
+    """Event-log-first load for an already-resolved quest/epic file path."""
+    ev_path = eventlog.events_path_for(p)
+    events = eventlog.read_events(ev_path)
+    if events:
+        kind = "epic" if p.parent.name == "epics" else "quest"
+        return eventlog.fold_events(events, p.stem, kind)
+    return Quest.from_markdown(p.read_text(encoding="utf-8"))
+
+
 def save(
     quest: Quest,
     court_root: Optional[Path] = None,
-    auto_commit: bool = False,
+    auto_commit: bool = True,
     commit_msg: Optional[str] = None,
 ) -> Path:
-    """Write a Quest/Epic's markdown to disk.
-
-    By default (`auto_commit=False`) this is a plain, unconditional write —
-    byte-for-byte identical to the historical behavior every existing caller
-    depends on. Pass `auto_commit=True` to additionally stage+commit just
-    this file via `git_ops.git_commit_paths()`, gated by `_commit_allowed_here()`
-    to guard against the cross-branch pollution failure mode documented there.
-    """
     root = court_root or get_court_root()
     p = path_for(quest, root)
     if auto_commit and not _commit_allowed_here(quest, court_root=root):
-        # Check *before* writing to disk: writing here even without
-        # committing would still leave a real uncommitted diff on whatever
-        # branch this process is checked out on, which is just as capable of
-        # poisoning that branch's next rebase — so treat an out-of-scope
-        # save as a full no-op, not merely an uncommitted one.
         current = _current_repo_branch(root.parent) or "(unknown/detached)"
         print(
             f"WARNING: refusing to save {quest.id} from branch '{current}' — it is "
-            f"neither a protected trunk (castle/main/the-gatehouse/*) nor {quest.id}'s "
+            f"neither a protected trunk (castle/main) nor {quest.id}'s "
             f"own branch ({quest.branch or 'unset'}). Re-run this from a protected "
-            f"trunk or {quest.id}'s own worktree to auto-commit it.",
+            f"trunk or {quest.id}'s own worktree to save/auto-commit it.",
             file=sys.stderr,
         )
         return p
     p.parent.mkdir(parents=True, exist_ok=True)
+
+    ev_path = eventlog.events_path_for(p)
+    prior_events = eventlog.read_events(ev_path)
+    prior_quest = eventlog.fold_events(prior_events, quest.id, quest.kind) if prior_events else None
+    ts = quest.updated_at or now_iso()
+    new_events = eventlog.build_events_for_save(quest, prior_quest, ts)
+
+    paths_to_commit = [p]
+    if new_events:
+        eventlog.append_events(ev_path, new_events)
+        paths_to_commit.append(ev_path)
+
     p.write_text(quest.to_markdown(), encoding="utf-8")
+
     if auto_commit:
         msg = commit_msg or f"court: save {quest.id}"
-        res = git_ops.git_commit_paths([p], msg, cwd=root.parent)
+        res = git_ops.git_commit_paths(paths_to_commit, msg, cwd=root.parent)
         if not res.get("ok") and not res.get("no_changes"):
             warning = res.get("warning") or res.get("stderr") or "unknown git error"
             print(f"WARNING: autocommit failed for {p.name}: {warning}", file=sys.stderr)
@@ -294,7 +279,7 @@ def load(quest_id: str, court_root: Optional[Path] = None) -> Quest:
     p = find_path(quest_id, court_root)
     if p is None:
         raise FileNotFoundError(f"No quest/epic file found for id {quest_id!r}")
-    return Quest.from_markdown(p.read_text(encoding="utf-8"))
+    return _load_from_path(p)
 
 
 def list_all(include_archive: bool = False, court_root: Optional[Path] = None) -> list[Quest]:
@@ -307,13 +292,18 @@ def list_all(include_archive: bool = False, court_root: Optional[Path] = None) -
         d.mkdir(parents=True, exist_ok=True)
         for p in sorted(d.glob("Q*.md")):
             try:
-                out.append(Quest.from_markdown(p.read_text(encoding="utf-8")))
+                out.append(_load_from_path(p))
             except Exception as e:
                 print(f"WARNING: failed to parse {p}: {e}")
     return sorted(out, key=lambda q: q.id)
 
 
-def archive(quest_id: str, court_root: Optional[Path] = None) -> Path:
+def archive(
+    quest_id: str,
+    court_root: Optional[Path] = None,
+    auto_commit: bool = True,
+    commit_msg: Optional[str] = None,
+) -> Path:
     root = court_root or get_court_root()
     src = find_path(quest_id, root)
     archive_d = get_archive_dir(root)
@@ -321,39 +311,61 @@ def archive(quest_id: str, court_root: Optional[Path] = None) -> Path:
         raise FileNotFoundError(f"No active quest/epic file found for id {quest_id!r}")
     archive_d.mkdir(parents=True, exist_ok=True)
     dst = archive_d / src.name
+    src_events = eventlog.events_path_for(src)
+    dst_events = eventlog.events_path_for(dst)
+    paths_to_commit = [src, dst]
+    has_events = src_events.exists()
     src.rename(dst)
+    if has_events:
+        src_events.rename(dst_events)
+        paths_to_commit.extend([src_events, dst_events])
+    if auto_commit:
+        msg = commit_msg or f"court: archive {quest_id}"
+        res = git_ops.git_commit_paths(paths_to_commit, msg, cwd=root.parent)
+        if not res.get("ok") and not res.get("no_changes"):
+            warning = res.get("warning") or res.get("stderr") or "unknown git error"
+            print(f"WARNING: autocommit failed for archive {quest_id}: {warning}", file=sys.stderr)
     return dst
 
 
-def rollup_section(
+def rollup(
     section_name: str,
     app: Optional[str] = None,
     epic: Optional[str] = None,
     status: Optional[str] = None,
+    cogship: Optional[str] = None,
     include_archive: bool = False,
     court_root: Optional[Path] = None,
+    quests: Optional[list[Quest]] = None,
 ) -> list[tuple[Quest, str]]:
-    """Roll up a specific tribute subsection across Quests matching filters."""
-    quests = list_all(include_archive=include_archive, court_root=court_root)
-    if app:
-        quests = [q for q in quests if q.app.lower() == app.lower()]
-    if epic:
-        epic_norm = epic.lower().lstrip("q").partition("-")[0]
-        quests = [
-            q for q in quests
-            if q.parent_epic.lower().lstrip("q").partition("-")[0] == epic_norm
-            or q.id.lower().lstrip("q").partition("-")[0] == epic_norm
-        ]
-    if status:
-        status_set = {s.strip().upper() for s in status.split(",")}
-        quests = [q for q in quests if q.status in status_set]
+    """Roll up a specific tribute subsection across Quests matching filters or given list."""
+    if quests is None:
+        quests = list_all(include_archive=include_archive, court_root=court_root)
+        if app:
+            quests = [q for q in quests if q.app.lower() == app.lower()]
+        if epic:
+            epic_norm = epic.lower().lstrip("q").partition("-")[0]
+            quests = [
+                q for q in quests
+                if q.parent_epic.lower().lstrip("q").partition("-")[0] == epic_norm
+                or q.id.lower().lstrip("q").partition("-")[0] == epic_norm
+            ]
+        if status:
+            status_set = {s.strip().upper() for s in status.split(",")}
+            quests = [q for q in quests if q.status in status_set]
+        if cogship:
+            cog_norm = normalize_cogship_id(cogship)
+            quests = [q for q in quests if normalize_cogship_id(q.cogship_id) == cog_norm]
 
     results = []
     for q in quests:
-        content = q.extract_tribute_subsection(section_name)
-        if content:
-            results.append((q, content))
+        val = q.extract_tribute_subsection(section_name)
+        if val:
+            results.append((q, val))
     return results
+
+
+rollup_section = rollup
 
 
 def get_hierarchy(include_archive: bool = False, court_root: Optional[Path] = None) -> dict:
@@ -366,48 +378,99 @@ def get_hierarchy(include_archive: bool = False, court_root: Optional[Path] = No
     epics = [q for q in quests if q.kind == "epic"]
     scouts = [q for q in quests if q.kind == "scout" or q.section == "Investigation"]
 
-    epic_map: dict[str, list[Quest]] = {e.id: [] for e in epics}
-    epic_short_map: dict[str, str] = {e.id.split("-")[0].lower(): e.id for e in epics}
+    epic_children: dict[str, list[Quest]] = {e.id: [] for e in epics}
+    standalone = []
 
-    standalone: list[Quest] = []
     for q in quests:
         if q.kind == "epic":
             continue
-        if q.kind == "scout" or q.section == "Investigation":
-            continue
         if q.parent_epic:
-            parent_key = q.parent_epic.strip()
-            parent_short = parent_key.split("-")[0].lower()
-            if parent_key in epic_map:
-                epic_map[parent_key].append(q)
-            elif parent_short in epic_short_map:
-                epic_map[epic_short_map[parent_short]].append(q)
+            matched_epic = None
+            for e_id in epic_children:
+                if e_id == q.parent_epic or e_id.startswith(q.parent_epic) or q.parent_epic.startswith(e_id):
+                    matched_epic = e_id
+                    break
+            if matched_epic:
+                epic_children[matched_epic].append(q)
             else:
                 standalone.append(q)
         else:
-            standalone.append(q)
+            if q.kind != "scout" and q.section != "Investigation":
+                standalone.append(q)
 
-    epic_pairs = [(e, epic_map.get(e.id, [])) for e in epics]
     return {
-        "epics": epic_pairs,
+        "epics": [(e, epic_children[e.id]) for e in epics],
         "standalone": standalone,
         "scouts": scouts,
     }
 
 
+def get_epic_children(epic_id: str, include_archive: bool = True, court_root: Optional[Path] = None) -> list[Quest]:
+    """Return the child Quests/Scouts belonging to the given Epic id."""
+    hierarchy = get_hierarchy(include_archive=include_archive, court_root=court_root)
+    epic_short = epic_id.strip().lower().lstrip("q").partition("-")[0]
+    for epic_quest, children in hierarchy["epics"]:
+        epic_quest_short = epic_quest.id.lower().lstrip("q").partition("-")[0]
+        if epic_quest.id == epic_id or epic_quest_short == epic_short:
+            return children
+    return []
+
+
+def render_ship_manifest_markdown(manifest: dict, epic_id: str = "") -> str:
+    """Render an aggregated rollup_ship_manifest() dict as markdown text."""
+    quest_count = len(manifest.get("quests", []))
+    pillars = [
+        ("ballad", "Ballad", manifest.get("ballads", [])),
+        ("tribute", "Tribute", manifest.get("tributes", [])),
+        ("tally", "Tally", manifest.get("tallies", [])),
+        ("penance", "Penance", manifest.get("penances", [])),
+        ("opinion", "Opinion", manifest.get("opinions", [])),
+        ("commutation", "Commutation", manifest.get("commutations", [])),
+    ]
+
+    lines: list[str] = []
+    scope = f" of {epic_id}" if epic_id else ""
+    lines.append(
+        f"_Aggregated automatically from {quest_count} completed child Quest(s){scope} "
+        f"(no code changes of its own; this Epic closed directly to Closing Vault)._"
+    )
+
+    for key, label, items in pillars:
+        lines.append(f"\n## {label}\n")
+        if not items:
+            lines.append(f"(no {key} content found among child Quests)")
+            continue
+        for q, content in items:
+            lines.append(f"### {q.id}: {q.title}\n")
+            lines.append(content.strip())
+            lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
 def load_edicts(court_root: Optional[Path] = None) -> str:
-    """Load the contents of .court/EDICTS.md."""
     p = get_edicts_path(court_root)
     if p.exists():
         return p.read_text(encoding="utf-8").strip()
     return ""
 
 
-def save_edicts(content: str, court_root: Optional[Path] = None) -> Path:
-    """Save content to .court/EDICTS.md."""
+def save_edicts(
+    content: str,
+    court_root: Optional[Path] = None,
+    auto_commit: bool = True,
+    commit_msg: Optional[str] = None,
+) -> Path:
     p = get_edicts_path(court_root)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content.strip() + "\n", encoding="utf-8")
+    if auto_commit:
+        msg = commit_msg or "court: update royal edicts"
+        root = court_root or get_court_root()
+        res = git_ops.git_commit_paths([p], msg, cwd=root.parent)
+        if not res.get("ok") and not res.get("no_changes"):
+            warning = res.get("warning") or res.get("stderr") or "unknown git error"
+            print(f"WARNING: autocommit failed for {p.name}: {warning}", file=sys.stderr)
     return p
 
 
@@ -415,31 +478,38 @@ def rollup_ship_manifest(
     app: Optional[str] = None,
     epic: Optional[str] = None,
     status: Optional[str] = None,
+    cogship: Optional[str] = None,
     include_archive: bool = False,
     court_root: Optional[Path] = None,
+    quests: Optional[list[Quest]] = None,
 ) -> dict:
-    """Extract and aggregate all four rollups (ballad, tribute, penance, opinion)
-    for Quests in the Cog Ship deployment convoy — the tribute entering the castle
-    ahead of promoting `castle` into `main`.
-    Defaults to Quests with status READY_FOR_TEARDOWN or DONE if status is not specified.
+    """Extract and aggregate all rollups (ballad, tribute, tally, penance, opinion, commutation)
+    for Quests in the deployment convoy.
+    Defaults to Quests with status READY_TO_RAZE, READY_FOR_TEARDOWN, or DONE if status is not specified.
     """
-    if status is None:
-        target_statuses = {"READY_FOR_TEARDOWN", "DONE"}
+    if quests is None:
+        if status is None:
+            target_statuses = {"READY_TO_RAZE", "READY_FOR_TEARDOWN", "DONE"}
+        else:
+            target_statuses = {s.strip().upper() for s in status.split(",")}
+
+        all_quests = list_all(include_archive=include_archive, court_root=court_root)
+        if app:
+            all_quests = [q for q in all_quests if q.app.lower() == app.lower()]
+        if epic:
+            epic_norm = epic.lower().lstrip("q").partition("-")[0]
+            all_quests = [
+                q for q in all_quests
+                if q.parent_epic.lower().lstrip("q").partition("-")[0] == epic_norm
+                or q.id.lower().lstrip("q").partition("-")[0] == epic_norm
+            ]
+        if cogship:
+            cog_norm = normalize_cogship_id(cogship)
+            all_quests = [q for q in all_quests if normalize_cogship_id(q.cogship_id) == cog_norm]
+
+        convoy_quests = [q for q in all_quests if q.status in target_statuses]
     else:
-        target_statuses = {s.strip().upper() for s in status.split(",")}
-
-    all_quests = list_all(include_archive=include_archive, court_root=court_root)
-    if app:
-        all_quests = [q for q in all_quests if q.app.lower() == app.lower()]
-    if epic:
-        epic_norm = epic.lower().lstrip("q").partition("-")[0]
-        all_quests = [
-            q for q in all_quests
-            if q.parent_epic.lower().lstrip("q").partition("-")[0] == epic_norm
-            or q.id.lower().lstrip("q").partition("-")[0] == epic_norm
-        ]
-
-    convoy_quests = [q for q in all_quests if q.status in target_statuses]
+        convoy_quests = quests
 
     manifest = {
         "quests": convoy_quests,
@@ -448,6 +518,8 @@ def rollup_ship_manifest(
         "tallies": [],
         "penances": [],
         "opinions": [],
+        "commutations": [],
+        "extra_tributes": [],
     }
 
     for q in convoy_quests:
@@ -460,11 +532,17 @@ def rollup_ship_manifest(
         v = q.extract_tribute_subsection("tally")
         if v:
             manifest["tallies"].append((q, v))
-        p_ = q.extract_tribute_subsection("penance")
-        if p_:
-            manifest["penances"].append((q, p_))
+        p = q.extract_tribute_subsection("penance")
+        if p:
+            manifest["penances"].append((q, p))
         o = q.extract_tribute_subsection("opinion")
         if o:
             manifest["opinions"].append((q, o))
+        c = q.extract_commutation()
+        if c:
+            manifest["commutations"].append((q, c))
+        et = q.extract_extra_tribute()
+        if et:
+            manifest["extra_tributes"].append((q, et))
 
     return manifest

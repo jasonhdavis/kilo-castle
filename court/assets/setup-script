@@ -1,0 +1,35 @@
+#!/bin/bash
+set -e
+
+# Setup script for Kilo Castle worktree checkouts
+# Runs in WORKTREE_PATH with REPO_PATH set by Agent Manager / Kilo
+
+WT_DIR="${WORKTREE_PATH:-$(pwd)}"
+
+# 1. Write worktree-scoped kilo.json defaulting to serf
+mkdir -p "$WT_DIR/.kilo"
+cat << 'EOF' > "$WT_DIR/.kilo/kilo.json"
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "default_agent": "serf"
+}
+EOF
+
+# 2. Normalize sanitized branch name if Agent Manager replaced / with -
+CURRENT_BRANCH=$(git -C "$WT_DIR" branch --show-current 2>/dev/null || true)
+if [[ -n "$CURRENT_BRANCH" ]]; then
+    NEW_BRANCH=""
+    if [[ "$CURRENT_BRANCH" =~ ^quest-(.*) ]]; then
+        NEW_BRANCH="quest/${BASH_REMATCH[1]}"
+    elif [[ "$CURRENT_BRANCH" =~ ^epic-(.*) ]]; then
+        NEW_BRANCH="epic/${BASH_REMATCH[1]}"
+    elif [[ "$CURRENT_BRANCH" =~ ^scout-(.*) ]]; then
+        NEW_BRANCH="scout/${BASH_REMATCH[1]}"
+    elif [[ "$CURRENT_BRANCH" =~ ^the-gatehouse-(.*) ]]; then
+        NEW_BRANCH="the-gatehouse/${BASH_REMATCH[1]}"
+    fi
+
+    if [[ -n "$NEW_BRANCH" && "$NEW_BRANCH" != "$CURRENT_BRANCH" ]]; then
+        git -C "$WT_DIR" branch -m "$NEW_BRANCH" 2>/dev/null || true
+    fi
+fi

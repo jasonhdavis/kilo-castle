@@ -1,8 +1,7 @@
 """
-Deterministic git/test verification helpers.
-
-All functions are subprocess wrappers returning plain dicts/booleans.
-Zero LLM calls. Used by Gatekeeper and Steward for independent verification.
+Deterministic git/test verification helpers. No LLM calls here — these are
+the facts a Tribute review is checked against. All functions are subprocess
+wrappers that return plain dicts/booleans.
 """
 from __future__ import annotations
 
@@ -11,7 +10,6 @@ import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
-
 _CONFLICT_BLOCK_RE = re.compile(
     r"<<<<<<< [^\n]*\n(?P<ours>.*?)\n=======\n(?P<theirs>.*?)\n>>>>>>> [^\n]*",
     re.DOTALL,
@@ -19,383 +17,182 @@ _CONFLICT_BLOCK_RE = re.compile(
 _HISTORY_ROW_RE = re.compile(r"^\|\s*([0-9T:\-Z]+)\s*\|.*\|\s*$")
 
 
+def _reconcile_history_only_conflict(path: Path) -> bool:
+    """For a Quest/Epic ledger file conflicted *only* in its History-table
+    rows and/or its `updated_at:` frontmatter line, resolve by taking the
+    union of both sides' History rows (deduped, sorted by timestamp) and the
+    later `updated_at`."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if "<<<<<<<" not in text:
+        return False
+
+    def _resolve_block(m: "re.Match[str]") -> Optional[str]:
+        ours_lines = m.group("ours").splitlines()
+        theirs_lines = m.group("theirs").splitlines()
+
+        if (
+            len(ours_lines) == 1 and len(theirs_lines) == 1
+            and ours_lines[0].startswith("updated_at:")
+            and theirs_lines[0].startswith("updated_at:")
+        ):
+            ours_ts = ours_lines[0].split(":", 1)[1].strip()
+            theirs_ts = theirs_lines[0].split(":", 1)[1].strip()
+            return f"updated_at: {max(ours_ts, theirs_ts)}"
+
+        all_rows = [l for l in ours_lines + theirs_lines if l.strip()]
+        if all_rows and all(_HISTORY_ROW_RE.match(l) for l in all_rows):
+            merged = list(dict.fromkeys(ours_lines + theirs_lines))
+            merged.sort(key=lambda l: _HISTORY_ROW_RE.match(l).group(1))
+            return "\n".join(merged)
+
+        return None
+
+    out_parts = []
+    pos = 0
+    for m in _CONFLICT_BLOCK_RE.finditer(text):
+        resolved = _resolve_block(m)
+        if resolved is None:
+            return False
+        out_parts.append(text[pos:m.start()])
+        out_parts.append(resolved)
+        pos = m.end()
+    out_parts.append(text[pos:])
+    new_text = "".join(out_parts)
+    if "<<<<<<<" in new_text or ">>>>>>>" in new_text:
+        return False
+
+    path.write_text(new_text, encoding="utf-8")
+    return True
+
+
 def _run(cmd: list[str], cwd: Path, timeout: int = 60) -> dict:
     try:
         proc = subprocess.run(
-            cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout
+            cmd,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
         return {
             "cmd": " ".join(cmd),
             "exit_code": proc.returncode,
-            "stdout": proc.stdout.strip(),
-            "stderr": proc.stderr.strip(),
+            "stdout": proc.stdout.rstrip("\n"),
+            "stderr": proc.stderr.rstrip("\n"),
             "ok": proc.returncode == 0,
         }
     except subprocess.TimeoutExpired as e:
         return {
             "cmd": " ".join(cmd),
-            "exit_code": None,
-            "stdout": "",
-            "stderr": f"TIMEOUT after {timeout}s: {e}",
+            "exit_code": -1,
+            "stdout": (e.stdout or "").rstrip("\n") if isinstance(e.stdout, str) else "",
+            "stderr": f"Command timed out after {timeout}s",
             "ok": False,
+            "timed_out": True,
         }
-    except FileNotFoundError as e:
+    except Exception as e:
         return {
             "cmd": " ".join(cmd),
-            "exit_code": None,
+            "exit_code": -1,
             "stdout": "",
-            "stderr": f"COMMAND NOT FOUND: {e}",
+            "stderr": str(e),
             "ok": False,
         }
 
 
-def get_repo_root(cwd: Optional[Path] = None) -> Path:
+def get_repo_root(cwd: Optional[Path | str] = None) -> Path:
     """Find the top-level directory of the current git repository."""
-    base = cwd or Path.cwd()
+    base = Path(cwd) if cwd else Path.cwd()
     res = _run(["git", "rev-parse", "--show-toplevel"], base)
     if res.get("ok") and res.get("stdout"):
         return Path(res["stdout"])
     return Path(__file__).resolve().parent.parent
 
 
-def list_git_worktrees(cwd: Optional[Path] = None) -> list[dict]:
-    """Parse `git worktree list --porcelain` into structured worktree info."""
+def verify_commit_is_ancestor(sha: str, ref: str, cwd: Optional[Path | str] = None) -> dict:
+    """Independently verify that commit `sha` really is an ancestor of `ref`."""
+    root = get_repo_root(cwd)
+    sha_res = _run(["git", "rev-parse", "--verify", f"{sha}^{{commit}}"], root)
+    if not sha_res.get("ok"):
+        return {
+            "ok": False, "is_ancestor": False,
+            "error": f"'{sha}' does not resolve to a real commit in this repository.",
+        }
+    resolved_sha = sha_res["stdout"].strip()
+
+    ref_res = _run(["git", "rev-parse", "--verify", ref], root)
+    if not ref_res.get("ok"):
+        ref_res = _run(["git", "rev-parse", "--verify", f"refs/heads/{ref}"], root)
+        if not ref_res.get("ok"):
+            return {"ok": False, "is_ancestor": False, "error": f"ref '{ref}' does not resolve."}
+
+    anc_res = _run(["git", "merge-base", "--is-ancestor", resolved_sha, ref], root)
+    is_ancestor = anc_res.get("exit_code") == 0
+    return {
+        "ok": True,
+        "is_ancestor": is_ancestor,
+        "resolved_sha": resolved_sha,
+        "ref": ref,
+        "error": None if is_ancestor else f"{resolved_sha[:12]} is NOT an ancestor of {ref} — it is not actually merged.",
+    }
+
+
+def list_git_worktrees(cwd: Optional[Path | str] = None) -> list[dict]:
+    """Parse `git worktree list --porcelain` into structured records."""
     root = get_repo_root(cwd)
     res = _run(["git", "worktree", "list", "--porcelain"], root)
-    if not res.get("ok") or not res.get("stdout"):
+    if not res.get("ok"):
         return []
 
-    worktrees = []
+    worktrees: list[dict] = []
     current: dict = {}
-    for line in res["stdout"].splitlines():
+
+    for line in res.get("stdout", "").splitlines():
         line = line.strip()
         if not line:
             if current and "worktree" in current:
                 worktrees.append(current)
                 current = {}
             continue
+
         if line.startswith("worktree "):
             if current and "worktree" in current:
                 worktrees.append(current)
-            current = {"worktree": line[len("worktree "):].strip()}
+                current = {}
+            current["worktree"] = line[9:].strip()
+            current["bare"] = False
+            current["detached"] = False
+            current["locked"] = False
+            current["prunable"] = False
+            current["branch"] = ""
+            current["raw_branch"] = ""
+            current["head"] = ""
         elif line.startswith("HEAD "):
-            current["head"] = line[len("HEAD "):].strip()
+            current["head"] = line[5:].strip()
         elif line.startswith("branch "):
-            branch_ref = line[len("branch "):].strip()
-            current["branch_ref"] = branch_ref
-            current["branch"] = branch_ref[len("refs/heads/"):] if branch_ref.startswith("refs/heads/") else branch_ref
+            raw_branch = line[7:].strip()
+            current["raw_branch"] = raw_branch
+            current["branch"] = raw_branch[11:] if raw_branch.startswith("refs/heads/") else raw_branch
+        elif line == "bare":
+            current["bare"] = True
         elif line == "detached":
             current["detached"] = True
+        elif line.startswith("locked"):
+            current["locked"] = True
+        elif line.startswith("prunable"):
+            current["prunable"] = True
 
     if current and "worktree" in current:
         worktrees.append(current)
+
     return worktrees
 
 
-def find_worktree_for_branch(branch_or_id: str, cwd: Optional[Path] = None) -> Optional[str]:
-    """Find local filesystem worktree path for a given branch name or identifier."""
-    clean = branch_or_id.strip()
-    if clean.startswith("refs/heads/"):
-        clean = clean[len("refs/heads/"):]
-    wts = list_git_worktrees(cwd)
-    for wt in wts:
-        if wt.get("branch") == clean or wt.get("branch_ref") == f"refs/heads/{clean}":
-            return wt.get("worktree")
-    for wt in wts:
-        wt_path = wt.get("worktree", "")
-        if wt_path == clean or wt_path.endswith(f"/{clean}") or Path(wt_path).name == clean:
-            return wt_path
-    clean_slug = clean.split("/")[-1]
-    for wt in wts:
-        wt_branch = wt.get("branch", "")
-        if wt_branch and wt_branch.split("/")[-1] == clean_slug:
-            return wt.get("worktree")
-    return None
-
-
-def worktree_status(worktree_path: str) -> dict:
-    """Check branch, dirty state, and ahead/behind counts for a given worktree."""
-    p = Path(worktree_path)
-    if not p.exists():
-        return {"exists": False, "error": f"path does not exist: {worktree_path}"}
-
-    branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], p)
-    status = _run(["git", "status", "--porcelain"], p)
-    ahead_behind = _run(
-        ["git", "rev-list", "--left-right", "--count", "HEAD...@{u}"], p
-    )
-
-    dirty = bool(status.get("stdout"))
-    ahead = behind = None
-    if ahead_behind.get("ok") and ahead_behind.get("stdout"):
-        parts = ahead_behind["stdout"].split()
-        if len(parts) == 2:
-            ahead, behind = int(parts[0]), int(parts[1])
-
-    return {
-        "exists": True,
-        "branch": branch.get("stdout", "").strip(),
-        "dirty": dirty,
-        "dirty_files": status.get("stdout", "").splitlines(),
-        "ahead": ahead,
-        "behind": behind,
-    }
-
-
-def diffstat(worktree_path: str, base_ref: str = "HEAD") -> dict:
-    """Return git diff --stat against a given base reference."""
-    p = Path(worktree_path)
-    return _run(["git", "diff", "--stat", base_ref], p)
-
-
-def check_merged_status(
-    worktree_or_branch: str,
-    target_ref: str = "gatehouse",
-    base_ref: str = "castle",
-    cwd: Optional[Path] = None,
-) -> dict:
-    """
-    Deterministic merge verification and differencing against target_ref and base_ref.
-    """
-    root = get_repo_root(cwd)
-    run_cwd = root
-    worktree_path: Optional[Path] = None
-    branch: str = ""
-
-    candidate_path = Path(worktree_or_branch)
-    if candidate_path.exists() and candidate_path.is_dir():
-        worktree_path = candidate_path.resolve()
-        run_cwd = worktree_path
-        branch_res = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], worktree_path)
-        if branch_res.get("ok"):
-            branch = branch_res["stdout"].strip()
-    else:
-        branch = worktree_or_branch.strip()
-        found_wt = find_worktree_for_branch(branch, root)
-        if found_wt:
-            worktree_path = Path(found_wt)
-            if not _run(["git", "rev-parse", "--verify", branch], root).get("ok") and not _run(["git", "rev-parse", "--verify", f"refs/heads/{branch}"], root).get("ok"):
-                wt_branch_res = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], worktree_path)
-                if wt_branch_res.get("ok") and wt_branch_res.get("stdout"):
-                    branch = wt_branch_res["stdout"].strip()
-
-    uncommitted_files: list[str] = []
-    clean_worktree = True
-    if worktree_path and worktree_path.exists() and worktree_path.is_dir():
-        status_res = _run(["git", "status", "--porcelain"], worktree_path)
-        if status_res.get("ok") and status_res.get("stdout"):
-            uncommitted_files = [line.strip() for line in status_res["stdout"].splitlines() if line.strip()]
-            clean_worktree = len(uncommitted_files) == 0
-
-    branch_ref = branch
-    branch_verify = _run(["git", "rev-parse", "--verify", branch_ref], run_cwd)
-    if not branch_verify.get("ok"):
-        branch_ref_head = f"refs/heads/{branch}"
-        if _run(["git", "rev-parse", "--verify", branch_ref_head], run_cwd).get("ok"):
-            branch_ref = branch_ref_head
-        else:
-            return {
-                "branch": branch,
-                "worktree": str(worktree_path) if worktree_path else None,
-                "target_ref": target_ref,
-                "base_ref": base_ref,
-                "is_merged": False,
-                "is_merged_in_target": False,
-                "is_merged_in_base": False,
-                "is_ancestor": False,
-                "is_ancestor_target": False,
-                "is_ancestor_base": False,
-                "clean_worktree": clean_worktree,
-                "uncommitted_files": uncommitted_files,
-                "unmerged_commits": [],
-                "unmerged_commits_count": 0,
-                "unmerged_commits_base": [],
-                "unmerged_commits_base_count": 0,
-                "diff_stat": "",
-                "has_diff": False,
-                "cherry_unmerged_count": 0,
-                "cherry_merged_count": 0,
-                "cherry_unmerged_commits": [],
-                "cherry_merged_commits": [],
-                "recommendation": f"ERROR: cannot resolve branch ref {branch!r}",
-                "ok": False,
-                "error": f"Branch ref not found: {branch}",
-            }
-
-    target_resolved = target_ref
-    if not _run(["git", "rev-parse", "--verify", target_resolved], run_cwd).get("ok"):
-        if _run(["git", "rev-parse", "--verify", f"refs/heads/{target_ref}"], run_cwd).get("ok"):
-            target_resolved = f"refs/heads/{target_ref}"
-
-    base_resolved = base_ref
-    if not _run(["git", "rev-parse", "--verify", base_resolved], run_cwd).get("ok"):
-        if _run(["git", "rev-parse", "--verify", f"refs/heads/{base_ref}"], run_cwd).get("ok"):
-            base_resolved = f"refs/heads/{base_ref}"
-
-    unmerged_commits: list[dict] = []
-    log_target = _run(["git", "log", "--oneline", f"{target_resolved}..{branch_ref}"], run_cwd)
-    if log_target.get("ok") and log_target.get("stdout"):
-        for line in log_target["stdout"].splitlines():
-            h, _, msg = line.strip().partition(" ")
-            unmerged_commits.append({"hash": h, "message": msg})
-
-    unmerged_commits_base: list[dict] = []
-    log_base = _run(["git", "log", "--oneline", f"{base_resolved}..{branch_ref}"], run_cwd)
-    if log_base.get("ok") and log_base.get("stdout"):
-        for line in log_base["stdout"].splitlines():
-            h, _, msg = line.strip().partition(" ")
-            unmerged_commits_base.append({"hash": h, "message": msg})
-
-    diff_stat_res = _run(["git", "diff", "--stat", f"{target_resolved}...{branch_ref}"], run_cwd)
-    diff_stat = diff_stat_res.get("stdout", "").strip()
-    diff_quiet = _run(["git", "diff", "--quiet", f"{target_resolved}...{branch_ref}"], run_cwd)
-    has_diff = (diff_quiet.get("exit_code") != 0)
-
-    ancestor_target_res = _run(["git", "merge-base", "--is-ancestor", branch_ref, target_resolved], run_cwd)
-    is_ancestor_target = (ancestor_target_res.get("exit_code") == 0)
-
-    ancestor_base_res = _run(["git", "merge-base", "--is-ancestor", branch_ref, base_resolved], run_cwd)
-    is_ancestor_base = (ancestor_base_res.get("exit_code") == 0)
-
-    cherry_res = _run(["git", "cherry", "-v", target_resolved, branch_ref], run_cwd)
-    cherry_unmerged: list[str] = []
-    cherry_merged: list[str] = []
-    if cherry_res.get("ok") and cherry_res.get("stdout"):
-        for line in cherry_res["stdout"].splitlines():
-            if line.startswith("+"):
-                cherry_unmerged.append(line[1:].strip())
-            elif line.startswith("-"):
-                cherry_merged.append(line[1:].strip())
-
-    cherry_unmerged_count = len(cherry_unmerged)
-    cherry_merged_count = len(cherry_merged)
-
-    target_has_all_commits = is_ancestor_target or (len(unmerged_commits) == 0) or (cherry_unmerged_count == 0 and len(unmerged_commits) > 0 and not has_diff)
-    is_merged_target = target_has_all_commits and not has_diff
-
-    target_in_base = (_run(["git", "merge-base", "--is-ancestor", target_resolved, base_resolved], run_cwd).get("exit_code") == 0)
-    is_merged_base = is_ancestor_base or (is_merged_target and target_in_base)
-
-    is_merged = clean_worktree and is_merged_target
-
-    if not clean_worktree:
-        recommendation = (
-            f"DIRTY_WORKTREE: {len(uncommitted_files)} uncommitted or untracked file(s) present in worktree; "
-            f"commit, stash, or clean before teardown"
-        )
-    elif not is_merged_target:
-        if len(unmerged_commits) > 0 and has_diff:
-            recommendation = (
-                f"UNMERGED: branch has {len(unmerged_commits)} unmerged commit(s) and pending diff against {target_ref}; "
-                f"do not teardown"
-            )
-        elif len(unmerged_commits) > 0:
-            recommendation = (
-                f"UNMERGED_COMMITS: branch has {len(unmerged_commits)} commit(s) not in {target_ref} history; "
-                f"verify cherry-pick/rebase status"
-            )
-        elif has_diff:
-            recommendation = (
-                f"DIFF_PRESENT: branch has pending tree diff against {target_ref}; do not teardown"
-            )
-        else:
-            recommendation = f"UNMERGED: branch not merged into {target_ref}; do not teardown"
-    elif is_merged_base:
-        recommendation = (
-            f"SAFE_TO_TEARDOWN: branch fully merged into {target_ref} and promoted to {base_ref}, worktree clean"
-        )
-    else:
-        recommendation = (
-            f"MERGED_IN_TARGET: branch merged into {target_ref} (awaiting whole-branch promotion to {base_ref}), worktree clean"
-        )
-
-    return {
-        "branch": branch,
-        "worktree": str(worktree_path) if worktree_path else None,
-        "target_ref": target_ref,
-        "base_ref": base_ref,
-        "is_merged": is_merged,
-        "is_merged_in_target": is_merged_target,
-        "is_merged_in_base": is_merged_base,
-        "is_ancestor": is_ancestor_target,
-        "is_ancestor_target": is_ancestor_target,
-        "is_ancestor_base": is_ancestor_base,
-        "clean_worktree": clean_worktree,
-        "uncommitted_files": uncommitted_files,
-        "unmerged_commits": unmerged_commits,
-        "unmerged_commits_count": len(unmerged_commits),
-        "unmerged_commits_base": unmerged_commits_base,
-        "unmerged_commits_base_count": len(unmerged_commits_base),
-        "diff_stat": diff_stat,
-        "has_diff": has_diff,
-        "cherry_unmerged_count": cherry_unmerged_count,
-        "cherry_merged_count": cherry_merged_count,
-        "cherry_unmerged_commits": cherry_unmerged,
-        "cherry_merged_commits": cherry_merged,
-        "recommendation": recommendation,
-        "ok": True,
-    }
-
-
-def run_test_command(worktree_path: str, test_cmd: str, timeout: int = 600) -> dict:
-    """Run an arbitrary test or build command inside a worktree directory
-    and return exit code with bounded output."""
-    p = Path(worktree_path)
-    if not p.exists():
-        return {"ok": False, "error": f"path does not exist: {worktree_path}"}
-    result = _run(["/bin/sh", "-c", test_cmd], p, timeout=timeout)
-    for k in ("stdout", "stderr"):
-        if len(result.get(k, "")) > 4000:
-            result[k] = "...(truncated)...\n" + result[k][-4000:]
-    return result
-
-
-def can_fast_forward(worktree_path: str, base_branch: str = "castle") -> dict:
-    """Check whether worktree branch can fast-forward onto base_branch."""
-    p = Path(worktree_path)
-    fetch = _run(["git", "fetch", "origin", base_branch], p, timeout=60)
-    behind_check = _run(
-        ["git", "rev-list", "--count", f"HEAD..origin/{base_branch}"], p
-    )
-    behind = None
-    if behind_check.get("ok") and behind_check.get("stdout").isdigit():
-        behind = int(behind_check["stdout"])
-    return {"fetch_ok": fetch.get("ok"), "behind_base": behind}
-
-
-def get_branch_diffstat(base: str = "main", head: str = "castle", cwd: Optional[Path] = None) -> dict:
-    """Return diffstat between base and head branches (e.g. main..castle) —
-    used by `court ship` to show the aggregate promotion diff."""
-    p = cwd or Path.cwd()
-    return _run(["git", "diff", "--stat", f"{base}..{head}"], p)
-
-
-def get_branch_log(base: str = "main", head: str = "castle", max_count: int = 50, cwd: Optional[Path] = None) -> dict:
-    """Return oneline log of commits between base and head (e.g. git log main..castle --oneline)."""
-    p = cwd or Path.cwd()
-    return _run(["git", "log", f"{base}..{head}", "--oneline", f"-n{max_count}"], p)
-
-
-def get_ahead_behind(base: str = "main", head: str = "castle", cwd: Optional[Path] = None) -> dict:
-    """Return number of commits head is ahead of / behind base."""
-    p = cwd or Path.cwd()
-    result = _run(["git", "rev-list", "--left-right", "--count", f"{base}...{head}"], p)
-    behind = ahead = None
-    if result.get("ok") and result.get("stdout"):
-        parts = result["stdout"].split()
-        if len(parts) == 2:
-            behind, ahead = int(parts[0]), int(parts[1])
-    return {"ok": result.get("ok"), "base": base, "head": head, "behind": behind, "ahead": ahead}
-
-
-def find_worktree_for_quest(quest: Any, cwd: Optional[Path] = None) -> Optional[Path]:
-    """Resolve the filesystem path of a Quest's git worktree.
-
-    Checks:
-    1. quest.worktree if non-empty and directory exists
-    2. Exact branch match in git worktrees
-    3. Quest ID match in worktree paths or branch names (handling epics vs quests)
-    """
+def find_worktree_for_quest(quest: Any, cwd: Optional[Path | str] = None) -> Optional[Path]:
+    """Resolve the filesystem path of a Quest's git worktree."""
     worktree_attr = getattr(quest, "worktree", "")
     if worktree_attr:
         p = Path(worktree_attr)
@@ -406,22 +203,19 @@ def find_worktree_for_quest(quest: Any, cwd: Optional[Path] = None) -> Optional[
     quest_id = getattr(quest, "id", str(quest))
     branch = getattr(quest, "branch", "")
     kind = getattr(quest, "kind", "quest")
-    short_id = quest_id.split("-")[0].lower()  # e.g. "q075"
+    short_id = quest_id.split("-")[0].lower()
 
-    # Match by exact branch
     if branch:
         for wt in worktrees:
-            if wt.get("branch") == branch or wt.get("branch_ref") == f"refs/heads/{branch}":
+            if wt.get("branch") == branch or wt.get("raw_branch") == f"refs/heads/{branch}":
                 p = Path(wt["worktree"])
                 if p.is_dir():
                     return p
 
-    # Match by short id in branch or worktree folder name
     for wt in worktrees:
         wt_path = wt.get("worktree", "")
         wt_branch = wt.get("branch", "")
 
-        # For epics, do not match child quest branches/worktrees
         if kind == "epic":
             if wt_branch.startswith("epic/") and short_id in wt_branch.lower():
                 p = Path(wt_path)
@@ -433,7 +227,6 @@ def find_worktree_for_quest(quest: Any, cwd: Optional[Path] = None) -> Optional[
                     return p
             continue
 
-        # For regular quests or scouts, match quest id in leaf branch or worktree
         leaf_branch = wt_branch.split("/")[-1].lower() if "/" in wt_branch else wt_branch.lower()
         leaf_wt = wt_path.split("/")[-1].lower() if "/" in wt_path else wt_path.lower()
 
@@ -451,12 +244,7 @@ def find_worktree_for_quest(quest: Any, cwd: Optional[Path] = None) -> Optional[
 
 
 def get_worktree_git_status(worktree_path: str | Path, base: str = "castle") -> dict:
-    """Comprehensive worktree status inspection:
-    - dirty/clean state (untracked, modified, staged, deleted)
-    - branch name and HEAD sha
-    - ahead / behind count against base branch (e.g. castle)
-    - diffstat vs base
-    """
+    """Comprehensive worktree status inspection."""
     p = Path(worktree_path)
     if not p.exists() or not p.is_dir():
         return {
@@ -507,9 +295,6 @@ def get_worktree_git_status(worktree_path: str | Path, base: str = "castle") -> 
 
     dirty = bool(untracked or modified or staged or deleted)
 
-    # Ahead / behind vs base (e.g. castle...HEAD)
-    # parts[0] = behind (commits in base not in HEAD)
-    # parts[1] = ahead (commits in HEAD not in base)
     ahead_behind_res = _run(["git", "rev-list", "--left-right", "--count", f"{base}...HEAD"], p)
     ahead = behind = None
     if ahead_behind_res.get("ok") and ahead_behind_res.get("stdout"):
@@ -520,7 +305,6 @@ def get_worktree_git_status(worktree_path: str | Path, base: str = "castle") -> 
             except ValueError:
                 pass
 
-    # Diffstat vs base
     diffstat_res = _run(["git", "diff", "--stat", f"{base}...HEAD"], p)
     diffstat_str = diffstat_res.get("stdout", "") if diffstat_res.get("ok") else ""
 
@@ -620,384 +404,630 @@ def get_worktree_diff(
     }
 
 
-def _reconcile_history_only_conflict(path: Path) -> bool:
-    """For a Quest/Epic ledger file conflicted *only* in its History-table
-    rows and/or its `updated_at:` frontmatter line, resolve by taking the
-    union of both sides' History rows (deduped, sorted by timestamp) and the
-    later `updated_at`.
+def find_worktree_for_branch(branch_or_id: str, cwd: Optional[Path | str] = None) -> Optional[str]:
+    clean = branch_or_id.strip()
+    if clean.startswith("refs/heads/"):
+        clean = clean[len("refs/heads/"):]
+    wts = list_git_worktrees(cwd)
+    for wt in wts:
+        if wt.get("branch") == clean or wt.get("raw_branch") == f"refs/heads/{clean}":
+            return wt.get("worktree")
+    for wt in wts:
+        wt_path = wt.get("worktree", "")
+        if wt_path == clean or wt_path.endswith(f"/{clean}") or Path(wt_path).name == clean:
+            return wt_path
+    clean_slug = clean.split("/")[-1]
+    for wt in wts:
+        wt_branch = wt.get("branch", "")
+        if wt_branch and wt_branch.split("/")[-1] == clean_slug:
+            return wt.get("worktree")
+    return None
 
-    This is the routine, expected shape of an "own ledger file" conflict: a
-    Serf's own worktree branch and the protected trunk's own bookkeeping both
-    append different History rows since the worktree's last rebase — not a
-    real content disagreement, just two append-only logs that diverged.
-    Returns False (leaving the file untouched) if ANY conflicting block
-    contains anything else — e.g. genuinely different Tribute/Goal & Scope
-    prose — so real conflicts are always left for a human/Serf to resolve,
-    never silently discarded.
-    """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    if "<<<<<<<" not in text:
-        return False
 
-    def _resolve_block(m: "re.Match[str]") -> Optional[str]:
-        ours_lines = m.group("ours").splitlines()
-        theirs_lines = m.group("theirs").splitlines()
+def worktree_status(worktree_path: str) -> dict:
+    p = Path(worktree_path)
+    if not p.exists():
+        return {"exists": False, "error": f"path does not exist: {worktree_path}"}
+    branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], p)
+    status = _run(["git", "status", "--porcelain"], p)
+    ahead_behind = _run(["git", "rev-list", "--left-right", "--count", "origin/castle...HEAD"], p)
+    is_dirty = bool(status.get("stdout", "").strip()) if status.get("ok") else None
+    behind = ahead = None
+    if ahead_behind.get("ok") and ahead_behind.get("stdout"):
+        parts = ahead_behind["stdout"].split()
+        if len(parts) == 2:
+            behind, ahead = int(parts[0]), int(parts[1])
+    return {
+        "exists": True,
+        "branch": branch.get("stdout", "").strip() if branch.get("ok") else None,
+        "is_dirty": is_dirty,
+        "behind": behind,
+        "ahead": ahead,
+        "error": None if (branch.get("ok") and status.get("ok")) else status.get("stderr"),
+    }
 
-        if (
-            len(ours_lines) == 1 and len(theirs_lines) == 1
-            and ours_lines[0].startswith("updated_at:")
-            and theirs_lines[0].startswith("updated_at:")
-        ):
-            ours_ts = ours_lines[0].split(":", 1)[1].strip()
-            theirs_ts = theirs_lines[0].split(":", 1)[1].strip()
-            return f"updated_at: {max(ours_ts, theirs_ts)}"
 
-        all_rows = [l for l in ours_lines + theirs_lines if l.strip()]
-        if all_rows and all(_HISTORY_ROW_RE.match(l) for l in all_rows):
-            merged = list(dict.fromkeys(ours_lines + theirs_lines))  # dedup, stable order
-            merged.sort(key=lambda l: _HISTORY_ROW_RE.match(l).group(1))
-            return "\n".join(merged)
+def diffstat(worktree_path: str, base_ref: str = "HEAD") -> dict:
+    p = Path(worktree_path)
+    return _run(["git", "diff", "--stat", base_ref], p)
 
-        return None  # unrecognized content in this block — refuse to guess
 
-    out_parts = []
-    pos = 0
-    for m in _CONFLICT_BLOCK_RE.finditer(text):
-        resolved = _resolve_block(m)
-        if resolved is None:
-            return False
-        out_parts.append(text[pos:m.start()])
-        out_parts.append(resolved)
-        pos = m.end()
-    out_parts.append(text[pos:])
-    new_text = "".join(out_parts)
-    if "<<<<<<<" in new_text or ">>>>>>>" in new_text:
-        return False  # safety net: something didn't fully resolve
+def check_merged_status(
+    worktree_or_branch: str,
+    target_ref: str = "castle",
+    base_ref: str = "castle",
+    cwd: Optional[Path] = None,
+) -> dict:
+    """Deterministic merge verification and differencing against target_ref and base_ref."""
+    root = get_repo_root(cwd)
+    run_cwd = root
+    worktree_path: Optional[Path] = None
 
-    path.write_text(new_text, encoding="utf-8")
-    return True
+    if Path(worktree_or_branch).exists() and Path(worktree_or_branch).is_dir():
+        worktree_path = Path(worktree_or_branch)
+        run_cwd = worktree_path
+        branch_res = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], worktree_path)
+        if branch_res.get("ok") and branch_res.get("stdout"):
+            branch = branch_res["stdout"].strip()
+        else:
+            branch = worktree_path.name
+    else:
+        branch = worktree_or_branch.strip()
+        found_wt = find_worktree_for_branch(branch, root)
+        if found_wt:
+            worktree_path = Path(found_wt)
+            if not _run(["git", "rev-parse", "--verify", branch], root).get("ok") and not _run(["git", "rev-parse", "--verify", f"refs/heads/{branch}"], root).get("ok"):
+                wt_branch_res = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], worktree_path)
+                if wt_branch_res.get("ok") and wt_branch_res.get("stdout"):
+                    branch = wt_branch_res["stdout"].strip()
+
+    uncommitted_files: list[str] = []
+    clean_worktree = True
+    if worktree_path and worktree_path.exists() and worktree_path.is_dir():
+        status_res = _run(["git", "status", "--porcelain=v1", "-uall"], worktree_path)
+        if status_res.get("ok"):
+            uncommitted_files = [line.strip() for line in status_res["stdout"].splitlines() if line.strip()]
+            clean_worktree = len(uncommitted_files) == 0
+
+    branch_ref = branch
+    branch_verify = _run(["git", "rev-parse", "--verify", branch_ref], run_cwd)
+    if not branch_verify.get("ok"):
+        branch_ref = f"refs/heads/{branch}"
+        branch_verify = _run(["git", "rev-parse", "--verify", branch_ref], run_cwd)
+
+    if not branch_verify.get("ok"):
+        found = False
+        for b_name in (branch, f"quest/{branch}", f"epic/{branch}", f"scout/{branch}"):
+            res = _run(["git", "rev-parse", "--verify", b_name], run_cwd)
+            if res.get("ok"):
+                branch_ref = b_name
+                found = True
+                break
+            res2 = _run(["git", "rev-parse", "--verify", f"refs/heads/{b_name}"], run_cwd)
+            if res2.get("ok"):
+                branch_ref = f"refs/heads/{b_name}"
+                found = True
+                break
+        if not found:
+            return {
+                "branch": branch,
+                "target_ref": target_ref,
+                "base_ref": base_ref,
+                "is_merged": False,
+                "clean_worktree": clean_worktree,
+                "uncommitted_files": uncommitted_files,
+                "recommendation": f"BRANCH_NOT_FOUND: git ref for '{branch}' could not be resolved.",
+                "error": f"Branch ref not found: {branch}",
+            }
+
+    base_resolved = base_ref
+    if not _run(["git", "rev-parse", "--verify", base_resolved], run_cwd).get("ok"):
+        if _run(["git", "rev-parse", "--verify", f"refs/heads/{base_ref}"], run_cwd).get("ok"):
+            base_resolved = f"refs/heads/{base_ref}"
+
+    target_resolved = target_ref
+    if not _run(["git", "rev-parse", "--verify", target_resolved], run_cwd).get("ok"):
+        if _run(["git", "rev-parse", "--verify", f"refs/heads/{target_ref}"], run_cwd).get("ok"):
+            target_resolved = f"refs/heads/{target_ref}"
+        else:
+            target_resolved = base_resolved
+
+    unmerged_commits: list[dict] = []
+    log_target = _run(["git", "log", "--oneline", f"{target_resolved}..{branch_ref}"], run_cwd)
+    if log_target.get("ok") and log_target.get("stdout"):
+        for line in log_target["stdout"].splitlines():
+            h, _, msg = line.strip().partition(" ")
+            unmerged_commits.append({"hash": h, "message": msg})
+
+    unmerged_commits_base: list[dict] = []
+    log_base = _run(["git", "log", "--oneline", f"{base_resolved}..{branch_ref}"], run_cwd)
+    if log_base.get("ok") and log_base.get("stdout"):
+        for line in log_base["stdout"].splitlines():
+            h, _, msg = line.strip().partition(" ")
+            unmerged_commits_base.append({"hash": h, "message": msg})
+
+    diff_stat_res = _run(["git", "diff", "--stat", f"{target_resolved}...{branch_ref}"], run_cwd)
+    diff_stat = diff_stat_res.get("stdout", "").strip()
+    diff_quiet = _run(["git", "diff", "--quiet", f"{target_resolved}...{branch_ref}"], run_cwd)
+    has_diff = (diff_quiet.get("exit_code") != 0)
+
+    ancestor_target_res = _run(["git", "merge-base", "--is-ancestor", branch_ref, target_resolved], run_cwd)
+    is_ancestor_target = (ancestor_target_res.get("exit_code") == 0)
+
+    ancestor_base_res = _run(["git", "merge-base", "--is-ancestor", branch_ref, base_resolved], run_cwd)
+    is_ancestor_base = (ancestor_base_res.get("exit_code") == 0)
+
+    cherry_res = _run(["git", "cherry", target_resolved, branch_ref], run_cwd)
+    cherry_unmerged = []
+    cherry_merged = []
+    if cherry_res.get("ok") and cherry_res.get("stdout"):
+        for line in cherry_res["stdout"].splitlines():
+            sign, _, sha = line.strip().partition(" ")
+            if sign == "+":
+                cherry_unmerged.append(sha)
+            elif sign == "-":
+                cherry_merged.append(sha)
+
+    cherry_unmerged_count = len(cherry_unmerged)
+    cherry_merged_count = len(cherry_merged)
+
+    target_has_all_commits_heuristic = is_ancestor_target or (len(unmerged_commits) == 0) or (cherry_unmerged_count == 0 and len(unmerged_commits) > 0 and not has_diff)
+    is_merged_target = is_ancestor_target and not has_diff
+
+    target_in_base = (_run(["git", "merge-base", "--is-ancestor", target_resolved, base_resolved], run_cwd).get("exit_code") == 0)
+    is_merged_base = is_ancestor_base or (is_merged_target and target_in_base and is_ancestor_target)
+
+    is_merged = clean_worktree and is_merged_target
+
+    if not clean_worktree:
+        recommendation = (
+            f"DIRTY_WORKTREE: {len(uncommitted_files)} uncommitted or untracked file(s) present in worktree; "
+            "cannot safely prune until committed or cleaned."
+        )
+    elif is_merged:
+        recommendation = (
+            f"PRUNABLE: All commits and tree state are fully merged into {target_resolved}. "
+            "Safe to prune branch and remove worktree."
+        )
+    elif is_merged_base and not is_merged_target:
+        recommendation = (
+            f"MERGED_INTO_BASE: Merged into base ({base_resolved}) though not in target ({target_resolved}). "
+            "Safe to prune if base is authoritative."
+        )
+    elif len(unmerged_commits) > 0 and cherry_unmerged_count == 0 and not has_diff:
+        recommendation = (
+            f"REBASED_EQUIVALENT: Branch commits appear to have been rebased or cherry-picked into {target_resolved} "
+            "(tree diff is empty). Safe to prune if confirmed."
+        )
+    elif len(unmerged_commits) > 0:
+        recommendation = (
+            f"UNMERGED_COMMITS: {len(unmerged_commits)} commit(s) on branch not reachable in {target_resolved}. "
+            "Do not prune until merged or explicitly discarded."
+        )
+    elif has_diff:
+        recommendation = (
+            f"TREE_DIFF: Branch has differences vs {target_resolved} despite commit ancestry. "
+            "Review diff before pruning."
+        )
+    else:
+        recommendation = "UNVERIFIED: Status could not be verified automatically."
+
+    return {
+        "branch": branch,
+        "resolved_branch_ref": branch_ref,
+        "target_ref": target_resolved,
+        "base_ref": base_resolved,
+        "is_merged": is_merged,
+        "is_merged_target": is_merged_target,
+        "is_merged_base": is_merged_base,
+        "is_ancestor_target": is_ancestor_target,
+        "is_ancestor_base": is_ancestor_base,
+        "clean_worktree": clean_worktree,
+        "uncommitted_files": uncommitted_files,
+        "unmerged_commits": unmerged_commits,
+        "unmerged_commits_count": len(unmerged_commits),
+        "unmerged_commits_base_count": len(unmerged_commits_base),
+        "has_diff": has_diff,
+        "diff_stat": diff_stat,
+        "cherry_unmerged_count": cherry_unmerged_count,
+        "cherry_merged_count": cherry_merged_count,
+        "cherry_unmerged_commits": cherry_unmerged,
+        "cherry_merged_commits": cherry_merged,
+        "target_has_all_commits_heuristic": target_has_all_commits_heuristic,
+        "recommendation": recommendation,
+        "ok": True,
+    }
+
+
+def run_test_command(worktree_path: str, test_cmd: str, timeout: int = 600) -> dict:
+    p = Path(worktree_path)
+    if not p.exists():
+        return {"ok": False, "error": f"path does not exist: {worktree_path}"}
+    result = _run(["/bin/sh", "-c", test_cmd], p, timeout=timeout)
+    for k in ("stdout", "stderr"):
+        if len(result.get(k, "")) > 4000:
+            result[k] = "...(truncated)...\n" + result[k][-4000:]
+    return result
+
+
+def can_fast_forward(worktree_path: str, base_branch: str = "castle") -> dict:
+    p = Path(worktree_path)
+    fetch = _run(["git", "fetch", "origin", base_branch], p, timeout=60)
+    behind_check = _run(
+        ["git", "rev-list", "--count", f"HEAD..origin/{base_branch}"], p
+    )
+    behind = None
+    if behind_check.get("ok") and behind_check.get("stdout").isdigit():
+        behind = int(behind_check["stdout"])
+    return {"fetch_ok": fetch.get("ok"), "behind_base": behind}
 
 
 def rebase_worktree_onto_base(
     worktree_path: str | Path,
     base_branch: str = "castle",
-    own_quest_id: Optional[str] = None,
     auto_resolve_foreign_ledger: bool = True,
-    auto_resolve_own_history: bool = True,
+    own_quest_id: Optional[str] = None,
 ) -> dict:
-    """Mechanically converge a worktree onto `base_branch` via `git merge <base> --no-edit`,
-    with no LLM agent involved.
-
-    `base_branch` is typically a constantly-moving target in an active repo (every
-    Gatekeeper Cog Ship promotion advances it), while the "deferred rebase" convention
-    expects a Serf agent to notice drift and run `git merge <base_branch>` themselves
-    before REVIEW. At real work-in-progress volume, the round-trip of "notice drift ->
-    spawn/prompt an agent -> agent runs the merge" is far slower than the rate the base
-    branch advances, so drift only ever grows and the WORKING/REVIEW queue can never
-    converge. This function performs the exact same mechanical step deterministically
-    and near-instantly (a subprocess call, not an agent turn), so `court levy`/`court
-    rebase` can converge an entire backlog of worktrees onto the base branch's current
-    tip in one sequential pass without spawning any agents.
-
-    A second failure mode this guards against: if `store.save()`'s auto-commit ever ran
-    from the wrong worktree (see `store._commit_allowed_here`), a bulk command could
-    poison one Quest's branch with phantom "court: save Q-B" commits for unrelated
-    Quests. Since those phantom copies of *other* Quests' `.court/quests/*.md` /
-    `.court/epics/*.md` files were never this worktree's real deliverable — the base
-    branch is unconditionally authoritative for them — a conflict limited to that class
-    of file is safe to auto-resolve by taking the base branch's side
-    (`auto_resolve_foreign_ledger=True`, the default). Pass this worktree's own Quest ID
-    as `own_quest_id` so its *own* ledger file is exempted from that auto-resolution and
-    left as a genuine conflict for a Serf if it disagrees with the base branch.
-
-    Skips (does not touch) a dirty worktree — uncommitted changes must be resolved by a
-    Serf first, since merging over them risks stomping in-progress work. On an
-    unresolvable merge conflict, aborts cleanly (`git merge --abort`) and reports the
-    conflicting paths rather than leaving a half-merged tree for the next command to
-    trip over.
-    """
+    """Mechanically converge a worktree onto `base_branch` via `git merge <base> --no-edit`."""
     p = Path(worktree_path)
     result: dict = {
         "ok": False,
-        "path": str(p),
-        "base": base_branch,
-        "skipped": None,
         "merged": False,
-        "already_up_to_date": False,
+        "already_current": False,
         "conflict": False,
-        "conflict_files": [],
-        "auto_resolved_foreign_ledger_files": [],
-        "auto_resolved_history_only_files": [],
-        "before_behind": None,
-        "after_behind": None,
+        "auto_resolved_files": [],
+        "conflicting_files": [],
         "error": None,
     }
     if not p.exists() or not p.is_dir():
-        result["error"] = f"worktree path does not exist: {p}"
+        result["error"] = f"worktree path does not exist: {worktree_path}"
         return result
 
-    status_res = _run(["git", "status", "--porcelain"], p)
-    if status_res.get("ok") and status_res.get("stdout", "").strip():
-        result["skipped"] = "dirty"
-        result["error"] = "Worktree has uncommitted changes; commit or stash before mechanical rebase."
+    status_res = _run(["git", "status", "--porcelain=v1", "-uall"], p)
+    if not status_res.get("ok"):
+        result["error"] = f"git status failed: {status_res.get('stderr')}"
+        return result
+    dirty_lines = [l for l in status_res.get("stdout", "").splitlines() if l.strip()]
+    if dirty_lines:
+        result["error"] = (
+            f"worktree is dirty ({len(dirty_lines)} uncommitted file(s)); "
+            "must be cleaned by Serf before rebase"
+        )
         return result
 
-    before = get_ahead_behind(base_branch, "HEAD", cwd=p)
-    result["before_behind"] = before.get("behind")
-
-    if before.get("behind") in (0, None):
+    behind_res = _run(["git", "rev-list", "--count", f"HEAD..{base_branch}"], p)
+    if behind_res.get("ok") and behind_res.get("stdout", "").strip() == "0":
         result["ok"] = True
-        result["already_up_to_date"] = True
-        result["after_behind"] = before.get("behind")
+        result["already_current"] = True
         return result
 
-    merge_res = _run(["git", "merge", base_branch, "--no-edit"], p, timeout=180)
+    merge_res = _run(["git", "merge", base_branch, "--no-edit"], p, timeout=120)
     if merge_res.get("ok"):
-        after = get_ahead_behind(base_branch, "HEAD", cwd=p)
         result["ok"] = True
         result["merged"] = True
-        result["after_behind"] = after.get("behind")
         return result
 
-    # Merge failed — almost certainly conflicts. Inspect each conflicting path;
-    # any that are *other* Quests'/Epics' ledger files (never this worktree's
-    # real deliverable, and the base branch is unconditionally authoritative
-    # for them) can be safely auto-resolved by taking the base branch's side.
-    # Anything else is a genuine conflict, so abort cleanly rather than leave
-    # a half-merged tree.
     conflict_res = _run(["git", "diff", "--name-only", "--diff-filter=U"], p)
     conflict_files = [
         line.strip() for line in conflict_res.get("stdout", "").splitlines() if line.strip()
     ]
+    result["conflicting_files"] = conflict_files
 
     if auto_resolve_foreign_ledger and conflict_files:
-        own_prefix = None
-        if own_quest_id:
-            m = re.match(r"^(Q\d+)", own_quest_id.strip(), re.IGNORECASE)
-            if m:
-                own_prefix = m.group(1).upper()
+        own_id = (own_quest_id or "").upper().split("-")[0]
+        auto_resolved: list[str] = []
+        remaining_conflicts: list[str] = []
 
-        ledger_pattern = re.compile(r"^\.court/(quests|epics)/(Q\d+)-.*\.md$")
-        remaining_conflicts = []
-        auto_resolved = []
         for f in conflict_files:
-            lm = ledger_pattern.match(f)
-            is_foreign_ledger = bool(lm) and (own_prefix is None or lm.group(2).upper() != own_prefix)
-            resolved = False
+            norm = f.replace("\\", "/")
+            is_foreign_ledger = (
+                (norm.startswith(".court/quests/") or norm.startswith(".court/epics/"))
+                and norm.endswith(".md")
+                and (not own_id or own_id not in Path(f).stem.upper())
+            )
             if is_foreign_ledger:
-                theirs_res = _run(["git", "checkout", base_branch, "--", f], p)
-                if theirs_res.get("ok"):
-                    add_res = _run(["git", "add", "--", f], p)
-                    resolved = add_res.get("ok", False)
-            if resolved:
-                auto_resolved.append(f)
+                chk_res = _run(["git", "checkout", f"--theirs", f], p)
+                add_res = _run(["git", "add", f], p)
+                if chk_res.get("ok") and add_res.get("ok"):
+                    auto_resolved.append(f)
+                else:
+                    remaining_conflicts.append(f)
             else:
                 remaining_conflicts.append(f)
 
-        result["auto_resolved_foreign_ledger_files"] = auto_resolved
+        result["auto_resolved_files"].extend(auto_resolved)
 
         if auto_resolved and not remaining_conflicts:
-            # Every conflicting path was a foreign ledger file, now resolved
-            # to the base branch's version. Confirm nothing is left unmerged,
-            # then complete the merge commit.
             unmerged_check = _run(["git", "diff", "--name-only", "--diff-filter=U"], p)
             if not unmerged_check.get("stdout", "").strip():
                 commit_res = _run(["git", "commit", "--no-edit"], p, timeout=60)
                 if commit_res.get("ok"):
-                    after = get_ahead_behind(base_branch, "HEAD", cwd=p)
                     result["ok"] = True
                     result["merged"] = True
-                    result["after_behind"] = after.get("behind")
+                    result["conflict"] = False
+                    result["conflicting_files"] = []
                     return result
-            # Fall through to abort below if the commit didn't take for any reason.
-            remaining_conflicts = conflict_files
-
         conflict_files = remaining_conflicts
 
-    # Second pass: the ONE most common remaining shape is the worktree's own
-    # ledger file conflicting with the base branch purely because both sides
-    # appended different History-table rows since the worktree's last
-    # rebase — not a real content disagreement. Safe to reconcile by union;
-    # anything else in the file is left untouched and reported as a genuine
-    # conflict.
-    if auto_resolve_own_history and conflict_files:
-        still_conflicted = []
-        history_resolved = []
+    if conflict_files and own_quest_id:
+        own_id = own_quest_id.upper().split("-")[0]
+        reconciled_any = False
+        remaining_after_union: list[str] = []
+
         for f in conflict_files:
-            full_path = p / f
-            if _reconcile_history_only_conflict(full_path):
-                add_res = _run(["git", "add", "--", f], p)
+            norm = f.replace("\\", "/")
+            is_own_ledger = (
+                (norm.startswith(".court/quests/") or norm.startswith(".court/epics/"))
+                and norm.endswith(".md")
+                and own_id in Path(f).stem.upper()
+            )
+            if is_own_ledger and _reconcile_history_only_conflict(p / f):
+                add_res = _run(["git", "add", f], p)
                 if add_res.get("ok"):
-                    history_resolved.append(f)
-                    continue
-            still_conflicted.append(f)
+                    result["auto_resolved_files"].append(f + " (ledger union)")
+                    reconciled_any = True
+                else:
+                    remaining_after_union.append(f)
+            else:
+                remaining_after_union.append(f)
 
-        result["auto_resolved_history_only_files"] = history_resolved
-
-        if history_resolved and not still_conflicted:
+        if reconciled_any and not remaining_after_union:
             unmerged_check = _run(["git", "diff", "--name-only", "--diff-filter=U"], p)
             if not unmerged_check.get("stdout", "").strip():
                 commit_res = _run(["git", "commit", "--no-edit"], p, timeout=60)
                 if commit_res.get("ok"):
-                    after = get_ahead_behind(base_branch, "HEAD", cwd=p)
                     result["ok"] = True
                     result["merged"] = True
-                    result["after_behind"] = after.get("behind")
+                    result["conflict"] = False
+                    result["conflicting_files"] = []
                     return result
-            still_conflicted = conflict_files
+        conflict_files = remaining_after_union
 
-        conflict_files = still_conflicted
-
-    result["conflict_files"] = conflict_files
     _run(["git", "merge", "--abort"], p)
     result["conflict"] = True
     result["error"] = merge_res.get("stderr") or merge_res.get("stdout") or "git merge failed"
     return result
 
 
+def get_branch_diffstat(base: str = "main", head: str = "castle", cwd: Optional[Path] = None) -> dict:
+    p = cwd or Path.cwd()
+    return _run(["git", "diff", "--stat", f"{base}..{head}"], p)
+
+
+def get_branch_log(base: str = "main", head: str = "castle", max_count: int = 50, cwd: Optional[Path] = None) -> dict:
+    p = cwd or Path.cwd()
+    return _run(["git", "log", f"{base}..{head}", "--oneline", f"-n{max_count}"], p)
+
+
+def get_ahead_behind(base: str = "main", head: str = "castle", cwd: Optional[Path] = None) -> dict:
+    p = cwd or Path.cwd()
+    result = _run(["git", "rev-list", "--left-right", "--count", f"{base}...{head}"], p)
+    behind = ahead = None
+    if result.get("ok") and result.get("stdout"):
+        parts = result["stdout"].split()
+        if len(parts) == 2:
+            behind, ahead = int(parts[0]), int(parts[1])
+    return {"ok": result.get("ok"), "base": base, "head": head, "behind": behind, "ahead": ahead}
+
+
 def git_commit_paths(
-    paths: "list[Path | str] | Path | str",
+    paths: list[Path | str] | Path | str,
     commit_msg: str,
     cwd: Optional[Path] = None,
 ) -> dict:
-    """Stage and commit specific file paths atomically without touching other files.
-    Returns dict with ok, exit_code, stdout, stderr, cmd.
-    Never raises an unhandled exception; callers should check `ok`/`warning`.
-    """
+    """Stage and commit specific file paths atomically without touching other files."""
     p = cwd or get_repo_root()
     if isinstance(paths, (str, Path)):
         path_list = [Path(paths)]
     else:
         path_list = [Path(x) for x in paths]
 
-    str_paths = []
-    p_resolved = p.resolve()
-    for item in path_list:
-        item_resolved = item.resolve()
-        try:
-            rel = item_resolved.relative_to(p_resolved)
-            str_paths.append(str(rel))
-        except ValueError:
-            str_paths.append(str(item))
+    diff_before = _run(["git", "diff", "--cached", "--name-only"], p)
+    staged_prior = [
+        line.strip() for line in diff_before.get("stdout", "").splitlines() if line.strip()
+    ] if diff_before.get("ok") else []
 
-    # Stage only the specific paths
-    add_res = _run(["git", "add", "--"] + str_paths, p)
+    unstage_needed = bool(staged_prior)
+
+    rel_paths = []
+    for target in path_list:
+        try:
+            rel = target.relative_to(p)
+            rel_paths.append(str(rel))
+        except ValueError:
+            rel_paths.append(str(target))
+
+    add_res = _run(["git", "add", "--"] + rel_paths, p)
     if not add_res.get("ok"):
-        err = add_res.get("stderr") or add_res.get("stdout") or "unknown git error"
         return {
             "ok": False,
-            "cmd": add_res.get("cmd"),
             "exit_code": add_res.get("exit_code"),
             "stdout": add_res.get("stdout", ""),
             "stderr": add_res.get("stderr", ""),
-            "warning": f"git add failed: {err}",
+            "cmd": add_res.get("cmd", ""),
         }
 
-    # Commit only the specified paths
-    commit_cmd = ["git", "commit", "-m", commit_msg, "--"] + str_paths
-    commit_res = _run(commit_cmd, p)
-    if not commit_res.get("ok"):
-        combined_out = f"{commit_res.get('stdout', '')} {commit_res.get('stderr', '')}".lower()
-        if "nothing to commit" in combined_out or "no changes added to commit" in combined_out:
-            return {
-                "ok": True,
-                "cmd": commit_res.get("cmd"),
-                "exit_code": commit_res.get("exit_code"),
-                "stdout": commit_res.get("stdout", ""),
-                "stderr": commit_res.get("stderr", ""),
-                "no_changes": True,
-            }
-        err = commit_res.get("stderr") or commit_res.get("stdout") or "unknown git error"
-        return {
-            "ok": False,
-            "cmd": commit_res.get("cmd"),
-            "exit_code": commit_res.get("exit_code"),
-            "stdout": commit_res.get("stdout", ""),
-            "stderr": commit_res.get("stderr", ""),
-            "warning": f"git commit failed: {err}",
-        }
+    commit_res = _run(["git", "commit", "-m", commit_msg, "--"] + rel_paths, p)
+    out_stdout = commit_res.get("stdout", "")
+    out_stderr = commit_res.get("stderr", "")
+
+    if unstage_needed and commit_res.get("ok"):
+        _run(["git", "restore", "--staged", "."], p)
+
+    is_no_changes = (
+        "nothing to commit" in out_stdout.lower()
+        or "nothing to commit" in out_stderr.lower()
+        or "no changes added to commit" in out_stdout.lower()
+        or "no changes added to commit" in out_stderr.lower()
+    )
 
     return {
-        "ok": True,
-        "cmd": commit_res.get("cmd"),
+        "ok": commit_res.get("ok") or is_no_changes,
+        "no_changes": is_no_changes,
         "exit_code": commit_res.get("exit_code"),
-        "stdout": commit_res.get("stdout", ""),
-        "stderr": commit_res.get("stderr", ""),
+        "stdout": out_stdout,
+        "stderr": out_stderr,
+        "cmd": commit_res.get("cmd", ""),
     }
 
 
 def check_proof_of_landing(quest: Any, cwd: Optional[Path | str] = None) -> dict:
-    """
-    Search the protected trunks — castle, main, and all four the-gatehouse/*
-    station branches — for proof that the Quest's work (branch, commit hashes,
-    or commit message / concern) actually landed somewhere.
-    """
     root = get_repo_root(cwd)
     quest_id = getattr(quest, "id", str(quest))
     branch = getattr(quest, "branch", "")
     concern = getattr(quest, "concern", "")
-    short_id = quest_id.split("-")[0].lower()
+    short_id = quest_id.split("-")[0].upper()
 
-    # Landing refs are STRICTLY the promotion trunks: castle, main, and the
-    # four the-gatehouse/* stations. Never scan arbitrary local branches —
-    # including the Quest's own quest/*/scout/* branch — because a commit
-    # message on the Quest's own branch mentioning its own ID would count as
-    # "proof of landing" and falsely clear a ghost/demote check.
-    candidate_refs = [
-        "castle",
-        "main",
-        "the-gatehouse/north",
-        "the-gatehouse/south",
-        "the-gatehouse/east",
-        "the-gatehouse/west",
-    ]
+    target_branches = ["castle", "main"]
+    for s in ("north", "south", "east", "west"):
+        target_branches.append(f"the-gatehouse/{s}")
 
-    target_refs = []
-    for ref in candidate_refs:
-        if branch and ref == branch:
-            continue  # never accept the quest's own branch as a landing target
-        if _run(["git", "rev-parse", "--verify", f"refs/heads/{ref}"], root).get("ok"):
-            target_refs.append(ref)
+    found_proofs: list[dict] = []
 
-    for ref in target_refs:
-        if branch and _run(["git", "rev-parse", "--verify", branch], root).get("ok"):
-            ancestor_res = _run(["git", "merge-base", "--is-ancestor", branch, ref], root)
-            if ancestor_res.get("exit_code") == 0:
-                log_res = _run(["git", "log", "-n1", "--oneline", f"{ref}"], root)
-                commit_msg = log_res.get("stdout", "")
-                return {
-                    "landed": True,
-                    "matched_ref": ref,
-                    "proof_commit": commit_msg,
-                    "reason": f"Branch {branch} is an ancestor of {ref}",
-                }
+    if branch:
+        for tb in target_branches:
+            anc = _run(["git", "merge-base", "--is-ancestor", branch, tb], root)
+            if anc.get("exit_code") == 0:
+                found_proofs.append({
+                    "target": tb,
+                    "kind": "ancestor",
+                    "detail": f"branch '{branch}' is an ancestor of '{tb}'",
+                })
 
-        log_grep = _run(["git", "log", f"{ref}", f"--grep={short_id}", "--oneline", "-n1"], root)
-        if log_grep.get("ok") and log_grep.get("stdout").strip():
-            return {
-                "landed": True,
-                "matched_ref": ref,
-                "proof_commit": log_grep["stdout"].strip(),
-                "reason": f"Found commit matching {short_id} in {ref} log",
-            }
+    for tb in target_branches:
+        if not _run(["git", "rev-parse", "--verify", f"refs/heads/{tb}"], root).get("ok"):
+            continue
 
-        if concern:
-            concern_slug = concern.replace("_", "-").lower()
-            log_grep_slug = _run(["git", "log", f"{ref}", f"--grep={concern_slug}", "--oneline", "-n1"], root)
-            if log_grep_slug.get("ok") and log_grep_slug.get("stdout").strip():
-                return {
-                    "landed": True,
-                    "matched_ref": ref,
-                    "proof_commit": log_grep_slug["stdout"].strip(),
-                    "reason": f"Found commit matching concern '{concern_slug}' in {ref} log",
-                }
+        log_id = _run(["git", "log", f"-n100", f"--grep={short_id}", "--oneline", tb], root)
+        if log_id.get("ok") and log_id.get("stdout"):
+            for line in log_id["stdout"].splitlines():
+                found_proofs.append({
+                    "target": tb,
+                    "kind": "commit_msg_id",
+                    "detail": line.strip(),
+                })
+
+        if concern and len(concern) >= 4:
+            log_c = _run(["git", "log", f"-n100", f"--grep={concern}", "--oneline", tb], root)
+            if log_c.get("ok") and log_c.get("stdout"):
+                for line in log_c["stdout"].splitlines():
+                    if line.strip() not in [p.get("detail") for p in found_proofs]:
+                        found_proofs.append({
+                            "target": tb,
+                            "kind": "commit_msg_concern",
+                            "detail": line.strip(),
+                        })
 
     return {
-        "landed": False,
-        "matched_ref": None,
-        "proof_commit": None,
-        "reason": "No ancestry or commit log match found in castle, main, or gatehouse station branches.",
+        "quest_id": quest_id,
+        "has_proof": len(found_proofs) > 0,
+        "proofs": found_proofs,
+        "proof_count": len(found_proofs),
+    }
+
+
+def create_git_worktree(
+    worktree_path: str | Path,
+    branch: str,
+    base_branch: str = "castle",
+    cwd: Optional[Path | str] = None,
+) -> dict:
+    """Create a new git worktree on the given branch (cut from base_branch if branch is new)."""
+    root = get_repo_root(cwd)
+    wt_p = Path(worktree_path)
+    if not wt_p.is_absolute():
+        wt_p = root / wt_p
+
+    res_b = _run(["git", "rev-parse", "--verify", branch], root)
+    if res_b.get("ok"):
+        cmd = ["git", "worktree", "add", str(wt_p), branch]
+    else:
+        base_ref = base_branch if _run(["git", "rev-parse", "--verify", base_branch], root).get("ok") else "HEAD"
+        cmd = ["git", "worktree", "add", "-b", branch, str(wt_p), base_ref]
+
+    res = _run(cmd, root)
+    return {
+        "ok": res.get("ok", False),
+        "path": str(wt_p),
+        "branch": branch,
+        "output": (res.get("stdout", "") or res.get("stderr", "")).strip(),
+    }
+
+
+def check_charter_integrity(quest: Any, worktree_path: str | Path, base: str = "castle") -> dict:
+    """Verify that the worktree branch has not modified/tampered with The Kingdom Requires
+    or Expected Tribute text relative to base (e.g. castle).
+
+    Returns dict with:
+      ok: bool
+      tampered: bool
+      violations: list[str]
+      base_file_found: bool
+    """
+    from .models import Quest
+
+    p = Path(worktree_path)
+    if not p.exists() or not p.is_dir():
+        return {"ok": False, "tampered": False, "violations": [], "base_file_found": False}
+
+    quest_id = getattr(quest, "id", str(quest))
+    kind = getattr(quest, "kind", "quest")
+    subdir = "epics" if kind == "epic" else "quests"
+    candidate_rel_paths = [
+        f".court/{subdir}/{quest_id}.md",
+        f".court/archive/{quest_id}.md",
+    ]
+
+    base_text = None
+    for rel_path in candidate_rel_paths:
+        res = _run(["git", "show", f"{base}:{rel_path}"], p)
+        if res.get("ok") and res.get("stdout"):
+            base_text = res["stdout"]
+            break
+
+    if not base_text:
+        return {"ok": True, "tampered": False, "violations": [], "base_file_found": False}
+
+    try:
+        base_quest = Quest.from_markdown(base_text)
+    except Exception:
+        return {"ok": True, "tampered": False, "violations": [], "base_file_found": True}
+
+    violations = []
+
+    # 1. Compare The Kingdom Requires / Goal & Scope
+    def _norm_text(t: str) -> str:
+        return "\n".join(line.strip() for line in t.splitlines() if line.strip())
+
+    base_goal = (base_quest.body_sections.get("The Kingdom Requires") or base_quest.body_sections.get("Goal & Scope") or "").strip()
+    head_goal = (getattr(quest, "body_sections", {}).get("The Kingdom Requires") or getattr(quest, "body_sections", {}).get("Goal & Scope") or "").strip()
+
+    if base_goal and head_goal and _norm_text(base_goal) != _norm_text(head_goal):
+        violations.append(
+            f"Charter tampering detected: '# The Kingdom Requires' text was modified on branch relative to {base} baseline."
+        )
+
+    # 2. Compare Expected Tribute checklist items (ignoring [ ] vs [x])
+    def _extract_checklist_items(text: str) -> list[str]:
+        items = []
+        for line in text.splitlines():
+            m = re.match(r"^\s*[-*+]\s+\[[ xX~-]\]\s+(.+)$", line)
+            if m:
+                items.append(m.group(1).strip())
+        return items
+
+    base_items = _extract_checklist_items(base_quest.body_sections.get("Expected Tribute", ""))
+    head_items = _extract_checklist_items(getattr(quest, "body_sections", {}).get("Expected Tribute", ""))
+
+    if base_items and base_items != head_items:
+        violations.append(
+            f"Charter tampering detected: '# Expected Tribute' checklist items were modified/added/removed on branch relative to {base} baseline."
+        )
+
+    tampered = len(violations) > 0
+    return {
+        "ok": True,
+        "tampered": tampered,
+        "violations": violations,
+        "base_file_found": True,
     }

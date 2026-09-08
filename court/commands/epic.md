@@ -9,7 +9,7 @@ work (that's `/quest`). Follow `.court/templates/vassal_dispatch_prompt.md`:
 
 1. Create the Epic record:
    ```
-   python3 .court/engine/cli.py new --app <app> --concern <concern> \
+   python3 -m court.cli new --app <app> --concern <concern> \
      --title "<short title>" --kind epic --goal "<Epic goal>"
    ```
    Immediately commit the new Epic file to `castle` (e.g. `git add .court/epics/<epic_id>.md && git commit -m "court: create <epic_id> (<title>)"`).

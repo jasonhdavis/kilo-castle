@@ -1,4 +1,4 @@
-from court.models import Quest, STATUSES, SECTIONS, KINDS, now_iso
+from court.models import Quest, STATUSES, SECTIONS, KINDS, DEFAULT_BODY_SECTIONS, LEGACY_SECTION_ALIASES, now_iso
 
 
 def test_quest_initialization_defaults():
@@ -8,8 +8,14 @@ def test_quest_initialization_defaults():
     assert q.app == "platform"
     assert q.concern == "test"
     assert q.tree_branch == "quest/q001-platform-test"
-    assert "History" in q.body_sections
-    assert "Goal & Scope" in q.body_sections
+    assert "Castle Ledger" in q.body_sections
+    assert "The Kingdom Requires" in q.body_sections
+    assert "Expected Tribute" in q.body_sections
+    assert "Tribute Rendered" in q.body_sections
+    assert "Master of Coin's Audit" in q.body_sections
+    assert "Judgement of the Condemned" in q.body_sections
+    assert "Cogship Log" in q.body_sections
+    assert "Audience Log" in q.body_sections
 
 
 def test_scout_branch_generation():
@@ -61,21 +67,61 @@ def test_markdown_serialization_and_deserialization():
         serf_session_id="ses_abc",
         serf_model="Gemini 3.7 Flash",
     )
-    q.set_section("Goal & Scope", "Implement user authentication with JWT.")
+    q.set_section("The Kingdom Requires", "Implement user authentication with JWT.")
     q.set_section("Expected Tribute", "- [ ] Auth service tests pass")
 
     md = q.to_markdown()
     assert "id: Q001-Platform-Auth" in md
     assert "status: WORKING" in md
-    assert "# Goal & Scope\n\nImplement user authentication with JWT." in md
+    assert "## The Kingdom Requires\n\nImplement user authentication with JWT." in md
 
     parsed = Quest.from_markdown(md)
     assert parsed.id == q.id
     assert parsed.title == q.title
     assert parsed.status == "WORKING"
     assert parsed.branch == "quest/q001-platform-auth"
-    assert parsed.body_sections["Goal & Scope"] == "Implement user authentication with JWT."
+    assert parsed.body_sections["The Kingdom Requires"] == "Implement user authentication with JWT."
     assert parsed.body_sections["Expected Tribute"] == "- [ ] Auth service tests pass"
+
+
+def test_legacy_markdown_deserialization_and_alias_mapping():
+    legacy_md = """---
+id: Q001-Legacy-Test
+title: Legacy Quest
+kind: quest
+app: legacy
+concern: test
+status: REVIEW
+---
+
+# Q001-Legacy-Test — Legacy Quest
+
+# History
+- 2026-09-01 — Created
+
+# Goal & Scope
+Old goal content.
+
+# Expected Tribute
+Old expected tribute.
+
+# Tribute Rendered
+Old tribute rendered.
+
+# Master of Coin Review
+Old review notes.
+
+# Gatekeeper Review
+Old gatekeeper notes.
+"""
+    parsed = Quest.from_markdown(legacy_md)
+    assert parsed.id == "Q001-Legacy-Test"
+    assert parsed.status == "REVIEW"
+    # Aliased sections
+    assert "Old goal content." in parsed.body_sections["The Kingdom Requires"]
+    assert "Old review notes." in parsed.body_sections["Master of Coin's Audit"]
+    assert "Old gatekeeper notes." in parsed.body_sections["Cogship Log"]
+    assert "- 2026-09-01 — Created" in parsed.body_sections["Castle Ledger"]
 
 
 def test_scout_report_subsection_extraction():
@@ -146,23 +192,23 @@ def test_status_transition_and_history():
     q = Quest(id="Q001-Test-Status", title="Test Status", app="test", concern="status")
     q.set_status("PLANNED", "Ready for dispatch")
     assert q.status == "PLANNED"
-    assert "PLANNED" in q.body_sections["History"]
+    assert "PLANNED" in q.body_sections["Castle Ledger"]
 
     q.set_status("WORKING", "Serf active")
     assert q.status == "WORKING"
-    assert "WORKING" in q.body_sections["History"]
+    assert "WORKING" in q.body_sections["Castle Ledger"]
 
 
 def test_set_section_append_and_replace():
     q = Quest(id="Q001-Test-Section", title="Test Section", app="test", concern="section")
-    q.set_section("Goal & Scope", "Line 1")
-    assert q.body_sections["Goal & Scope"] == "Line 1"
+    q.set_section("The Kingdom Requires", "Line 1")
+    assert q.body_sections["The Kingdom Requires"] == "Line 1"
 
-    q.set_section("Goal & Scope", "Line 2", mode="append")
-    assert q.body_sections["Goal & Scope"] == "Line 1\n\nLine 2"
+    q.set_section("The Kingdom Requires", "Line 2", mode="append")
+    assert q.body_sections["The Kingdom Requires"] == "Line 1\n\nLine 2"
 
-    q.set_section("Goal & Scope", "Replaced", mode="replace")
-    assert q.body_sections["Goal & Scope"] == "Replaced"
+    q.set_section("The Kingdom Requires", "Replaced", mode="replace")
+    assert q.body_sections["The Kingdom Requires"] == "Replaced"
 
 
 def test_punished_status_is_recognized():
@@ -170,16 +216,15 @@ def test_punished_status_is_recognized():
     q = Quest(id="Q040-Test-Punished", title="Punished Quest", app="test", concern="punished")
     q.set_status("PUNISHED", "Master of Coin rejected this audit")
     assert q.status == "PUNISHED"
-    assert "PUNISHED" in q.body_sections["History"]
+    assert "PUNISHED" in q.body_sections["Castle Ledger"]
 
 
 def test_judgement_of_the_condemned_section_present_by_default():
     q = Quest(id="Q041-Test-Judgement", title="Judgement Quest", app="test", concern="judgement")
     assert "Judgement of the Condemned" in q.body_sections
-    # Existing canonical section names must not have been renamed away.
-    assert "Goal & Scope" in q.body_sections
-    assert "Master of Coin Review" in q.body_sections
-    assert "Gatekeeper Review" in q.body_sections
+    assert "The Kingdom Requires" in q.body_sections
+    assert "Master of Coin's Audit" in q.body_sections
+    assert "Cogship Log" in q.body_sections
 
 
 def test_new_frontmatter_fields_roundtrip_through_markdown():
@@ -208,7 +253,7 @@ def test_new_frontmatter_fields_roundtrip_through_markdown():
     assert "task_file: tasks/apps/test/plan.md" in md
     assert "pillory_of: Q039-Test-Predecessor" in md
     assert "pilloried_by: Q043-Test-Successor" in md
-    assert "# Judgement of the Condemned" in md
+    assert "## Judgement of the Condemned" in md
     assert "Missing tests" in md
 
     parsed = Quest.from_markdown(md)
@@ -229,6 +274,7 @@ def test_validate_branch_name():
     assert validate_branch_name("castle")[0] is True
     assert validate_branch_name("main")[0] is True
     assert validate_branch_name("the-gatehouse/north")[0] is True
+    assert validate_branch_name("the-gatehouse/cogship-042")[0] is True
     assert validate_branch_name("quest/q001-platform-auth")[0] is True
     assert validate_branch_name("epic/q010-auth-migration")[0] is True
     assert validate_branch_name("scout/q005-marketplace-fingerprint")[0] is True

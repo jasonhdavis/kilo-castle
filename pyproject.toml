@@ -44,5 +44,6 @@ court = [
     "templates/*.md",
     "commands/*.md",
     "prompts/*.md",
+    "agents/*.md",
     "assets/*",
 ]

@@ -14,5 +14,6 @@ exactly:
    yourself, say so plainly and ask M'lord to open a fresh session tab on
    that worktree in the Agent Manager UI. Do NOT create a second
    worktree/branch as a workaround — that forks the Quest's implementation.
-4. Log it: `python3 .court/engine/cli.py log <quest_id> "Dismissed serf X, dispatched fresh serf Y"`
+4. Log it: `python3 -m court.cli log <quest_id> "Dismissed serf X, dispatched fresh serf Y"`
    and add a one-line entry to `.court/LEDGER.md`'s "Serf/Vassal churn log".
+5. When dispatching a fresh Serf session, always ensure it is started with GLM 5.3 Flash (`model: "GLM-5.3-Flash"`, `provider: "openrouter"`).

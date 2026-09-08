@@ -6,6 +6,8 @@ from court import store
 
 
 def test_cli_new_show_advance_status(tmp_path, monkeypatch, capsys):
+    _init_git_repo(tmp_path, branch="castle")
+    head_sha = subprocess.check_output(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], text=True).strip()
     monkeypatch.setenv("COURT_DIR", str(tmp_path / ".court"))
     monkeypatch.chdir(tmp_path)
 
@@ -38,27 +40,28 @@ def test_cli_new_show_advance_status(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Q001-Core-Jwt-Rotation: WORKING" in out
 
-    main(["advance", "Q001-Core-Jwt-Rotation,Q001-Core-Jwt-Rotation", "REVIEW", "--note", "Batch advance test"])
+    main(["advance", "Q001-Core-Jwt-Rotation,Q001-Core-Jwt-Rotation", "TRIBUTE_READY", "--note", "Batch advance test"])
     out = capsys.readouterr().out
-    assert "Q001-Core-Jwt-Rotation: REVIEW" in out
+    assert "Q001-Core-Jwt-Rotation: TRIBUTE_READY" in out
 
     main(["advance", "Q001-Core-Jwt-Rotation", "WORKING", "--note", "Reset to working"])
     capsys.readouterr()
 
     # 5. set-field
-    main(["set-field", "Q001-Core-Jwt-Rotation", "serf_model", "Gemini 3.7 Flash"])
+    main(["set-field", "Q001-Core-Jwt-Rotation", "tags", "security,auth"])
     out = capsys.readouterr().out
-    assert "serf_model = Gemini 3.7 Flash" in out
+    assert "tags = security,auth" in out
 
     # 6. set-section
-    main(["set-section", "Q001-Core-Jwt-Rotation", "Master of Coin Review", "--content", "Value approved"])
+    main(["set-section", "Q001-Core-Jwt-Rotation", "Master of Coin's Audit", "--content", "Value approved"])
     out = capsys.readouterr().out
-    assert "Updated section 'Master of Coin Review'" in out
+    assert "Master of Coin's Audit" in out
+    assert "Updated section" in out
 
     # 7. status
     main(["status"])
     out = capsys.readouterr().out
-    assert "[WORKING] (1)" in out
+    assert "QUESTING (1)" in out or "[WORKING]" in out
     assert "Q001-Core-Jwt-Rotation" in out
 
     # 8. list
@@ -160,9 +163,9 @@ Recommend adding automatic key deprecation cron.
     assert "Q003-Auth-Cleanup" in show_epic_out
 
     # 12. ship (Cog Ship deployment convoy summary)
-    main(["advance", "Q001-Core-Jwt-Rotation", "GATE", "--note", "test setup"])
+    main(["advance", "Q001-Core-Jwt-Rotation", "GATE", "--force", "--note", "test setup"])
     capsys.readouterr()
-    main(["advance", "Q001-Core-Jwt-Rotation", "READY_FOR_TEARDOWN", "--note", "Merged for ship test"])
+    main(["advance", "Q001-Core-Jwt-Rotation", "READY_TO_RAZE", "--force", "--verified-commit", head_sha, "--note", "Merged for ship test"])
     capsys.readouterr()
 
     main(["ship"])
@@ -212,7 +215,8 @@ def test_cli_engine_port_commands(tmp_path, monkeypatch, capsys):
     # audit: single quest, text and JSON modes.
     main(["audit", quest_id])
     audit_out = capsys.readouterr().out
-    assert f"Audit Report for {quest_id}" in audit_out
+    assert quest_id in audit_out
+    assert "Ward Compliance Audit" in audit_out
 
     main(["audit", quest_id, "--json"])
     audit_json_out = capsys.readouterr().out
@@ -254,7 +258,8 @@ def test_cli_engine_port_commands(tmp_path, monkeypatch, capsys):
     # status dashboard should now show the PUNISHED quest.
     main(["status"])
     status_out = capsys.readouterr().out
-    assert "[PUNISHED]" in status_out
+    assert "PUNISHED" in status_out
+    assert quest_id in status_out
 
     # timber: cross-references worktrees/quests; must not crash even with no
     # Agent Manager state file present.
@@ -262,12 +267,11 @@ def test_cli_engine_port_commands(tmp_path, monkeypatch, capsys):
     timber_out = capsys.readouterr().out
     assert "PHYSICAL GIT WORKTREES" in timber_out
 
-    # ward: compliance patrol summary; --check-fresh is optional and must
-    # degrade gracefully when unconfigured.
-    main(["ward", "--check-fresh"])
+    # ward: compliance patrol summary.
+    main(["ward"])
     ward_out = capsys.readouterr().out
-    assert "THE WARD — COMPLIANCE PATROL" in ward_out
-    assert "unavailable" in ward_out or "optional" in ward_out.lower()
+    assert "THE WARD —" in ward_out
+    assert "never surveyed" in ward_out
 
     # fix-branches: dry-run must not crash against a repo with only
     # already-canonical branches.

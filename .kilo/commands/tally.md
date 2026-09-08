@@ -5,7 +5,7 @@ agent: steward
 Arguments: $ARGUMENTS
 
 Follow the Tally Protocol:
-1. Run `python3 .court/engine/cli.py tally $ARGUMENTS` to deterministically extract all Tally sections across target Quests.
+1. Run `python3 -m court.cli tally $ARGUMENTS` to deterministically extract all Tally sections across target Quests.
 2. Synthesize the extracted verification instructions into a clear, actionable human QA and verification guide:
    - **Target Quest and Domain**
    - **Production and Staging UI Navigation Paths**: Exact URLs, routes, and query parameters.

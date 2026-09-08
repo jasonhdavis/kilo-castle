@@ -1,11 +1,14 @@
 """
 The Ward — Deterministic Information Presence, Gap Verification, and Compliance Auditor.
 
+This is the Court's internal compliance subsystem, patrolled by Warden agents
+and surfaced to the Steward via `court ward`.
+
 Audits Quests, Epics, and Scouts for:
 1. 6-part Serf Tribute presence (Ballad, Tribute, Tally, Penance, Audience, Opinion)
    or 5-part Scout Report presence (Survey, Map, Dangers, Tribute, Plot).
-2. Protocol compliance: base drift (behind > 0 vs the base branch), dirty working tree
-   state, branch naming folder hierarchy, and frontmatter/worktree mappings.
+2. Protocol compliance: Base drift (behind > 0 vs base branch), dirty working tree state,
+   branch naming folder hierarchy, and frontmatter/worktree mappings.
 3. Artifact presence: verified deliverables on disk.
 4. Worktree task markdown checklist progress (tasks/*.md, .court/quests/*.md, .kilo/plans/*.md).
 
@@ -16,38 +19,49 @@ compliance summary used by `court ward`.
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from court import git_ops, store
-from court.models import Quest, validate_branch_name
+from . import git_ops, store
+from .models import STATUSES, Quest, validate_branch_name
 
 SERF_REQUIRED_SECTIONS = ("ballad", "tribute", "tally", "penance", "audience", "opinion")
 SCOUT_REQUIRED_SECTIONS = ("survey", "map", "dangers", "tribute", "plot")
 
-# The 5-part Warden Report format (Survey, Stack Trace, Impact/Affected Accounts,
-# Root Cause Diagnosis, Proposed Fix/Remit).
 WARDEN_REPORT_SECTIONS = ("survey", "stack_trace", "impact", "root_cause", "proposed_fix")
 
 
+@dataclass(frozen=True)
 class WardViolation(str):
-    """A single blocking compliance violation surfaced by the Ward.
+    message: str = ""
+    blocking: bool = True
 
-    Subclasses `str` so every existing consumer (f-string interpolation,
-    `"text" in violation` membership checks, JSON serialization via
-    `dataclasses.asdict()`/`json.dumps()`) keeps working unmodified while the
-    type carries a distinct, documented name in the engine's public surface.
-    """
+    def __new__(cls, message: str = "", blocking: bool = True):
+        obj = str.__new__(cls, message)
+        return obj
 
-    __slots__ = ()
+    def __str__(self) -> str:
+        return self.message or str.__str__(self)
+
+    def lower(self) -> str:
+        return (self.message or str.__str__(self)).lower()
 
 
+@dataclass(frozen=True)
 class WardWarning(str):
-    """A single non-blocking compliance warning surfaced by the Ward. See `WardViolation`."""
+    message: str = ""
+    blocking: bool = False
 
-    __slots__ = ()
+    def __new__(cls, message: str = "", blocking: bool = False):
+        obj = str.__new__(cls, message)
+        return obj
 
+    def __str__(self) -> str:
+        return self.message or str.__str__(self)
+
+    def lower(self) -> str:
+        return (self.message or str.__str__(self)).lower()
 
 _PLACEHOLDER_PATTERNS = [
     re.compile(r"^\s*\[?(?:pending|todo|tbd|none yet|tribute rendered)\]?\s*$", re.I),
@@ -55,13 +69,8 @@ _PLACEHOLDER_PATTERNS = [
     re.compile(r"^\s*<!--.*?-->\s*$", re.DOTALL),
 ]
 
-CHECKLIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[\.\)])\s+\[([ xX~-])\]\s+(.+)$")
-HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
-PHASE_RE = re.compile(r"\b(Phase\s+\d+|Milestone\s+\d+|Step\s+\d+|Part\s+\d+)(?::|\s*-|\s*—)?\s*(.*)", re.I)
 
-
-def is_placeholder(text: str) -> bool:
-    """Check if section content is empty or merely placeholder text."""
+def _is_placeholder_or_empty(text: str) -> bool:
     trimmed = text.strip()
     if not trimmed:
         return True
@@ -71,372 +80,367 @@ def is_placeholder(text: str) -> bool:
     return False
 
 
-def parse_markdown_checklist(content: str, filepath: str = "") -> dict:
-    """Parse markdown checklist items (- [ ] / - [x]) and track active phases/headings.
-
-    Returns dict with:
-    total, completed, pending, cancelled, percent, active_phase, active_heading, summary, items, file.
+def check_tribute_sections(quest: Quest) -> tuple[bool, list[str], list[str], dict[str, str]]:
     """
-    total = 0
-    completed = 0
-    pending = 0
+    Check for presence of required subsections in Tribute Rendered.
+    Returns:
+        (tribute_present, present_sections, missing_sections, extracted_dict)
+    """
+    raw_tribute = quest.body_sections.get("Tribute Rendered", "").strip()
+    if not raw_tribute or _is_placeholder_or_empty(raw_tribute):
+        return False, [], list(SERF_REQUIRED_SECTIONS), {}
+
+    is_scout = (quest.kind == "scout") or (quest.section == "Investigation")
+    req_secs = SCOUT_REQUIRED_SECTIONS if is_scout else SERF_REQUIRED_SECTIONS
+
+    extracted = {}
+    present = []
+    missing = []
+
+    for sec in req_secs:
+        val = quest.extract_tribute_subsection(sec)
+        if val and not _is_placeholder_or_empty(val):
+            extracted[sec] = val
+            present.append(sec)
+        else:
+            missing.append(sec)
+
+    return True, present, missing, extracted
+
+
+def is_placeholder(text: str) -> bool:
+    return _is_placeholder_or_empty(text)
+
+
+def parse_markdown_checklist(markdown_content: str, filepath: Optional[str] = None) -> dict[str, Any]:
+    """Parse markdown text for task checklists (- [ ] / - [x] / - [~])."""
+    checked = 0
+    unchecked = 0
     cancelled = 0
-    items: list[dict] = []
-
-    current_heading = ""
-    current_phase = ""
     active_phase = ""
-    active_heading = ""
+    current_phase = ""
 
-    lines = content.splitlines()
-    for line_idx, line in enumerate(lines, 1):
-        line_str = line.strip()
-
-        # Track markdown headings
-        hm = HEADING_RE.match(line_str)
-        if hm:
-            current_heading = hm.group(2).strip()
-            pm = PHASE_RE.search(current_heading)
-            if pm:
-                phase_label = pm.group(1).strip()
-                phase_desc = pm.group(2).strip()
-                current_phase = f"{phase_label}: {phase_desc}" if phase_desc else phase_label
-            continue
-
-        # Track checklist items
-        cm = CHECKLIST_ITEM_RE.match(line)
-        if cm:
-            mark = cm.group(1)
-            item_text = cm.group(2).strip()
-            is_done = (mark in ("x", "X"))
-            is_cancelled = (mark in ("-", "~"))
-
-            total += 1
-            if is_done:
-                completed += 1
-            elif is_cancelled:
-                cancelled += 1
-            else:
-                pending += 1
-                if not active_phase and current_phase:
+    for line in markdown_content.splitlines():
+        line_s = line.strip()
+        m_phase = re.match(r"^#{1,3}\s+(.+)$", line_s)
+        if m_phase:
+            header_text = m_phase.group(1).strip()
+            if "phase" in header_text.lower():
+                current_phase = header_text
+                if not active_phase:
                     active_phase = current_phase
-                if not active_heading and current_heading:
-                    active_heading = current_heading
 
-            items.append({
-                "text": item_text,
-                "completed": is_done,
-                "cancelled": is_cancelled,
-                "heading": current_heading,
-                "phase": current_phase,
-                "line": line_idx,
-                "file": str(filepath),
-            })
+        if re.match(r"^[-*]\s+\[[xX]\]", line_s):
+            checked += 1
+        elif re.match(r"^[-*]\s+\[\s\]", line_s):
+            unchecked += 1
+            if current_phase and not active_phase:
+                active_phase = current_phase
+        elif re.match(r"^[-*]\s+\[[~-]\]", line_s):
+            cancelled += 1
 
-    # If no pending items were encountered to set active_phase, infer from state
-    if total > 0 and not active_phase:
-        if pending == 0 and completed > 0:
-            active_phase = "Complete" if not current_phase else f"{current_phase} (Complete)"
-        elif current_phase:
-            active_phase = current_phase
-
-    if not active_heading and current_heading:
-        active_heading = current_heading
-
-    percent = round((completed / total) * 100.0, 1) if total > 0 else 0.0
-    summary = f"{completed}/{total} ({percent:.0f}%)" if total > 0 else "0/0 (0%)"
-
+    total = checked + unchecked + cancelled
+    pct = int((checked / total) * 100) if total > 0 else 0
     return {
-        "total": total,
-        "completed": completed,
-        "pending": pending,
+        "filepath": filepath,
+        "file": filepath,
+        "checked": checked,
+        "completed": checked,
+        "unchecked": unchecked,
+        "pending": unchecked,
         "cancelled": cancelled,
-        "percent": percent,
-        "active_phase": active_phase,
-        "active_heading": active_heading,
-        "summary": summary,
-        "items": items,
-        "file": str(filepath),
+        "total": total,
+        "percent": pct,
+        "active_phase": active_phase or "Phase 1",
     }
 
 
-def discover_worktree_task_files(
-    worktree_path: str | Path,
-    app: str = "",
-    quest_id: str = "",
-) -> list[Path]:
-    """Find all candidate task and plan markdown files in an active worktree."""
+def discover_worktree_task_files(worktree_path: str | Path, app: Optional[str] = None) -> list[Path]:
+    """Discover task checklist markdown files within a worktree."""
     wt = Path(worktree_path)
-    if not wt.exists() or not wt.is_dir():
+    if not wt.is_dir():
         return []
-
     candidates: list[Path] = []
-    seen: set[Path] = set()
-
-    def _add(p: Path):
-        if p.is_file() and p not in seen:
-            seen.add(p)
-            candidates.append(p)
-
-    # 1. Worktree quest/epic markdown file
-    if quest_id:
-        for d in (wt / ".court" / "quests", wt / ".court" / "epics"):
-            if d.is_dir():
-                exact = d / f"{quest_id}.md"
-                if exact.is_file():
-                    _add(exact)
-                bare = quest_id.lstrip("Qq").partition("-")[0]
-                if bare.isdigit():
-                    prefix = f"Q{int(bare):03d}-"
-                    for qp in d.glob(f"{prefix}*.md"):
-                        _add(qp)
-
-    # 2. Check git status for modified/untracked markdown files in tasks/ or plans/
-    status_res = git_ops._run(["git", "status", "--porcelain=v1", "-uall"], wt)
-    if status_res.get("ok"):
-        for line in status_res.get("stdout", "").splitlines():
-            if len(line) >= 3:
-                fpath_str = line[3:].strip()
-                if " -> " in fpath_str:
-                    fpath_str = fpath_str.split(" -> ")[1].strip()
-                if fpath_str.endswith(".md"):
-                    if fpath_str.startswith("tasks/") or fpath_str.startswith(".kilo/plans/") or fpath_str.startswith(".court/"):
-                        p = wt / fpath_str
-                        if p.is_file():
-                            _add(p)
-
-    # 3. Project-specific task plans under tasks/apps/<app>/*.md — a common
-    # convention, only activated if the worktree actually uses this layout.
-    # No hardcoded app names: this is purely a directory-presence check.
-    apps_root = wt / "tasks" / "apps"
-    if apps_root.is_dir():
-        if app:
-            app_tasks_dir = apps_root / app.lower()
-            if app_tasks_dir.is_dir():
-                for p in sorted(app_tasks_dir.glob("*.md"), reverse=True):
-                    _add(p)
-        for p in sorted(apps_root.glob("*/*.md"), reverse=True):
-            _add(p)
-
-    # 4. Root task files in tasks/
-    tasks_root = wt / "tasks"
-    if tasks_root.is_dir():
-        for fname in ("ACTIVE.md", "PLANNING.md", "BACKLOG.md"):
-            p = tasks_root / fname
-            if p.is_file():
-                _add(p)
-        for p in sorted(tasks_root.glob("*.md")):
-            _add(p)
-
-    # 5. .kilo/plans/*.md
-    plans_dir = wt / ".kilo" / "plans"
-    if plans_dir.is_dir():
-        for p in sorted(plans_dir.glob("*.md")):
-            _add(p)
-
+    search_dirs = [wt / "tasks", wt / ".kilo" / "plans"]
+    if app:
+        search_dirs.append(wt / "tasks" / "apps" / app)
+    for d in search_dirs:
+        if d.is_dir():
+            for p in sorted(d.glob("**/*.md")):
+                if p.is_file() and p not in candidates:
+                    candidates.append(p)
     return candidates
 
 
-def get_worktree_task_progress(
-    worktree_path: Optional[str | Path] = None,
+def parse_worktree_task_progress(
+    worktree_path: str | Path = "",
     quest: Optional[Quest] = None,
-    app: str = "",
-    quest_id: str = "",
+    task_file_rel: Optional[str] = None,
+    app: Optional[str] = None,
+    quest_id: Optional[str] = None,
+    **kwargs,
 ) -> dict:
-    """Discover task files in worktree and compute real-time checklist progress."""
-    wt_path = Path(worktree_path) if worktree_path else None
-    qid = quest_id or (quest.id if quest else "")
-    app_name = app or (quest.app if quest else "")
+    """Discover and parse task checklist progress within a worktree."""
+    if not worktree_path and quest:
+        found_wt = git_ops.find_worktree_for_quest(quest)
+        if found_wt:
+            worktree_path = found_wt
 
-    quest_checklist: dict = {}
-    plan_checklist: dict = {}
-    files_inspected: list[str] = []
+    wt = Path(worktree_path) if worktree_path else None
+    if not wt or not wt.exists() or not wt.is_dir():
+        if quest:
+            expected_tribute = quest.body_sections.get("Expected Tribute", "")
+            if expected_tribute:
+                parsed_et = parse_markdown_checklist(expected_tribute)
+                if parsed_et["total"] > 0:
+                    return {
+                        "task_file": f".court/quests/{quest.id}.md (Expected Tribute)",
+                        "checked": parsed_et["checked"],
+                        "completed": parsed_et["completed"],
+                        "unchecked": parsed_et["unchecked"],
+                        "pending": parsed_et["pending"],
+                        "total": parsed_et["total"],
+                        "percent": parsed_et["percent"],
+                        "source": "expected_tribute",
+                    }
+        return {
+            "task_file": None,
+            "checked": 0,
+            "completed": 0,
+            "unchecked": 0,
+            "pending": 0,
+            "total": 0,
+            "percent": 0,
+            "source": "none",
+        }
 
-    # 1. Parse Quest's own Expected Tribute (from quest obj or worktree file)
-    quest_text = ""
+    quest_checklist = None
     if quest:
-        quest_text = quest.body_sections.get("Expected Tribute", "")
-    elif wt_path and wt_path.is_dir() and qid:
-        q_file = wt_path / ".court" / "quests" / f"{qid}.md"
-        if not q_file.exists():
-            q_file = wt_path / ".court" / "epics" / f"{qid}.md"
-        if q_file.is_file():
+        expected_tribute = quest.body_sections.get("Expected Tribute", "")
+        if expected_tribute:
+            parsed_et = parse_markdown_checklist(expected_tribute)
+            if parsed_et["total"] > 0:
+                quest_checklist = parsed_et
+
+    matched_plan = None
+    plan_checklist = None
+
+    if task_file_rel:
+        candidate = wt / task_file_rel
+        if candidate.is_file():
             try:
-                loaded_q = Quest.from_markdown(q_file.read_text(encoding="utf-8"))
-                quest_text = loaded_q.body_sections.get("Expected Tribute", "")
+                content = candidate.read_text(encoding="utf-8")
+                parsed = parse_markdown_checklist(content)
+                if parsed["total"] > 0:
+                    matched_plan = task_file_rel
+                    plan_checklist = parsed
             except Exception:
                 pass
 
-    if quest_text:
-        quest_checklist = parse_markdown_checklist(
-            quest_text,
-            filepath=f".court/quests/{qid}.md" if qid else "quest.md",
-        )
+    if not matched_plan:
+        short_qid = quest.id.split("-")[0].lower() if quest else None
+        concern_slug = quest.concern.lower() if quest else None
+        app_name = quest.app.lower() if quest else None
 
-    # 2. Discover worktree task files if worktree path is available
-    matched_plan = False
-    if wt_path and wt_path.is_dir():
-        candidate_files = discover_worktree_task_files(wt_path, app=app_name, quest_id=qid)
-        short_qid = qid.split("-")[0].lower() if qid else ""
-        concern_slug = quest.concern.lower().replace("-", "_") if (quest and quest.concern) else ""
+        candidates: list[Path] = []
+        seen: set[Path] = set()
 
-        # Check git status for modified/untracked files in this worktree
-        modified_files: set[str] = set()
-        status_res = git_ops._run(["git", "status", "--porcelain=v1", "-uall"], wt_path)
+        def _add(p: Path):
+            if p not in seen and p.is_file():
+                seen.add(p)
+                candidates.append(p)
+
+        # 1. Look in worktree root .court/quests/
+        if short_qid:
+            court_quests = wt / ".court" / "quests"
+            if court_quests.is_dir():
+                for p in court_quests.glob(f"{short_qid.upper()}*.md"):
+                    _add(p)
+
+        # 2. Check git status for recently modified markdown files
+        status_res = git_ops._run(["git", "status", "--porcelain=v1", "-uall"], wt)
+        modified_files: list[str] = []
         if status_res.get("ok"):
             for line in status_res.get("stdout", "").splitlines():
                 if len(line) >= 3:
-                    fpath = line[3:].strip()
-                    if " -> " in fpath:
-                        fpath = fpath.split(" -> ")[1].strip()
-                    modified_files.add(fpath)
+                    f_rel = line[3:].strip()
+                    if f_rel.endswith(".md"):
+                        modified_files.append(f_rel)
+                        p = wt / f_rel
+                        if p.is_file():
+                            _add(p)
 
-        for cf in candidate_files:
+        # 3. App-specific task plans in tasks/apps/<app>/
+        if app_name:
+            app_tasks_dir = wt / "tasks" / "apps" / app_name
+            if app_tasks_dir.is_dir():
+                for p in sorted(app_tasks_dir.glob("*.md"), reverse=True):
+                    _add(p)
+
+        # 4. Other app task plans in tasks/apps/*/*.md
+        all_apps_dir = wt / "tasks" / "apps"
+        if all_apps_dir.is_dir():
+            for p in sorted(all_apps_dir.glob("*/*.md"), reverse=True):
+                _add(p)
+
+        # 5. Root task files in tasks/
+        tasks_root = wt / "tasks"
+        if tasks_root.is_dir():
+            for fname in ("ACTIVE.md", "PLANNING.md", "BACKLOG.md"):
+                p = tasks_root / fname
+                if p.is_file():
+                    _add(p)
+            for p in sorted(tasks_root.glob("*.md")):
+                _add(p)
+
+        # 6. .kilo/plans/*.md
+        plans_dir = wt / ".kilo" / "plans"
+        if plans_dir.is_dir():
+            for p in sorted(plans_dir.glob("*.md")):
+                _add(p)
+
+        for cf in candidates:
             try:
-                rel_path = str(cf.relative_to(wt_path))
+                rel_path = str(cf.relative_to(wt))
             except ValueError:
                 rel_path = str(cf)
-            files_inspected.append(rel_path)
 
-            # If this candidate is the quest file itself and we already parsed it, skip
-            if cf.name == f"{qid}.md" or (qid and short_qid in cf.stem.lower() and ".court" in str(cf)):
+            if rel_path.startswith(".court/quests/") or rel_path.startswith(".court/archive/"):
                 continue
 
-            # Check if this file is specifically matched to this quest
+            try:
+                content = cf.read_text(encoding="utf-8")
+            except Exception:
+                continue
+
+            parsed = parse_markdown_checklist(content)
+            if parsed["total"] == 0:
+                continue
+
             is_specific_match = False
-            norm_path = str(cf).lower().replace("\\", "/")
             if short_qid and short_qid in cf.stem.lower():
                 is_specific_match = True
             elif concern_slug and (concern_slug in cf.stem.lower() or concern_slug.replace("_", "-") in cf.stem.lower()):
                 is_specific_match = True
             elif rel_path in modified_files:
                 is_specific_match = True
-            elif app_name and f"tasks/apps/{app_name.lower()}" in norm_path:
-                is_specific_match = True
 
-            # If not already found a plan checklist with items, check this file
             if not plan_checklist or plan_checklist.get("total", 0) == 0 or (is_specific_match and not matched_plan):
-                try:
-                    content = cf.read_text(encoding="utf-8", errors="replace")
-                    parsed = parse_markdown_checklist(content, filepath=rel_path)
-                    if parsed.get("total", 0) > 0:
-                        plan_checklist = parsed
-                        if is_specific_match:
-                            matched_plan = True
-                except Exception:
-                    pass
+                matched_plan = rel_path
+                plan_checklist = parsed
+                if is_specific_match:
+                    break
 
-    # 3. Determine primary progress:
-    # Prefer quest_checklist (e.g. Expected Tribute) over external worktree plans unless matched.
-    if quest_checklist and quest_checklist.get("total", 0) > 0 and not matched_plan:
-        primary = quest_checklist
-    elif plan_checklist and plan_checklist.get("total", 0) > 0:
-        primary = plan_checklist
-    elif quest_checklist and quest_checklist.get("total", 0) > 0:
-        primary = quest_checklist
-    else:
-        primary = plan_checklist or quest_checklist
+    if plan_checklist and plan_checklist["total"] > 0:
+        return {
+            "task_file": matched_plan,
+            "checked": plan_checklist["checked"],
+            "unchecked": plan_checklist["unchecked"],
+            "total": plan_checklist["total"],
+            "percent": plan_checklist["percent"],
+            "source": "task_file",
+        }
 
-    total = primary.get("total", 0) if primary else 0
-    completed = primary.get("completed", 0) if primary else 0
-    pending = primary.get("pending", 0) if primary else 0
-    percent = primary.get("percent", 0.0) if primary else 0.0
-    active_phase = primary.get("active_phase", "") if primary else ""
-    active_heading = primary.get("active_heading", "") if primary else ""
-    summary = primary.get("summary", "0/0 (0%)") if primary else "0/0 (0%)"
-    primary_file = primary.get("file", "") if primary else ""
-    items = primary.get("items", []) if primary else []
-
-    found = total > 0
+    if quest_checklist and quest_checklist["total"] > 0:
+        return {
+            "task_file": f".court/quests/{quest.id}.md (Expected Tribute)",
+            "checked": quest_checklist["checked"],
+            "unchecked": quest_checklist["unchecked"],
+            "total": quest_checklist["total"],
+            "percent": quest_checklist["percent"],
+            "source": "expected_tribute",
+        }
 
     return {
-        "found": found,
-        "file": primary_file,
-        "total": total,
-        "completed": completed,
-        "pending": pending,
-        "percent": percent,
-        "active_phase": active_phase,
-        "active_heading": active_heading,
-        "summary": summary,
-        "items": items,
-        "quest_checklist": quest_checklist,
-        "plan_checklist": plan_checklist,
-        "files_inspected": files_inspected,
+        "task_file": matched_plan,
+        "checked": 0,
+        "unchecked": 0,
+        "total": 0,
+        "percent": 0,
+        "source": "none",
     }
+
+
+get_worktree_task_progress = parse_worktree_task_progress
 
 
 @dataclass
 class WardAudit:
-    quest_id: str
-    title: str
-    kind: str
-    status: str
-    section: str
-    branch: str
-    worktree: str
-    is_compliant: bool
+    quest: Quest
+    worktree_path: Optional[str]
+    git_status: dict
+    task_progress: dict
     tribute_present: bool
-    sections_present: list[str] = field(default_factory=list)
-    missing_sections: list[str] = field(default_factory=list)
-    violations: list[str] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
-    git_status: dict = field(default_factory=dict)
-    artifacts_checked: list[dict] = field(default_factory=list)
-    task_progress: dict = field(default_factory=dict)
+    present_sections: list[str]
+    missing_sections: list[str]
+    extracted_sections: dict[str, str]
+    test_proof_found: bool
+    artifacts_checked: list[dict]
+    violations: list[WardViolation] = field(default_factory=list)
+    warnings: list[WardWarning] = field(default_factory=list)
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+    @property
+    def sections_present(self) -> list[str]:
+        return self.present_sections
+
+    @property
+    def quest_id(self) -> str:
+        return self.quest.id
+
+    @property
+    def is_compliant(self) -> bool:
+        return len(self.violations) == 0
 
     def summary_badge(self) -> str:
         if not self.violations:
             return "COMPLIANT" if self.tribute_present else "IN PROGRESS"
         return "NON-COMPLIANT"
 
+    def to_dict(self) -> dict:
+        return {
+            "quest_id": self.quest.id,
+            "status": self.quest.status,
+            "is_compliant": self.is_compliant,
+            "summary": self.summary_badge(),
+            "violations": [str(v) for v in self.violations],
+            "warnings": [str(w) for w in self.warnings],
+            "git_status": self.git_status,
+            "task_progress": self.task_progress,
+            "tribute_present": self.tribute_present,
+            "present_sections": self.present_sections,
+            "missing_sections": self.missing_sections,
+        }
+
     def format_report(self) -> str:
         lines = [
-            f"Audit Report for {self.quest_id}: {self.title}",
-            f"Kind: {self.kind} | Status: [{self.status}] | Section: {self.section or '-'}",
-            f"Branch: {self.branch or '-'} | Worktree: {self.worktree or '-'}",
-            f"Compliance Verdict: {self.summary_badge()}",
+            f"=== Ward Compliance Audit: {self.quest.id} ({self.quest.title}) ===",
+            f"Status: {self.quest.status} | Branch: {self.quest.branch or '-'} | Worktree: {self.worktree_path or '-'}",
+            f"Result: {self.summary_badge()}",
+            "",
+            "1. Information & Tribute Presence:",
+            f"   - Tribute Rendered Present: {'YES' if self.tribute_present else 'NO'}",
+            f"   - Present Subsections: {', '.join(self.present_sections) if self.present_sections else 'None'}",
+            f"   - Missing Subsections: {', '.join(self.missing_sections) if self.missing_sections else 'None'}",
+            f"   - Test Execution Proof: {'FOUND' if self.test_proof_found else 'MISSING / UNVERIFIED'}",
+            "",
+            "2. Task Progress (Checklist):",
+            f"   - Source File: {self.task_progress.get('task_file') or 'None detected'}",
+            f"   - Progress: {self.task_progress.get('checked', 0)}/{self.task_progress.get('total', 0)} ({self.task_progress.get('percent', 0)}%)",
+            "",
+            "3. Protocol Compliance & Git Worktree:",
+            f"   - Worktree State: {'DIRTY' if self.git_status.get('dirty') else 'CLEAN'}",
+            f"   - Base Drift: {self.git_status.get('behind', 0)} commit(s) behind base branch",
+            f"   - Ahead Commits: {self.git_status.get('ahead', 0)} commit(s) ahead",
         ]
 
-        if self.task_progress.get("found"):
-            tp = self.task_progress
-            phase_str = f" | Phase: {tp['active_phase']}" if tp.get("active_phase") else ""
-            file_str = f" (file: {tp['file']})" if tp.get("file") else ""
-            lines.append(f"Task Progress: [{tp['summary']}]{phase_str}{file_str}")
-
-        if self.git_status.get("exists"):
-            gs = self.git_status
-            behind_str = f"{gs.get('behind', 0)} commits behind base"
-            ahead_str = f"{gs.get('ahead', 0)} commits ahead of base"
-            dirty_str = "DIRTY" if gs.get("dirty") else "CLEAN"
-            lines.append(f"Git State: [{dirty_str}] ({ahead_str}, {behind_str})")
-            if gs.get("untracked"):
-                lines.append(f"  - Untracked ({len(gs['untracked'])}): {', '.join(gs['untracked'][:3])}")
-            if gs.get("modified"):
-                lines.append(f"  - Modified ({len(gs['modified'])}): {', '.join(gs['modified'][:3])}")
-            if gs.get("staged"):
-                lines.append(f"  - Staged ({len(gs['staged'])}): {', '.join(gs['staged'][:3])}")
-        elif self.worktree:
-            lines.append(f"Git State: Worktree path not found on disk ({self.worktree})")
-
-        # Sections
-        lines.append(f"Tribute Rendered: {'Present' if self.tribute_present else 'Empty / Missing'}")
-        if self.sections_present:
-            lines.append(f"  - Found ({len(self.sections_present)}): {', '.join(self.sections_present)}")
-        if self.missing_sections:
-            lines.append(f"  - Missing ({len(self.missing_sections)}): {', '.join(self.missing_sections)}")
-
-        # Artifacts
         if self.artifacts_checked:
-            lines.append(f"Artifacts Checked ({len(self.artifacts_checked)}):")
+            lines.append("")
+            lines.append("4. Artifact Presence Check:")
             for art in self.artifacts_checked:
-                status_icon = "✓" if art["exists"] else "✗"
-                lines.append(f"  [{status_icon}] {art['path']}")
+                status_str = "FOUND" if art["exists"] else "MISSING"
+                lines.append(f"   - [{status_str}] {art['path']}")
 
-        # Violations & Warnings
+        lines.append("")
         if self.violations:
             lines.append("Violations (Blocking):")
             for v in self.violations:
@@ -449,56 +453,27 @@ class WardAudit:
         return "\n".join(lines)
 
 
-def check_tribute_sections(quest: Quest) -> tuple[bool, list[str], list[str], dict[str, str]]:
-    """Inspect Quest tribute and extract required subsections.
-
-    Returns:
-    (tribute_present, sections_present, missing_sections, extracted_sections_dict)
-    """
-    raw_tribute = quest.body_sections.get("Tribute Rendered", "").strip()
-    is_scout = quest.kind == "scout" or quest.section == "Investigation"
-    required = SCOUT_REQUIRED_SECTIONS if is_scout else SERF_REQUIRED_SECTIONS
-
-    if not raw_tribute or is_placeholder(raw_tribute):
-        return False, [], list(required), {}
-
-    extracted: dict[str, str] = {}
-    present: list[str] = []
-    missing: list[str] = []
-
-    for sec in required:
-        content = quest.extract_tribute_subsection(sec)
-        if content and not is_placeholder(content):
-            extracted[sec] = content
-            present.append(sec)
-        else:
-            missing.append(sec)
-
-    tribute_present = bool(present)
-    return tribute_present, present, missing, extracted
-
-
 def extract_expected_artifact_paths(quest: Quest) -> list[str]:
-    """Parse Expected Tribute and Goal & Scope for file/directory paths."""
+    """Parse Expected Tribute and The Kingdom Requires for file/directory paths."""
     text = (
         quest.body_sections.get("Expected Tribute", "")
         + "\n"
-        + quest.body_sections.get("Goal & Scope", "")
+        + quest.body_sections.get("The Kingdom Requires", "")
     )
-    # Match paths like `tasks/apps/...`, `tasks/artifacts/...`, `apps/...`, `tests/...`, `.court/...`
     pattern = re.compile(
-        r"`([a-zA-Z0-9_\-\./]+(?:\.[a-zA-Z0-9]+|/))`"
+        r"(?:(?:tasks|apps|tests|\.court|\.kilo|scripts|src)/[A-Za-z0-9_./-]+|\b[A-Za-z0-9_-]+\.(?:py|md|html|json|sql|sh)\b)"
     )
-    paths = set()
-    for m in pattern.finditer(text):
-        p = m.group(1).strip()
-        if "/" in p and not p.startswith("http") and not p.startswith("github"):
-            paths.add(p)
-    return sorted(paths)
+    paths = []
+    for line in text.splitlines():
+        for match in pattern.findall(line):
+            cleaned = match.strip("`'\",:()")
+            if cleaned and cleaned not in paths and not cleaned.endswith("."):
+                paths.append(cleaned)
+    return paths
 
 
 def audit_quest(
-    quest_or_id: Quest | str,
+    quest_or_id: str | Quest,
     worktree_path: Optional[str | Path] = None,
     base_branch: str = "castle",
     cwd: Optional[Path | str] = None,
@@ -513,189 +488,176 @@ def audit_quest(
     violations: list[WardViolation] = []
     warnings: list[WardWarning] = []
 
-    # 1. Branch Naming Compliance
+    # 1. Branch Naming Validation
     if quest.branch:
-        is_valid_branch, branch_err = validate_branch_name(quest.branch)
-        if not is_valid_branch:
-            violations.append(WardViolation(branch_err))
+        is_valid, err_msg = validate_branch_name(quest.branch)
+        if not is_valid:
+            violations.append(WardViolation(err_msg))
     else:
         violations.append(WardViolation("Quest frontmatter missing 'branch' name."))
 
     # 2. Frontmatter Mappings
-    if quest.status in ("WORKING", "REVIEW", "GATE", "READY_FOR_TEARDOWN", "DONE"):
+    if quest.status in ("QUESTING", "WORKING", "TRIBUTE_READY", "GATE", "READY_TO_RAZE", "LANDED", "LAUNCHED", "DONE"):
         if not quest.serf_session_id and quest.kind != "epic":
             warnings.append(WardWarning("Missing 'serf_session_id' in frontmatter."))
 
-    # 3. Worktree Resolution & Git Status
-    wt_resolved = None
+    # 3. Worktree Path & Status
+    wt_p = None
     if worktree_path:
-        wt_resolved = Path(worktree_path)
-    elif quest.worktree and Path(quest.worktree).is_dir():
-        wt_resolved = Path(quest.worktree)
+        wt_p = Path(worktree_path)
     else:
-        wt_resolved = git_ops.find_worktree_for_quest(quest, cwd=cwd)
+        found_p = git_ops.find_worktree_for_quest(quest, cwd=cwd)
+        if found_p:
+            wt_p = found_p
 
     git_stat = {}
-    if wt_resolved and wt_resolved.is_dir():
-        git_stat = git_ops.get_worktree_git_status(wt_resolved, base=base_branch)
+    if wt_p and wt_p.exists() and wt_p.is_dir():
+        git_stat = git_ops.get_worktree_git_status(wt_p, base=base_branch)
 
-        # Checked-out branch folder hierarchy check
-        actual_branch = git_stat.get("branch", "")
-        if actual_branch:
-            is_valid_actual, actual_branch_err = validate_branch_name(actual_branch)
-            if not is_valid_actual:
-                target_branch_hint = quest.branch or "canonical/slash-branch"
-                violations.append(
-                    f"Checked-out branch in worktree is flat '{actual_branch}'. "
-                    f"Must use slash hierarchy (run: git branch -m {target_branch_hint})."
-                )
-            elif quest.branch and actual_branch != quest.branch:
-                violations.append(
+        # Dirty worktree check
+        if git_stat.get("dirty"):
+            uncommitted = (
+                git_stat.get("untracked", [])
+                + git_stat.get("modified", [])
+                + git_stat.get("staged", [])
+                + git_stat.get("deleted", [])
+            )
+            violations.append(WardViolation(
+                f"Worktree has {len(uncommitted)} uncommitted file(s) ({', '.join(uncommitted[:3])}{'...' if len(uncommitted)>3 else ''})."
+            ))
+
+        # Check worktree branch matches frontmatter
+        actual_branch = git_stat.get("branch")
+        if actual_branch and quest.branch:
+            clean_actual = actual_branch.replace("refs/heads/", "")
+            clean_quest_b = quest.branch.replace("refs/heads/", "")
+            if clean_actual != clean_quest_b:
+                violations.append(WardViolation(
                     f"Worktree branch mismatch: checked-out branch '{actual_branch}' does not match quest frontmatter branch '{quest.branch}'."
-                )
+                ))
 
-        # Base drift check (behind > 0 vs base_branch)
+        # Base drift check
         behind = git_stat.get("behind")
         if behind is not None and behind > 0:
-            if quest.status == "WORKING":
-                # Tolerated during WORKING; a deferred rebase is required before REVIEW.
+            if quest.status in ("QUESTING", "WORKING"):
                 warnings.append(WardWarning(
-                    f"Worktree is {behind} commit(s) behind {base_branch} (tolerated in WORKING; "
-                    f"deferred rebase `git merge {base_branch}` required before REVIEW)."
+                    f"Worktree is {behind} commit(s) behind {base_branch} (tolerated in QUESTING under drift immunity; deferred rebase merge castle required before TRIBUTE_READY)."
                 ))
-            elif quest.status in ("REVIEW", "GATE", "READY_FOR_TEARDOWN"):
-                # The deferred-rebase requirement is a one-time *entry* gate, enforced
-                # independently and freshly at the moment of the WORKING -> REVIEW
-                # transition itself (see `cmd_levy`'s auto-advance re-check of
-                # `behind == 0` right before calling `set_status`). Re-litigating it
-                # here as an ongoing violation on every later audit would make the
-                # queue unable to converge: the base branch keeps moving as *other*
-                # Quests advance/get promoted while this one just waits its turn,
-                # so it would immediately get flagged non-compliant through no
-                # fault of its own. Bounded drift accumulated *after* a clean entry
-                # is tolerated at every downstream stage and absorbed by the next
-                # `court rebase`/`court levy` sweep, or by the Gatekeeper during
-                # Cog Ship packing.
+            elif quest.status in ("TRIBUTE_READY", "GATE", "READY_TO_RAZE"):
                 warnings.append(WardWarning(
                     f"Bounded residual drift: worktree is {behind} commit(s) behind {base_branch} at {quest.status} "
                     f"(tolerated after a clean entry; absorbed by the next `court rebase`/`court levy` sweep or by the Gatekeeper during Cog Ship packing)."
                 ))
             else:
                 violations.append(WardViolation(
-                    f"Base drift: worktree is {behind} commit(s) behind {base_branch}."
+                    f"Worktree is {behind} commit(s) behind {base_branch} at {quest.status}."
                 ))
 
-        # Dirty working tree check
-        if git_stat.get("dirty"):
-            dirty_count = (
-                len(git_stat.get("untracked", []))
-                + len(git_stat.get("modified", []))
-                + len(git_stat.get("staged", []))
-                + len(git_stat.get("deleted", []))
-            )
-            dirty_sample = (
-                git_stat.get("untracked", [])
-                + git_stat.get("modified", [])
-                + git_stat.get("staged", [])
-                + git_stat.get("deleted", [])
-            )[:3]
-            sample_str = ", ".join(dirty_sample)
-            violations.append(WardViolation(
-                f"Dirty working tree: {dirty_count} uncommitted file(s) ({sample_str})."
-            ))
-
-        # Ahead commits check (if review/gate or tribute present)
+        # Ahead commits check
         ahead = git_stat.get("ahead")
-        if ahead == 0 and quest.status in ("REVIEW", "GATE", "READY_FOR_TEARDOWN"):
+        if ahead == 0 and quest.status in ("TRIBUTE_READY", "GATE", "READY_TO_RAZE"):
             violations.append(WardViolation(
                 f"Zero commits delivered on branch (0 commits ahead of {base_branch})."
             ))
+
+        # Charter Integrity & Anti-Tampering Check
+        charter_check = git_ops.check_charter_integrity(quest, wt_p, base=base_branch)
+        if charter_check.get("tampered"):
+            for v in charter_check.get("violations", []):
+                violations.append(WardViolation(v))
     else:
-        # No worktree directory resolved on disk. DISPATCHED/WORKING quests are
-        # supposed to have a live worktree (Serf spawned into it) — that's a
-        # blocking violation. REVIEW/GATE quests may have already had their
-        # worktree pruned mid-handoff, so that's only a warning.
-        if quest.status in ("DISPATCHED", "WORKING", "REVIEW", "GATE"):
+        if quest.status in ("CHARTERED", "DISPATCHED", "QUESTING", "WORKING", "TRIBUTE_READY", "GATE"):
             warnings.append(WardWarning(
                 f"No active git worktree directory resolved for {quest.id} (branch: {quest.branch or '-'})."
             ))
-            if quest.status in ("WORKING", "DISPATCHED"):
+            if quest.status in ("QUESTING", "WORKING", "CHARTERED", "DISPATCHED"):
                 violations.append(WardViolation(
                     f"No active git worktree directory on disk (worktree missing or pruned)."
                 ))
 
-    # 4. Task Markdown Checklist Progress
-    task_prog = get_worktree_task_progress(
-        worktree_path=wt_resolved,
-        quest=quest,
-        app=quest.app,
-        quest_id=quest.id,
-    )
+    # 4. Task Progress
+    task_prog = {}
+    if wt_p:
+        task_prog = parse_worktree_task_progress(wt_p, quest=quest, task_file_rel=quest.task_file)
+    else:
+        task_prog = {
+            "task_file": None,
+            "checked": 0,
+            "unchecked": 0,
+            "total": 0,
+            "percent": 0,
+            "source": "none",
+        }
 
     # 5. Tribute Rendered & Section Completeness
     tribute_present, present_secs, missing_secs, extracted = check_tribute_sections(quest)
 
-    if quest.status in ("REVIEW", "GATE", "READY_FOR_TEARDOWN", "DONE"):
+    if quest.status in ("TRIBUTE_READY", "GATE", "READY_TO_RAZE", "LANDED", "LAUNCHED", "DONE"):
         if not tribute_present:
             violations.append(WardViolation("Missing '# Tribute Rendered' body section."))
         elif missing_secs:
             violations.append(WardViolation(
                 f"Incomplete tribute: missing required subsection(s): {', '.join(missing_secs)}."
             ))
-    elif quest.status in ("WORKING", "DISPATCHED"):
+    elif quest.status in ("QUESTING", "WORKING", "CHARTERED", "DISPATCHED"):
         if tribute_present and missing_secs:
             warnings.append(WardWarning(
                 f"Partial tribute rendered: missing {', '.join(missing_secs)}."
             ))
 
+    # 5b. Pending Serf Audience Check
+    if quest.status in ("TRIBUTE_READY", "GATE") and quest.has_pending_audience():
+        warnings.append(WardWarning(
+            "Pending Serf Audience: Serf documented an open decision in Tribute requiring royal judgment; resolve via /audience or record decision in Audience Log before packing."
+        ))
+
     # 6. Check Test Proof
     if tribute_present:
         tribute_body = extracted.get("tribute", "") + "\n" + extracted.get("tally", "")
-        test_indicators = ("pytest", "python -m unittest", "exit_code", "passed", "test_", "run_test_command")
-        has_test_mention = any(ind in tribute_body.lower() for ind in test_indicators)
-        if not has_test_mention and quest.kind != "epic" and quest.section != "Investigation":
-            warnings.append(WardWarning("No explicit test command or exit code record detected in Tribute/Tally."))
+        test_proof = (
+            "passed" in tribute_body.lower()
+            or "ok" in tribute_body.lower()
+            or "pytest" in tribute_body.lower()
+            or "manage.py test" in tribute_body.lower()
+            or "test_" in tribute_body.lower()
+            or "exit code 0" in tribute_body.lower()
+        )
+    else:
+        test_proof = False
 
-    # 7. Artifact Existence Verification
-    artifacts_checked: list[dict] = []
-    expected_paths = extract_expected_artifact_paths(quest)
-    search_root = wt_resolved if (wt_resolved and wt_resolved.is_dir()) else (Path(cwd) if cwd else Path.cwd())
+    # 7. Check Artifact Presence
+    expected_artifacts = extract_expected_artifact_paths(quest)
+    artifacts_checked = []
+    search_root = wt_p if wt_p and wt_p.exists() else git_ops.get_repo_root(cwd)
 
-    for p_str in expected_paths:
+    for p_str in expected_artifacts:
         candidate = search_root / p_str
         exists = candidate.exists()
         artifacts_checked.append({"path": p_str, "exists": exists})
-        # If an artifact in tasks/ or tests/ was expected and quest is in REVIEW/GATE, check existence
-        if not exists and quest.status in ("REVIEW", "GATE"):
+        if not exists and quest.status in ("TRIBUTE_READY", "GATE"):
             if p_str.startswith("tasks/") or p_str.startswith("tests/"):
                 warnings.append(WardWarning(f"Expected artifact path not found on disk: {p_str}"))
 
-    is_compliant = len(violations) == 0
-
     return WardAudit(
-        quest_id=quest.id,
-        title=quest.title,
-        kind=quest.kind,
-        status=quest.status,
-        section=quest.section,
-        branch=quest.branch,
-        worktree=str(wt_resolved) if wt_resolved else quest.worktree,
-        is_compliant=is_compliant,
+        quest=quest,
+        worktree_path=str(wt_p) if wt_p else None,
+        git_status=git_stat,
+        task_progress=task_prog,
         tribute_present=tribute_present,
-        sections_present=present_secs,
+        present_sections=present_secs,
         missing_sections=missing_secs,
+        extracted_sections=extracted,
+        test_proof_found=test_proof,
+        artifacts_checked=artifacts_checked,
         violations=violations,
         warnings=warnings,
-        git_status=git_stat,
-        artifacts_checked=artifacts_checked,
-        task_progress=task_prog,
     )
 
 
 def audit_all_quests(
-    status: Optional[str] = None,
     app: Optional[str] = None,
     epic: Optional[str] = None,
+    status: Optional[str] = None,
     include_archive: bool = False,
     base_branch: str = "castle",
     cwd: Optional[Path | str] = None,
@@ -731,66 +693,85 @@ def sync_tribute_from_worktree(
     cwd: Optional[Path | str] = None,
     court_root: Optional[Path] = None,
 ) -> tuple[bool, str]:
-    """Auto-sync `# Tribute Rendered`, `# Expected Tribute`, and frontmatter from a worktree into the master quest file."""
+    """Auto-sync `# Tribute Rendered`, `# Expected Tribute`, and frontmatter from a worktree into master quest file."""
     wt = None
     if worktree_path:
         wt = Path(worktree_path)
-    elif quest.worktree and Path(quest.worktree).is_dir():
-        wt = Path(quest.worktree)
     else:
-        wt = git_ops.find_worktree_for_quest(quest, cwd=cwd)
+        found_p = git_ops.find_worktree_for_quest(quest, cwd=cwd)
+        if found_p:
+            wt = found_p
 
-    if not wt or not wt.is_dir():
-        return False, f"No worktree found for {quest.id}"
+    if not wt or not wt.exists():
+        return False, f"No active worktree found on disk for {quest.id}"
 
-    # Search for quest markdown in the worktree
-    candidate_paths = [
-        wt / ".court" / "quests" / f"{quest.id}.md",
-        wt / ".court" / "epics" / f"{quest.id}.md",
-    ]
-    # Also check glob for Q0NN-*.md
-    short_num = quest.id.split("-")[0].lstrip("Qq")
-    prefix = f"Q{short_num}-"
-    for d in (wt / ".court" / "quests", wt / ".court" / "epics"):
-        if d.is_dir():
-            candidate_paths.extend(list(d.glob(f"{prefix}*.md")))
+    wt_quest_file = wt / ".court" / "quests" / f"{quest.id}.md"
+    if not wt_quest_file.exists():
+        wt_epic_file = wt / ".court" / "epics" / f"{quest.id}.md"
+        if wt_epic_file.exists():
+            wt_quest_file = wt_epic_file
+        else:
+            court_q_dir = wt / ".court" / "quests"
+            if court_q_dir.exists():
+                short_id = quest.id.split("-")[0]
+                matches = list(court_q_dir.glob(f"{short_id}*.md"))
+                if matches:
+                    wt_quest_file = matches[0]
 
-    src_file = None
-    for cp in candidate_paths:
-        if cp.exists() and cp.is_file():
-            src_file = cp
-            break
-
-    if not src_file:
-        return False, f"No quest markdown found inside worktree {wt}"
+    if not wt_quest_file.exists():
+        return False, f"Quest file not found in worktree: {wt_quest_file}"
 
     try:
-        wt_quest = Quest.from_markdown(src_file.read_text(encoding="utf-8"))
+        wt_quest = Quest.from_markdown(wt_quest_file.read_text(encoding="utf-8"))
     except Exception as e:
-        return False, f"Failed to parse quest file in worktree: {e}"
+        return False, f"Failed to parse worktree quest markdown: {e}"
 
     modified = False
     notes = []
 
-    # Check tribute rendered
     wt_tribute = wt_quest.body_sections.get("Tribute Rendered", "").strip()
-    curr_tribute = quest.body_sections.get("Tribute Rendered", "").strip()
+    master_tribute = quest.body_sections.get("Tribute Rendered", "").strip()
 
-    if wt_tribute and (wt_tribute != curr_tribute):
+    if wt_tribute and not _is_placeholder_or_empty(wt_tribute) and wt_tribute != master_tribute:
         quest.body_sections["Tribute Rendered"] = wt_tribute
         modified = True
         notes.append("Synced Tribute Rendered")
 
-    # Check expected tribute
     wt_expected = wt_quest.body_sections.get("Expected Tribute", "").strip()
-    curr_expected = quest.body_sections.get("Expected Tribute", "").strip()
-
-    if wt_expected and (wt_expected != curr_expected):
+    master_expected = quest.body_sections.get("Expected Tribute", "").strip()
+    if wt_expected and not _is_placeholder_or_empty(wt_expected) and wt_expected != master_expected:
         quest.body_sections["Expected Tribute"] = wt_expected
         modified = True
         notes.append("Synced Expected Tribute")
 
-    # Sync frontmatter if worktree has newer or missing values
+    _legacy_status_aliases = {"REVIEW": "TRIBUTE_READY"}
+    _forward_sync_order = {
+        "OPEN": 0,
+        "PLANNED": 1,
+        "CHARTERED": 2,
+        "DISPATCHED": 2,
+        "QUESTING": 3,
+        "WORKING": 3,
+        "TRIBUTE_READY": 4,
+    }
+    wt_status_raw = (wt_quest.status or "").strip()
+    wt_status = _legacy_status_aliases.get(wt_status_raw, wt_status_raw)
+    current_rank = _forward_sync_order.get(quest.status, -1)
+    wt_rank = _forward_sync_order.get(wt_status, -1)
+    if (
+        quest.status in ("CHARTERED", "DISPATCHED", "QUESTING", "WORKING")
+        and wt_rank > current_rank
+        and wt_status in STATUSES
+    ):
+        old_status = quest.status
+        legacy_note = f" (worktree copy still used legacy 'REVIEW' name)" if wt_status_raw == "REVIEW" else ""
+        quest.set_status(
+            wt_status,
+            note=f"Auto-synced status advance from worktree's own copy, which had already self-advanced{legacy_note}",
+        )
+        modified = True
+        notes.append(f"Synced status {old_status} -> {wt_status} from worktree")
+
     if wt_quest.serf_session_id and not quest.serf_session_id:
         quest.serf_session_id = wt_quest.serf_session_id
         modified = True
@@ -799,7 +780,7 @@ def sync_tribute_from_worktree(
         quest.serf_model = wt_quest.serf_model
         modified = True
         notes.append("Synced serf_model")
-    if not quest.worktree:
+    if not quest.worktree and wt:
         quest.worktree = str(wt)
         modified = True
         notes.append("Mapped worktree path")
@@ -816,84 +797,98 @@ def audit_realm(
     include_archive: bool = False,
     court_root: Optional[Path] = None,
 ) -> dict:
-    """Realm-wide compliance health summary used by `court ward`.
-
-    Audits every in-flight Quest/Epic (WORKING, DISPATCHED, REVIEW, GATE) for
-    base drift, dirty worktrees, and tribute completeness, and returns an
-    aggregate scorecard alongside the individual `WardAudit` records.
-    """
+    """Realm-wide compliance health summary used by `court ward`."""
     results = audit_all_quests(
-        status="WORKING,DISPATCHED,REVIEW,GATE",
+        status="WORKING,DISPATCHED,TRIBUTE_READY,GATE",
         include_archive=include_archive,
         base_branch=base_branch,
         court_root=court_root,
     )
     non_compliant = [r for r in results if not r.is_compliant]
     dirty = [r for r in results if r.git_status.get("dirty")]
-    behind = [r for r in results if (r.git_status.get("behind") or 0) > 0]
+    drifting = [r for r in results if (r.git_status.get("behind") or 0) > 0]
+    missing_tribute = [r for r in results if not r.tribute_present]
 
     return {
+        "total_audited": len(results),
         "total_active": len(results),
         "compliant_count": len(results) - len(non_compliant),
         "non_compliant_count": len(non_compliant),
+        "dirty_worktrees_count": len(dirty),
         "dirty_count": len(dirty),
-        "behind_count": len(behind),
+        "drifting_worktrees_count": len(drifting),
+        "behind_count": len(drifting),
+        "missing_tribute_count": len(missing_tribute),
+        "results": results,
         "audits": results,
     }
 
-
-# ---------------------------------------------------------------------------
-# Warden Report parsing — standalone 5-part investigation briefs produced by
-# a Warden's hunting-grounds patrol (Survey, Stack Trace, Impact / Affected
-# Accounts, Root Cause Diagnosis, Proposed Fix / Remit). These live outside
-# any Quest's Tribute Rendered section, typically at `.court/ward/reports/*.md`.
-# ---------------------------------------------------------------------------
 
 _WARDEN_SECTION_ALIASES = {
     "survey": "survey",
     "the survey": "survey",
     "stack trace": "stack_trace",
+    "stack_trace": "stack_trace",
+    "traceback": "stack_trace",
+    "error": "stack_trace",
     "the stack trace": "stack_trace",
-    "stacktrace": "stack_trace",
     "impact": "impact",
-    "impact affected accounts": "impact",
     "affected accounts": "impact",
-    "impact and affected accounts": "impact",
-    "root cause diagnosis": "root_cause",
+    "affected_accounts": "impact",
+    "impact / affected accounts": "impact",
+    "the impact": "impact",
     "root cause": "root_cause",
-    "the root cause diagnosis": "root_cause",
-    "proposed fix remit": "proposed_fix",
+    "root_cause": "root_cause",
+    "diagnosis": "root_cause",
+    "root cause diagnosis": "root_cause",
+    "the root cause": "root_cause",
     "proposed fix": "proposed_fix",
+    "proposed_fix": "proposed_fix",
     "remit": "proposed_fix",
-    "the proposed fix remit": "proposed_fix",
+    "proposed fix / remit": "proposed_fix",
+    "fix": "proposed_fix",
+    "the proposed fix": "proposed_fix",
 }
 
 
-def parse_warden_report(text: str, filepath: str = "") -> dict:
-    """Parse a standalone 5-part Warden Report markdown document.
+def parse_warden_report(path_or_text: str | Path, filepath: Optional[str] = None) -> dict[str, Any]:
+    """Parse a standalone 5-part Warden Report markdown document or string."""
+    p = Path(path_or_text) if isinstance(path_or_text, Path) else None
+    if p and p.is_file():
+        try:
+            text = p.read_text(encoding="utf-8")
+            path_str = str(p)
+        except Exception as e:
+            return {"path": str(p), "exists": True, "valid": False, "error": f"read error: {e}"}
+    elif isinstance(path_or_text, str) and "\n" in path_or_text:
+        text = path_or_text
+        path_str = filepath or "<string>"
+    else:
+        candidate = Path(str(path_or_text))
+        if candidate.is_file():
+            try:
+                text = candidate.read_text(encoding="utf-8")
+                path_str = str(candidate)
+            except Exception as e:
+                return {"path": str(candidate), "exists": True, "valid": False, "error": f"read error: {e}"}
+        else:
+            return {"path": str(path_or_text), "exists": False, "valid": False, "error": "file not found"}
 
-    Unlike `Quest.extract_tribute_subsection` (which reads a Quest's embedded
-    `Tribute Rendered` body), this operates on a standalone Warden Report
-    string/file and extracts the canonical sections: `survey`, `stack_trace`,
-    `impact`, `root_cause`, `proposed_fix`.
-
-    Returns a dict with `sections`, `present`, `missing`, `complete`, `file`.
-    """
     sections: dict[str, str] = {}
     current_key: Optional[str] = None
     buf: list[str] = []
 
     for line in text.splitlines():
-        m = HEADING_RE.match(line.strip())
+        m = re.match(r"^#{1,4}\s+(.*)$", line.strip())
         matched_key = None
         if m:
-            raw_title = m.group(2).strip()
+            raw_title = m.group(1).strip()
             raw_title = re.sub(r"^\(?\d+[\.\)]\s*", "", raw_title)
+            raw_title = re.sub(r"\s*\(.*?\)\s*$", "", raw_title)
             cleaned = re.sub(r"[^\w\s/_-]", "", raw_title).lower().strip()
-            cleaned = cleaned.replace("/", " ").replace("_", " ").replace("-", " ")
-            cleaned = re.sub(r"\s+", " ", cleaned).strip()
-            matched_key = _WARDEN_SECTION_ALIASES.get(cleaned)
-            if not matched_key:
+            if cleaned in _WARDEN_SECTION_ALIASES:
+                matched_key = _WARDEN_SECTION_ALIASES[cleaned]
+            else:
                 for k, v in _WARDEN_SECTION_ALIASES.items():
                     if cleaned == k or cleaned.startswith(k + " ") or cleaned.endswith(" " + k):
                         matched_key = v
@@ -910,20 +905,17 @@ def parse_warden_report(text: str, filepath: str = "") -> dict:
     if current_key is not None:
         sections[current_key] = "\n".join(buf).strip()
 
-    present = [s for s in WARDEN_REPORT_SECTIONS if sections.get(s) and not is_placeholder(sections[s])]
+    present = [s for s in WARDEN_REPORT_SECTIONS if s in sections and not _is_placeholder_or_empty(sections[s])]
     missing = [s for s in WARDEN_REPORT_SECTIONS if s not in present]
 
     return {
-        "sections": sections,
-        "present": present,
-        "missing": missing,
+        "path": path_str,
+        "exists": True,
+        "valid": len(missing) == 0,
         "complete": len(missing) == 0,
-        "file": str(filepath),
+        "present": present,
+        "present_sections": present,
+        "missing_sections": missing,
+        "sections": sections,
+        "raw_text": text,
     }
-
-
-def parse_warden_report_file(path: Path | str) -> dict:
-    """Read and parse a Warden Report markdown file from disk. See `parse_warden_report`."""
-    p = Path(path)
-    text = p.read_text(encoding="utf-8")
-    return parse_warden_report(text, filepath=str(p))

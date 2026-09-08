@@ -5,7 +5,7 @@ agent: steward
 Arguments: $ARGUMENTS (expected shape: "<quest id> <reason>")
 
 ```
-python3 .court/engine/cli.py advance <id> WORKING --note "<reason>"
+python3 -m court.cli advance <id> WORKING --note "<reason>"
 ```
 Then decide whether the existing Serf can address the reason with a
 follow-up prompt, or whether a fresh Serf is warranted (same worktree,

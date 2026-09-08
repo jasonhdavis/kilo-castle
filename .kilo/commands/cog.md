@@ -5,29 +5,35 @@ agent: steward
 Arguments: $ARGUMENTS
 
 Follow the Cog Ship Protocol:
-> **The Cog Ship**: The convoy of tribute entering the castle. As newly merged Quests accumulate on `castle`, `/cog ship` (or `/ship`) generates a comprehensive deployment manifest combining the Bard's narrative chronicle, the Coffers treasury ledger, the Serf penance backlog, and the Humble Opinions, alongside the git diff/commit vector preparing for promotion from `castle` into `main`.
+> **The Cog Ship**: The convoy of tribute entering the castle, built and packed by the **Gatekeeper** as verified Quests pass through the gatehouse. As newly merged Quests accumulate on `castle`, `/cog ship` (or `/ship`) generates a comprehensive deployment manifest combining the Bard's narrative chronicle, the Coffers treasury ledger, the Serf penance backlog, and git diff/commit vectors preparing for promotion from `castle` into `main`.
 
 1. **Reconstruct the Incoming Fleet Manifest:**
    - Execute the deterministic deployment rollup:
      ```bash
-     court ship $ARGUMENTS
+     python3 -m court.cli ship $ARGUMENTS
      ```
    - If filtering by specific Epic or App:
      ```bash
-     court ship --epic <id>
-     court ship --app <app>
+     python3 -m court.cli ship --epic <id>
+     python3 -m court.cli ship --app <app>
      ```
 
 2. **Inspect the Git Promotion Vector (`castle` -> `main`):**
-   - The `court ship` output already includes the ahead/behind counts, commit log, and diffstat for `main..castle`. Review it directly.
+   - Review pending commits on `castle` ahead of `main` (`git log main..castle --oneline`).
+   - Review aggregate file changes (`git diff --stat main..castle`).
 
-3. **Synthesize the 4 Rollup Pillars for M'Lord:**
+3. **Synthesize the 5 Rollup Pillars for M'Lord:**
    - 📜 **The Bard's Chronicle (`/bard`)**: Executive story of challenges, architecture decisions, and transformations shipped.
    - 💰 **The Coffers Ledger (`/coffers`)**: Provable inventory of commits, files created/modified, passed test suites, migrations, endpoints, and data artifacts.
+   - 🔍 **The Tally Runbook (`/tally`)**: Production & staging UI verification paths, routes, and expected outcomes.
    - ⚖️ **The Serf Penance (`/atone`)**: Actionable technical debt, shortcuts taken, and system/prompt improvement opportunities.
    - 💡 **The Humble Opinions (`/murmur`)**: Ground-level insights and proposed future Quests.
 
 4. **Present the Cog Ship Voyage Report & Readiness Checklist:**
-   - Present the structured deployment summary to M'Lord.
-   - If M'Lord approves promotion from `castle` to `main`, facilitate the clean merge / release tag.
-   - `/cog ship` is read-only reporting — it never merges or advances Quest status itself.
+   - Present the structured deployment summary to M'Lord with confidence score.
+   - If M'Lord approves promotion from `castle` to `main`, facilitate the clean merge / release tag:
+     ```bash
+     # Rehearse the promotion with preflight checks only (no mutations):
+     python3 -m court.cli ship --confirm
+     ```
+   - `--confirm` runs preflight safety checks first (production checkout located, correct branch, clean tree, push fast-forward) and aborts with zero mutations if any fail; a conflicting merge is auto-aborted.

@@ -1,0 +1,10 @@
+{
+  "models": {
+    "serf": "GLM-5.3-Flash",
+    "serf_provider": "openrouter",
+    "master_of_coin": "openrouter/google/gemini-3.7-flash",
+    "gatekeeper": "openrouter/google/gemini-3.7-flash",
+    "steward": "openrouter/google/gemini-3.7-flash"
+  },
+  "no_kilo_mode": false
+}

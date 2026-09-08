@@ -1,8 +1,14 @@
 ---
-description: Mark a completed Quest as DONE and move to archive
+description: Close a DONE Quest and archive its record
 agent: steward
 ---
 Quest: $ARGUMENTS
 
-1. Advance Quest to `DONE` using `court advance <id> DONE --note "Closed"`.
-2. Move to archive if requested using `court archive <id>`.
+Only close a Quest that has actually reached `DONE` (merged, and any
+teardown M'lord wanted is complete) — not just `READY_TO_RAZE`.
+```
+python3 -m court.cli advance <id> DONE --note "Closed"
+python3 -m court.cli archive <id>
+```
+Archiving moves the file to `.court/archive/` — it stays readable, it is
+never deleted.

@@ -1,6 +1,6 @@
 # 🏰 Kilo Castle
 
-**Deterministic multi-agent orchestration framework for [Kilo Code](https://kilo.codes) with Git Worktrees, role separation, and durable state.**
+**Deterministic multi-agent orchestration framework for [Kilo Code](https://kilo.codes) with Git Worktrees, role separation, and durable event-sourced state.**
 
 ---
 
@@ -9,12 +9,18 @@
 **Kilo Castle** (also known as **The Court**) is an open-source orchestration layer built on top of Kilo Code and VS Code Agent Manager. It turns single-agent coding into a disciplined, fleet-coordinated engineering organization.
 
 Instead of relying on fragile chat history or allowing a single LLM session to wander across an entire codebase, Castle introduces:
-1. **Durable Markdown Persistence**: Quests and Epics tracked on disk in `.court/` with frontmatter and monotonic global IDs — zero token burn to read state.
-2. **Role Hierarchy**: Strict separation between the orchestrator (**Steward**), disposable implementers (**Serfs**), reconnaissance explorers (**Scouts**), value auditors (**Master of Coin**), integration checkpoints (**Gatekeeper**), and a dedicated log-patrol role (**Warden**).
-3. **The Tribute & Scout Completion Contracts**: Mandatory structured handoffs written durably to disk.
-4. **Isolated Git Worktree Topology**: Tree-structured branches (`quest/<id>-<slug>`, `scout/<id>-<slug>`) flowing through staging lanes (`gatehouse` $\rightarrow$ `castle` $\rightarrow$ `main`).
-5. **Model Tiering**: Fast, cost-efficient models in the trenches; frontier reasoning models at the gate.
-6. **The Pillory**: A genuine value/scope/duplication rejection freezes a Quest as `PUNISHED` with Decrees for a chartered successor, instead of returning it to `WORKING` — see `.court/README.md` for the full side-state model and its mechanical-rejection carve-out.
+1. **Durable Event-Sourced Persistence**: Quests and Epics tracked on disk in `.court/` backed by append-only `.events.jsonl` event logs (`merge=union` in `.gitattributes`) with `.md` as a regenerated human view — conflict-free merges across parallel worktrees with zero token burn to read state.
+2. **Role Hierarchy & Model Tiering**: Strict division of labor:
+   - **Steward** (Orchestrator resident on `castle`)
+   - **Serf** (Disposable implementers in worktrees — **GLM 5.3 Flash**)
+   - **Scout** (Reconnaissance on non-merging `scout/*` branches)
+   - **Master of Coin** (Accounting arm auditing value in `TRIBUTE_READY` via dedicated worktree session — **Gemini 3.7 Flash**)
+   - **Gatekeeper** (Batch integration & test execution at `GATE` on ephemeral convoys — **Gemini 3.7 Flash**)
+   - **Warden** (Diagnostic log & error auditor on `ward/*` branches)
+3. **The Tribute & Scout Completion Contracts**: Mandatory structured handoffs written durably to disk (Ballad, Tribute, Tally, Penance, Audience, Humble Opinion).
+4. **Isolated Git Worktree Topology**: Tree-structured branches (`quest/<id>-<slug>`, `scout/<id>-<slug>`) flowing through ephemeral gatehouse convoy staging branches (`the-gatehouse/<cogship_id>` $\rightarrow$ `castle` $\rightarrow$ `main`).
+5. **Castle Guard**: Technical branch-protection rules preventing direct commits or bypasses to staging/production trunks.
+6. **The Pillory & Commutation**: Value/scope/duplication rejection freezes a Quest as `PUNISHED` with Decrees for a successor Quest; post-deploy activation requirements are recorded under `Commutation`.
 
 ---
 
@@ -34,24 +40,26 @@ Instead of relying on fragile chat history or allowing a single LLM session to w
   (POC / Reconnaissance)         (Value & Resource Audit)       (Test Suite & Merge Gate)
         │                                     │                             │
         ▼                                     ▼                             ▼
-  Scout Worktrees                     🔨 Serf Worktrees              🏰 Castle (Staging)
- (Throwaway Scripts)              (Disposable Implementers)                 │
-        │                                                                   ▼
-        └──────────────► /plot ─────────────────────────────────────►  🚀 Main (Prod)
-                  (Blueprint Quests)
+  Scout Worktrees                     🔨 Serf Worktrees             🛡️ Gatehouse Convoy
+ (Throwaway Scripts)              (Disposable Implementers)      (the-gatehouse/<cogship>)
+        │                                     │                             │
+        └──────────────► /plot ───────────────┴─────────────────────► 🏰 Castle (Staging)
+                  (Blueprint Quests)                                        │
+                                                                            ▼
+                                                                      🚀 Main (Prod)
 ```
 
 ### The Roles
 
-| Role | Responsibilities | Default Model Tier |
+| Role | Responsibilities | Recommended Model Tier |
 |---|---|---|
 | **👑 M'Lord** | The human owner. The only source of genuine product authority, scope changes, and irreversible decisions. | Human |
-| **🏰 Steward** | The primary orchestrator and strategic planner you interact with. Triages tasks into Quests, writes dispatch contracts, monitors active work, blue prints next steps (`/plot`), and synthesizes fleet rollups. | Fast / Resident (e.g. Gemini 3.7 Flash) |
-| **🌲 Scout** | Reconnaissance agent for proof-of-concept investigations on non-merging `scout/*` branches. Probes APIs, tests feasibility with throwaway scripts in `tasks/artifacts/`, and generates the 5-part Scout Report. | Fast / Cost-Efficient (e.g. Gemini 3.7 Flash) |
-| **🔨 Serf** | Disposable coding agent assigned to a single isolated Git worktree. Builds clean, production-ready code against approved blueprints. Dismissed and replaced if confused. | Fast / Cost-Efficient (e.g. Gemini 3.7 Flash) |
-| **🪙 Master of Coin** | Dispatched during `REVIEW` **before** testing and merging. Audits the rendered Tribute directly on the worktree for criteria satisfaction, scope discipline, and query/compute cost efficiency. | Fast / Cost-Efficient (e.g. Gemini 3.7 Flash) |
-| **🛡️ Gatekeeper** | Lives inside the persistent `the-gatehouse` bastions. Dispatched during `GATE`. Decides the Cog Ship convoy pack, runs unified integration test suites across the pack all at once, isolates/re-tests and rejects failing commits with Serf remediation, and promotes verified Cog Ships into `castle`. | Frontier Reasoning (e.g. Claude 3.7 Sonnet) |
-| **📜 Vassal** | Dispatched only for large, multi-Quest **Epics**. Decomposes initiatives into child Quests, coordinates dependencies, and compresses fleet status upward. | Fast / Frontier |
+| **🏰 Steward** | The primary orchestrator and strategic planner you interact with. Triages tasks into Quests, writes dispatch contracts, monitors active work, blueprints next steps (`/plot`), manages teardowns, and synthesizes fleet rollups. | Fast / Resident (e.g. Gemini 3.7 Flash) |
+| **🌲 Scout** | Reconnaissance agent for proof-of-concept investigations on non-merging `scout/*` branches. Probes APIs, tests feasibility with throwaway scripts in `tasks/artifacts/`, and generates the 5-part Scout Report. | Fast / Cost-Efficient (e.g. Gemini 3.7 Flash / GLM 5.3 Flash) |
+| **🔨 Serf** | Disposable coding agent assigned to a single isolated Git worktree. Builds clean, production-ready code against approved blueprints. | Fast / Cost-Efficient (**GLM 5.3 Flash** mandate) |
+| **🪙 Master of Coin** | Dedicated session inside Quest worktree during `TRIBUTE_READY`. Audits rendered Tribute, verifies claims live, settles paperwork, identifies Commutation activation steps, and syncs verdict back (`git push . HEAD:<branch>`). | Fast / Capable (**Gemini 3.7 Flash**) |
+| **🛡️ Gatekeeper** | Ephemeral convoy worktree (`the-gatehouse/<cogship_id>`) during `GATE`. Packs convoy batches, runs unified integration test suites across the pack all at once, isolates/re-tests and rejects failing commits via `/reject_tribute` with Serf remediation, and promotes verified Cog Ships directly into `castle`. | Fast / Capable (**Gemini 3.7 Flash**) |
+| **📜 Vassal** | Dispatched for large, multi-Quest **Epics**. Decomposes initiatives into child Quests, coordinates dependencies, and compresses fleet status upward. | Fast / Frontier |
 | **🏹 Warden** | Patrols production logs and error trackers on a non-merging `ward/*` branch. Files 5-part Warden Reports (Survey, Stack Trace, Impact, Root Cause Diagnosis, Proposed Fix) for the Steward to charter into `Bug fix` Quests. Diagnoses only — never writes remediation code. | Fast / Cost-Efficient |
 
 ---
@@ -105,16 +113,14 @@ M'Lord brings an ambition, complaint, opportunity, Scout Report, or half-formed 
    - **Private Council**: 1 question at a time (for voice interfaces, high-consequence architecture, or ambiguous initiatives).
    - **Full Council**: 1–3 ripe questions at a time (for terminal/chat, ranked by leverage).
 5. **Challenge False Names & Trial by Example**:
-   - Ambiguous domain terms ("account", "campaign", "ready", "complete") are clarified before writing code.
+   - Ambiguous domain terms are clarified before writing code.
    - Abstract agreements are tested against concrete edge cases, error modes, and boundary conditions before confirmation.
 6. **Confirmation & Sealing**:
    Council continues until the Decision Tree is exhausted and no material matter remains in Audience. The Steward presents `# 📜 The Plot` (Intent, Decrees, Bounds of Realm, Findings, Consequences, Delayed Judgments, Victory Criteria). Upon royal assent, the Plot is sealed, transitioning the Quest from `OPEN` $\rightarrow$ `PLANNED`.
 
 ---
 
-## The Scout Reconnaissance Pipeline (Pioneering Methods Without Polluting Production)
-
-The transition from a Proof-of-Concept to production code is often painful when agents try to weld exploratory scripts directly into core services. Castle enforces a strict separation:
+## The Scout Reconnaissance Pipeline
 
 ```
 [1. RECONNAISSANCE]
@@ -140,7 +146,7 @@ Review Scout Report ──► Determine Vision ──► Blueprint Production Qu
 [3. PRODUCTION IMPLEMENTATION]
 🏰 Production Quest (`quest/<id>-<slug>` in Feature / Optimization lane)
 Serf builds clean, modular service code strictly against the Scout's Blueprint + Fixtures
-Master of Coin Audits ──► Gatekeeper Tests on Gatehouse ──► Merge to Castle
+Master of Coin Audits ──► Gatekeeper Tests on Gatehouse Convoy ──► Merge to Castle
 (The Scout branch is razed to Ashes — never merged wholesale into staging)
 ```
 
@@ -148,9 +154,7 @@ Master of Coin Audits ──► Gatekeeper Tests on Gatehouse ──► Merge to
 
 ## The Tribute Contract & Intelligence Rollups
 
-A plain "done" from a coding agent is never accepted. Before advancing to review, every Serf and Scout must render a formal report persisted to disk under `# Tribute Rendered`.
-
-Each section maps directly to dedicated slash commands and CLI rollups:
+Before advancing to review, every Serf and Scout must render a formal report persisted to disk under `# Tribute Rendered`.
 
 ```
                     ┌────────────────────────────────────────────────────────┐
@@ -167,32 +171,29 @@ Each section maps directly to dedicated slash commands and CLI rollups:
     Release Story)       Asset Ledger)     Prompt Feedback)        M'Lord)           Intelligence)
 ```
 
-1. **📜 `/bard` (Ballad)**: Weaves narrative summaries across an Epic or App into a cohesive executive story of challenges encountered, architecture decisions, and transformed features.
-2. **💰 `/coffers` (Tribute)**: Collects the hard deliverables across Quests: git commits, line diff stats, passed test exit codes, new endpoints, data payloads, and **The Tally** (production & UI verification runbooks).
-3. **🪨 `/atone` (Penance)**: Aggregates agent self-flagellations on shortcuts taken, deferred edge cases, and shaky confidence to automatically generate technical debt backlogs and prompt/rule improvement items.
+1. **📜 `/bard` (Ballad)**: Weaves narrative summaries across an Epic or App into a cohesive executive story.
+2. **💰 `/coffers` (Tribute)**: Collects hard deliverables: git commits, line diff stats, test exit codes, new endpoints, and **The Tally** (production & UI verification runbooks).
+3. **🪨 `/atone` (Penance)**: Aggregates agent self-flagellations on shortcuts taken, deferred edge cases, and confidence ratings to generate technical debt backlogs.
 4. **👑 `/audience` (Audience)**: Surfaces pending trade-offs and questions requiring M'Lord's authority.
 5. **👂 `/murmur` (Humble Opinion)**: Clusters bottom-up suggestions from agents in the trenches on emergent optimizations and next architectural moves.
 
 ---
 
-## Branch Topology & Agent Manager Lanes
+## Branch Topology & Ephemeral Gatehouse Convoys
 
 ```
 main                    (production root trunk)
   ^
 castle                  (staging root trunk for main; attached to localhost)
   ^
-  Gatehouse Stations folder (Autonomous Direct-Promotion Stations; Dynamic Rolling: North -> South -> East -> West):
-    - the-gatehouse/north     (Autonomous Cog Ship staging station)
-    - the-gatehouse/south     (Autonomous Cog Ship staging station)
-    - the-gatehouse/east      (Autonomous Cog Ship staging station)
-    - the-gatehouse/west      (Autonomous Cog Ship staging station)
+  Gatehouse folder (Ephemeral per-convoy staging branches; one per Cog Ship convoy, torn down after promotion):
+    - the-gatehouse/<cogship_id>   (e.g. the-gatehouse/cogship-042 — brand-new branch per convoy, never reused)
   ^
-  agent worktrees, structured in tree format:
-    - epics:              epic/<epic_id>-<slug>
-    - epic child quests:  quest/<epic_id>/<quest_id>-<slug>
-    - standalone quests:  quest/<quest_id>-<slug>
-    - scout spikes:       scout/<quest_id>-<slug> (non-merging exploratory POCs)
+  Organizational branch folders:
+    - Epics folder:               epic/<epic_id>-<slug>
+    - Epic child quests folder:   quest/<epic_id>/<quest_id>-<slug>
+    - Standalone quests folder:   quest/<quest_id>-<slug>
+    - Scout spikes folder:        scout/<quest_id>-<slug> or scout/<epic_id>/<quest_id>-<slug>
 ```
 
 ### Agent Manager Sections
@@ -201,7 +202,7 @@ castle                  (staging root trunk for main; attached to localhost)
 - **`Feature`**: Net-new production functionality; verified against component + integration tests.
 - **`Optimization`**: Refactoring, performance, query optimization; full broad test suite.
 - **`Investigation`**: Spikes, POCs, exploratory research (Scouts); **never auto-merges into `gatehouse`**.
-- **`GATEHOUSE`**: Staging worktrees (`the-gatehouse/north`, `the-gatehouse/south`, `the-gatehouse/east`, `the-gatehouse/west`).
+- **`GATEHOUSE`**: Ephemeral staging worktrees (`the-gatehouse/<cogship_id>`).
 - **`Ashes`**: Completed worktrees queued for manual teardown.
 
 ---
@@ -225,29 +226,28 @@ court init
 
 ### 3. Daily Workflow with Kilo Slash Commands
 
-Inside Kilo Code, interact naturally with the Steward:
-
 | Command | Action |
 |---|---|
 | `/plot` | Interactive blueprinting: consults M'Lord on priorities, planning docs, and next Quests |
 | `/scout <app> <concern> "<goal>"` | Dispatch an exploratory Scout for POC reconnaissance on a `scout/*` branch |
 | `/edict <text>` | Record a strategic decree or priority from M'Lord |
 | `/status` | Display Court dashboard (Audiences, In-Review, Active Serfs/Scouts, Teardown queue) |
-| `/charter <id>` | Commission a Quest (create worktree, tree branch, section lane, dispatch Serf) |
-| `/levy` | Scan the Court for idle Serfs and route rendered Tributes to Master of Coin |
-| `/review <id>` | Dispatch Master of Coin to audit value and resource efficiency |
-| `/collect` | Collect approved Tributes, run tests on `gatehouse`, and merge to `castle` |
-| `/gate <id>` | Dispatch Gatekeeper to test and merge a specific Quest |
+| `/charter <id>` | Commission a Quest (fold notes into charter, advance to `PLANNED`, prepare dispatch) |
+| `/dispatch <id>` | Spawn a Serf worktree session with GLM 5.3 Flash and advance to `WORKING` |
+| `/levy` | Scan the Court for idle Serfs, rebase to zero drift, and route rendered Tributes to Master of Coin |
+| `/collect` | Pack approved Quests at `GATE` into a Cog Ship convoy for Gatekeeper testing & promotion |
+| `/ship` | Compile Cog Ship deployment convoy summary with Commutation manifest |
+| `/reject_tribute` | Isolate a failing Quest from a Cog Ship and dispatch Serf remediation in its worktree |
 | `/bear-tribute` | Prompt an active Serf to render its 5-part completion report |
 | `/bard` | Synthesize narrative ballads across Quests into a release story |
-| `/coffers` | Aggregate provable deliverables (commits, line counts, endpoints, passed tests, and production verification runbooks) |
-| `/tally` | Extract and summarize production verification runbooks and UI navigation paths across Quests |
+| `/coffers` | Aggregate provable deliverables and production verification runbooks |
+| `/tally` | Extract and summarize production verification runbooks across Quests |
 | `/atone` | Aggregate agent penance to uncover tech debt and prompt flaws |
 | `/murmur` | Surface bottom-up field recommendations from the agents |
 | `/audience` | Surface pending decisions requiring M'Lord's judgment |
-| `/raze <id>` | Move a merged worktree to Ashes for teardown |
+| `/raze <id>` | Verify merge status, fast-forward branch, and move worktree to Ashes |
 | `/goad <id>` | Nudge an idle or exited Serf session, or diagnose whether it actually finished |
-| `/pillory <id>` | Freeze a Quest as `PUNISHED` with Decrees for a chartered successor (judgment-call rejection) |
+| `/pillory <id>` | Freeze a Quest as `PUNISHED` with Decrees for a chartered successor |
 | `/ward` | Display the Warden's log-patrol dashboard, or dispatch a fresh patrol session |
 
 ---

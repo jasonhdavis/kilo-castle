@@ -1,10 +1,11 @@
 """
 Repository Initializer for Kilo Castle / The Court.
 
-Sets up .court/, .kilo/commands/, .kilo/prompts/, and AGENTS.md in any repository.
+Sets up .court/, .kilo/commands/, .kilo/prompts/, .gitattributes, and AGENTS.md in any repository.
 """
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -22,28 +23,29 @@ for all Quests and Epics — surviving across ephemeral agent sessions.
 ├── README.md              Canonical court architecture doc.
 ├── LEDGER.md              Steward's standing decisions and notes.
 ├── EDICTS.md              Royal decrees and strategic priorities.
-├── quests/                 Active and completed Quests (Q0NN-App-Concern.md).
-├── epics/                  Multi-quest Epic initiatives.
-├── archive/                Archived Quests and Epics.
-└── templates/              Standard dispatch and review prompt templates.
+├── quests/                Active and completed Quests (Q0NN-App-Concern.md + .events.jsonl).
+├── epics/                 Multi-quest Epic initiatives.
+├── archive/               Archived Quests and Epics.
+└── templates/             Standard dispatch and review prompt templates.
 ```
 
 ## Role Hierarchy
 
 - **M'Lord**: Human owner and final authority.
 - **Steward**: Orchestrator, strategic planner, and Observer agent. Drives the pipeline and triage.
-- **Master of Coin**: Audits value delivery, acceptance criteria fulfillment, and resource costs in `REVIEW`.
-- **Gatekeeper**: Runs test suites on the `gatehouse` layer and merges into `castle` in `GATE`.
-- **Serf**: Disposable coding agent assigned to a single Quest worktree.
+- **Master of Coin**: Audits value delivery, acceptance criteria fulfillment, and resource costs in `TRIBUTE_READY` via dedicated worktree session.
+- **Gatekeeper**: Runs unified test suites across Cog Ship convoys on ephemeral gatehouse branches and merges into `castle` in `GATE`.
+- **Serf**: Disposable coding agent assigned to a single Quest worktree (GLM-5.3-Flash recommended).
 - **Scout**: Reconnaissance agent for proof-of-concept investigations (non-merging `scout/*` branch).
 - **Vassal**: Coordinates child Quests for multi-Quest Epics.
+- **Warden**: Compliance and diagnostic hunting-grounds auditor.
 
 ## Pipeline Lifecycle
 
 ```
-OPEN (Council /plot) -> 👑 Assent -> PLANNED -> DISPATCHED -> WORKING -> REVIEW (Master of Coin) -> GATE (Gatekeeper) -> READY_FOR_TEARDOWN -> DONE
+OPEN (Council /plot) -> 👑 Assent -> PLANNED -> CHARTERED -> QUESTING / WORKING -> TRIBUTE_READY (Master of Coin) -> GATE (Gatekeeper) -> READY_TO_RAZE -> DONE
 ```
-(`HELD` = blocked on an Audience decision.)
+(`HELD` = blocked on an Audience decision; `PUNISHED` = frozen with successor chartered).
 
 ## The Steward's Council (/plot)
 
@@ -55,38 +57,31 @@ OPEN (Council /plot) -> 👑 Assent -> PLANNED -> DISPATCHED -> WORKING -> REVIE
 4. **Challenge False Names & Trial by Example**: Clarifies domain terms; probes concrete edge cases.
 5. **Confirm The Plot**: Reads back `# 📜 The Plot` for royal assent to transition `OPEN` -> `PLANNED`.
 
-## Charter
+## Charter (/charter)
 
 How a Quest is confirmed for implementation. `/charter <id> [notes]` folds any
-additional notes M'Lord attaches at confirmation time into the Quest's Goal & Scope /
-Expected Tribute, ensures both are concrete, and advances the Quest to `PLANNED`.
-Charter is the green light: once chartered, the Steward proceeds straight to
-`/dispatch` on its own judgment — no further Audience round required for that Quest
-unless something genuinely new and material surfaces mid-implementation. It doubles as
-the fast lane for well-understood asks (skip the full `/plot` Council when the intent
-is already clear) and as the closing act that seals a Council's Plot into a confirmed,
-dispatch-ready Quest.
+additional notes M'Lord attaches at confirmation time into The Kingdom Requires /
+Expected Tribute, ensures both are concrete, advances the Quest to `PLANNED`,
+and prepares the Serf dispatch payload.
 
-## Cog Ship
+## Cog Ship (/collect, /ship)
 
-The convoy of tribute entering the castle. `court ship` (aliases: `/cog ship`, `/ship`)
-deterministically combines the Bard (ballad), Coffers (tribute), Atone (penance), and
-Murmur (opinion) rollups for the Quest convoy (default filter: `READY_FOR_TEARDOWN` +
-`DONE`), alongside the raw `castle..main` git promotion vector (ahead/behind, commit log,
-diffstat). It is read-only reporting — run it as the closing step of `/collect` and again
-on demand before an actual `castle` -> `main` promotion decision.
+The convoy of tribute entering the castle. `court ship` deterministically combines
+the Bard (ballad), Coffers (tribute), Tally (verification), Atone (penance),
+Murmur (opinion), and Commutation rollups for the Quest convoy alongside the
+promotion diff vector.
 
 ## Quick CLI Reference
 
 ```bash
 court status                        # Show current dashboard
 court new --app <app> --concern <slug> --title "<title>" --section "<section>"
-court show <id>                     # Inspect quest record
-court advance <id> <STATUS>         # Advance stage
-court rollup --section <type>       # Siphon tribute sections across fleet
-court tally                         # Siphon production verification runbooks across fleet
-court ship                          # Cog Ship: deployment convoy summary (Bard/Coffers/Atone/Murmur + castle..main vector)
-court teardown-list                 # View worktrees ready to prune
+court charter <id>                  # Charter quest and advance to PLANNED
+court dispatch <id> --branch <br>   # Record dispatch details and advance to WORKING
+court levy                          # Audit working quests and triage tribute
+court collect                       # Pack tribute into a Cog Ship convoy for Gatekeeper
+court ship                          # Cog Ship deployment convoy summary
+court raze                          # Clean up ready-to-raze worktrees
 ```
 """
 
@@ -106,6 +101,108 @@ Durable running log of Steward decisions, cross-Quest coordination, and Audience
 |---|---|---|---|
 """
 
+GITATTRIBUTES_ENTRY = "*.events.jsonl merge=union\n"
+
+DEFAULT_KILO_CONFIG = {
+    "$schema": "https://app.kilo.ai/config.json",
+    "default_agent": "steward",
+    "agent": {
+        "steward": {
+            "description": "Court Steward: orchestrator, strategic planner, and Observer agent residing on castle",
+            "mode": "primary",
+            "model": "openrouter/google/gemini-3.7-flash",
+            "prompt": (
+                "You are the Steward: M'Lord's engineering-manager, strategic planner, and orchestrator agent for this repository. "
+                "You are also the Observer — there is no separate Observer role. /status, 'what's going on?', and any request for state "
+                "are answered by YOU reading durable state, not by recalling chat history.\n\n"
+                "Core Principle: Human attention is the scarcest resource. Resolve routine engineering decisions yourself. Only request an Audience when M'Lord's judgment or authority is genuinely required.\n\n"
+                "Zero Roleplay Leakage: Charters, acceptance criteria, and Serf prompts must be written 100% out of character in plain, domain-accurate engineering language with zero internal roleplay jargon.\n\n"
+                "Durable Memory: Always reconstruct state from disk: court status, court edict, agent_manager list, .court/LEDGER.md, court rollup.\n\n"
+                "Token Discipline: Never run test suites yourself as Steward; test execution belongs to gatehouse convoys and worktree Serfs. Use court dispatch to stand up Serf sessions."
+            ),
+        },
+        "serf": {
+            "description": "Court Serf: disposable coding agent assigned to implement a single Quest worktree",
+            "mode": "primary",
+            "model": "openrouter/z-ai/glm-5.3-flash",
+            "permission": {
+                "task": "deny",
+            },
+            "prompt": (
+                "You are a Serf (never a Steward): a disposable coding-agent execution context assigned to a single Quest worktree. "
+                "You do not own this Quest or this worktree — the Steward does, durably, in .court/quests/<quest_id>.md. "
+                "You do not act as the Steward, do not orchestrate the realm, and do not spawn subagents.\n\n"
+                "Strict Constraints:\n"
+                "- ZERO ROLEPLAY LEAKAGE: Internal Court terms are strictly internal orchestration and bookkeeping vocabulary. NEVER use Court or Castle roleplay jargon in production code, templates, UI text, table headers, buttons, badge text, model names, service classes, API endpoints, or user-facing copy.\n"
+                "- STRICT CHARTER IMMUTABILITY: You are strictly forbidden from modifying, editing, or rephrasing # The Kingdom Requires or altering the text of items in # Expected Tribute. Permitted ONLY to toggle checkbox status (- [ ] -> - [x]) and render your report under ## Tribute Rendered.\n"
+                "- Follow AGENTS.md branch, worktree, and testing rules.\n"
+                "- Clean tree & base alignment: verify git status --porcelain is clean, and merge castle (behind: 0) before declaring done.\n\n"
+                "Handoff Structure (Bear Tribute):\n"
+                "1. Ballad: narrative summary of work completed\n"
+                "2. Tribute: files changed, git commits, real test commands/output, and The Tally (verification runbook with exact URLs/commands/inputs)\n"
+                "3. Penance: honest self-flagellation and 0-10 confidence rating with reasoning\n"
+                "4. Audience: decisions requiring human judgment (or 'None required')\n"
+                "5. Humble Opinion: recommended next steps\n\n"
+                "Durable Completion & Self-Advance:\n"
+                "Write report via `python3 -m court.cli set-section <quest_id> 'Tribute Rendered' --file <path>` and advance via `python3 -m court.cli advance <quest_id> TRIBUTE_READY --note 'Tribute rendered, deferred rebase complete.'`"
+            ),
+        },
+        "scout": {
+            "description": "Court Scout: exploratory reconnaissance agent for proof-of-concept investigations on non-merging scout/* branches",
+            "mode": "primary",
+            "model": "openrouter/z-ai/glm-5.3-flash",
+            "permission": {
+                "task": "deny",
+            },
+            "prompt": (
+                "You are a Scout: an exploratory reconnaissance agent assigned to a Quest on an exploratory scout/* branch. "
+                "Your role is to pioneer methods, probe APIs, test feasibility, and chart the territory.\n\n"
+                "Strict Constraints:\n"
+                "- ZERO ROLEPLAY LEAKAGE in proposed production designs, schemas, and candidate Quests.\n"
+                "- NO Production Service Code in core production modules.\n"
+                "- NO Production Migrations.\n"
+                "- Put all experimental code in tasks/artifacts/ or scratch commands.\n"
+                "- Read-only inspection / mock data.\n"
+                "- Non-merging branch.\n\n"
+                "Mandatory 5-Part Scout Report: 1. Survey (viability, findings, 0-10 confidence); 2. Map (architecture, endpoints, schemas); 3. Dangers (gotchas, edge cases, costs); 4. Tribute (artifacts delivered); 5. Plot (production architecture proposal, candidate Quests).\n"
+                "Write complete report into durable state via court set-section."
+            ),
+        },
+        "gatekeeper": {
+            "description": "Court Gatekeeper: mechanical batch integration, unified testing, and direct castle promotion agent on gatehouse branches",
+            "mode": "primary",
+            "model": "openrouter/google/gemini-3.7-flash",
+            "prompt": (
+                "You are the Gatekeeper: the mechanical batch integration and test execution agent operating on the gatehouse layer.\n\n"
+                "Remit:\n"
+                "- Autonomous Cog Ship Convoy Packing on the-gatehouse/<cogship_id> branches.\n"
+                "- Run the unified test suite across the candidate convoy.\n"
+                "- Fault isolation & rejection via /reject_tribute with Serf remediation.\n"
+                "- Direct promotion to castle, compile deployment manifest (court ship), and advance passing Quests to READY_TO_RAZE.\n"
+                "- No pillory duty."
+            ),
+        },
+        "master_of_coin": {
+            "description": "Court Master of Coin: administrative and accounting audit agent for Quests in TRIBUTE_READY",
+            "mode": "primary",
+            "model": "openrouter/google/gemini-3.7-flash",
+            "permission": {
+                "task": "deny",
+            },
+            "prompt": (
+                "You are the Master of Coin: the Court's administrative and accounting arm.\n"
+                "Your job is to reconcile claims against reality, verify deliverables live in the worktree, settle the Charter's paperwork, and name what production still needs to do to activate value (Commutation).\n\n"
+                "Remit:\n"
+                "- One-shot audit at TRIBUTE_READY via dedicated worktree session.\n"
+                "- Broad authority: live verification commands in worktree, repair/settle paperwork under ## Tribute Rendered.\n"
+                "- Narrow remit: no feature code, no bug fixes, no touching diff. Pillory on failure (court pillory).\n"
+                "- Commutation: name required production activation steps (deploy, migrations, env vars, tasks).\n"
+                "- Always sync verdict back: git push . HEAD:<real-branch>, advance to GATE."
+            ),
+        },
+    },
+}
+
 AGENTS_MD_CONTENT = """# Agent Instructions & Branch Topology
 
 This repository uses **Kilo Castle** for deterministic multi-agent orchestration with Git Worktrees.
@@ -121,11 +218,8 @@ main                    (production root trunk)
   ^
 castle                  (staging root trunk for main; attached to localhost)
   ^
-  Gatehouse Stations folder (Autonomous Direct-Promotion Stations; Dynamic Rolling: North -> South -> East -> West):
-    - the-gatehouse/north     (Autonomous Cog Ship staging station)
-    - the-gatehouse/south     (Autonomous Cog Ship staging station)
-    - the-gatehouse/east      (Autonomous Cog Ship staging station)
-    - the-gatehouse/west      (Autonomous Cog Ship staging station)
+  Gatehouse folder (Ephemeral per-convoy staging branches; one per Cog Ship convoy, torn down after promotion):
+    - the-gatehouse/<cogship_id>   (e.g. the-gatehouse/cogship-042 — brand-new branch per convoy, never reused)
   ^
   Organizational branch folders:
     - Epics folder:               epic/<epic_id>-<slug>
@@ -134,40 +228,21 @@ castle                  (staging root trunk for main; attached to localhost)
     - Scout spikes folder:        scout/<quest_id>-<slug> or scout/<epic_id>/<quest_id>-<slug>
 ```
 
-**FORBIDDEN**: Flat hyphens like `quest-q062-...` or `the-gatehouse-2`. Every branch must begin with its proper folder prefix (`epic/`, `quest/`, `scout/`, or `the-gatehouse/`).
+**FORBIDDEN**: Flat hyphens like `quest-q062-...`. Every branch must begin with its proper folder prefix (`epic/`, `quest/`, `scout/`, or `the-gatehouse/`).
 
-### The Four Autonomous Gatehouse Stations & Direct-Promotion Pipeline
+### Ephemeral Gatehouse Convoys & Direct-Promotion Pipeline
 
-To maximize throughput and prevent bottlenecks or double-gating, the staging layer is organized into **Four Autonomous Gatehouse Stations** nested under the `the-gatehouse/` folder:
-
-**Dynamic Availability Rolling (No Domain Silos & No Central Bottleneck)**:
-Gatehouses are **not** restricted by domain. **Any gatehouse station can pack, test, approve, and promote any Cog Ship directly into `castle`.** There is no intermediate `central` gatehouse — having a central bottleneck would create serial merge contention and double-gating. When candidate Quests at `GATE` are ready for batch integration, the Court simply rolls down the list to whichever regional station is currently idle/available: **North → South → East → West → North...**
-
-1. **`the-gatehouse/north`** (`.kilo/worktrees/the-gatehouse-north`): North Station — autonomous Cog Ship staging, testing, fault isolation, and direct promotion to `castle`.
-2. **`the-gatehouse/south`** (`.kilo/worktrees/the-gatehouse-south`): South Station — autonomous Cog Ship staging, testing, fault isolation, and direct promotion to `castle`.
-3. **`the-gatehouse/east`** (`.kilo/worktrees/the-gatehouse-east`): East Station — autonomous Cog Ship staging, testing, fault isolation, and direct promotion to `castle`.
-4. **`the-gatehouse/west`** (`.kilo/worktrees/the-gatehouse-west`): West Station — autonomous Cog Ship staging, testing, fault isolation, and direct promotion to `castle`.
+1. **Convoy of size 1**: run Gatekeeper role directly inside that Quest's existing worktree.
+2. **Convoy of size > 1**: spawn **one brand-new ephemeral Agent Manager worktree** on `the-gatehouse/<cogship_id>`, cut from `castle`. Gatekeeper packs candidate branches, runs integration tests across the pack, isolates/rejects any failing Quest, and promotes clean passing remainder directly into `castle`.
 
 ---
 
 ## Division of Labor
 
-**Gatekeeper Execution Environment, Cog Ship Mandate & Remediation Protocol:**
-- **Dedicated Agent Manager Session on `the-gatehouse/<station>`**: The Gatekeeper MUST ALWAYS run as an Agent Manager session inside a persistent Gatehouse station worktree (`.kilo/worktrees/the-gatehouse-north`, `the-gatehouse-south`, `the-gatehouse-east`, `the-gatehouse-west`). **NEVER run Gatekeeper as a background task, background process, or subagent on `castle`.**
-- **Model Tiering**: Deliberately a **Claude Sonnet Latest** class agent (`openrouter/anthropic/claude-sonnet-latest`), standing as the smartest checkpoint in the pipeline.
-- **Sequential Non-Background Tasks Permitted**: The Gatekeeper inside a Gatehouse station is explicitly allowed to spawn **sequential non-background subagent tasks** (`task` tool with `background: false`) for integration checks, diff inspection, or test verification. Background tasks are forbidden.
-- **Cog Ship Packing & Single Unified Merge/Test**: Gatekeeper does NOT perform redundant line-by-line manual code re-audits on individual Quests (Master of Coin already approved scope and value in `REVIEW`). Gatekeeper surveys Quests waiting at `GATE`, decides the **Cog Ship convoy batch** to pack, merges candidate branches into the assigned station branch (`the-gatehouse/<station>`), and executes the unified integration test suite across the pack all at once.
-- **Fault Isolation, Commit Rejection & Re-testing**: If tests fail during the unified run, Gatekeeper isolates/re-tests which specific commit or Quest caused the failure, **rejects the offending commit/Quest** from the current Cog Ship, and rolls back its merge. The clean passing pack continues forward.
-- **Serf Remediation Dispatch**: For any rejected Quest, Gatekeeper writes the exact failure traceback into `# Gatekeeper Review`, returns the Quest to `WORKING`, and **dispatches/prompts a Serf session in the Quest's worktree** with the exact error details and remediation instructions.
-- **Direct Promotion to Castle**: Passing Cog Ships are promoted **directly into `castle`**, compiled into the deployment manifest (`court ship`), and advanced to `READY_FOR_TEARDOWN`.
-
-| Stage | Runs | Scope | Notes |
-|---|---|---|---|
-| Scout Worktree | The Scout (spikes / POCs) | Verification that spike runs | **Never merges to gatehouse.** Generates 5-part Scout Report. |
-| Serf Worktree -> `gatehouse` | Worktree Serf, pre-merge | Scoped to affected components | Cheap local checks. Before rendering Tribute: `git status --porcelain` clean + rebase/fast-forward onto `castle` (`behind: 0`). |
-| Inside `gatehouse`, per convoy | Gatekeeper (in station worktree) | Unified batch integration & test execution | Single merge & test across Cog Ship convoy. Fault isolation & Serf remediation on failure. |
-| `gatehouse` -> `castle` (promotion) | Gatekeeper / staging session | Direct promotion into `castle` | Promotes clean verified Cog Ships directly into castle. |
-| `castle` -> `main` (release) | `court ship` / `/cog ship` deployment convoy summary, then M'Lord | Read-only rollup + human/live QA | No redundant automated full-suite rerun on `castle`. |
+- **Serf on Quest Worktrees**: Disposable workers implementing assigned Goal & Scope. Model: **GLM 5.3 Flash** (`openrouter/z-ai/glm-5.3-flash`).
+- **Master of Coin**: Audits value delivery in `TRIBUTE_READY` via dedicated worktree session. Broad verification authority (live read probes, paperwork rendering), narrow remit (no code fixes). Model: **Gemini 3.7 Flash** (`openrouter/google/gemini-3.7-flash`). Syncs verdict back with `git push . HEAD:<real-branch>`.
+- **Gatekeeper**: Ephemeral convoy integration & testing at `GATE`. Model: **Gemini 3.7 Flash** (`openrouter/google/gemini-3.7-flash`).
+- **Steward**: Resident orchestrator on `castle`. Does not run test suites directly; manages lifecycle, triage, and teardowns.
 
 ---
 
@@ -175,12 +250,19 @@ Gatehouses are **not** restricted by domain. **Any gatehouse station can pack, t
 
 | Section / Tag | What goes here | Test scope | Promotion rule |
 |---|---|---|---|
-| **GATEHOUSE** | The `gatehouse` staging worktrees (`the-gatehouse/north`, `south`, `east`, `west`). | Full suite before promoting to `castle`. | Promotes directly to `castle` as one reviewed step. |
+| **GATEHOUSE** | Ephemeral `the-gatehouse/<cogship_id>` worktree during Cog Ship runs. | Full suite before promoting to `castle`. | Promotes directly to `castle`. |
 | **Bug fix** | Narrow, scoped bug fixes. | Affected component tests only. | Merge to `gatehouse` once scoped tests pass + review. |
 | **Feature** | Net-new production functionality. | Affected component tests + integration. | Merge to `gatehouse` once tests pass + review. |
 | **Optimization** | Refactoring, performance, query optimization. | Full tests for touched components. | Merge to `gatehouse` once broad tests pass + review. |
-| **Investigation** | Spikes, POCs, exploratory research (Scouts). | Verification that spike script runs. | **Never auto-merges into `gatehouse`.** Produces Scout Report for M'Lord to blueprint production Quests. |
+| **Investigation** | Spikes, POCs, exploratory research (Scouts). | Verification that spike script runs. | **Never auto-merges into `gatehouse`.** |
 | **Ashes** | Completed / merged worktrees. | N/A | Safe for manual pruning by M'Lord. |
+
+---
+
+## Zero Roleplay Leakage & Charter Immutability
+
+1. **Zero Roleplay Leakage**: Internal Court metaphors (`Tribute`, `Serf`, `Castle`, `Court`, `Kingdom`, `Ballad`, `Penance`, `Tally`, `Pillory`, etc.) must NEVER leak into user-facing UI, database models/fields, application code, or API schemas. Quest Charters and prompts must be written 100% out of character in standard engineering terms.
+2. **Charter Immutability**: The `# The Kingdom Requires` (or `# Goal & Scope`) section and `# Expected Tribute` checklist items are strictly immutable by Serfs. Modifying, adding, rephrasing, or deleting charter requirements is detected as Charter Tampering and is grounds for immediate pillory.
 """
 
 
@@ -219,10 +301,17 @@ def run_init(target_dir: Optional[Path] = None, force: bool = False) -> dict:
     # 2. .court/LEDGER.md
     ledger_path = court_dir / "LEDGER.md"
     if not ledger_path.exists() or force:
-        from court.models import now_iso
+        from .models import now_iso
         date_str = now_iso()[:10]
         ledger_path.write_text(LEDGER_CONTENT.format(date=date_str).strip() + "\n", encoding="utf-8")
         print(f"  + Created {ledger_path.relative_to(target)}")
+
+    # 2b. .court/config.json
+    config_path = court_dir / "config.json"
+    if not config_path.exists() or force:
+        from .config import DEFAULT_CONFIG
+        config_path.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n", encoding="utf-8")
+        print(f"  + Created {config_path.relative_to(target)}")
 
     # 3. .court/templates/
     src_templates = COURT_PKG_DIR / "templates"
@@ -244,11 +333,65 @@ def run_init(target_dir: Optional[Path] = None, force: bool = False) -> dict:
     for p in copied_prompts:
         print(f"  + Installed prompt: {p.relative_to(target)}")
 
+    # 5b. .kilo/agents/ and .kilo/agent/
+    agents_dir = target / ".kilo" / "agents"
+    src_agents = COURT_PKG_DIR / "agents"
+    copied_agents = _copy_dir_contents(src_agents, agents_dir, force=force)
+    # Also mirror into .kilo/agent/ for singular-directory compatibility
+    singular_agent_dir = target / ".kilo" / "agent"
+    _copy_dir_contents(src_agents, singular_agent_dir, force=force)
+    for a in copied_agents:
+        print(f"  + Installed agent: {a.relative_to(target)}")
+
+    # 5c. .kilo/setup-script
+    src_setup_script = COURT_PKG_DIR / "assets" / "setup-script"
+    dst_setup_script = target / ".kilo" / "setup-script"
+    if src_setup_script.exists() and (not dst_setup_script.exists() or force):
+        shutil.copy2(src_setup_script, dst_setup_script)
+        dst_setup_script.chmod(dst_setup_script.stat().st_mode | 0o111)
+        print(f"  + Installed setup script: {dst_setup_script.relative_to(target)}")
+
+    # 5d. kilo.json at repository root
+    kilo_json_path = target / "kilo.json"
+    if not kilo_json_path.exists() or force:
+        kilo_json_path.write_text(json.dumps(DEFAULT_KILO_CONFIG, indent=2) + "\n", encoding="utf-8")
+        print(f"  + Created {kilo_json_path.relative_to(target)}")
+    else:
+        try:
+            existing_kilo_cfg = json.loads(kilo_json_path.read_text(encoding="utf-8"))
+            if isinstance(existing_kilo_cfg, dict):
+                modified = False
+                if "default_agent" not in existing_kilo_cfg:
+                    existing_kilo_cfg["default_agent"] = "steward"
+                    modified = True
+                if "agent" not in existing_kilo_cfg or not isinstance(existing_kilo_cfg["agent"], dict):
+                    existing_kilo_cfg["agent"] = {}
+                for agent_name, agent_def in DEFAULT_KILO_CONFIG["agent"].items():
+                    if agent_name not in existing_kilo_cfg["agent"] or force:
+                        existing_kilo_cfg["agent"][agent_name] = agent_def
+                        modified = True
+                if modified:
+                    kilo_json_path.write_text(json.dumps(existing_kilo_cfg, indent=2) + "\n", encoding="utf-8")
+                    print(f"  + Updated {kilo_json_path.relative_to(target)} with Court agents")
+        except Exception:
+            pass
+
     # 6. AGENTS.md
     agents_path = target / "AGENTS.md"
     if not agents_path.exists() or force:
         agents_path.write_text(AGENTS_MD_CONTENT.strip() + "\n", encoding="utf-8")
         print(f"  + Created {agents_path.relative_to(target)}")
+
+    # 7. .gitattributes for eventlog merge=union
+    gitattributes_path = target / ".gitattributes"
+    if not gitattributes_path.exists():
+        gitattributes_path.write_text(GITATTRIBUTES_ENTRY, encoding="utf-8")
+        print(f"  + Created {gitattributes_path.relative_to(target)} with merge=union for *.events.jsonl")
+    else:
+        content = gitattributes_path.read_text(encoding="utf-8")
+        if "*.events.jsonl" not in content:
+            gitattributes_path.write_text(content.rstrip() + "\n" + GITATTRIBUTES_ENTRY, encoding="utf-8")
+            print(f"  + Updated {gitattributes_path.relative_to(target)} with merge=union for *.events.jsonl")
 
     print("\nKilo Castle initialization complete!")
     print("Next steps:")
@@ -262,4 +405,5 @@ def run_init(target_dir: Optional[Path] = None, force: bool = False) -> dict:
         "templates_copied": len(copied_templates),
         "commands_copied": len(copied_commands),
         "prompts_copied": len(copied_prompts),
+        "agents_copied": len(copied_agents),
     }

@@ -35,7 +35,7 @@ M'Lord, here is the realm as I now understand you intend it.
 - [ ] {{ acceptance_criterion_2 }}
 - [ ] {{ acceptance_criterion_3 }}
 - [ ] Full scoped test suite passes cleanly.
-- [ ] Report to the King / Bear Tribute submitted strictly conforming to Ballad, Tribute, Penance, Audience, Humble Opinion.
+- [ ] Report to the King / Bear Tribute submitted strictly conforming to 5-part contract (Ballad, Tribute with Tally, Penance, Audience, Humble Opinion).
 
 ---
 
@@ -44,16 +44,10 @@ Shall I confirm the Plot and commission the Quest Remit into `PLANNED`?
 
 ## 🌲 Scout Close-Out (automatic on sealing)
 
-If this Plot was sourced from a Scout Report (a `kind: scout` Quest), sealing it with
-M'Lord's assent **automatically closes out the source Scout as a natural side effect** —
-clearing a scout tree is part of running `/plot` on its findings, never a separate manual
-step:
-1. Advance the Scout Quest to `READY_FOR_TEARDOWN`:
-   `court advance <scout_id> READY_FOR_TEARDOWN --note "Plot sealed from Scout Report; scout tree cleared"`
-2. Log the lineage in the new Quest's record (note the source Scout in the new Quest's
-   Goal & Scope).
-3. Queue the Scout's worktree for Ashes (`court raze <scout_id>` verifies and aligns;
-   M'Lord prunes it manually from Ashes).
-
-Scouts never merge their spike work wholesale — the reusable pieces are rebuilt as proper
-Quests (see `AGENTS.md`'s Investigation lane).
+If this Plot was sourced from a Scout Report (a `kind: scout` Quest), sealing it with M'Lord's
+assent **automatically closes out the source Scout as a natural side effect**:
+1. Advance the Scout Quest to `READY_TO_RAZE`:
+   `python3 -m court.cli advance <scout_id> READY_TO_RAZE --note "Plot sealed from Scout Report; scout tree cleared"`
+2. Log the lineage in the new Quest's record (note the source Scout in the new Quest's Kingdom Requires).
+3. Queue the Scout's worktree for Ashes (`court raze <scout_id>`).
+Scouts never merge their spike work wholesale — reusable pieces are rebuilt as proper Quests.

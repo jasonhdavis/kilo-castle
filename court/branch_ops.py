@@ -120,12 +120,23 @@ def resolve_canonical_branch_name(
         quest_id = m_stand_q.group(1).lower()
         slug = m_stand_q.group(2).lower()
 
+        fork_suffix = ""
+        m_fork = re.search(r"(-\d+)$", clean)
+        if m_fork:
+            fork_suffix = m_fork.group(1)
+
         quest = find_quest_in_court(quest_id, cwd=cwd)
         if quest:
             if quest.branch and quest.branch.startswith("quest/"):
-                return quest.branch, f"court_quest_frontmatter ({quest.id})"
+                b = quest.branch
+                if fork_suffix and not b.endswith(fork_suffix):
+                    b = f"{b}{fork_suffix}"
+                return b, f"court_quest_frontmatter ({quest.id})"
             elif quest.tree_branch:
-                return quest.tree_branch, f"court_quest_tree_branch ({quest.id})"
+                b = quest.tree_branch
+                if fork_suffix and not b.endswith(fork_suffix):
+                    b = f"{b}{fork_suffix}"
+                return b, f"court_quest_tree_branch ({quest.id})"
 
         return f"quest/{quest_id}-{slug}", "regex_standalone_quest"
 
@@ -134,12 +145,23 @@ def resolve_canonical_branch_name(
         quest_id = m_stand_s.group(1).lower()
         slug = m_stand_s.group(2).lower()
 
+        fork_suffix = ""
+        m_fork = re.search(r"(-\d+)$", clean)
+        if m_fork:
+            fork_suffix = m_fork.group(1)
+
         quest = find_quest_in_court(quest_id, cwd=cwd)
         if quest:
             if quest.branch and quest.branch.startswith("scout/"):
-                return quest.branch, f"court_scout_frontmatter ({quest.id})"
+                b = quest.branch
+                if fork_suffix and not b.endswith(fork_suffix):
+                    b = f"{b}{fork_suffix}"
+                return b, f"court_scout_frontmatter ({quest.id})"
             elif quest.tree_branch:
-                return quest.tree_branch, f"court_scout_tree_branch ({quest.id})"
+                b = quest.tree_branch
+                if fork_suffix and not b.endswith(fork_suffix):
+                    b = f"{b}{fork_suffix}"
+                return b, f"court_scout_tree_branch ({quest.id})"
 
         return f"scout/{quest_id}-{slug}", "regex_standalone_scout"
 

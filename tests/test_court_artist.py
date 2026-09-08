@@ -283,8 +283,19 @@ class TestCourtArtist(unittest.TestCase):
             title="Quest with Skipped UI Review",
             app="common",
             concern="ui",
+            branch="quest/q908-ui",
             status="TRIBUTE_READY",
             body_sections={
+                "The Kingdom Requires": "Scope",
+                "Expected Tribute": "- [x] Done",
+                "Tribute Rendered": (
+                    "## 1. Ballad\nDone\n"
+                    "## 2. Tribute\nDone\n"
+                    "## 3. Tally\nDone\n"
+                    "## 4. Penance\nNone\n"
+                    "## 5. Audience\nNone\n"
+                    "## 6. Humble Opinion\nDone\n"
+                ),
                 "Master of Coin's Audit": (
                     "- **Verdict:** PASS\n"
                     "- **UI Review:** PENDING (Recommend Court Artist session via /artist Q908)\n"

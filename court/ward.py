@@ -526,15 +526,23 @@ def audit_quest(
                 f"Worktree has {len(uncommitted)} uncommitted file(s) ({', '.join(uncommitted[:3])}{'...' if len(uncommitted)>3 else ''})."
             ))
 
-        # Check worktree branch matches frontmatter
+        # Check worktree branch matches frontmatter and hierarchy
         actual_branch = git_stat.get("branch")
-        if actual_branch and quest.branch:
+        if actual_branch:
             clean_actual = actual_branch.replace("refs/heads/", "")
-            clean_quest_b = quest.branch.replace("refs/heads/", "")
-            if clean_actual != clean_quest_b:
+            is_valid_actual, actual_branch_err = validate_branch_name(clean_actual)
+            if not is_valid_actual:
+                target_branch_hint = quest.branch or "canonical/slash-branch"
                 violations.append(WardViolation(
-                    f"Worktree branch mismatch: checked-out branch '{actual_branch}' does not match quest frontmatter branch '{quest.branch}'."
+                    f"Checked-out branch in worktree is flat '{actual_branch}'. "
+                    f"Must use slash hierarchy (run: git branch -m {target_branch_hint})."
                 ))
+            if quest.branch:
+                clean_quest_b = quest.branch.replace("refs/heads/", "")
+                if clean_actual != clean_quest_b:
+                    violations.append(WardViolation(
+                        f"Worktree branch mismatch: checked-out branch '{actual_branch}' does not match quest frontmatter branch '{quest.branch}'."
+                    ))
 
         # Base drift check
         behind = git_stat.get("behind")

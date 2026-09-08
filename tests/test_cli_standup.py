@@ -118,10 +118,11 @@ class TestCliStandup(unittest.TestCase):
         self.assertTrue((wt_dir / ".kilo" / "TASK.md").is_file())
         self.assertEqual((wt_dir / ".kilo" / "TASK.md").read_text(encoding="utf-8"), "Do task")
 
+    @patch("court.cli.find_kilo_binary", return_value=None)
     @patch("court.git_ops.create_git_worktree")
     @patch("court.git_ops.get_repo_root")
     @patch("court.store.get_court_root")
-    def test_dispatch_automated_standup(self, mock_court_root, mock_repo_root, mock_create_wt):
+    def test_dispatch_automated_standup(self, mock_court_root, mock_repo_root, mock_create_wt, mock_find_kilo):
         """Verify court dispatch without --worktree performs automated standup and transitions to WORKING."""
         mock_court_root.return_value = self.court_dir
         mock_repo_root.return_value = self.tmp_path
@@ -140,10 +141,11 @@ class TestCliStandup(unittest.TestCase):
         # Check worktree config was created
         self.assertTrue((wt_path / ".kilo" / "kilo.json").is_file())
 
+    @patch("court.cli.find_kilo_binary", return_value=None)
     @patch("court.git_ops.create_git_worktree")
     @patch("court.git_ops.get_repo_root")
     @patch("court.store.get_court_root")
-    def test_charter_with_dispatch_flag(self, mock_court_root, mock_repo_root, mock_create_wt):
+    def test_charter_with_dispatch_flag(self, mock_court_root, mock_repo_root, mock_create_wt, mock_find_kilo):
         """Verify court charter --dispatch charters and stands up the Serf in one call."""
         mock_court_root.return_value = self.court_dir
         mock_repo_root.return_value = self.tmp_path

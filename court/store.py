@@ -546,3 +546,13 @@ def rollup_ship_manifest(
             manifest["extra_tributes"].append((q, et))
 
     return manifest
+
+
+def __getattr__(name: str) -> Any:
+    if name == "QUESTS_DIR":
+        return get_quests_dir()
+    if name == "EPICS_DIR":
+        return get_epics_dir()
+    if name == "ARCHIVE_DIR":
+        return get_archive_dir()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -904,6 +904,7 @@ def cmd_status(args):
                 "warnings": audit.warnings,
                 "forced_transition": _last_ledger_entry_is_forced(q),
                 "commutation": q.extract_commutation(),
+                "commutation_done": q.commutation_complete(),
                 "pending_audience": q.has_pending_audience(),
             }
             results.append(q_dict)
@@ -1057,16 +1058,24 @@ def cmd_status(args):
         for q in raze_quests:
             _render_item(q)
 
-    # 12. COMMUTATIONS REQUIRED
-    commutations = []
+    # 12. COMMUTATIONS REQUIRED / DONE
+    pending_commutations = []
+    done_commutations = []
     for q in quests:
         c = q.extract_commutation()
-        if c:
-            commutations.append((q, c))
-    if commutations:
-        print(f"\n⚡ COMMUTATIONS REQUIRED ({len(commutations)}) — post-deployment actions for the Steward")
-        for q, c in commutations:
+        if not c:
+            continue
+        if q.commutation_complete():
+            done_commutations.append((q, c))
+        else:
+            pending_commutations.append((q, c))
+    if pending_commutations:
+        print(f"\n⚡ COMMUTATIONS REQUIRED ({len(pending_commutations)}) — post-deployment actions for the Steward")
+        for q, c in pending_commutations:
             print(f"  - {q.id} ({q.app}): {c}")
+    if done_commutations:
+        done_ids = ", ".join(q.id for q, _ in done_commutations)
+        print(f"\n✅ Commutations Done ({len(done_commutations)}) — logged in Cogship Log: {done_ids}")
 
     # 13. Footer & Action Prompts
     print("\nHear the quest ballads with /bard /atone /coffers /tally and /murmur")
@@ -1329,6 +1338,37 @@ def cmd_log(args):
     auto_commit = not getattr(args, "no_commit", False)
     store.save(quest, auto_commit=auto_commit, commit_msg=f"court: log note on {quest.id}")
     print(f"Logged note on {quest.id}")
+
+
+def cmd_commute(args):
+    """Record a post-deployment commutation as completed on a single Quest.
+
+    Appends one dated bullet to the Quest's Cogship Log:
+        - **Commutation (YYYY-MM-DD):** <what was executed>
+    The dated Cogship Log entry is the completion marker: once present, the
+    Quest drops out of `court status`'s "⚡ COMMUTATIONS REQUIRED" section and
+    the /ship Commutation Manifest, moving to the collapsed
+    "✅ Commutations Done (N)" line instead. The MoC's original
+    **Commutation:** instruction in the audit is left untouched, preserving the
+    audit history.
+    """
+    quest = store.load(args.quest_id)
+    if args.file:
+        note = Path(args.file).read_text(encoding="utf-8")
+    else:
+        note = args.note or ""
+    if not note.strip():
+        print("ERROR: provide completion details via --note <text> or --file <path>", file=sys.stderr)
+        sys.exit(1)
+    if quest.commutation_log_entries() and not getattr(args, "force", False):
+        print(f"ℹ️  {quest.id} already has a commutation completion entry in its Cogship Log; nothing appended (use --force to log another).")
+        return
+    if not quest.commutation_required():
+        print(f"⚠️  {quest.id} has no recorded commutation instruction (Master of Coin marked it none/n/a); appending an audit-trail entry anyway.")
+    entry = quest.append_commutation(note)
+    auto_commit = not getattr(args, "no_commit", False)
+    store.save(quest, auto_commit=auto_commit, commit_msg=f"court: commute {quest.id} — commutation logged as completed")
+    print(f"✅ Logged commutation completion on {quest.id} (Cogship Log):\n   {entry}")
 
 
 def cmd_set_field(args):
@@ -2843,6 +2883,12 @@ def cmd_ship(args):
             print(f"\n### {q.id}: {q.title} ({q.app})")
             print(c)
 
+    # 6b. Commutations already executed and logged in the Cogship Log.
+    if manifest.get("commutations_done"):
+        done_ids = ", ".join(q.id for q, _ in manifest["commutations_done"])
+        print(f"\n✅ Commutations Done ({len(manifest['commutations_done'])}) — already executed and logged in Cogship Log: {done_ids}")
+        print("   (steer them with `court` /status — they are no longer outstanding post-deploy actions)")
+
     # 7. Extra Tribute Not Requested (Scope Smuggling / Over-Delivery Intelligence)
     if manifest.get("extra_tributes"):
         print("\n" + "-" * 76)
@@ -3567,6 +3613,14 @@ def build_parser():
     p_log.add_argument("note")
     p_log.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_log.set_defaults(func=cmd_log)
+
+    p_commute = sub.add_parser("commute", help="Record a post-deployment commutation as completed (appends a dated entry to the Quest's Cogship Log)")
+    p_commute.add_argument("quest_id")
+    p_commute.add_argument("--note", "--content", dest="note", default="", help="What was executed to complete the commutation")
+    p_commute.add_argument("--file", default=None, help="Read the completion note from a file")
+    p_commute.add_argument("--force", action="store_true", help="Append another completion entry even if one is already logged")
+    p_commute.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
+    p_commute.set_defaults(func=cmd_commute)
 
     p_pillory = sub.add_parser(
         "pillory",

@@ -570,6 +570,49 @@ class Quest:
             return False
         return True
 
+    def commutation_required(self) -> bool:
+        """True when the Quest carries a non-empty, non-'none' Commutation
+        instruction: a post-deployment action the Steward must execute."""
+        return bool(self.extract_commutation())
+
+    def commutation_log_entries(self) -> list[str]:
+        """Return dated Commutation completion entries recorded in the Cogship Log.
+
+        A completion entry is any Cogship Log bullet that names a Commutation as
+        executed, e.g.:
+            - **Commutation (2026-09-08):** set BRAVE_SEARCH_API_KEY_FREE on pb-app
+        Hand-written variants — `Commutation #2 (...)`, a bare `Commutation:`
+        bullet, an optional trailing ✓ — are all recognized: the presence of the
+        bullet is the completion marker, not its exact wording. The Cogship Log
+        is the rendezvous point because it already holds the Gatekeeper stamp;
+        this keeps every deploy record in exactly one place.
+        """
+        log = self.body_sections.get("Cogship Log", "") or ""
+        return [
+            line.strip()
+            for line in log.splitlines()
+            if line.lstrip().startswith(("-", "*"))
+            and re.search(r"\*\*\s*Commutation\b", line, re.IGNORECASE)
+        ]
+
+    def commutation_complete(self) -> bool:
+        """True when a required commutation has been logged as done in the
+        Cogship Log. Quests with no required commutation report False (they are
+        simply never actionable, not "done")."""
+        if not self.commutation_required():
+            return False
+        return bool(self.commutation_log_entries())
+
+    def append_commutation(self, note: str) -> str:
+        """Record a post-deployment commutation as completed: append one dated
+        bullet to the Cogship Log and bump updated_at. Returns the bullet text."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        entry = f"- **Commutation ({today}):** {note.strip()}"
+        existing = self.body_sections.get("Cogship Log", "").rstrip()
+        self.body_sections["Cogship Log"] = (existing + "\n" + entry).strip() if existing else entry
+        self.updated_at = now_iso()
+        return entry
+
     def extract_ui_review_status(self) -> str:
         """Extract the UI Review status from Master of Coin's Audit or Tribute Rendered."""
         moc = (

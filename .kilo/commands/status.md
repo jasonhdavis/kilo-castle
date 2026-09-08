@@ -21,7 +21,7 @@ Reconstruct current state using single-shot deterministic Court status:
    - 🛡️ **Tribute at the GATE ready for /collect ({N})** (`GATE`): Master-of-Coin-approved; standing by for Gatekeeper convoy packing.
    - 🚢 **Cogships Ready ({N}) — launch with /ship**: landed tributes staged on `castle`, ready to sail to production (`main`).
    - 🪦 **READY_TO_RAZE ({N}) — ready for /teardown** (`READY_TO_RAZE`): merged to `castle`, awaiting worktree pruning.
-   - ⚡ **COMMUTATIONS REQUIRED ({N}) — post-deployment actions for the Steward**: operational actions (migrations, backfills, worker restarts, setting toggles) for landed/shipped quests.
+   - ⚡ **COMMUTATIONS REQUIRED ({N}) — post-deployment actions for the Steward**: operational actions (migrations, backfills, worker restarts, setting toggles) for landed/shipped quests. Quests whose commutation has been logged as completed in `## Cogship Log` (via `python3 -m court.cli commute <id> --note "..."`) drop out of this list and appear on a collapsed `✅ Commutations Done (N) — logged in Cogship Log: <ids>` line.
 4. Badge format: `[Phase: ...] [Tasks: X/Y (%)] (Tribute: X/Y sections) [CLEAN/DIRTY]` (no ahead/behind).
 5. Footer:
    - `Hear the quest ballads with /bard /atone /coffers /tally and /murmur`

@@ -278,3 +278,65 @@ def test_cli_engine_port_commands(tmp_path, monkeypatch, capsys):
     main(["fix-branches", "--dry-run"])
     fix_out = capsys.readouterr().out
     assert "BRANCH REALIGNMENT" in fix_out
+
+
+def test_cli_commute_marks_commutation_done(tmp_path, monkeypatch, capsys):
+    """court commute records a dated Cogship Log entry; committed entries drop
+    out of the ⚡ COMMUTATIONS REQUIRED list and appear under the collapsed
+    ✅ Commutations Done line in court status."""
+    _init_git_repo(tmp_path, branch="castle")
+    monkeypatch.setenv("COURT_DIR", str(tmp_path / ".court"))
+    monkeypatch.chdir(tmp_path)
+
+    main(["init"])
+    capsys.readouterr()
+
+    main([
+        "new",
+        "--app", "platform",
+        "--concern", "commute-flow",
+        "--title", "Commute Flow Quest",
+        "--section", "Feature",
+    ])
+    capsys.readouterr()
+
+    quest_id = "Q001-Platform-Commute-Flow"
+    main([
+        "set-section", quest_id, "Master of Coin's Audit",
+        "--content",
+        "- **Verdict:** PASS\n- **Commutation:** Set secret BRAVE_SEARCH_API_KEY_FREE on pb-app and verify ledger table.\n- **Recommended Next Steps:** Ship.",
+    ])
+    capsys.readouterr()
+
+    # 1. Status shows the quest as an outstanding commutation.
+    main(["status"])
+    status = capsys.readouterr().out
+    assert "COMMUTATIONS REQUIRED" in status
+    assert quest_id in status
+    assert "Commutations Done" not in status
+
+    # 2. Court commute records the completion and flips the dashboard split.
+    main(["commute", quest_id, "--note", "Set env var on pb-app and pb-app-worker; verified ledger table via brave_search_usage."])
+    commute_out = capsys.readouterr().out
+    assert "Logged commutation completion" in commute_out
+    assert "Commutation (20" in commute_out
+
+    main(["status"])
+    status = capsys.readouterr().out
+    assert "COMMUTATIONS REQUIRED" not in status
+    assert "Commutations Done (1)" in status
+    assert quest_id in status
+
+    # 3. Persisted: the Cogship Log carries the dated entry.
+    stored = store.load(quest_id, court_root=tmp_path / ".court")
+    assert stored.commutation_complete()
+    assert len(stored.commutation_log_entries()) == 1
+
+    # 4. Re-running without --force is a no-op; --force appends another.
+    main(["commute", quest_id, "--note", "Double check."])
+    noop_out = capsys.readouterr().out
+    assert "already has a commutation completion entry" in noop_out
+    main(["commute", quest_id, "--note", "Second entry.", "--force"])
+    capsys.readouterr()
+    stored = store.load(quest_id, court_root=tmp_path / ".court")
+    assert len(stored.commutation_log_entries()) == 2

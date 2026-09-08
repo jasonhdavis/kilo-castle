@@ -445,6 +445,11 @@ def render_ship_manifest_markdown(manifest: dict, epic_id: str = "") -> str:
             lines.append(content.strip())
             lines.append("")
 
+    done = manifest.get("commutations_done", [])
+    if done:
+        lines.append("\n## Commutations Done\n")
+        lines.append(f"({', '.join(q.id for q, _ in done)}) — already executed and logged in Cogship Log\n")
+
     return "\n".join(lines).strip() + "\n"
 
 
@@ -519,6 +524,7 @@ def rollup_ship_manifest(
         "penances": [],
         "opinions": [],
         "commutations": [],
+        "commutations_done": [],
         "extra_tributes": [],
     }
 
@@ -540,7 +546,10 @@ def rollup_ship_manifest(
             manifest["opinions"].append((q, o))
         c = q.extract_commutation()
         if c:
-            manifest["commutations"].append((q, c))
+            if q.commutation_complete():
+                manifest["commutations_done"].append((q, c))
+            else:
+                manifest["commutations"].append((q, c))
         et = q.extract_extra_tribute()
         if et:
             manifest["extra_tributes"].append((q, et))

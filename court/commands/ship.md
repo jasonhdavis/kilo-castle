@@ -18,4 +18,4 @@ mutating anything. Only pass `--confirm` when M'Lord has explicitly approved the
 Following successful deployment to production:
 1. **Review the Commutation Manifest**: Inspect the `⚡ THE COMMUTATION MANIFEST` generated during `/ship`.
 2. **Execute Kingdom Actions**: The Steward is responsible for executing any data backfills, worker reboots/boot log checks, environment variable toggles, and marking issues resolved in error tracking.
-3. **Record in Quest Charter**: Log the completed commutation steps in the Quest's `## Cogship Log` via `python3 -m court.cli log <id> "Commutation executed: ..."` so the durable record reflects production activation.
+3. **Record in Quest Charter**: Record completion with the dedicated verb — `python3 -m court.cli commute <id> --note "<what was executed>"` — which appends a dated `**Commutation (YYYY-MM-DD):**` entry to the Quest's `## Cogship Log`. That entry is the completion marker: it drops the Quest out of `court status`'s ⚡ COMMUTATIONS REQUIRED list and the next `/ship` Commutation Manifest, moving it to the collapsed `✅ Commutations Done (N)` line while preserving the Master of Coin's audit history unchanged.

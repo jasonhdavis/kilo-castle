@@ -13,15 +13,14 @@ There is no "return to WORKING for another try" outcome: a Fail for *any* reason
 Quest straight to the pillory (`court pillory`, synonym `court punish`) with explicit
 Decrees, and the Steward charters a brand-new Quest+worktree from those Decrees.
 
-## Dispatch Pattern: Dedicated New Session, Ephemeral Fork Worktree (Never Reuse the Serf's Session)
+## Dispatch Pattern: Dedicated New Session via Kilo CLI (Never Reuse the Serf's Session)
 
-1. Read `branch`/`worktree` from the Quest's frontmatter (`court show {{ quest_id }}`) or `agent_manager list`.
-2. Start the session: `agent_manager` `start`, `mode: "worktree"`, `branchName: "{{ branch }}"`,
-   `model: "Gemini 3.8 Flash"`, `provider: "openrouter"` (or qualified `openrouter/google/gemini-3.8-flash`).
-   This creates a **new fork worktree/branch**, not a session in the Serf's original one —
-   treat it as disposable review scaffolding, never as a second home for the Quest's code.
-3. Send this prompt (every `{{ }}` filled in) as the session's initial prompt.
-4. The session assumes the Master of Coin persona inside the fork, renders its one audit
+1. Read `branch`/`worktree` from the Quest's frontmatter (`court show {{ quest_id }}`).
+2. Dispatch via Court CLI:
+   `python3 -m court.cli coin {{ quest_id }}`
+   (or via Kilo CLI: `kilo run --agent master_of_coin --model openrouter/google/gemini-3.8-flash --dir {{ worktree }} "<prompt>"`).
+   This evaluates directly in the Quest's existing worktree under `agent: master_of_coin` with Gemini 3.8 Flash, bypassing Agent Manager's agent-mode inheritance bug.
+3. The session assumes the Master of Coin persona inside the worktree, renders its one audit
    into `.court/quests/{{ quest_id }}.md` under `## Master of Coin's Audit`, and either
    advances the Quest to `GATE` or reports back to the Steward for pillorying.
 5. **Mandatory sync-back**: because the advance/set-section commands in step 4 only ever commit onto the fork branch, the verdict is invisible to the real

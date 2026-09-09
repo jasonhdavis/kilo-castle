@@ -8,7 +8,7 @@ Follow the Court Artist Protocol:
 
 1. **Parse Arguments**:
    - Extract `<quest_id>` from `$ARGUMENTS` (e.g. `Q196`).
-   - Extract optional `--model <model>` or custom model string if provided by M'Lord (Court Artist supports flexible model selection; default is `GLM-5.3` via `openrouter`).
+   - Extract optional `--model <model>` or custom model string if provided by M'Lord (Court Artist supports flexible model selection; default is `openrouter/z-ai/glm-5.3`, matching the other personas' qualified `provider/model` convention).
 
 2. **Execute Deterministic Artist CLI Command**:
    - Run:

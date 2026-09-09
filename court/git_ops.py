@@ -7,8 +7,38 @@ from __future__ import annotations
 
 import re
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
+
+# Short-TTL process-level cache for the two most repeated git lookups
+# (`rev-parse --show-toplevel` and `worktree list`). A single levy/collect run
+# re-resolves worktrees several times per Quest; each miss costs 1-3 git
+# subprocess spawns. TTL bounds staleness; mutation paths that change the
+# worktree set call clear_git_cache().
+_GIT_CACHE: dict[str, tuple[float, Any]] = {}
+_GIT_CACHE_TTL_SECONDS = 1.5
+_GIT_CACHE_LOCK = threading.Lock()
+
+
+def _cache_get(key: str) -> Any:
+    now = time.monotonic()
+    with _GIT_CACHE_LOCK:
+        hit = _GIT_CACHE.get(key)
+        if hit and (now - hit[0]) <= _GIT_CACHE_TTL_SECONDS:
+            return hit[1]
+    return None
+
+
+def _cache_put(key: str, value: Any) -> None:
+    with _GIT_CACHE_LOCK:
+        _GIT_CACHE[key] = (time.monotonic(), value)
+
+
+def clear_git_cache() -> None:
+    with _GIT_CACHE_LOCK:
+        _GIT_CACHE.clear()
 
 _CONFLICT_BLOCK_RE = re.compile(
     r"<<<<<<< [^\n]*\n(?P<ours>.*?)\n=======\n(?P<theirs>.*?)\n>>>>>>> [^\n]*",
@@ -103,12 +133,20 @@ def _run(cmd: list[str], cwd: Path, timeout: int = 60) -> dict:
         }
 
 
-def get_repo_root(cwd: Optional[Path | str] = None) -> Path:
+def get_repo_root(cwd: Optional[Path | str] = None, use_cache: bool = True) -> Path:
     """Find the top-level directory of the current git repository."""
     base = Path(cwd) if cwd else Path.cwd()
+    cache_key = f"root:{base.resolve()}"
+    if use_cache:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
     res = _run(["git", "rev-parse", "--show-toplevel"], base)
     if res.get("ok") and res.get("stdout"):
-        return Path(res["stdout"])
+        root = Path(res["stdout"])
+        if use_cache:
+            _cache_put(cache_key, root)
+        return root
     return Path(__file__).resolve().parent.parent
 
 
@@ -140,9 +178,14 @@ def verify_commit_is_ancestor(sha: str, ref: str, cwd: Optional[Path | str] = No
     }
 
 
-def list_git_worktrees(cwd: Optional[Path | str] = None) -> list[dict]:
+def list_git_worktrees(cwd: Optional[Path | str] = None, use_cache: bool = True) -> list[dict]:
     """Parse `git worktree list --porcelain` into structured records."""
-    root = get_repo_root(cwd)
+    root = get_repo_root(cwd, use_cache=use_cache)
+    cache_key = f"wtlist:{root}"
+    if use_cache:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
     res = _run(["git", "worktree", "list", "--porcelain"], root)
     if not res.get("ok"):
         return []
@@ -187,6 +230,9 @@ def list_git_worktrees(cwd: Optional[Path | str] = None) -> list[dict]:
 
     if current and "worktree" in current:
         worktrees.append(current)
+
+    if use_cache:
+        _cache_put(cache_key, worktrees)
 
     return worktrees
 
@@ -243,8 +289,17 @@ def find_worktree_for_quest(quest: Any, cwd: Optional[Path | str] = None) -> Opt
     return None
 
 
-def get_worktree_git_status(worktree_path: str | Path, base: str = "castle") -> dict:
-    """Comprehensive worktree status inspection."""
+def get_worktree_git_status(
+    worktree_path: str | Path,
+    base: str = "castle",
+    include_diffstat: bool = False,
+) -> dict:
+    """Comprehensive worktree status inspection.
+
+    `include_diffstat` is opt-in: `git diff --stat <base>...HEAD` is O(total
+    diff size) and dominates audit latency on drifted branches, while every
+    in-repo caller (ward.audit_quest) only consumes dirty/branch/ahead/behind.
+    """
     p = Path(worktree_path)
     if not p.exists() or not p.is_dir():
         return {
@@ -305,8 +360,10 @@ def get_worktree_git_status(worktree_path: str | Path, base: str = "castle") -> 
             except ValueError:
                 pass
 
-    diffstat_res = _run(["git", "diff", "--stat", f"{base}...HEAD"], p)
-    diffstat_str = diffstat_res.get("stdout", "") if diffstat_res.get("ok") else ""
+    diffstat_str = ""
+    if include_diffstat:
+        diffstat_res = _run(["git", "diff", "--stat", f"{base}...HEAD"], p)
+        diffstat_str = diffstat_res.get("stdout", "") if diffstat_res.get("ok") else ""
 
     return {
         "ok": True,
@@ -639,6 +696,39 @@ def check_merged_status(
     }
 
 
+def is_quest_merged_into(
+    quest,
+    target_ref: str = "main",
+    cwd: Optional[Path] = None,
+) -> bool:
+    """Return True if the quest's deliverables have already been merged into target_ref.
+    Returns False for scouts/investigation spikes (non-merging spikes) or if target_ref
+    cannot be resolved.
+    """
+    if getattr(quest, "kind", "") == "scout" or getattr(quest, "section", "") == "Investigation":
+        return False
+    root = get_repo_root(cwd)
+    ref_check = _run(["git", "rev-parse", "--verify", target_ref], root)
+    if not ref_check.get("ok"):
+        ref_check = _run(["git", "rev-parse", "--verify", f"refs/heads/{target_ref}"], root)
+        if not ref_check.get("ok"):
+            return False
+
+    promoted = getattr(quest, "cogship_promoted_commit", None)
+    if promoted:
+        c_check = _run(["git", "merge-base", "--is-ancestor", str(promoted).strip(), target_ref], root)
+        if c_check.get("exit_code") == 0:
+            return True
+
+    branch = getattr(quest, "branch", None)
+    if branch:
+        st = check_merged_status(branch, target_ref=target_ref, base_ref=target_ref, cwd=root)
+        if st.get("is_merged_target") or st.get("is_ancestor_target"):
+            return True
+
+    return False
+
+
 def run_test_command(worktree_path: str, test_cmd: str, timeout: int = 600) -> dict:
     p = Path(worktree_path)
     if not p.exists():
@@ -946,6 +1036,7 @@ def create_git_worktree(
         cmd = ["git", "worktree", "add", "-b", branch, str(wt_p), base_ref]
 
     res = _run(cmd, root)
+    clear_git_cache()
     return {
         "ok": res.get("ok", False),
         "path": str(wt_p),

@@ -102,7 +102,7 @@ class TestCliStandup(unittest.TestCase):
             self.assertEqual(found, fake_bin)
 
     def test_standup_kilo_session_config_mode(self):
-        """Verify standup_kilo_session writes .kilo/TASK.md and configures worktree."""
+        """Verify standup_kilo_session writes .kilo/TASK.md and configures worktree when run_now=False."""
         wt_dir = self.tmp_path / "worktree_session"
         wt_dir.mkdir(parents=True)
 
@@ -112,11 +112,46 @@ class TestCliStandup(unittest.TestCase):
             model="openrouter/z-ai/glm-5.3-flash",
             prompt="Do task",
             title="Q123 Serf Worker",
+            run_now=False,
         )
         self.assertTrue(res["ok"])
         self.assertEqual(res["session_id"], "kilo-serf")
         self.assertTrue((wt_dir / ".kilo" / "TASK.md").is_file())
         self.assertEqual((wt_dir / ".kilo" / "TASK.md").read_text(encoding="utf-8"), "Do task")
+
+    @patch("court.cli.subprocess.Popen")
+    def test_standup_kilo_session_cli_mode(self, mock_popen):
+        """Verify standup_kilo_session launches background Kilo CLI with proper agent and model."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+        mock_popen.return_value = mock_proc
+
+        wt_dir = self.tmp_path / "worktree_cli"
+        wt_dir.mkdir(parents=True)
+        fake_bin = self.tmp_path / "kilo"
+        fake_bin.write_text("#!/bin/sh\nexit 0", encoding="utf-8")
+        fake_bin.chmod(0o755)
+
+        with patch("court.cli.query_latest_kilo_session_id", return_value="ses_test123"):
+            res = standup_kilo_session(
+                worktree_path=wt_dir,
+                agent="serf",
+                model="GLM-5.3-Flash",
+                prompt="Do work",
+                title="Q123 Serf Worker",
+                kilo_bin=fake_bin,
+                run_now=True,
+            )
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["mode"], "cli")
+        self.assertEqual(res["session_id"], "ses_test123")
+        self.assertTrue(mock_popen.called)
+        cmd_called = mock_popen.call_args[0][0]
+        self.assertIn("--agent", cmd_called)
+        self.assertIn("serf", cmd_called)
+        self.assertIn("--model", cmd_called)
+        self.assertIn("openrouter/z-ai/glm-5.3-flash", cmd_called)
 
     @patch("court.cli.find_kilo_binary", return_value=None)
     @patch("court.git_ops.create_git_worktree")
@@ -160,6 +195,74 @@ class TestCliStandup(unittest.TestCase):
         q = store.load("Q123-Core-Standup", court_root=self.court_dir)
         self.assertEqual(q.status, "WORKING")
         self.assertIn("M'Lord's Charter Notes: Implement fully", q.body_sections["The Kingdom Requires"])
+
+    @patch("court.cli.subprocess.Popen")
+    @patch("court.store.get_court_root")
+    def test_coin_dispatch_kilo_cli(self, mock_court_root, mock_popen):
+        """Verify court coin dispatches Master of Coin via Kilo CLI with proper agent."""
+        mock_court_root.return_value = self.court_dir
+        mock_proc = MagicMock()
+        mock_proc.pid = 88888
+        mock_popen.return_value = mock_proc
+
+        wt_path = self.tmp_path / "wt_coin"
+        wt_path.mkdir(parents=True)
+        self.quest.worktree = str(wt_path)
+        self.quest.status = "TRIBUTE_READY"
+        store.save(self.quest, court_root=self.court_dir, auto_commit=False)
+
+        fake_bin = self.tmp_path / "kilo"
+        fake_bin.write_text("#!/bin/sh\nexit 0", encoding="utf-8")
+        fake_bin.chmod(0o755)
+
+        with patch("court.cli.find_kilo_binary", return_value=fake_bin):
+            with patch("court.cli.query_latest_kilo_session_id", return_value="ses_coin_999"):
+                with patch("court.store.find_path") as mock_find:
+                    mock_find.return_value = self.quests_dir / "Q123-Core-Standup.md"
+                    rc = main(["coin", "Q123-Core-Standup", "--no-commit"])
+
+        self.assertIn(rc, (0, None))
+        self.assertTrue(mock_popen.called)
+        cmd_called = mock_popen.call_args[0][0]
+        self.assertIn("--agent", cmd_called)
+        self.assertIn("master_of_coin", cmd_called)
+        self.assertIn("--model", cmd_called)
+        self.assertIn("openrouter/google/gemini-3.8-flash", cmd_called)
+        q = store.load("Q123-Core-Standup", court_root=self.court_dir)
+        self.assertEqual(q.master_of_coin_session_id, "ses_coin_999")
+
+    @patch("court.cli.subprocess.Popen")
+    @patch("court.store.get_court_root")
+    def test_goad_dispatch_kilo_cli(self, mock_court_root, mock_popen):
+        """Verify court goad dispatches Serf goad via Kilo CLI."""
+        mock_court_root.return_value = self.court_dir
+        mock_proc = MagicMock()
+        mock_proc.pid = 77777
+        mock_popen.return_value = mock_proc
+
+        wt_path = self.tmp_path / "wt_goad"
+        wt_path.mkdir(parents=True)
+        self.quest.worktree = str(wt_path)
+        self.quest.status = "WORKING"
+        store.save(self.quest, court_root=self.court_dir, auto_commit=False)
+
+        fake_bin = self.tmp_path / "kilo"
+        fake_bin.write_text("#!/bin/sh\nexit 0", encoding="utf-8")
+        fake_bin.chmod(0o755)
+
+        with patch("court.cli.find_kilo_binary", return_value=fake_bin):
+            with patch("court.cli.query_latest_kilo_session_id", return_value="ses_goad_777"):
+                with patch("court.store.find_path") as mock_find:
+                    mock_find.return_value = self.quests_dir / "Q123-Core-Standup.md"
+                    rc = main(["goad", "Q123-Core-Standup", "--no-commit"])
+
+        self.assertIn(rc, (0, None))
+        self.assertTrue(mock_popen.called)
+        cmd_called = mock_popen.call_args[0][0]
+        self.assertIn("--agent", cmd_called)
+        self.assertIn("serf", cmd_called)
+        q = store.load("Q123-Core-Standup", court_root=self.court_dir)
+        self.assertEqual(q.serf_session_id, "ses_goad_777")
 
 
 class TestAgentDefinitions(unittest.TestCase):

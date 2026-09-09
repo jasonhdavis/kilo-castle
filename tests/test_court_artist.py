@@ -20,15 +20,15 @@ class TestCourtArtist(unittest.TestCase):
             app="common",
             concern="ui-review",
             artist_session_id="ses_artist_12345",
-            artist_model="GLM-5.3",
+            artist_model="openrouter/z-ai/glm-5.3",
         )
         md = q.to_markdown()
         self.assertIn("artist_session_id: ses_artist_12345", md)
-        self.assertIn("artist_model: GLM-5.3", md)
+        self.assertIn("artist_model: openrouter/z-ai/glm-5.3", md)
 
         loaded = Quest.from_markdown(md)
         self.assertEqual(loaded.artist_session_id, "ses_artist_12345")
-        self.assertEqual(loaded.artist_model, "GLM-5.3")
+        self.assertEqual(loaded.artist_model, "openrouter/z-ai/glm-5.3")
 
     def test_extract_ui_review_status(self):
         """Verify extraction of UI Review status from Master of Coin's Audit."""
@@ -183,7 +183,7 @@ class TestCourtArtist(unittest.TestCase):
     @patch("court.store.load")
     @patch("court.store.save")
     def test_cmd_artist_default_model_uses_glm53(self, mock_save, mock_load, mock_find_wt):
-        """Test cmd_artist defaults to GLM-5.3 when no model override is provided."""
+        """Test cmd_artist defaults to openrouter/z-ai/glm-5.3 when no model override is provided."""
         with tempfile.TemporaryDirectory() as tmpdir:
             wt_path = Path(tmpdir)
             (wt_path / ".worktree-port").write_text("8089\n")
@@ -222,11 +222,11 @@ class TestCourtArtist(unittest.TestCase):
             output = buf.getvalue()
             data = json.loads(output)
 
-            self.assertEqual(data["model"], "GLM-5.3")
-            self.assertEqual(data["task"]["model"], "GLM-5.3")
+            self.assertEqual(data["model"], "openrouter/z-ai/glm-5.3")
+            self.assertEqual(data["task"]["model"], "openrouter/z-ai/glm-5.3")
             self.assertEqual(data["provider"], "openrouter")
             self.assertEqual(data["task"]["provider"], "openrouter")
-            self.assertEqual(q.artist_model, "GLM-5.3")
+            self.assertEqual(q.artist_model, "openrouter/z-ai/glm-5.3")
             mock_save.assert_called_once()
 
     @patch("court.ward.audit_quest")

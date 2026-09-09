@@ -26,8 +26,11 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -49,7 +52,7 @@ DEFAULT_SERF_MODEL = _CFG["models"].get("serf", "GLM-5.3-Flash")
 SERF_PROVIDER = _CFG["models"].get("serf_provider", "openrouter")
 DEFAULT_MOC_MODEL = _CFG["models"].get("master_of_coin", "openrouter/google/gemini-3.8-flash")
 DEFAULT_GATEKEEPER_MODEL = _CFG["models"].get("gatekeeper", "openrouter/google/gemini-3.8-flash")
-DEFAULT_ARTIST_MODEL = _CFG["models"].get("artist", "GLM-5.3")
+DEFAULT_ARTIST_MODEL = _CFG["models"].get("artist", "openrouter/z-ai/glm-5.3")
 ARTIST_PROVIDER = _CFG["models"].get("artist_provider", "openrouter")
 SERF_DISPATCH_TEMPLATE = ".court/templates/serf_dispatch_prompt.md"
 ARTIST_DISPATCH_TEMPLATE = ".court/templates/court_artist_prompt.md"
@@ -149,6 +152,50 @@ def setup_worktree_agent_config(worktree_path: Path, agent: str = "serf") -> Non
     cfg_file.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 
 
+def canonical_model_id(model_str: str, provider: Optional[str] = None) -> str:
+    """Map human/display model names to fully qualified provider/model strings for Kilo CLI."""
+    if not model_str:
+        return "openrouter/z-ai/glm-5.3-flash"
+    m = model_str.strip()
+    if "/" in m:
+        return m
+    low = m.lower().replace(" ", "").replace("-", "").replace(".", "")
+    if "glm53flash" in low:
+        return "openrouter/z-ai/glm-5.3-flash"
+    if "glm53" in low:
+        return "openrouter/z-ai/glm-5.3"
+    if "gemini38flash" in low:
+        return "openrouter/google/gemini-3.8-flash"
+    if "gemini37flash" in low:
+        return "openrouter/google/gemini-3.7-flash"
+    p = provider or "openrouter"
+    return f"{p}/{m}"
+
+
+def query_latest_kilo_session_id(worktree_path: Path, timeout_seconds: float = 2.5) -> Optional[str]:
+    """Inspect local kilo.db to find the session ID created for a worktree."""
+    db_path = Path.home() / ".local" / "share" / "kilo" / "kilo.db"
+    wt_str = str(worktree_path.resolve())
+    deadline = time.time() + timeout_seconds
+    while time.time() <= deadline:
+        if db_path.is_file():
+            try:
+                conn = sqlite3.connect(str(db_path), timeout=1.0)
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id FROM session WHERE directory = ? ORDER BY time_created DESC LIMIT 1",
+                    (wt_str,)
+                )
+                row = cur.fetchone()
+                conn.close()
+                if row and row[0]:
+                    return row[0]
+            except Exception:
+                pass
+        time.sleep(0.2)
+    return None
+
+
 def standup_kilo_session(
     worktree_path: Path,
     agent: str,
@@ -158,7 +205,7 @@ def standup_kilo_session(
     kilo_bin: Optional[Path] = None,
     server_port: Optional[int] = None,
     server_password: Optional[str] = None,
-    run_now: bool = False,
+    run_now: bool = True,
 ) -> dict:
     """Stand up a Kilo session in a worktree with explicit agent mode.
 
@@ -219,28 +266,52 @@ def standup_kilo_session(
 
     if bin_path and run_now:
         try:
-            cmd = [
-                str(bin_path),
-                "run",
-                "--agent", agent,
-                "--model", model,
-                "--dir", str(worktree_path),
-                prompt,
-            ]
-            subprocess.Popen(cmd, cwd=str(worktree_path))
+            qual_model = canonical_model_id(model, provider=SERF_PROVIDER)
+            log_dir = worktree_path / ".kilo"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / f"{agent}.log"
+
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"\n--- Launching {agent} session: {title} ({datetime.now().isoformat()}) ---\n")
+
+            log_out = open(log_file, "a", encoding="utf-8")
+            try:
+                cmd = [
+                    str(bin_path),
+                    "run",
+                    "--agent", agent,
+                    "--model", qual_model,
+                    "--dir", str(worktree_path),
+                    "--title", title,
+                    prompt,
+                ]
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(worktree_path),
+                    stdout=log_out,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            finally:
+                log_out.close()
+
+            session_id = query_latest_kilo_session_id(worktree_path, timeout_seconds=2.5) or f"kilo-{agent}-{proc.pid}"
             return {
                 "ok": True,
                 "mode": "cli",
-                "session_id": "kilo-cli",
-                "message": f"Spawned background kilo run under agent '{agent}'",
+                "session_id": session_id,
+                "pid": proc.pid,
+                "log": str(log_file),
+                "message": f"Spawned background Kilo CLI {agent} session {session_id} (PID {proc.pid})",
             }
-        except Exception:
+        except Exception as e:
             pass
 
     return {
         "ok": True,
         "mode": "config",
-        "session_id": "kilo-serf",
+        "session_id": f"kilo-{agent}",
         "message": f"Worktree configured with agent '{agent}' and task written to .kilo/TASK.md",
     }
 
@@ -1043,13 +1114,22 @@ def cmd_status(args):
             _render_item(q)
 
     # 10. COGSHIPS READY
-    ship_manifest = store.rollup_ship_manifest(quests=quests)
-    cogship_quests = ship_manifest.get("quests", [])
-    if cogship_quests:
-        print(f"\n🚢 Cogships Ready ({len(cogship_quests)}) launch with /ship")
-        for q in cogship_quests:
-            parent_info = f" [Epic: {q.parent_epic}]" if q.parent_epic else ""
-            print(f"  - {q.id} ({q.app}): {q.title}{parent_info}")
+    cogship_quests = []
+    cogship_candidates = [
+        q for q in quests
+        if q.status in ("READY_TO_RAZE", "READY_FOR_TEARDOWN", "DONE")
+        and q.kind != "scout"
+        and q.section != "Investigation"
+        and not git_ops.is_quest_merged_into(q, target_ref="main")
+    ]
+    if cogship_candidates:
+        ship_manifest = store.rollup_ship_manifest(quests=cogship_candidates)
+        cogship_quests = ship_manifest.get("quests", [])
+        if cogship_quests:
+            print(f"\n🚢 Cogships Ready ({len(cogship_quests)}) launch with /ship")
+            for q in cogship_quests:
+                parent_info = f" [Epic: {q.parent_epic}]" if q.parent_epic else ""
+                print(f"  - {q.id} ({q.app}): {q.title}{parent_info}")
 
     # 11. READY_TO_RAZE
     raze_quests = [q for q in quests if q.status == "READY_TO_RAZE"]
@@ -1519,18 +1599,23 @@ def cmd_charter(args):
         _print_charter_next_steps(quest, am_section=getattr(args, "section", None) or quest.section)
 
 
-def _print_dispatch_next_steps(quest: Quest) -> None:
+def _print_dispatch_next_steps(quest: Quest, standup_res: Optional[dict] = None) -> None:
     """Q183: print the NEXT STEPS reminder after `court dispatch-complete`."""
-    _print_next_steps(
-        f"⚙️ NEXT STEPS — {quest.id} IS NOW WORKING",
-        [
-            f"- Serf session {quest.serf_session_id or '-'} ({quest.serf_model or '-'}) is toiling in",
-            f"  {quest.worktree or '-'} on branch {quest.branch or '-'}.",
-            "- Initialized under agent mode 'serf' with pure charter task instructions.",
-            "- Nothing to do right now: this is normal Serf toil time.",
-            f"- Once the Serf reports done, collect the tribute: `court levy {quest.id}`",
-        ],
-    )
+    is_scout = getattr(quest, "kind", "") == "scout" or getattr(quest, "section", "") == "Investigation"
+    role_name = "Scout" if is_scout else "Serf"
+    role_mode = "scout" if is_scout else "serf"
+    steps = [
+        f"- {role_name} session {quest.serf_session_id or '-'} ({quest.serf_model or '-'}) is toiling in",
+        f"  {quest.worktree or '-'} on branch {quest.branch or '-'}.",
+        f"- Initialized under agent mode '{role_mode}' with pure charter task instructions via Kilo CLI.",
+        f"- Nothing to do right now: this is normal {role_name} toil time.",
+    ]
+    if standup_res and standup_res.get("log"):
+        steps.append(f"- Worker log: tail -f {standup_res['log']}")
+    elif quest.worktree:
+        steps.append(f"- Worker log: tail -f {quest.worktree}/.kilo/{role_mode}.log")
+    steps.append(f"- Once the {role_name} reports done, collect the tribute: `court levy {quest.id}`")
+    _print_next_steps(f"⚙️ NEXT STEPS — {quest.id} IS NOW WORKING", steps)
 
 
 def cmd_dispatch(args):
@@ -1548,7 +1633,8 @@ def cmd_dispatch(args):
     worktree = getattr(args, "worktree", None)
     create_wt = getattr(args, "create_worktree", False) or getattr(args, "native", False)
     standup = getattr(args, "standup", False)
-    run_now = getattr(args, "run", False)
+    no_run = getattr(args, "no_run", False)
+    run_now = not no_run
     serf_model = getattr(args, "serf_model", None) or DEFAULT_SERF_MODEL
 
     kilo_bin = find_kilo_binary()
@@ -1572,7 +1658,12 @@ def cmd_dispatch(args):
                         capture_output=True,
                         text=True,
                         check=True,
+                        timeout=300,
                     )
+                    git_ops.clear_git_cache()
+                except subprocess.TimeoutExpired:
+                    print(f"ERROR: 'kilo worktree create {wt_name}' timed out after 300s.", file=sys.stderr)
+                    sys.exit(1)
                 except (subprocess.CalledProcessError, FileNotFoundError):
                     wt_res = git_ops.create_git_worktree(
                         str(worktree_path),
@@ -1583,8 +1674,8 @@ def cmd_dispatch(args):
                         print(f"ERROR: Failed to create git worktree: {wt_res.get('output')}", file=sys.stderr)
                         sys.exit(1)
             worktree = str(worktree_path)
-            subprocess.run(["git", "-C", worktree, "branch", "-m", branch], capture_output=True)
-            subprocess.run(["git", "-C", worktree, "merge", base_branch, "--ff-only"], capture_output=True)
+            subprocess.run(["git", "-C", worktree, "branch", "-m", branch], capture_output=True, timeout=60)
+            subprocess.run(["git", "-C", worktree, "merge", base_branch, "--ff-only"], capture_output=True, timeout=120)
             print(f"✅ Worktree ready: {worktree}")
         else:
             short_id = quest.id.split("-")[0].lower()
@@ -1598,13 +1689,18 @@ def cmd_dispatch(args):
             if not wt_res["ok"]:
                 print(f"ERROR: Failed to create git worktree: {wt_res.get('output')}", file=sys.stderr)
                 sys.exit(1)
-            worktree = str(worktree_path)
+            worktree = wt_res.get("path") or str(worktree_path)
             print(f"✅ Git worktree ready: {worktree}")
 
     worktree_path = Path(worktree).resolve()
 
-    # Configure worktree-scoped default_agent: serf
-    setup_worktree_agent_config(worktree_path, "serf")
+    # Determine agent role (serf vs scout)
+    is_scout = (getattr(quest, "kind", "") == "scout" or getattr(quest, "section", "") == "Investigation")
+    agent_role = getattr(args, "agent", None) or ("scout" if is_scout else "serf")
+    role_label = "Scout" if agent_role == "scout" else "Serf"
+
+    # Configure worktree-scoped default_agent
+    setup_worktree_agent_config(worktree_path, agent_role)
 
     # Run setup-script if present
     setup_script = root / ".kilo" / "setup-script"
@@ -1623,10 +1719,10 @@ def cmd_dispatch(args):
     session_id = getattr(args, "session_id", None)
     standup_res = standup_kilo_session(
         worktree_path=worktree_path,
-        agent="serf",
+        agent=agent_role,
         model=serf_model,
         prompt=task_prompt,
-        title=f"{quest.id} Serf Worker",
+        title=f"{quest.id} {role_label} Worker",
         kilo_bin=kilo_bin,
         run_now=run_now,
     )
@@ -1634,7 +1730,7 @@ def cmd_dispatch(args):
         if getattr(args, "create_worktree", False) or getattr(args, "native", False):
             session_id = "native"
         else:
-            session_id = standup_res.get("session_id") or "kilo-serf"
+            session_id = standup_res.get("session_id") or f"kilo-{agent_role}"
 
     quest.branch = branch
     quest.worktree = str(worktree_path)
@@ -1644,11 +1740,11 @@ def cmd_dispatch(args):
 
     entered_working = False
     if quest.status in ("OPEN", "PLANNED"):
-        quest.set_status("DISPATCHED", "Serf dispatched (`court dispatch`)")
-        quest.set_status("WORKING", "Serf toiling in worktree (`court dispatch`)")
+        quest.set_status("DISPATCHED", f"{role_label} dispatched (`court dispatch`)")
+        quest.set_status("WORKING", f"{role_label} toiling in worktree (`court dispatch`)")
         entered_working = True
     elif quest.status == "DISPATCHED":
-        quest.set_status("WORKING", "Serf toiling in worktree (`court dispatch`)")
+        quest.set_status("WORKING", f"{role_label} toiling in worktree (`court dispatch`)")
         entered_working = True
     else:
         print(f"ℹ️  {quest.id} is already [{quest.status}] ({status_label(quest.status)}) — DISPATCHED/WORKING transitions skipped.")
@@ -1659,12 +1755,204 @@ def cmd_dispatch(args):
     if entered_working:
         _auto_transition_source_scout_on_working(quest, auto_commit=auto_commit)
 
-    _print_dispatch_next_steps(quest)
+    _print_dispatch_next_steps(quest, standup_res=standup_res)
 
 
 def cmd_dispatch_complete(args):
     """Composite post-dispatch bookkeeping (Q183). Alias for cmd_dispatch."""
     return cmd_dispatch(args)
+
+
+def cmd_coin(args):
+    """Dispatch Master of Coin into a Quest's worktree via Kilo CLI to audit Tribute."""
+    quest = store.load(args.quest_id)
+    if not quest.worktree:
+        print(f"ERROR: {quest.id} has no worktree path configured", file=sys.stderr)
+        sys.exit(1)
+    wt = Path(quest.worktree).resolve()
+    if not wt.is_dir():
+        print(f"ERROR: Worktree directory does not exist: {wt}", file=sys.stderr)
+        sys.exit(1)
+
+    if quest.status != "TRIBUTE_READY" and not getattr(args, "force", False):
+        print(f"⚠️  {quest.id} is [{quest.status}], not [TRIBUTE_READY]. Pass --force to audit anyway.", file=sys.stderr)
+        sys.exit(1)
+
+    kilo_bin = find_kilo_binary()
+    if not kilo_bin:
+        print("ERROR: Kilo binary not found. Cannot dispatch Master of Coin via CLI.", file=sys.stderr)
+        sys.exit(1)
+
+    model = getattr(args, "model", None) or DEFAULT_MOC_MODEL
+    qual_model = canonical_model_id(model)
+
+    tmpl_path = config.find_court_dir() / "templates" / "master_of_coin_review_prompt.md"
+    if not tmpl_path.is_file():
+        tmpl_path = Path(__file__).resolve().parent.parent / "templates" / "master_of_coin_review_prompt.md"
+
+    if tmpl_path.is_file():
+        tmpl_text = tmpl_path.read_text(encoding="utf-8")
+    else:
+        tmpl_text = "You are the Master of Coin for {{ quest_id }} ({{ quest_title }}). Audit worktree {{ worktree }}."
+
+    rendered_prompt = (
+        tmpl_text
+        .replace("{{ quest_id }}", quest.id)
+        .replace("{{ quest_title }}", quest.title)
+        .replace("{{ worktree }}", str(wt))
+        .replace("{{ branch }}", quest.branch or "-")
+        .replace("{{ epic_id }}", quest.parent_epic or "-")
+        .replace("{{ epic_title }}", quest.parent_epic or "-")
+    )
+
+    setup_worktree_agent_config(wt, "master_of_coin")
+
+    task_file = wt / ".kilo" / "TASK_COIN.md"
+    try:
+        task_file.write_text(rendered_prompt, encoding="utf-8")
+    except Exception:
+        pass
+
+    log_dir = wt / ".kilo"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "coin.log"
+
+    title = f"{quest.id} Master of Coin Audit"
+    cmd = [
+        str(kilo_bin),
+        "run",
+        "--agent", "master_of_coin",
+        "--model", qual_model,
+        "--dir", str(wt),
+        "--title", title,
+        rendered_prompt,
+    ]
+
+    auto_commit = not getattr(args, "no_commit", False)
+    wait = getattr(args, "wait", False)
+
+    if wait:
+        print(f"🪙 Running Master of Coin audit for {quest.id} synchronously (agent: master_of_coin, model: {qual_model})...")
+        res = subprocess.run(cmd, cwd=str(wt))
+        session_id = query_latest_kilo_session_id(wt)
+        if session_id:
+            quest.master_of_coin_session_id = session_id
+            quest.master_of_coin_model = model
+            store.save(quest, auto_commit=auto_commit, commit_msg=f"court: record MoC session {session_id} for {quest.id}")
+        return res.returncode
+    else:
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n--- Master of Coin Audit: {title} ({datetime.now().isoformat()}) ---\n")
+        log_out = open(log_file, "a", encoding="utf-8")
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(wt),
+                stdout=log_out,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        finally:
+            log_out.close()
+        session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5) or f"kilo-coin-{proc.pid}"
+        quest.master_of_coin_session_id = session_id
+        quest.master_of_coin_model = model
+        store.save(quest, auto_commit=auto_commit, commit_msg=f"court: dispatch MoC {session_id} for {quest.id}")
+        print(f"🪙 Dispatched Master of Coin for {quest.id}:")
+        print(f"   Session:  {session_id} (PID {proc.pid})")
+        print(f"   Agent:    master_of_coin")
+        print(f"   Model:    {qual_model}")
+        print(f"   Worktree: {wt}")
+        print(f"   Log:      tail -f {log_file}")
+
+
+def cmd_goad(args):
+    """Goad an active or stalled Serf session in a worktree via Kilo CLI."""
+    quest = store.load(args.quest_id)
+    if not quest.worktree:
+        print(f"ERROR: {quest.id} has no worktree path configured", file=sys.stderr)
+        sys.exit(1)
+    wt = Path(quest.worktree).resolve()
+    if not wt.is_dir():
+        print(f"ERROR: Worktree directory does not exist: {wt}", file=sys.stderr)
+        sys.exit(1)
+
+    kilo_bin = find_kilo_binary()
+    if not kilo_bin:
+        print("ERROR: Kilo binary not found. Cannot goad session via CLI.", file=sys.stderr)
+        sys.exit(1)
+
+    is_scout = getattr(quest, "kind", "") == "scout" or getattr(quest, "section", "") == "Investigation"
+    agent_role = "scout" if is_scout else "serf"
+    role_label = "Scout" if is_scout else "Serf"
+    model = getattr(args, "model", None) or quest.serf_model or DEFAULT_SERF_MODEL
+    qual_model = canonical_model_id(model)
+
+    tmpl_path = config.find_court_dir() / "templates" / "goad_prompt.md"
+    if not tmpl_path.is_file():
+        tmpl_path = Path(__file__).resolve().parent.parent / "templates" / "goad_prompt.md"
+
+    if tmpl_path.is_file():
+        tmpl_text = tmpl_path.read_text(encoding="utf-8")
+    else:
+        tmpl_text = "You are being goaded on Quest <QUEST_ID> (branch <canonical_branch>). Please resume work and complete the checklist."
+
+    rendered_prompt = (
+        tmpl_text
+        .replace("<QUEST_ID>", quest.id)
+        .replace("<canonical_branch>", quest.branch or "-")
+        .replace("{{ quest_id }}", quest.id)
+        .replace("{{ branch }}", quest.branch or "-")
+    )
+
+    setup_worktree_agent_config(wt, agent_role)
+
+    task_file = wt / ".kilo" / "TASK_GOAD.md"
+    try:
+        task_file.write_text(rendered_prompt, encoding="utf-8")
+    except Exception:
+        pass
+
+    log_dir = wt / ".kilo"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"{agent_role}.log"
+
+    title = f"{quest.id} {role_label} Goad"
+    cmd = [
+        str(kilo_bin),
+        "run",
+        "--agent", agent_role,
+        "--model", qual_model,
+        "--dir", str(wt),
+        "--title", title,
+        rendered_prompt,
+    ]
+
+    auto_commit = not getattr(args, "no_commit", False)
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(f"\n--- Goad {role_label}: {title} ({datetime.now().isoformat()}) ---\n")
+    log_out = open(log_file, "a", encoding="utf-8")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(wt),
+            stdout=log_out,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    finally:
+        log_out.close()
+    session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5) or f"kilo-{agent_role}-{proc.pid}"
+    quest.serf_session_id = session_id
+    store.save(quest, auto_commit=auto_commit, commit_msg=f"court: goad {role_label} session {session_id} for {quest.id}")
+    print(f"⚡ Goaded {role_label} for {quest.id}:")
+    print(f"   Session:  {session_id} (PID {proc.pid})")
+    print(f"   Agent:    {agent_role}")
+    print(f"   Model:    {qual_model}")
+    print(f"   Worktree: {wt}")
+    print(f"   Log:      tail -f {log_file}")
 
 
 def _extract_target_routes(quest: Quest, worktree: Optional[Path] = None) -> list[str]:
@@ -2039,7 +2327,7 @@ def cmd_raze(args):
     # default set the magic strings used to mean.
     target_quests = resolve_quest_selection(
         args, batchable=True, required=False,
-        default_status="GATE,READY_TO_RAZE,TRIBUTE_READY",
+        default_status="READY_TO_RAZE",
     )
     target_ids = [q.id for q in target_quests]
 
@@ -2280,53 +2568,89 @@ def cmd_collect(args):
         print(f"{quest.id}: GATE")
 
     accepted_ids = ", ".join(q.id for q in accepted)
+    qual_gatekeeper = canonical_model_id(DEFAULT_GATEKEEPER_MODEL)
     if len(accepted) == 1:
         solo_id = accepted[0].id
+        solo_quest = accepted[0]
         next_steps = [
             f"Packed 1 Quest: {solo_id}",
             "",
             "Convoy size 1 -- no separate Gatehouse worktree needed. Nothing to batch,",
             "so run the Gatekeeper role directly inside this Quest's own existing",
-            "worktree/session instead of spawning a new one.",
+            "worktree via Kilo CLI:",
             "",
-            "1. Prompt that Quest's EXISTING session via `agent_manager` action=\"prompt\"",
-            "   (find its session ID via action=\"list\") to act as Gatekeeper: merge",
-            "   castle in, run the full test suite, and on a clean pass merge straight",
-            "   into castle.",
-            "2. Record the session (no dedicated command yet -- raw set-field is correct):",
+            f"   kilo run --agent gatekeeper --model {qual_gatekeeper} --dir {solo_quest.worktree or '<worktree>'} \"Act as Gatekeeper for {solo_id}: merge castle in, run test suite, and on a clean pass merge straight into castle.\"",
             "",
+            "1. Record the session:",
             f"   python3 -m court.cli set-field {solo_id} gatekeeper_session_id <session_id>",
             f"   python3 -m court.cli set-field {solo_id} gatekeeper_model \"{DEFAULT_GATEKEEPER_MODEL}\"",
             "",
-            "3. On a clean suite run, promote directly into castle and advance to",
+            "2. On a clean suite run, promote directly into castle and advance to",
             "   READY_TO_RAZE.",
         ]
     else:
+        wt_name = f"the-gatehouse-{cogship_id}"
+        branch_name = f"the-gatehouse/{cogship_id}"
         next_steps = [
             f"Packed {len(accepted)} Quest(s): {accepted_ids}",
             "",
             "Convoy size > 1 -- spawn a BRAND-NEW ephemeral Gatehouse worktree scoped to",
-            "just this convoy. Never attach to an old/idle named station: Agent Manager",
-            "cannot attach a fresh session to an already-existing, sessionless worktree",
-            "(only create new), which is exactly why the old north/south/east/west",
-            "stations kept going stale between convoys.",
+            "just this convoy via Kilo CLI:",
             "",
-            "1. Use the `agent_manager` tool, mode=\"worktree\", to create ONE new",
-            f"   worktree+session with branchName \"the-gatehouse/{cogship_id}\", off",
-            "   castle's current tip.",
-            "2. Prompt that new session to act as Gatekeeper: merge in each of this",
-            "   convoy's Quest branches, run the unified suite ONCE across the pack,",
-            "   isolate+reject any failing Quest back to WORKING with the exact failure",
-            "   details, then promote the clean remainder directly into castle.",
-            "3. Record the session on each packed Quest (no dedicated command yet --",
-            "   raw set-field is correct):",
+            f"1. Stand up the convoy worktree and Gatekeeper session via Kilo CLI:",
+            f"   kilo worktree create {wt_name}",
+            f"   git -C .kilo/worktrees/{wt_name} branch -m {branch_name}",
+            f"   kilo run --agent gatekeeper --model {qual_gatekeeper} --dir .kilo/worktrees/{wt_name} \"Act as Gatekeeper for {cogship_id}: merge in branches for {accepted_ids}, run unified suite once, promote clean remainder directly into castle.\"",
             "",
-            "   python3 -m court.cli set-field <id> gatekeeper_session_id <session_id>",
+            "2. Record the session on each packed Quest:",
+            f"   python3 -m court.cli set-field <id> gatekeeper_session_id <session_id>",
             f"   python3 -m court.cli set-field <id> gatekeeper_model \"{DEFAULT_GATEKEEPER_MODEL}\"",
             "",
-            "4. Tear the ephemeral worktree down (Ashes/stop) once promoted -- it is",
-            "   scoped to this one convoy, not meant to persist for reuse.",
+            "3. Tear the ephemeral worktree down once promoted.",
         ]
+
+    if getattr(args, "standup", False):
+        kilo_bin = find_kilo_binary()
+        if kilo_bin:
+            if len(accepted) == 1:
+                solo = accepted[0]
+                if solo.worktree and Path(solo.worktree).is_dir():
+                    wt = Path(solo.worktree)
+                    setup_worktree_agent_config(wt, "gatekeeper")
+                    prompt = f"Act as Gatekeeper for {solo.id} on {cogship_id}: merge castle in, run test suite, and on clean pass merge into castle."
+                    res = standup_kilo_session(wt, agent="gatekeeper", model=qual_gatekeeper, prompt=prompt, title=f"{cogship_id} Gatekeeper", kilo_bin=kilo_bin, run_now=True)
+                    sid = res.get("session_id")
+                    if sid:
+                        solo.gatekeeper_session_id = sid
+                        solo.gatekeeper_model = DEFAULT_GATEKEEPER_MODEL
+                        store.save(solo, auto_commit=auto_commit, commit_msg=f"court: record Gatekeeper {sid} for {solo.id}")
+                        print(f"🛡️ Stood up Gatekeeper session {sid} for {solo.id} via Kilo CLI.")
+            else:
+                root = git_ops.get_repo_root()
+                wt_name = f"the-gatehouse-{cogship_id}"
+                branch_name = f"the-gatehouse/{cogship_id}"
+                wt_path = root / ".kilo" / "worktrees" / wt_name
+                try:
+                    # Timeouts are mandatory here: `kilo worktree create` used to
+                    # be the only unbounded subprocess in court, so a prompt/hang
+                    # inside it blocked `collect --standup` forever.
+                    subprocess.run([str(kilo_bin), "worktree", "create", wt_name], cwd=str(root), capture_output=True, check=True, timeout=300)
+                    git_ops.clear_git_cache()
+                    subprocess.run(["git", "-C", str(wt_path), "branch", "-m", branch_name], capture_output=True, timeout=60)
+                    subprocess.run(["git", "-C", str(wt_path), "merge", base_branch, "--ff-only"], capture_output=True, timeout=120)
+                    setup_worktree_agent_config(wt_path, "gatekeeper")
+                    prompt = f"Act as Gatekeeper for {cogship_id}: integrate Quests {accepted_ids}, run integration suite, promote to castle."
+                    res = standup_kilo_session(wt_path, agent="gatekeeper", model=qual_gatekeeper, prompt=prompt, title=f"{cogship_id} Gatekeeper", kilo_bin=kilo_bin, run_now=True)
+                    sid = res.get("session_id")
+                    if sid:
+                        for q in accepted:
+                            q.gatekeeper_session_id = sid
+                            q.gatekeeper_model = DEFAULT_GATEKEEPER_MODEL
+                            store.save(q, auto_commit=auto_commit, commit_msg=f"court: record Gatekeeper {sid} for {q.id}")
+                        print(f"🛡️ Stood up Gatekeeper convoy session {sid} on {branch_name} via Kilo CLI.")
+                except Exception as e:
+                    print(f"⚠️ Could not auto-standup Gatekeeper: {e}")
+
     _print_next_steps(f"🛡️ NEXT STEPS — SUMMON THE GATEKEEPER FOR {cogship_id}", next_steps)
 
 
@@ -2544,6 +2868,7 @@ def cmd_teardown_list(args):
         print(f"\n📦 Already Pruned from Agent Manager / Disk ({len(already_pruned)} Quests ready to archive):")
         for q in already_pruned:
             print(f"   * {q.id} (branch={q.branch or '-'})")
+        print(f"\n   👉 Archive all {len(already_pruned)} pruned quests with: python3 -m court.cli raze")
 
     print("\n" + "=" * 76)
 
@@ -2788,6 +3113,13 @@ def cmd_ship(args):
     target_quests = resolve_quest_selection(
         args, batchable=True, required=False, default_status="READY_TO_RAZE,DONE"
     )
+    explicit_selection = bool(getattr(args, "quest_ids", None) or getattr(args, "quest_id", None))
+    if not explicit_selection:
+        target_quests = [
+            q for q in target_quests
+            if q.kind != "scout" and q.section != "Investigation"
+            and not git_ops.is_quest_merged_into(q, target_ref=base_branch)
+        ]
     manifest = store.rollup_ship_manifest(quests=target_quests)
     quests = manifest["quests"]
 
@@ -3146,14 +3478,19 @@ def cmd_levy(args):
     violations_list = []
 
     for q in target_quests:
+        # Resolve this Quest's worktree exactly once per run and pass it down
+        # to every step below: find_worktree_for_quest costs 1-3 git subprocess
+        # spawns per call, and the old flow re-resolved it in the rebase step,
+        # sync, AND audit (up to ~9 wasted spawns per Quest per levy pass).
+        wt = None
+        if q.worktree and Path(q.worktree).is_dir():
+            wt = Path(q.worktree)
+        else:
+            wt = git_ops.find_worktree_for_quest(q)
+
         # Step 0: Mechanical rebase onto base_branch, right before this
         # specific quest's own audit/advance decision (see note above).
         if getattr(args, "rebase", True) and q.status in ("WORKING", "TRIBUTE_READY", "DISPATCHED"):
-            wt = None
-            if q.worktree and Path(q.worktree).is_dir():
-                wt = Path(q.worktree)
-            else:
-                wt = git_ops.find_worktree_for_quest(q)
             if wt and Path(wt).is_dir():
                 rb = git_ops.rebase_worktree_onto_base(wt, base_branch=base_branch, own_quest_id=q.id)
                 if rb.get("merged"):
@@ -3174,12 +3511,12 @@ def cmd_levy(args):
 
         # Step 1: Auto-sync tribute and frontmatter from worktree if present
         if getattr(args, "sync", True):
-            ward.sync_tribute_from_worktree(q)
+            ward.sync_tribute_from_worktree(q, worktree_path=wt)
 
         # Step 2: Sentry Audit — freshly re-reads git status now, so it sees
         # the rebase this quest just got (and any castle advance from an
         # earlier quest in this same loop), not a stale pre-flight snapshot.
-        audit = ward.audit_quest(q, base_branch=base_branch)
+        audit = ward.audit_quest(q, worktree_path=wt, base_branch=base_branch)
 
         # Step 3: Advance if requested and compliant
         did_advance = False
@@ -3199,11 +3536,10 @@ def cmd_levy(args):
                 q.set_status("TRIBUTE_READY", "Levied: Tribute synced from worktree and verified compliant")
                 store.save(q)
                 did_advance = True
-                audit.status = "TRIBUTE_READY"
 
         if audit.violations:
             violations_list.append((q, audit))
-        elif audit.status == "TRIBUTE_READY" or did_advance:
+        elif q.status == "TRIBUTE_READY" or did_advance:
             levied_list.append((q, audit, did_advance))
         else:
             working_list.append((q, audit))
@@ -3517,7 +3853,9 @@ def build_parser():
     p_dispatch.add_argument("--create-worktree", action="store_true", help="Create native git worktree automatically")
     p_dispatch.add_argument("--standup", action="store_true", help="Automate Kilo worktree creation, worktree agent config, and session standup")
     p_dispatch.add_argument("--native", action="store_true", help="Force native git worktree without Kilo CLI")
-    p_dispatch.add_argument("--run", action="store_true", help="Run kilo headless command immediately")
+    p_dispatch.add_argument("--run", action="store_true", default=True, help="Run kilo headless command immediately (default: True)")
+    p_dispatch.add_argument("--no-run", action="store_true", help="Configure worktree and write task without launching background Kilo session")
+    p_dispatch.add_argument("--agent", default=None, help="Agent to use (default: serf, or scout for investigations)")
     p_dispatch.add_argument("--prompt", default=None, help="Custom prompt override (defaults to pure charter task instructions)")
     p_dispatch.add_argument("--base", default="castle", help="Base branch for new worktrees (default: castle)")
     p_dispatch.add_argument("--session-id", default=None, dest="session_id", help="Agent session ID (defaults to 'native')")
@@ -3529,6 +3867,26 @@ def build_parser():
     )
     p_dispatch.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_dispatch.set_defaults(func=cmd_dispatch)
+
+    p_coin = sub.add_parser(
+        "coin",
+        help="Dispatch Master of Coin into a Quest's worktree via Kilo CLI to audit Tribute",
+    )
+    p_coin.add_argument("quest_id", help="Quest ID to audit (must be in TRIBUTE_READY unless --force)")
+    p_coin.add_argument("--model", default=DEFAULT_MOC_MODEL, help=f"Model for Master of Coin (default: {DEFAULT_MOC_MODEL})")
+    p_coin.add_argument("--force", action="store_true", help="Audit even if not currently in TRIBUTE_READY")
+    p_coin.add_argument("--wait", action="store_true", help="Run synchronously and wait for completion instead of background")
+    p_coin.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
+    p_coin.set_defaults(func=cmd_coin)
+
+    p_goad = sub.add_parser(
+        "goad",
+        help="Goad an active or stalled Serf session in a worktree via Kilo CLI",
+    )
+    p_goad.add_argument("quest_id", help="Quest ID to goad")
+    p_goad.add_argument("--model", default=None, help="Model override for goad")
+    p_goad.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
+    p_goad.set_defaults(func=cmd_goad)
 
     p_dispatch_complete = sub.add_parser(
         "dispatch-complete",
@@ -3712,6 +4070,7 @@ def build_parser():
     p_collect.add_argument("--cogship", default=None, help="Existing Cog Ship ID to stamp (e.g. cogship-002); omit or pass 'new' to allocate the next id")
     p_collect.add_argument("--base", default="castle", help="Base branch for the compliance audit (default: castle)")
     p_collect.add_argument("--skip-ui-review", action="store_true", help="Bypass pending UI review check when packing into Cog Ship")
+    p_collect.add_argument("--standup", action="store_true", help="Automatically stand up the Gatekeeper worktree and session via Kilo CLI")
     p_collect.add_argument("--force", action="store_true", help="Force packing even if checks warn/fail")
     p_collect.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_collect.set_defaults(func=cmd_collect)

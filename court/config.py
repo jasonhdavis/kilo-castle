@@ -16,8 +16,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "master_of_coin": "openrouter/google/gemini-3.8-flash",
         "gatekeeper": "openrouter/google/gemini-3.8-flash",
         "steward": "openrouter/google/gemini-3.7-flash",
-        "artist": "GLM-5.3",
-        "artist_provider": "openrouter",
+        "artist": "openrouter/z-ai/glm-5.3",
     },
     "no_kilo_mode": False,
 }
@@ -57,3 +56,23 @@ def get_model(role: str, default: Optional[str] = None, court_dir: Optional[Path
     cfg = load_config(court_dir)
     models = cfg.get("models", {})
     return models.get(role, default or DEFAULT_CONFIG["models"].get(role, ""))
+
+
+def canonical_model_id(model_str: str, provider: Optional[str] = None) -> str:
+    """Map human/display model names to fully qualified provider/model strings for Kilo CLI."""
+    if not model_str:
+        return "openrouter/z-ai/glm-5.3-flash"
+    m = model_str.strip()
+    if "/" in m:
+        return m
+    low = m.lower().replace(" ", "").replace("-", "").replace(".", "")
+    if "glm53flash" in low:
+        return "openrouter/z-ai/glm-5.3-flash"
+    if "glm53" in low:
+        return "openrouter/z-ai/glm-5.3"
+    if "gemini38flash" in low:
+        return "openrouter/google/gemini-3.8-flash"
+    if "gemini37flash" in low:
+        return "openrouter/google/gemini-3.7-flash"
+    p = provider or "openrouter"
+    return f"{p}/{m}"

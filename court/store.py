@@ -514,7 +514,10 @@ def rollup_ship_manifest(
 
         convoy_quests = [q for q in all_quests if q.status in target_statuses]
     else:
-        convoy_quests = quests
+        convoy_quests = list(quests)
+        if status:
+            target_statuses = {s.strip().upper() for s in status.split(",")}
+            convoy_quests = [q for q in convoy_quests if q.status in target_statuses]
 
     manifest = {
         "quests": convoy_quests,

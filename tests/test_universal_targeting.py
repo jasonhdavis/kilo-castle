@@ -146,6 +146,51 @@ class TestUniversalTargeting(unittest.TestCase):
         self.assertIn("Q102-Platform-Task-Orchestration", out)
         self.assertNotIn("Q101", out)
 
+    def test_ship_excludes_already_merged_to_main(self):
+        from unittest.mock import patch
+        # When Q102 is already merged to main, bare `ship` should exclude it
+        with patch("court.git_ops.is_quest_merged_into", return_value=True):
+            args = self.parser.parse_args(["ship"])
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cli.cmd_ship(args)
+            out = buf.getvalue()
+            self.assertIn("0 Quests", out)
+            self.assertNotIn("Q102-Platform-Task-Orchestration", out)
+
+    def test_ship_includes_unmerged_quest(self):
+        from unittest.mock import patch
+        # When Q102 is staged on castle and not yet merged into main
+        with patch("court.git_ops.is_quest_merged_into", return_value=False):
+            args = self.parser.parse_args(["ship"])
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cli.cmd_ship(args)
+            out = buf.getvalue()
+            self.assertIn("1 Quests", out)
+            self.assertIn("Q102-Platform-Task-Orchestration", out)
+
+    def test_status_cogships_ready_filters_already_merged(self):
+        from unittest.mock import patch
+        # When already merged to main, Cogships Ready does not show it
+        with patch("court.git_ops.is_quest_merged_into", return_value=True):
+            args = self.parser.parse_args(["status"])
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cli.cmd_status(args)
+            out = buf.getvalue()
+            self.assertNotIn("🚢 Cogships Ready", out)
+
+        # When NOT yet merged to main, Cogships Ready displays it
+        with patch("court.git_ops.is_quest_merged_into", return_value=False):
+            args = self.parser.parse_args(["status"])
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cli.cmd_status(args)
+            out = buf.getvalue()
+            self.assertIn("🚢 Cogships Ready (1) launch with /ship", out)
+            self.assertIn("Q102-Platform-Task-Orchestration", out)
+
 
 if __name__ == "__main__":
     unittest.main()

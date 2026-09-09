@@ -388,6 +388,10 @@ class WardAudit:
         return self.quest.id
 
     @property
+    def title(self) -> str:
+        return self.quest.title
+
+    @property
     def is_compliant(self) -> bool:
         return len(self.violations) == 0
 

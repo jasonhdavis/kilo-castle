@@ -2195,8 +2195,8 @@ def _format_merge_status_card(target_label: str, status: dict) -> str:
         f"Base Ref:         {status.get('base_ref')}",
         "",
         f"STATUS:           {'✅ MERGED' if status.get('is_merged') else ('🚨 DIRTY WORKTREE' if not status.get('clean_worktree') else '⚠️ UNMERGED')}",
-        f"Merged in Target: {'✅ YES' if status.get('is_merged_in_target') else '❌ NO'} (ancestor={status.get('is_ancestor_target')})",
-        f"Merged in Base:   {'✅ YES' if status.get('is_merged_in_base') else '❌ NO'} (ancestor={status.get('is_ancestor_base')})",
+        f"Merged in Target: {'✅ YES' if status.get('is_merged_target') else '❌ NO'} (ancestor={status.get('is_ancestor_target')})",
+        f"Merged in Base:   {'✅ YES' if status.get('is_merged_base') else '❌ NO'} (ancestor={status.get('is_ancestor_base')})",
         f"Worktree Clean:   {'✅ YES' if status.get('clean_worktree') else '🚨 DIRTY (' + str(len(status.get('uncommitted_files', []))) + ' files)'}",
         f"Unmerged Commits: {status.get('unmerged_commits_count', 0)} vs {status.get('target_ref')} ({status.get('unmerged_commits_base_count', 0)} vs {status.get('base_ref')})",
         f"Pending Diff:     {'⚠️ YES' if status.get('has_diff') else '✅ NONE'}",
@@ -2255,7 +2255,7 @@ def cmd_verify_merged(args):
             res = git_ops.check_merged_status(target, target_ref=target_ref, base_ref=base_ref)
             is_scout = (q.kind == "scout" or q.section == "Investigation")
 
-            if res.get("is_merged") and res.get("is_merged_in_base"):
+            if res.get("is_merged") and res.get("is_merged_base"):
                 badge = "✅ MERGED(gatehouse+castle)"
             elif res.get("is_merged"):
                 badge = "🟡 MERGED(gatehouse)"
@@ -2428,7 +2428,7 @@ def cmd_raze(args):
         # and the Scout Report, not in merged commits.
         is_scout = (quest.kind == "scout" or quest.section == "Investigation")
         status = git_ops.check_merged_status(found_wt_path or branch, target_ref="castle", base_ref="castle")
-        is_merged = status.get("is_merged_in_target") or status.get("is_merged_in_base")
+        is_merged = status.get("is_merged_target") or status.get("is_merged_base")
 
         if not is_merged and not is_scout:
             unmerged_count = status.get("unmerged_commits_count", 0)

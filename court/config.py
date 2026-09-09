@@ -13,8 +13,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "serf": "GLM-5.3-Flash",
         "serf_provider": "openrouter",
         "scout": "openrouter/z-ai/glm-5.3-flash",
-        "master_of_coin": "openrouter/google/gemini-3.8-flash",
-        "gatekeeper": "openrouter/google/gemini-3.8-flash",
+        "master_of_coin": "openrouter/google/gemma-4-31b-it",
+        "gatekeeper": "openrouter/google/gemma-4-31b-it",
         "steward": "openrouter/google/gemini-3.7-flash",
         "artist": "openrouter/z-ai/glm-5.3",
     },
@@ -70,8 +70,8 @@ def canonical_model_id(model_str: str, provider: Optional[str] = None) -> str:
         return "openrouter/z-ai/glm-5.3-flash"
     if "glm53" in low:
         return "openrouter/z-ai/glm-5.3"
-    if "gemini38flash" in low:
-        return "openrouter/google/gemini-3.8-flash"
+    if "gemma431bit" in low or "gemini38flash" in low:
+        return "openrouter/google/gemma-4-31b-it"
     if "gemini37flash" in low:
         return "openrouter/google/gemini-3.7-flash"
     p = provider or "openrouter"

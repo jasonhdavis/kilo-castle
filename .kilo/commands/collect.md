@@ -56,12 +56,12 @@ Follow the Collect Protocol (absorbing gate progression):
        act as Gatekeeper. Tear the worktree down (Ashes/stop) once promoted; it is scoped to
        this one convoy only, not meant to persist for reuse.
      - **NEVER** run Gatekeeper as a background task, background process, or on castle.
-     - Gatekeeper is a **Gemini 3.8 Flash** class agent (`openrouter/google/gemini-3.8-flash`).
+     - Gatekeeper is a **Gemma 4 31B IT** class agent (`openrouter/google/gemma-4-31b-it`).
      - Allowed to spawn sequential non-background tasks (`background: false`) for integration verification.
    - Record metadata:
      ```bash
      python3 -m court.cli set-field <id> gatekeeper_session_id <session_id>
-     python3 -m court.cli set-field <id> gatekeeper_model "openrouter/google/gemini-3.8-flash"
+     python3 -m court.cli set-field <id> gatekeeper_model "openrouter/google/gemma-4-31b-it"
      ```
    - **Unified Test Run & Fault Isolation**: Gatekeeper merges the Cog Ship pack into the target
      worktree (the solo Quest's own branch for a size-1 convoy, or the fresh ephemeral

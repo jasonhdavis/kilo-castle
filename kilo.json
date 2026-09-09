@@ -29,13 +29,13 @@
     "gatekeeper": {
       "description": "Court Gatekeeper: mechanical batch integration, unified testing, and direct castle promotion agent on gatehouse branches",
       "mode": "primary",
-      "model": "openrouter/google/gemini-3.8-flash",
+      "model": "openrouter/google/gemma-4-31b-it",
       "prompt": "You are the Gatekeeper: the mechanical batch integration and test execution agent operating on the gatehouse layer.\n\nRemit:\n- Autonomous Cog Ship Convoy Packing on the-gatehouse/<cogship_id> branches.\n- Run the unified test suite across the candidate convoy.\n- Fault isolation & rejection via /reject_tribute with Serf remediation.\n- Direct promotion to castle, compile deployment manifest (court ship), and advance passing Quests to READY_TO_RAZE.\n- No pillory duty."
     },
     "master_of_coin": {
       "description": "Court Master of Coin: administrative and accounting audit agent for Quests in TRIBUTE_READY",
       "mode": "primary",
-      "model": "openrouter/google/gemini-3.8-flash",
+      "model": "openrouter/google/gemma-4-31b-it",
       "permission": {
         "task": "deny"
       },

@@ -50,8 +50,8 @@ WARD_REPORTS_DIR = WARD_DIR / "reports"
 _CFG = config.load_config()
 DEFAULT_SERF_MODEL = _CFG["models"].get("serf", "GLM-5.3-Flash")
 SERF_PROVIDER = _CFG["models"].get("serf_provider", "openrouter")
-DEFAULT_MOC_MODEL = _CFG["models"].get("master_of_coin", "openrouter/google/gemini-3.8-flash")
-DEFAULT_GATEKEEPER_MODEL = _CFG["models"].get("gatekeeper", "openrouter/google/gemini-3.8-flash")
+DEFAULT_MOC_MODEL = _CFG["models"].get("master_of_coin", "openrouter/google/gemma-4-31b-it")
+DEFAULT_GATEKEEPER_MODEL = _CFG["models"].get("gatekeeper", "openrouter/google/gemma-4-31b-it")
 DEFAULT_ARTIST_MODEL = _CFG["models"].get("artist", "openrouter/z-ai/glm-5.3")
 ARTIST_PROVIDER = _CFG["models"].get("artist_provider", "openrouter")
 SERF_DISPATCH_TEMPLATE = ".court/templates/serf_dispatch_prompt.md"
@@ -164,8 +164,8 @@ def canonical_model_id(model_str: str, provider: Optional[str] = None) -> str:
         return "openrouter/z-ai/glm-5.3-flash"
     if "glm53" in low:
         return "openrouter/z-ai/glm-5.3"
-    if "gemini38flash" in low:
-        return "openrouter/google/gemini-3.8-flash"
+    if "gemma431bit" in low or "gemini38flash" in low:
+        return "openrouter/google/gemma-4-31b-it"
     if "gemini37flash" in low:
         return "openrouter/google/gemini-3.7-flash"
     p = provider or "openrouter"

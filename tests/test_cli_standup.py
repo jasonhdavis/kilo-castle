@@ -227,7 +227,7 @@ class TestCliStandup(unittest.TestCase):
         self.assertIn("--agent", cmd_called)
         self.assertIn("master_of_coin", cmd_called)
         self.assertIn("--model", cmd_called)
-        self.assertIn("openrouter/google/gemini-3.8-flash", cmd_called)
+        self.assertIn("openrouter/google/gemma-4-31b-it", cmd_called)
         q = store.load("Q123-Core-Standup", court_root=self.court_dir)
         self.assertEqual(q.master_of_coin_session_id, "ses_coin_999")
 

@@ -171,7 +171,7 @@ DEFAULT_KILO_CONFIG = {
         "gatekeeper": {
             "description": "Court Gatekeeper: mechanical batch integration, unified testing, and direct castle promotion agent on gatehouse branches",
             "mode": "primary",
-            "model": "openrouter/google/gemini-3.8-flash",
+            "model": "openrouter/google/gemma-4-31b-it",
             "prompt": (
                 "You are the Gatekeeper: the mechanical batch integration and test execution agent operating on the gatehouse layer.\n\n"
                 "Remit:\n"
@@ -185,7 +185,7 @@ DEFAULT_KILO_CONFIG = {
         "master_of_coin": {
             "description": "Court Master of Coin: administrative and accounting audit agent for Quests in TRIBUTE_READY",
             "mode": "primary",
-            "model": "openrouter/google/gemini-3.8-flash",
+            "model": "openrouter/google/gemma-4-31b-it",
             "permission": {
                 "task": "deny",
             },
@@ -254,8 +254,8 @@ castle                  (staging root trunk for main; attached to localhost)
 ## Division of Labor
 
 - **Serf on Quest Worktrees**: Disposable workers implementing assigned Goal & Scope. Model: **GLM 5.3 Flash** (`openrouter/z-ai/glm-5.3-flash`).
-- **Master of Coin**: Audits value delivery in `TRIBUTE_READY` via dedicated worktree session. Broad verification authority (live read probes, paperwork rendering), narrow remit (no code fixes). Model: **Gemini 3.8 Flash** (`openrouter/google/gemini-3.8-flash`). Syncs verdict back with `git push . HEAD:<real-branch>`.
-- **Gatekeeper**: Ephemeral convoy integration & testing at `GATE`. Model: **Gemini 3.8 Flash** (`openrouter/google/gemini-3.8-flash`).
+- **Master of Coin**: Audits value delivery in `TRIBUTE_READY` via dedicated worktree session. Broad verification authority (live read probes, paperwork rendering), narrow remit (no code fixes). Model: **Gemma 4 31B IT** (`openrouter/google/gemma-4-31b-it`). Syncs verdict back with `git push . HEAD:<real-branch>`.
+- **Gatekeeper**: Ephemeral convoy integration & testing at `GATE`. Model: **Gemma 4 31B IT** (`openrouter/google/gemma-4-31b-it`).
 - **Court Artist**: Interactive UI/UX craftsman working directly with M'Lord on frontend styling with active runserver. Model: **GLM 5.3** (`openrouter/z-ai/glm-5.3`).
 - **Steward**: Resident orchestrator on `castle`. Does not run test suites directly; manages lifecycle, triage, and teardowns.
 

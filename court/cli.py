@@ -172,8 +172,36 @@ def canonical_model_id(model_str: str, provider: Optional[str] = None) -> str:
     return f"{p}/{m}"
 
 
-def query_latest_kilo_session_id(worktree_path: Path, timeout_seconds: float = 2.5) -> Optional[str]:
-    """Inspect local kilo.db to find the session ID created for a worktree."""
+def query_kilo_session_ids(worktree_path: Path) -> set[str]:
+    """Inspect local kilo.db and return all session IDs recorded for a worktree."""
+    db_path = Path.home() / ".local" / "share" / "kilo" / "kilo.db"
+    wt_str = str(worktree_path.resolve())
+    if not db_path.is_file():
+        return set()
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=1.0)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM session WHERE directory = ?",
+            (wt_str,)
+        )
+        ids = {row[0] for row in cur.fetchall() if row and row[0]}
+        conn.close()
+        return ids
+    except Exception:
+        return set()
+
+
+def query_latest_kilo_session_id(
+    worktree_path: Path,
+    timeout_seconds: float = 2.5,
+    exclude_ids: Optional[set[str]] = None,
+) -> Optional[str]:
+    """Inspect local kilo.db to find the session ID created for a worktree.
+
+    When `exclude_ids` is provided (sessions that existed before dispatch),
+    prefer a newly created session over a resumed pre-existing one.
+    """
     db_path = Path.home() / ".local" / "share" / "kilo" / "kilo.db"
     wt_str = str(worktree_path.resolve())
     deadline = time.time() + timeout_seconds
@@ -183,13 +211,18 @@ def query_latest_kilo_session_id(worktree_path: Path, timeout_seconds: float = 2
                 conn = sqlite3.connect(str(db_path), timeout=1.0)
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT id FROM session WHERE directory = ? ORDER BY time_created DESC LIMIT 1",
+                    "SELECT id FROM session WHERE directory = ? ORDER BY time_created DESC",
                     (wt_str,)
                 )
-                row = cur.fetchone()
+                rows = cur.fetchall()
                 conn.close()
-                if row and row[0]:
-                    return row[0]
+                excluded = exclude_ids or set()
+                new_ids = [r[0] for r in rows if r and r[0] and r[0] not in excluded]
+                if new_ids:
+                    return new_ids[0]
+                if not excluded:
+                    if rows and rows[0][0]:
+                        return rows[0][0]
             except Exception:
                 pass
         time.sleep(0.2)
@@ -1833,14 +1866,16 @@ def cmd_coin(args):
 
     if wait:
         print(f"🪙 Running Master of Coin audit for {quest.id} synchronously (agent: master_of_coin, model: {qual_model})...")
+        pre_existing = query_kilo_session_ids(wt)
         res = subprocess.run(cmd, cwd=str(wt))
-        session_id = query_latest_kilo_session_id(wt)
+        session_id = query_latest_kilo_session_id(wt, exclude_ids=pre_existing) or query_latest_kilo_session_id(wt)
         if session_id:
             quest.master_of_coin_session_id = session_id
             quest.master_of_coin_model = model
             store.save(quest, auto_commit=auto_commit, commit_msg=f"court: record MoC session {session_id} for {quest.id}")
         return res.returncode
     else:
+        pre_existing = query_kilo_session_ids(wt)
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\n--- Master of Coin Audit: {title} ({datetime.now().isoformat()}) ---\n")
         log_out = open(log_file, "a", encoding="utf-8")
@@ -1855,7 +1890,7 @@ def cmd_coin(args):
             )
         finally:
             log_out.close()
-        session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5) or f"kilo-coin-{proc.pid}"
+        session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5, exclude_ids=pre_existing) or f"kilo-coin-{proc.pid}"
         quest.master_of_coin_session_id = session_id
         quest.master_of_coin_model = model
         store.save(quest, auto_commit=auto_commit, commit_msg=f"court: dispatch MoC {session_id} for {quest.id}")

@@ -102,7 +102,7 @@ python3 -m court.cli dispatch-complete <id> --session-id <ses_id> --branch <bran
 ### 6. Levy & Review (`/levy`)
 - Run `python3 -m court.cli levy` to audit working Quests and rebase them to zero drift.
 - When Tribute is rendered and zero drift reached, advance to `TRIBUTE_READY`.
-- Dispatch **Master of Coin** (`master_of_coin_review_prompt.md`) via a dedicated Agent Manager session in the Quest's worktree (`model: "Gemma 4 31B IT"` / `openrouter/google/gemma-4-31b-it`).
+- Dispatch **Master of Coin** (`master_of_coin_review_prompt.md`) via a dedicated Agent Manager session in the Quest's worktree (`model` resolved from `.court/config.json` (`models.master_of_coin`) / the configured `models` entry in `.court/config.json`).
 - Master of Coin verifies the claims live, fixes paperwork, identifies commutation steps, and advances to `GATE`.
 
 ### 6b. Court Artist & UI Review (`/artist`)
@@ -112,7 +112,7 @@ python3 -m court.cli dispatch-complete <id> --session-id <ses_id> --branch <bran
 
 ### 7. Collect & Gate (`/collect`)
 - Run `python3 -m court.cli collect` to audit Quests waiting at `GATE`, stamp a Cog Ship convoy (`cogship-NNN`), and prepare the Gatekeeper dispatch payload.
-- Dispatch **Gatekeeper** (`gatekeeper_review_prompt.md`, `model: "Gemma 4 31B IT"` / `openrouter/google/gemma-4-31b-it`):
+- Dispatch **Gatekeeper** (`gatekeeper_review_prompt.md`, `model` resolved from `.court/config.json` (`models.master_of_coin`) / the configured `models` entry in `.court/config.json`):
   - For convoy of size 1: runs directly in the Quest's own worktree.
   - For convoy of size > 1: runs in a brand-new ephemeral convoy worktree (`.kilo/worktrees/the-gatehouse-<cogship_id>`, branch `the-gatehouse/<cogship_id>`).
 - Gatekeeper runs the unified test suite across the pack. If test regressions occur, it isolates the offending Quest, rejects it via `/reject_tribute`, and dispatches a remediation Serf.

@@ -5,7 +5,7 @@ Its job is to **account for what already exists** — reconcile the Serf's claim
 reality, verify them with live commands where needed, and settle the Charter's paperwork
 (Ballad/Tally/Penance/Audience/Humble-Opinion headings, task-file checkboxes). It never
 produces new work product: no code, no implementation, no touching the diff. This is why
-it runs as a **Gemma 4 31B IT** class agent (`openrouter/google/gemma-4-31b-it`) — one tier above the Serf's GLM 5.3 Flash.
+it runs as a model pinned in `.court/config.json` (`models.master_of_coin`) — one tier above the Serf's GLM 5.3 Flash.
 An accounting remit doesn't need top-tier intelligence; what it needs is broad authority to actually go verify things live in the
 worktree rather than take the Serf's claims on faith. It renders **exactly one** audit per
 Quest — a single, unconditional verdict — **BEFORE** the Gatekeeper is ever dispatched.
@@ -18,8 +18,8 @@ Decrees, and the Steward charters a brand-new Quest+worktree from those Decrees.
 1. Read `branch`/`worktree` from the Quest's frontmatter (`court show {{ quest_id }}`).
 2. Dispatch via Court CLI:
    `python3 -m court.cli coin {{ quest_id }}`
-   (or via Kilo CLI: `kilo run --agent master_of_coin --model openrouter/google/gemma-4-31b-it --dir {{ worktree }} "<prompt>"`).
-   This evaluates directly in the Quest's existing worktree under `agent: master_of_coin` with Gemma 4 31B IT, bypassing Agent Manager's agent-mode inheritance bug.
+   (or via Kilo CLI: `kilo run --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir {{ worktree }} "<prompt>"`).
+   This evaluates directly in the Quest's existing worktree under `agent: master_of_coin` with the configured `models.master_of_coin`, bypassing Agent Manager's agent-mode inheritance bug.
 3. The session assumes the Master of Coin persona inside the worktree, renders its one audit
    into `.court/quests/{{ quest_id }}.md` under `## Master of Coin's Audit`, and either
    advances the Quest to `GATE` or reports back to the Steward for pillorying.

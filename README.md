@@ -71,7 +71,7 @@ court update      # vendors engine/, templates/, commands/, agents/, prompts/, k
 👑 M'Lord (Human Owner)
    │
    ▼
-🏰 The Steward (resides on castle — Gemini 3.7 Flash)
+🏰 The Steward (resides on castle — model from `.court/config.json`)
    │
    ├──► 🌲 Scout (scout/* branches — GLM 5.3 Flash)
    │        5-Part Scout Report → /plot → production Quests
@@ -79,13 +79,13 @@ court update      # vendors engine/, templates/, commands/, agents/, prompts/, k
    ├──► 🔨 Serf (quest/* worktrees — GLM 5.3 Flash)
    │        implements Quests against the charter
    │
-   ├──► 🪙 Master of Coin (TRIBUTE_READY audit — Gemma 4 31B IT)
+   ├──► 🪙 Master of Coin (TRIBUTE_READY audit — model from `.court/config.json`)
    │        verifies claims live, settles paperwork, names Commutation
    │
    ├──► 🎨 Court Artist (UI studio with live runserver — GLM 5.3)
    │        refines front-end with M'Lord before collection
    │
-   └──► 🛡️ Gatekeeper (the-gatehouse/* convoys — Gemma 4 31B IT)
+   └──► 🛡️ Gatekeeper (the-gatehouse/* convoys — model from `.court/config.json`)
           unified test run → promote to castle
                    │
                    ▼
@@ -95,12 +95,12 @@ court update      # vendors engine/, templates/, commands/, agents/, prompts/, k
 | Role | Where it runs | Responsibilities | Model (pinned) |
 |---|---|---|---|
 | **👑 M'Lord** | Human | Product authority, scope changes, irreversible decisions, Audience rulings. | Human |
-| **🏰 Steward** | `castle` (primary agent) | Orchestrator, strategic planner, Council (`/plot`), dispatch, triage, teardowns. Never runs test suites — that belongs to the gatehouse. | **Gemini 3.7 Flash** (`openrouter/google/gemini-3.7-flash`) |
-| **🔨 Serf** | Quest worktree (`quest/*`) | Disposable coding agent implementing one Quest. Builds production-ready code against the immutable charter, renders Tribute. Never orchestrates. | **GLM 5.3 Flash** (`openrouter/z-ai/glm-5.3-flash`) |
-| **🌲 Scout** | `scout/*` branch (Investigation lane) | POC reconnaissance: probes APIs, feasibility, throwaway scripts in `tasks/artifacts/`, renders the 5-part Scout Report. Branch is razed, never merged. | **GLM 5.3 Flash** (`openrouter/z-ai/glm-5.3-flash`) |
-| **🪙 Master of Coin** | Dedicated session in Quest worktree at `TRIBUTE_READY` | Audits Expected vs Delivered against the `castle` baseline charter, verifies claims live, settles paperwork, names Commutation steps, syncs verdict back (`git push . HEAD:<branch>`), advances to `GATE`. No code work. | **Gemma 4 31B IT** (`openrouter/google/gemma-4-31b-it`) |
+| **🏰 Steward** | `castle` (primary agent) | Orchestrator, strategic planner, Council (`/plot`), dispatch, triage, teardowns. Never runs test suites — that belongs to the gatehouse. | From `.court/config.json` (`models.steward`) |
+| **🔨 Serf** | Quest worktree (`quest/*`) | Disposable coding agent implementing one Quest. Builds production-ready code against the immutable charter, renders Tribute. Never orchestrates. | From `.court/config.json` (`models.scout` / `models.serf`) |
+| **🌲 Scout** | `scout/*` branch (Investigation lane) | POC reconnaissance: probes APIs, feasibility, throwaway scripts in `tasks/artifacts/`, renders the 5-part Scout Report. Branch is razed, never merged. | From `.court/config.json` (`models.scout` / `models.serf`) |
+| **🪙 Master of Coin** | Dedicated session in Quest worktree at `TRIBUTE_READY` | Audits Expected vs Delivered against the `castle` baseline charter, verifies claims live, settles paperwork, names Commutation steps, syncs verdict back (`git push . HEAD:<branch>`), advances to `GATE`. No code work. | From `.court/config.json` (`models.master_of_coin`) |
 | **🎨 Court Artist** | Quest worktree with live runserver | Interactive UI studio: preview, critique, polish templates/views/styles directly with M'Lord after MoC audit, before Gatekeeper collection. | **GLM 5.3** (`openrouter/z-ai/glm-5.3`) |
-| **🛡️ Gatekeeper** | Ephemeral `the-gatehouse/<cogship_id>` convoy | Packs MoC-approved Quests, runs the unified integration suite across the pack, isolates/rejects failures via `/reject_tribute`, promotes the clean convoy directly to `castle`, packs the ship manifest. | **Gemma 4 31B IT** (`openrouter/google/gemma-4-31b-it`) |
+| **🛡️ Gatekeeper** | Ephemeral `the-gatehouse/<cogship_id>` convoy | Packs MoC-approved Quests, runs the unified integration suite across the pack, isolates/rejects failures via `/reject_tribute`, promotes the clean convoy directly to `castle`, packs the ship manifest. | From `.court/config.json` (`models.master_of_coin`) |
 | **🏹 Warden** | Patrol (`court ward`) | Diagnostic patrol of production logs/error trackers; files 5-part Warden Reports (Survey, Stack Trace, Impact, Root Cause, Proposed Fix) to be chartered as `Bug fix` Quests. Diagnosis only — never remediates. | /ward command |
 
 Agent definitions live in **three synced places**: `kilo.json` (`agent` map — the live configuration), `.kilo/agent/` + `.kilo/agents/` (installed agent files), and `court/agents/` (source templates). Every summonable role carries an explicit `model`, `provider`, and prompt — agents are never summoned inheriting whatever model the active turn happens to use.
@@ -320,9 +320,9 @@ Agents are defined in `kilo.json` (`mode: primary`, pinned model, full prompt). 
 
 - **Serf**: `court dispatch <id> --standup` (GLM 5.3 Flash) or `kilo run --agent serf --model "GLM-5.3-Flash" --dir <worktree>`
 - **Scout**: `/scout <app> <concern> "<goal>"` (GLM 5.3 Flash)
-- **Master of Coin**: `/levy <id>` starts a fresh dedicated worktree session (Gemma 4 31B IT)
+- **Master of Coin**: `/levy <id>` starts a fresh dedicated worktree session (model from `.court/config.json`)
 - **Court Artist**: `/artist <id>` spawns the interactive UI studio with a live runserver (GLM 5.3)
-- **Gatekeeper**: `/collect` packs the convoy and prints the Gatekeeper NEXT STEPS (Gemma 4 31B IT)
+- **Gatekeeper**: `/collect` packs the convoy and prints the Gatekeeper NEXT STEPS (model from `.court/config.json`)
 
 ### 4. Daily workflow
 

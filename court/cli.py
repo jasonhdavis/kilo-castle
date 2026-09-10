@@ -1504,6 +1504,25 @@ def cmd_set_field(args):
     print(f"{quest.id}.{args.field} = {args.value}")
 
 
+def cmd_model(args):
+    cfg = _CFG.get("models", {})
+    role = args.role.replace("-", "_")
+    default_map = {
+        "master_of_coin": DEFAULT_MOC_MODEL,
+        "gatekeeper": DEFAULT_GATEKEEPER_MODEL,
+        "serf": DEFAULT_SERF_MODEL,
+        "artist": DEFAULT_ARTIST_MODEL,
+        "steward": cfg.get("steward", ""),
+        "scout": cfg.get("scout", ""),
+    }
+    if role not in default_map:
+        print(f"Unknown role: {args.role} (known: {', '.join(sorted(k for k in default_map if default_map[k]))})")
+        return 2
+    model = cfg.get(role) or default_map[role]
+    print(canonical_model_id(model, provider=cfg.get(f"{role}_provider")))
+    return 0
+
+
 def cmd_set_section(args):
     quest = store.load(args.quest_id)
     if args.file:
@@ -4032,6 +4051,10 @@ def build_parser():
     p_field.add_argument("value")
     p_field.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_field.set_defaults(func=cmd_set_field)
+
+    p_model = sub.add_parser("model", help="Print the resolved model for a role (from .court/config.json)")
+    p_model.add_argument("role", help="Role: serf, master_of_coin, gatekeeper, artist, steward, scout")
+    p_model.set_defaults(func=cmd_model)
 
     p_section = sub.add_parser("set-section", help="Replace/append a body section")
     p_section.add_argument("quest_id")

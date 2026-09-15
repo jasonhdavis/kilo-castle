@@ -307,23 +307,27 @@ def run_init(target_dir: Optional[Path] = None, force: bool = False) -> dict:
     for d in (quests_dir, epics_dir, archive_dir, templates_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    # 1. .court/README.md
+    # 1. .court/README.md (create-once repo state; see LEDGER note below)
     readme_path = court_dir / "README.md"
-    if not readme_path.exists() or force:
+    if not readme_path.exists():
         readme_path.write_text(COURT_README_CONTENT.strip() + "\n", encoding="utf-8")
         print(f"  + Created {readme_path.relative_to(target)}")
 
     # 2. .court/LEDGER.md
+    # NEVER force-overwrite repo state: `court update` re-runs run_init(force=True)
+    # and the durable LEDGER / config / README must survive it (a force-overwrite
+    # here wiped pb-app's 1666-line LEDGER and model-pinned config on 2026-09-15;
+    # recovered from git). These are create-once files, unlike templates/engine.
     ledger_path = court_dir / "LEDGER.md"
-    if not ledger_path.exists() or force:
+    if not ledger_path.exists():
         from .models import now_iso
         date_str = now_iso()[:10]
         ledger_path.write_text(LEDGER_CONTENT.format(date=date_str).strip() + "\n", encoding="utf-8")
         print(f"  + Created {ledger_path.relative_to(target)}")
 
-    # 2b. .court/config.json
+    # 2b. .court/config.json (create-once; operator model pins must survive updates)
     config_path = court_dir / "config.json"
-    if not config_path.exists() or force:
+    if not config_path.exists():
         from .config import DEFAULT_CONFIG
         config_path.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n", encoding="utf-8")
         print(f"  + Created {config_path.relative_to(target)}")
@@ -403,9 +407,10 @@ def run_init(target_dir: Optional[Path] = None, force: bool = False) -> dict:
         except Exception:
             pass
 
-    # 6. AGENTS.md
+    # 6. AGENTS.md (create-once repo state; the castle's own agent instructions
+    # must never be clobbered by a package sync)
     agents_path = target / "AGENTS.md"
-    if not agents_path.exists() or force:
+    if not agents_path.exists():
         agents_path.write_text(AGENTS_MD_CONTENT.strip() + "\n", encoding="utf-8")
         print(f"  + Created {agents_path.relative_to(target)}")
 

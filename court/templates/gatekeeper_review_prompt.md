@@ -35,6 +35,21 @@ You are the Gatekeeper running inside the ephemeral gatehouse convoy worktree `.
    ```
 3. **Zero Roleplay Leakage Sanity Check**: Confirm no internal Court/Castle vocabulary (`Tribute`, `Serf`, `Kingdom`, `Ballad`, `Penance`, `Pillory`, etc.) is present in modified production UI templates, headers, or API contracts. If found, reject via `/reject_tribute` for immediate Serf remediation.
 
+
+### Step 2b: Migration Graph Doctrine (deterministic shapes — the 2026-09-14 v1383 class)
+
+`court collect` already refuses to pack quest-local merge migrations (Shape C). The remaining collision shapes are yours to resolve mechanically, BY SHAPE — not by judgment calls:
+
+- **Shape A — two leaves, distinct filenames** (git merges clean; Django refuses the multi-leaf graph at graph-build): do NOT bounce either Quest. After ALL candidate branches are merged into the convoy (ordering matters: the next-free-number computation must see every leaf), generate exactly ONE trunk-owned merge node in the convoy:
+  ```bash
+  python manage.py makemigrations <app> --merge --noinput
+  ```
+  Then re-run the graph check (`python manage.py makemigrations --check --dry-run`) and the unified suite. Quest round-trips are churn here: Django natively unifies forks via merge nodes, and a rebase would cascade renumbers through sibling branches. Exception: if both leaves mutate the SAME model with conflicting operations (e.g. two AlterFields on one field), treat it as Shape B — a merge node fixes graph shape, not content, and the last-applied op would silently win.
+- **Shape B — same filename (git add/add), or conflicting ops on one model**: the merge physically cannot proceed. Keep the trunk-side (`castle`) migration verbatim, reject the losing Quest via `/reject_tribute`, and have its Serf run the delete-and-regenerate procedure (`.court/templates/serf_remediation_prompt.md` → Migration Collision Remediation).
+- **Shape C — quest-local `NNNN_merge_*` on a candidate branch**: contraband. `court collect` refuses to pack the carrier; reject with the same remediation procedure if one reaches you.
+
+A suite-time error naming "Conflicting migrations detected; multiple leaf nodes" with an app and leaf list is a Shape A occurrence: resolve it in the convoy with the trunk-owned merge node — never by hand-renumbering migrations inside the convoy.
+
 ### Step 3: Handle Outcomes & Fault Isolation
 
 #### Case A: All Tests Pass (Clean Convoy)

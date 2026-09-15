@@ -40,6 +40,7 @@ from . import git_ops
 from . import ward
 from . import branch_ops
 from . import config
+from . import migration_guard
 
 # The Ward's durable workspace: patrol ledger + Warden Report queue.
 WARD_DIR = Path(__file__).resolve().parent.parent / "ward"
@@ -1564,6 +1565,52 @@ def _print_charter_next_steps(quest: Quest, am_section: str) -> None:
     )
 
 
+# In-flight statuses whose branches may carry unlanded migrations (advisory population).
+_MIGRATION_LANE_IN_FLIGHT = (
+    "OPEN", "PLANNED", "CHARTERED", "DISPATCHED", "QUESTING", "WORKING", "TRIBUTE_READY", "GATE",
+)
+
+
+def _print_migration_lane_advisory(chartered_quest: Quest, base_ref: str = "castle") -> None:
+    """Charter-time collision advisory (2026-09-15 migration-fork class).
+
+    N parallel Quests branching from the same castle tip each independently
+    autogenerate the same next migration number - a pigeonhole problem, not a
+    model/judgment problem, invisible to git (distinct filenames merge clean)
+    and to per-Quest suites (each sees only its own single leaf). Surface the
+    in-flight migration-lane population mechanically at charter time so the
+    Steward sequences lanes or consciously accepts the convoy merge path.
+    Advisory only - the deterministic refusal gate lives in `court collect`.
+    """
+    try:
+        root = git_ops.get_repo_root()
+    except Exception:
+        return
+    branches: list[tuple[str, str]] = []
+    for q in store.list_all():
+        if q.id == chartered_quest.id or not q.branch:
+            continue
+        if q.status in _MIGRATION_LANE_IN_FLIGHT:
+            branches.append((q.id, q.branch))
+    if not branches:
+        return
+    try:
+        activity = migration_guard.migration_activity(root, branches, base_ref)
+    except Exception:
+        return
+    if not activity:
+        return
+    print("\n🗺️  Migration-lane advisory — in-flight Quests adding migrations to shared app namespaces:")
+    for app in sorted(activity):
+        entries = sorted({e["quest_id"] for e in activity[app]})
+        print(f"   - apps/{app}/migrations/: {', '.join(entries)}")
+    print(
+        "   Sequence these lanes or consciously accept the merge path "
+        "(Gatekeeper template → Migration Graph Doctrine); most of this "
+        "collision class dies at charter/dispatch time."
+    )
+
+
 def cmd_charter(args):
     """Composite charter (Q183): fold M'Lord's notes into `The Kingdom Requires`,
     idempotently advance OPEN -> PLANNED, compute the canonical branch when
@@ -1643,6 +1690,8 @@ def cmd_charter(args):
     store.save(quest, auto_commit=auto_commit, commit_msg=f"court: charter {quest.id}")
     summary = f"; ".join(changed) if changed else "no changes"
     print(f"Chartered {quest.id}: status=[{quest.status}] branch={quest.branch or '-'} section={quest.section or '-'} ({summary})")
+
+    _print_migration_lane_advisory(quest)
 
     if getattr(args, "dispatch", False):
         print(f"\n🚀 --dispatch specified: proceeding directly to Serf standup...")
@@ -2572,6 +2621,8 @@ def cmd_collect(args):
 
     accepted: list[Quest] = []
     skipped: list[tuple[str, str]] = []
+    scan_warnings: list[str] = []
+    repo_root = git_ops.get_repo_root()
     for quest in candidates:
         if quest.status == "PUNISHED":
             skipped.append((quest.id, "PUNISHED (side-state, frozen pending its pillory successor)"))
@@ -2602,12 +2653,27 @@ def cmd_collect(args):
         if audit.violations:
             skipped.append((quest.id, f"{len(audit.violations)} compliance violation(s): {'; '.join(audit.violations)}"))
             continue
+        # Shape C gate (2026-09-15 migration-fork class): refuse to pack quest-local
+        # merge migrations. Differential scan - only files the branch ADDS over the
+        # trunk, so castle's own pre-existing merge nodes never flag innocent branches.
+        if quest.branch:
+            try:
+                contraband = migration_guard.scan_branch_contraband(repo_root, base_branch, quest.branch)
+            except Exception as e:
+                scan_warnings.append(f"{quest.id}: migration contraband scan failed ({e}); Gatekeeper graph check remains the backstop")
+            else:
+                if contraband:
+                    skipped.append((quest.id, migration_guard.remediation_message(contraband, base_branch)))
+                    continue
         accepted.append(quest)
 
     if skipped:
         print(f"⏭️  Skipped {len(skipped)} candidate(s) (not ready to pack):")
         for qid, reason in skipped:
             print(f"   - {qid}: {reason}")
+
+    for warning in scan_warnings:
+        print(f"⚠️  {warning}")
 
     if not accepted:
         print("(no Master-of-Coin-approved Quests ready to pack into a Cog Ship)")

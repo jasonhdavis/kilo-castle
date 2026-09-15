@@ -112,3 +112,15 @@ To prevent Serfs from retroactively expanding their own remit or laundering smug
    - The Master of Coin at Gate 3 and the Court auditor (`court audit` / `ward.py`) MUST NOT blindly evaluate against the worktree's local charter.
    - The auditor deterministically checks `git_ops.check_charter_integrity` against the original charter on `castle` (`git show castle:.court/quests/<id>.md`).
    - If ANY unauthorized changes to `# The Kingdom Requires` or `# Expected Tribute` item text are detected between `castle` and the branch, it is flagged as **Charter Tampering / Scope Laundering** and is grounds for **immediate audit failure and pillory (`court pillory`)**.
+
+
+---
+
+## Migration Graph Protocol (Same-Number & Leaf-Fork Collisions)
+
+N parallel Quests branching from the same `castle` tip each independently autogenerate the same next migration number — a pigeonhole problem, invisible to git (distinct filenames merge clean) and to per-Quest suites (each sees only its own single leaf). Resolution is mechanical, split by collision shape (full doctrine: `court/templates/gatekeeper_review_prompt.md` → Step 2b):
+
+1. **Shape A — two leaves, distinct filenames**: Gatekeeper generates exactly ONE trunk-owned merge node in the convoy AFTER all candidate branches are merged (`python manage.py makemigrations <app> --merge --noinput`), then re-runs `makemigrations --check --dry-run`. No Quest round-trips. Exception: conflicting operations on the same model degrade to Shape B (a merge node fixes graph shape, not content — last-applied op would silently win).
+2. **Shape B — same filename (git add/add), or conflicting ops on one model**: trunk-side migration wins verbatim; the loser is rejected via `/reject_tribute` and its Serf runs the delete-and-regenerate procedure (`serf_remediation_prompt.md` → Migration Collision Remediation): schema migrations regenerate via `makemigrations` (next free number + deps are computed), data migrations rename + hand-repoint dependencies, semantically-overlapping deltas are dropped outright.
+3. **Shape C — quest-local `NNNN_merge_*` migrations**: contraband. `court collect` deterministically refuses to pack a candidate branch that ADDS a merge-shaped migration over the trunk (filename `NNNN_merge_*` or zero-op content with ≥2 same-app dependencies). Merge nodes are trunk-owned convoy artifacts, never Quest deliverables.
+4. **Prevention at dispatch time**: `court charter` prints a migration-lane advisory listing in-flight Quests adding migrations to shared `apps/<x>/migrations/` namespaces — sequence those lanes or consciously accept the convoy merge path. Most of this collision class dies at charter/dispatch time.

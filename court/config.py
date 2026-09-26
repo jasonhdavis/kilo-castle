@@ -125,6 +125,28 @@ def get_harness_command(court_dir: Optional[Path] = None) -> str:
     return ""
 
 
+def get_studio_freshness(court_dir: Optional[Path] = None) -> dict:
+    """Combined-studio freshness-gate configuration from the manifest
+    (studio.freshness_command, studio.freshness_max_age_hours).
+
+    The freshness gate is project-specific (e.g. pb-app:
+    ``python3 scripts/db/local_db.py --age`` reporting the local production
+    mirror's sync age). It is WARN-ONLY by design: a stale mirror delays the
+    review, it must never auto-sync from a studio command. Returns
+    ``{"command": str, "max_age_hours": float}``; an empty command means the
+    gate is not configured and the studio reports that fact instead."""
+    cfg = load_config(court_dir)
+    studio = cfg.get("studio") if isinstance(cfg.get("studio"), dict) else {}
+    try:
+        max_age = float(studio.get("freshness_max_age_hours", 24) or 24)
+    except (TypeError, ValueError):
+        max_age = 24.0
+    return {
+        "command": str(studio.get("freshness_command") or "").strip(),
+        "max_age_hours": max_age,
+    }
+
+
 def canonical_model_id(model_str: str, provider: Optional[str] = None, court_dir: Optional[Path] = None) -> str:
     """Map human/display model names to fully qualified provider/model strings for Kilo CLI.
 

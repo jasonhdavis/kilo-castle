@@ -131,7 +131,7 @@ def validate_branch_name(branch: str) -> tuple[bool, str]:
         return True, ""
     if branch in ("main", "castle", "the-gatehouse"):
         return True, ""
-    if branch.startswith(("epic/", "quest/", "scout/", "ward/", "the-gatehouse/")):
+    if branch.startswith(("epic/", "quest/", "scout/", "ward/", "the-gatehouse/", "artist/")):
         return True, ""
     if branch.startswith(("quest-", "scout-", "epic-", "ward-")):
         parts = branch.split("-", 1)
@@ -140,7 +140,8 @@ def validate_branch_name(branch: str) -> tuple[bool, str]:
             f"Use organizational folder slash namespace like '{parts[0]}/{parts[1]}' instead."
         )
     return False, (
-        f"Branch '{branch}' must use organizational folder prefix ('epic/...', 'quest/...', 'scout/...', 'ward/...', or 'the-gatehouse/...')."
+        f"Branch '{branch}' must use organizational folder prefix ('epic/...', 'quest/...', "
+        f"'scout/...', 'ward/...', 'the-gatehouse/...', or 'artist/...')."
     )
 
 

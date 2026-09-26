@@ -39,3 +39,5 @@ Follow the Royal UI Atelier Protocol:
    - Run the unified suite via the ENGINE: `python3 -m court.cli runsuite --cogship <cogship_id> --dir .kilo/worktrees/the-gatehouse-<cogship_id>`.
    - Stand up the Gatekeeper in the same worktree (candidate branches are already merged; it runs the suite, promotes the clean convoy into `castle`, advances passing quests to `READY_TO_RAZE`, and packs the manifest via `court ship`).
    - If the Gatekeeper isolates/rejects a quest, addendum polish entangled with that quest's files is reverted with it (`gatekeeper_review_prompt.md` → Step 2c, rule 3).
+
+> **Atelier vs Studio**: this command is the pre-collect **Cog Ship convoy** lane (stamp + GATE + Gatekeeper promotion of the convoy branch). For the **combined artist easel** lane — no stamping, per-quest sync-back after sign-off, collection via the Steward — use `/studio <QID1>,<QID2>,...` (`court studio`, the Q-2 deterministic Combined Studio with the charter-paperwork → branch-wins / disclosed-union conflict policy and the WARN-ONLY freshness gate).

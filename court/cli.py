@@ -25,10 +25,12 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +56,7 @@ WARD_REPORTS_DIR = WARD_DIR / "reports"
 SERF_DISPATCH_TEMPLATE = ".court/templates/serf_dispatch_prompt.md"
 ARTIST_DISPATCH_TEMPLATE = ".court/templates/court_artist_prompt.md"
 ATELIER_DISPATCH_TEMPLATE = ".court/templates/court_artist_convoy_prompt.md"
+STUDIO_DISPATCH_TEMPLATE = ".court/templates/court_artist_studio_prompt.md"
 REPO_ROOT = git_ops.get_repo_root()
 MANAGE_SERVERS_PATH = REPO_ROOT / ".kilo" / "manage_servers.sh"
 
@@ -222,6 +225,7 @@ def standup_kilo_session(
     server_port: Optional[int] = None,
     server_password: Optional[str] = None,
     run_now: bool = True,
+    provider_hint: Optional[str] = None,
 ) -> dict:
     """Stand up a Kilo session in a worktree with explicit agent mode.
 
@@ -283,7 +287,7 @@ def standup_kilo_session(
     if bin_path and run_now:
         try:
             pre_existing = query_kilo_session_ids(worktree_path)
-            qual_model = canonical_model_id(model, provider=config.get_provider("serf"))
+            qual_model = canonical_model_id(model, provider=config.get_provider(provider_hint or "serf"))
             log_dir = worktree_path / ".kilo"
             log_dir.mkdir(parents=True, exist_ok=True)
             log_file = log_dir / f"{agent}.log"
@@ -3193,6 +3197,333 @@ def _pack_quest_branches(quests: list, wt_path: Path, cogship_id: str) -> tuple[
     return merged, isolated
 
 
+# ---------------------------------------------------------------------------
+# Combined Artist Studio (Q-2): deterministic multi-quest studio command.
+# Formalizes the hand-run recipe exercised on the Q472/Q473/Q412, Q589, and
+# Q617 cohorts: studio worktree from castle tip, merge N quest branches under
+# the established conflict policy, freshness-gated runserver, studio + session
+# recorded in the ledger, and both documented spawn paths kept intact.
+# ---------------------------------------------------------------------------
+
+# Charter-paperwork paths where a studio merge conflict is ALWAYS resolved
+# branch-wins: the Quest branch carries the freshest paperwork (tribute,
+# audit, ledger trail) and the trunk-side copy is by definition older. Every
+# other conflicted path is a genuine code overlap and goes through the
+# disclosed union resolution.
+STUDIO_PAPERWORK_PREFIXES = (
+    ".court/quests/",
+    ".court/epics/",
+    ".court/archive/",
+)
+STUDIO_PAPERWORK_FILES = (
+    ".court/LEDGER.md",
+    ".court/EDICTS.md",
+    ".kilo/TASK.md",
+    ".kilo/TASK_ARTIST.md",
+)
+
+
+def _is_paperwork_path(path: str) -> bool:
+    """Pure classifier: is this conflicted path charter paperwork (branch-wins)
+    or genuine code overlap (disclosed union resolution)?"""
+    p = (path or "").strip().strip('"').strip("'")
+    return p.startswith(STUDIO_PAPERWORK_PREFIXES) or p in STUDIO_PAPERWORK_FILES
+
+
+def _conflicted_paths(wt_path: Path) -> list[str]:
+    res = git_ops._run(["git", "diff", "--name-only", "--diff-filter=U"], wt_path)
+    if not res.get("ok"):
+        return []
+    return [ln.strip() for ln in (res.get("stdout") or "").splitlines() if ln.strip()]
+
+
+def _checkout_theirs_path(wt_path: Path, path: str) -> bool:
+    """Branch-wins resolution for one paperwork path (the Quest branch holds the
+    full tribute + audit). Honors a branch-side deletion."""
+    res = git_ops._run(["git", "checkout", "--theirs", "--", path], wt_path)
+    if res.get("ok"):
+        return bool(git_ops._run(["git", "add", "--", path], wt_path).get("ok"))
+    return bool(git_ops._run(["git", "rm", "-q", "--", path], wt_path).get("ok"))
+
+
+def _union_merge_path(wt_path: Path, path: str) -> tuple[bool, str]:
+    """Deterministic union resolution for one genuinely code-overlapped path.
+
+    Mechanizes the hand-run studio policy: take BOTH sides' line-level changes
+    (git merge-file --union) instead of exercising aesthetic judgment, then
+    guard the result — no conflict markers may remain, and .py sources must
+    still byte-compile. Paths union cannot resolve (add/add, modify/delete —
+    no common base to merge against) are left for isolation, never hand-merged
+    here. The resolution is disclosed to the Court Artist for live sanity-check.
+    """
+    blobs: dict[str, Optional[str]] = {}
+    for label, stage in (("base", ":1"), ("ours", ":2"), ("theirs", ":3")):
+        res = git_ops._run(["git", "show", f"{stage}:{path}"], wt_path)
+        blobs[label] = res.get("stdout") if res.get("ok") else None
+    ours, theirs, base = blobs["ours"], blobs["theirs"], blobs["base"]
+    if ours is None or theirs is None:
+        return False, "modify/delete conflict — no both-side content to union"
+    if ours == theirs:
+        (wt_path / path).write_text(ours if ours.endswith("\n") else ours + "\n", encoding="utf-8")
+        if not git_ops._run(["git", "add", "--", path], wt_path).get("ok"):
+            return False, "could not stage identical content"
+        return True, "both sides identical (staged as-is)"
+    if base is None:
+        return False, "add/add conflict — no common base for a union; needs hand resolution"
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpd = Path(tmp)
+        f_ours, f_base, f_theirs = tmpd / "ours", tmpd / "base", tmpd / "theirs"
+        f_ours.write_text(ours, encoding="utf-8")
+        f_base.write_text(base, encoding="utf-8")
+        f_theirs.write_text(theirs, encoding="utf-8")
+        res = git_ops._run(
+            ["git", "merge-file", "--union", "-p", str(f_ours), str(f_base), str(f_theirs)],
+            wt_path,
+        )
+    merged = res.get("stdout") or ""
+    if not merged.strip():
+        return False, f"union merge produced no output ({((res.get('stderr') or 'unknown'))[:160]})"
+    if "<<<<<<<" in merged or ">>>>>>>" in merged:
+        return False, "union left conflict markers; needs hand resolution"
+    if path.endswith(".py"):
+        try:
+            compile(merged, path, "exec")
+        except SyntaxError as e:
+            return False, f"union broke {path} syntax ({str(e)[:120]}); needs hand resolution"
+    (wt_path / path).write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
+    if not git_ops._run(["git", "add", "--", path], wt_path).get("ok"):
+        return False, "could not stage union result"
+    return True, "union of both sides' line-level changes"
+
+
+def _merge_quest_branches_with_policy(quests: list, wt_path: Path, studio_label: str) -> tuple[list, list[dict]]:
+    """Sequentially merge candidate Quest branches into the studio worktree
+    under the established conflict policy (Q-2; hand-run Q472/Q473/Q412, Q589,
+    and Q617 cohorts):
+
+    - charter paperwork (.court/quests/**, ledger, task files) -> branch-wins;
+      the Quest branch carries the full tribute + audit, the trunk-side copy
+      is older
+    - genuine code overlap -> disclosed union of both sides' line-level
+      changes (git merge-file --union), guarded by marker + syntax checks
+    - anything the policy cannot resolve -> the branch is isolated (merge
+      aborted, tree restored) and reported; it never enters the review
+      half-merged
+
+    Returns (merged_quests, per-quest reports). Each report is
+    ``{"id", "paperwork": [paths], "union": ["path — note"], "isolated": reason|None}``.
+    """
+    merged: list = []
+    reports: list[dict] = []
+    for quest in quests:
+        res = git_ops._run(
+            [
+                "git", "merge", quest.branch, "--no-edit", "-m",
+                f"court: merge {quest.id} into combined artist studio {studio_label}",
+            ],
+            wt_path,
+        )
+        if res.get("ok"):
+            merged.append(quest)
+            reports.append({"id": quest.id, "paperwork": [], "union": [], "isolated": None})
+            continue
+        paths = _conflicted_paths(wt_path)
+        if not paths:
+            git_ops._run(["git", "merge", "--abort"], wt_path)
+            git_ops._run(["git", "reset", "--hard", "HEAD"], wt_path)
+            reason = ((res.get("stderr") or "") + (res.get("stdout") or "")).strip().splitlines()
+            reports.append({
+                "id": quest.id, "paperwork": [], "union": [],
+                "isolated": reason[-1][:200] if reason else "merge failed",
+            })
+            continue
+        paperwork: list[str] = []
+        union: list[tuple[str, str]] = []
+        unresolved: list[str] = []
+        for p in paths:
+            if _is_paperwork_path(p):
+                if _checkout_theirs_path(wt_path, p):
+                    paperwork.append(p)
+                else:
+                    unresolved.append(f"{p} (branch-wins checkout failed)")
+            else:
+                ok, note = _union_merge_path(wt_path, p)
+                if ok:
+                    union.append((p, note))
+                else:
+                    unresolved.append(f"{p} ({note})")
+        union_str = [f"{p} — {note}" for p, note in union]
+        if unresolved:
+            git_ops._run(["git", "merge", "--abort"], wt_path)
+            git_ops._run(["git", "reset", "--hard", "HEAD"], wt_path)
+            reports.append({
+                "id": quest.id, "paperwork": paperwork, "union": union_str,
+                "isolated": "unresolved conflicts: " + "; ".join(unresolved),
+            })
+            continue
+        commit_res = git_ops._run(["git", "commit", "--no-edit"], wt_path)
+        if commit_res.get("ok"):
+            merged.append(quest)
+            reports.append({"id": quest.id, "paperwork": paperwork, "union": union_str, "isolated": None})
+        else:
+            git_ops._run(["git", "merge", "--abort"], wt_path)
+            git_ops._run(["git", "reset", "--hard", "HEAD"], wt_path)
+            reason = ((commit_res.get("stderr") or "") + (commit_res.get("stdout") or "")).strip().splitlines()
+            reports.append({
+                "id": quest.id, "paperwork": paperwork, "union": union_str,
+                "isolated": reason[-1][:200] if reason else "commit after conflict resolution failed",
+            })
+    return merged, reports
+
+
+def _studio_slug(quests: list) -> str:
+    """Hand-run naming: `artist-studio-q617-q627-q628` / branch
+    `artist/q617-q627-q628-ui-studio` — short id segments, lowercased."""
+    return "-".join((q.id.split("-", 1)[0] or q.id).lower() for q in quests)
+
+
+def _run_freshness_gate(repo_root: Path) -> dict:
+    """24h freshness gate for the studio runserver (Q672 doctrine): WARN-ONLY.
+
+    Runs the project-specific `studio.freshness_command` from the manifest
+    (e.g. pb-app: `python3 scripts/db/local_db.py --age`, reporting the local
+    production mirror's sync age). NEVER auto-syncs — a stale mirror surfaces
+    as a loud warning and the review proceeds.
+    """
+    gate = config.get_studio_freshness()
+    out: dict[str, Any] = {
+        "configured": bool(gate["command"]),
+        "command": gate["command"],
+        "max_age_hours": gate["max_age_hours"],
+        "age_hours": None,
+        "fresh": None,
+        "detail": "",
+    }
+    if not gate["command"]:
+        out["detail"] = "no studio.freshness_command configured in .court/config.json"
+        return out
+    try:
+        res = subprocess.run(
+            shlex.split(gate["command"]),
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception as e:
+        out["detail"] = f"freshness command failed to run ({e}) — WARN-ONLY, continuing"
+        return out
+    text = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
+    out["detail"] = text[-600:]
+    m = re.search(r"Freshness:\s*(\w+)", text)
+    if m:
+        out["fresh"] = m.group(1).upper() == "FRESH"
+    a = re.search(r"\(([\d.]+)\s*([smhd])\s*ago\)", text)
+    if a:
+        mult = {"s": 1.0 / 3600.0, "m": 1.0 / 60.0, "h": 1.0, "d": 24.0}[a.group(2)]
+        out["age_hours"] = round(float(a.group(1)) * mult, 2)
+    if res.returncode != 0 and out["fresh"] is None:
+        out["detail"] += "\n(freshness command exited non-zero — WARN-ONLY, continuing)"
+    return out
+
+
+def _freshness_verdict(freshness: dict) -> str:
+    """One-line WARN-ONLY verdict for the studio report and ledger note."""
+    if not freshness.get("configured"):
+        return "freshness gate not configured (no studio.freshness_command in .court/config.json)"
+    max_age = freshness.get("max_age_hours", 24)
+    age = freshness.get("age_hours")
+    if age is not None:
+        if age > max_age:
+            return (
+                f"STALE WARN — mirror age {age}h exceeds the {max_age}h freshness gate; "
+                "review proceeds, NEVER auto-syncs (run the configured freshness command's sync out-of-band)"
+            )
+        return f"OK — mirror age {age}h (gate: {max_age}h)"
+    if freshness.get("fresh") is False:
+        return "STALE WARN per the freshness command; review proceeds, NEVER auto-syncs"
+    if freshness.get("fresh") is True:
+        return "OK per the freshness command"
+    return "unparsed freshness output — WARN-ONLY, review proceeds"
+
+
+def _studio_sync_back(args, auto_commit: bool, repo_root: Path) -> None:
+    """Post-sign-off submode: merge the studio branch back into each selected
+    Quest's own worktree branch (the hand-run one-convoy sync-back pattern).
+
+    Deliberately NOT auto-resolving here: a sync-back conflict means the Quest
+    worktree drifted since the studio was cut, and the Quest branch is the
+    integration target — conflicts are disclosed for a remediation turn, the
+    merge is aborted, and the studio branch is never forced.
+    """
+    quests = resolve_quest_selection(args, batchable=True, required=True)
+    studio_branch = getattr(args, "branch", None) or f"artist/{_studio_slug(quests)}-ui-studio"
+    if not _verify_branch_exists(studio_branch, repo_root):
+        print(
+            f"ERROR: studio branch '{studio_branch}' not found in this repo. If the studio was "
+            "cut with a different cohort or --branch, pass the exact studio branch.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    results: list[tuple[str, str, str]] = []
+    changed: list[Quest] = []
+    for quest in quests:
+        wt = quest.worktree
+        if not wt or not Path(wt).is_dir():
+            results.append((quest.id, "SKIPPED", f"no Quest worktree at '{wt or '-'}'"))
+            continue
+        wtp = Path(wt)
+        status = git_ops._run(["git", "status", "--porcelain"], wtp)
+        if (status.get("stdout") or "").strip():
+            results.append((quest.id, "SKIPPED", "dirty worktree — commit or stash first"))
+            continue
+        res = git_ops._run(
+            [
+                "git", "merge", studio_branch, "--no-edit", "-m",
+                f"court: sync-back combined studio {studio_branch} into {quest.id}",
+            ],
+            wtp,
+        )
+        if res.get("ok"):
+            results.append((quest.id, "MERGED", f"{studio_branch} merged into {quest.branch}"))
+            quest.log_ledger(
+                quest.status, quest.status,
+                f"Synced combined studio {studio_branch} into {quest.branch} (royal sign-off complete; collection next)",
+            )
+            changed.append(quest)
+        else:
+            conflicts = _conflicted_paths(wtp)
+            if conflicts:
+                git_ops._run(["git", "merge", "--abort"], wtp)
+                git_ops._run(["git", "reset", "--hard", "HEAD"], wtp)
+                results.append((
+                    quest.id, "CONFLICT",
+                    f"sync-back conflicts {conflicts} — merge aborted, worktree restored; "
+                    "needs a remediation turn (studio branch was NOT forced)",
+                ))
+            else:
+                reason = ((res.get("stderr") or "") + (res.get("stdout") or "")).strip().splitlines()
+                results.append((quest.id, "FAILED", reason[-1][:200] if reason else "merge failed"))
+
+    if changed:
+        store.save_many(
+            changed,
+            f"court: record combined-studio sync-back for {', '.join(q.id for q in changed)}",
+            auto_commit=auto_commit,
+        )
+
+    print("=" * 76)
+    print("🔀 COMBINED STUDIO SYNC-BACK")
+    print("=" * 76)
+    print(f"Studio branch: {studio_branch}")
+    for qid, outcome, detail in results:
+        icon = {"MERGED": "✅", "SKIPPED": "⏭️ ", "CONFLICT": "⚠️ ", "FAILED": "❌"}.get(outcome, "•")
+        print(f"  {icon} {qid}: {outcome} — {detail}")
+    print("=" * 76)
+
+
 def cmd_atelier(args):
     """Royal UI Convoy Atelier: roll up multiple UI-review-pending Quests into one
     Cog Ship convoy PRE-integration-test, merge their branches together into the
@@ -3459,6 +3790,385 @@ def cmd_atelier(args):
     print(f"     \"Act as Gatekeeper for {cogship_id}: candidate branches already merged; run the unified")
     print(f"     suite via court runsuite, promote the clean convoy into castle, advance passing Quests")
     print(f"     to READY_TO_RAZE, and pack the manifest with court ship.\"")
+    print("=" * 76)
+
+
+def cmd_studio(args):
+    """Deterministic Multi-Quest Combined Studio (Q-2): formalize the hand-run
+    artist-studio recipe (Q472/Q473/Q412, Q589, Q617 cohorts) into one command.
+
+    Cuts an `artist-studio-<ids>` worktree from the castle tip on branch
+    `artist/<ids>-ui-studio`, merges every candidate Quest branch with the
+    established conflict policy (charter paperwork -> branch-wins; genuine
+    code overlap -> disclosed union resolution; unresolvable -> isolation),
+    copies the gitignored .env into the fresh worktree, starts the runserver
+    behind the WARN-ONLY freshness gate, renders the artist brief to
+    `.kilo/TASK_ARTIST.md`, and records the studio + session in each Quest's
+    Castle Ledger (`artist_session_id` / `artist_model`) — while both
+    documented spawn paths stay intact: Agent Manager first (Branch A, the
+    `--json` task payload), Kilo CLI fallback (Branch B, `--standup` or the
+    printed `kilo run` line).
+
+    Unlike /atelier, the studio does NOT stamp a Cog Ship or advance statuses:
+    Quests keep their pipeline place and sync-back happens per Quest
+    (`court studio <ids> --sync-back`), with collection remaining the
+    Steward's. Single-writer: the studio belongs to the Court Artist until
+    royal sign-off.
+    """
+    auto_commit = not getattr(args, "no_commit", False)
+    repo_root = git_ops.get_repo_root()
+
+    if getattr(args, "sync_back", False):
+        return _studio_sync_back(args, auto_commit, repo_root)
+
+    base_branch = getattr(args, "base", "castle") or "castle"
+    candidates = resolve_quest_selection(
+        args, batchable=True, required=True, default_status="TRIBUTE_READY,GATE",
+    )
+
+    accepted: list[Quest] = []
+    skipped: list[tuple[str, str]] = []
+    any_status = bool(getattr(args, "any_status", False))
+    for quest in candidates:
+        if quest.status == "PUNISHED":
+            skipped.append((quest.id, "PUNISHED (side-state, frozen pending its pillory successor)"))
+            continue
+        if quest.status not in ("TRIBUTE_READY", "GATE") and not any_status:
+            skipped.append((quest.id, f"status is [{quest.status}], not TRIBUTE_READY or GATE (use --any-status to override)"))
+            continue
+        if not quest.body_sections.get("Master of Coin's Audit", "").strip():
+            skipped.append((
+                quest.id,
+                "no recorded Master of Coin's Audit content -- refusing to merge unaudited "
+                "work into a royal studio (dispatch `/levy <id>` first)",
+            ))
+            continue
+        ui_status = quest.extract_ui_review_status()
+        if not ui_status.upper().startswith("PENDING"):
+            skipped.append((
+                quest.id,
+                f"UI Review is not PENDING ('{ui_status or 'not recorded'}') -- nothing for the "
+                "artist to review; route through /collect instead",
+            ))
+            continue
+        if not quest.branch or not _verify_branch_exists(quest.branch, repo_root):
+            skipped.append((quest.id, f"branch '{quest.branch or '-'}' not found in this repo -- nothing to merge"))
+            continue
+        audit = ward.audit_quest(quest, base_branch=base_branch)
+        if audit.git_status.get("dirty"):
+            skipped.append((quest.id, "dirty working tree"))
+            continue
+        if audit.violations:
+            skipped.append((quest.id, f"{len(audit.violations)} compliance violation(s): {'; '.join(audit.violations)}"))
+            continue
+        try:
+            contraband = migration_guard.scan_branch_contraband(repo_root, base_branch, quest.branch)
+        except Exception as e:
+            print(f"⚠️  {quest.id}: migration contraband scan failed ({e}); Gatekeeper graph check remains the backstop")
+        else:
+            if contraband:
+                skipped.append((quest.id, migration_guard.remediation_message(contraband, base_branch)))
+                continue
+        accepted.append(quest)
+
+    as_json = bool(getattr(args, "json", False))
+    if skipped and not as_json:
+        print(f"⏭️  Skipped {len(skipped)} candidate(s) (not studio material):")
+        for qid, reason in skipped:
+            print(f"   - {qid}: {reason}")
+
+    if not accepted:
+        print("(no UI-review-pending Quests ready to combine into a studio)")
+        return
+
+    if len(accepted) == 1 and not as_json:
+        print(f"ℹ️  Only one Quest accepted ({accepted[0].id}) — for a single Quest the lighter "
+              f"per-Quest review is `/artist {accepted[0].id}` (no studio worktree needed). "
+              "Proceeding with the combined studio anyway.")
+
+    slug = _studio_slug(accepted)
+    wt_name = f"artist-studio-{slug}"
+    branch_name = getattr(args, "branch", None) or f"artist/{slug}-ui-studio"
+    if not branch_name.startswith("artist/"):
+        print(f"ERROR: --branch must use the artist/ folder namespace (got '{branch_name}').", file=sys.stderr)
+        sys.exit(1)
+    wt_path = repo_root / ".kilo" / "worktrees" / wt_name
+    if wt_path.exists():
+        print(
+            f"ERROR: studio worktree already exists at {wt_path} — a combined studio is already "
+            f"stood up for this cohort. Single-writer rule: tear the existing worktree down or "
+            "pass --branch to cut a different studio.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if _verify_branch_exists(branch_name, repo_root):
+        print(
+            f"ERROR: branch '{branch_name}' already exists — a studio for this cohort was already "
+            "cut. Pass --branch to name a fresh studio branch.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    kilo_bin = find_kilo_binary()
+    created = False
+    if kilo_bin:
+        try:
+            subprocess.run(
+                [str(kilo_bin), "worktree", "create", wt_name],
+                cwd=str(repo_root), capture_output=True, check=True, timeout=300,
+            )
+            git_ops.clear_git_cache()
+            subprocess.run(["git", "-C", str(wt_path), "branch", "-m", branch_name], capture_output=True, timeout=60)
+            created = True
+        except Exception as e:
+            print(f"⚠️ kilo worktree create failed ({e}); falling back to git worktree add")
+    if not created:
+        res = git_ops._run(["git", "worktree", "add", str(wt_path), "-b", branch_name, base_branch], repo_root)
+        if not res.get("ok"):
+            print(f"ERROR: could not create studio worktree at {wt_path}: {res.get('stderr')}", file=sys.stderr)
+            sys.exit(1)
+
+    ff_res = git_ops._run(["git", "merge", base_branch, "--ff-only"], wt_path)
+    if not ff_res.get("ok"):
+        print(f"ERROR: studio worktree could not fast-forward to {base_branch}: {ff_res.get('stderr')}", file=sys.stderr)
+        sys.exit(1)
+
+    merged_quests, reports = _merge_quest_branches_with_policy(accepted, wt_path, slug)
+    isolated = [(r["id"], r["isolated"]) for r in reports if r["isolated"]]
+    if not as_json:
+        for r in reports:
+            if r["paperwork"]:
+                print(f"📄 {r['id']}: charter paperwork conflicts resolved branch-wins "
+                      f"(branch holds the full tribute + audit): {', '.join(r['paperwork'])}")
+            for u in r["union"]:
+                print(f"🔀 {r['id']}: code overlap union-resolved and disclosed to the Artist: {u}")
+        for qid, reason in isolated:
+            print(f"⚠️  Isolated {qid}: {reason}. It stays OUT of this studio — review it per-Quest "
+                  f"(/artist {qid}) or let a later convoy integrate it after remediation.")
+    if not merged_quests:
+        print("ERROR: every candidate branch failed to merge into the studio — no merged state to review.", file=sys.stderr)
+        sys.exit(1)
+
+    setup_worktree_agent_config(wt_path, "artist")
+
+    # .env plumbing — the gitignored per-checkout env file is absent in fresh worktrees
+    # (the Q617 studio's first boot failed on the missing QSTASH_URL before this copy).
+    env_note = ""
+    root_env = repo_root / ".env"
+    if root_env.is_file() and not (wt_path / ".env").exists():
+        shutil.copy2(root_env, wt_path / ".env")
+        env_note = ".env copied from the castle root (gitignored per-checkout file)"
+
+    no_server = getattr(args, "no_server", False)
+    port, runserver_url, server_status = _ensure_worktree_server(
+        wt_path,
+        port_override=getattr(args, "port", None),
+        no_server=no_server,
+    )
+    freshness = _run_freshness_gate(repo_root) if not no_server else {
+        "configured": False, "command": "", "max_age_hours": 24,
+        "age_hours": None, "fresh": None, "detail": "server skipped (--no-server)",
+    }
+    fresh_verdict = _freshness_verdict(freshness)
+
+    model = getattr(args, "model", None) or config.get_model("artist")
+    provider = getattr(args, "provider", None) or config.get_provider("artist")
+
+    quest_blocks: list[str] = []
+    routes_by_id: dict[str, list[str]] = {}
+    for quest in merged_quests:
+        routes = _extract_target_routes(quest, worktree=wt_path)
+        routes_by_id[quest.id] = routes
+        route_str = "\n".join(f"  - {runserver_url}{r}" if not r.startswith("http") else f"  - {r}" for r in routes)
+        quest_blocks.append(
+            f"### {quest.id} — {quest.title}\n- Branch: `{quest.branch}`\n"
+            f"- Charter: `.court/quests/{quest.id}.md` (merged into this worktree)\n"
+            f"- Preview routes:\n{route_str}"
+        )
+
+    merge_disclosure_lines: list[str] = []
+    for r in reports:
+        if r["paperwork"] or r["union"] or r["isolated"]:
+            bits = []
+            if r["paperwork"]:
+                bits.append("paperwork branch-wins: " + ", ".join(r["paperwork"]))
+            if r["union"]:
+                bits.append("code union (verify live): " + "; ".join(r["union"]))
+            if r["isolated"]:
+                bits.append(f"ISOLATED (not in this studio): {r['isolated']}")
+            merge_disclosure_lines.append(f"- **{r['id']}**: " + " | ".join(bits))
+
+    sync_back_commands = "\n".join(
+        f"git -C {q.worktree} merge {branch_name} --no-edit -m \"court: sync-back combined studio {slug} into {q.id}\""
+        if q.worktree else
+        f"# {q.id}: locate its worktree (court show {q.id}), then: git -C <worktree> merge {branch_name} --no-edit"
+        for q in merged_quests
+    )
+    sync_back_commands += (
+        f"\n# or, deterministic equivalent: python3 -m court.cli studio "
+        f"{','.join(q.id for q in merged_quests)} --sync-back --branch {branch_name}"
+    )
+
+    tmpl_path = REPO_ROOT / STUDIO_DISPATCH_TEMPLATE
+    if not tmpl_path.exists():
+        tmpl_path = Path(__file__).resolve().parent / "templates" / "court_artist_studio_prompt.md"
+    if tmpl_path.exists():
+        tmpl_text = tmpl_path.read_text(encoding="utf-8")
+    else:
+        tmpl_text = (
+            "You are the Court Artist for combined studio {{ studio_slug }}. Worktree: {{ worktree }}. "
+            "Runserver: {{ runserver_url }}. Quests: {{ quest_ids }}"
+        )
+
+    prompt = (
+        tmpl_text
+        .replace("{{ studio_slug }}", slug)
+        .replace("{{ worktree }}", str(wt_path))
+        .replace("{{ branch }}", branch_name)
+        .replace("{{ base_branch }}", base_branch)
+        .replace("{{ runserver_url }}", runserver_url)
+        .replace("{{ port }}", str(port))
+        .replace("{{ model }}", model)
+        .replace("{{ freshness_note }}", fresh_verdict)
+        .replace("{{ merge_disclosures }}", "\n".join(merge_disclosure_lines) or "- (clean merges — no policy resolutions needed)")
+        .replace("{{ sync_back_commands }}", sync_back_commands)
+        .replace("{{ target_routes }}", "\n".join(
+            f"- {runserver_url}{r}" if not r.startswith("http") else f"- {r}"
+            for r in [x for routes in routes_by_id.values() for x in routes]
+        ))
+        .replace("{{ quest_blocks }}", "\n\n".join(quest_blocks))
+        .replace("{{ quest_ids }}", ", ".join(q.id for q in merged_quests))
+    )
+
+    brief_path = wt_path / ".kilo" / "TASK_ARTIST.md"
+    try:
+        brief_path.parent.mkdir(parents=True, exist_ok=True)
+        brief_path.write_text(prompt, encoding="utf-8")
+    except Exception as e:
+        print(f"⚠️  could not write {brief_path} ({e}); the rendered brief is in the command output")
+
+    ledger_note_tail = (
+        f"runserver port {port} ({fresh_verdict.split(' — ')[0]})"
+        if not no_server else "runserver skipped (--no-server)"
+    )
+    for quest in merged_quests:
+        quest.artist_model = model
+        bits = [f"Routed to combined artist studio {slug} (worktree {wt_name}, branch {branch_name})"]
+        r = next(x for x in reports if x["id"] == quest.id)
+        if r["paperwork"]:
+            bits.append(f"conflicts resolved branch-wins: {', '.join(r['paperwork'])}")
+        if r["union"]:
+            bits.append(f"code overlaps union-resolved: {len(r['union'])} (disclosed to Artist)")
+        bits.append(ledger_note_tail)
+        if env_note:
+            bits.append(env_note)
+        quest.log_ledger(quest.status, quest.status, "; ".join(bits))
+    store.save_many(
+        merged_quests,
+        f"court: record combined studio {slug} routing ({len(merged_quests)} quest(s))",
+        auto_commit=auto_commit,
+    )
+
+    if getattr(args, "prompt_only", False):
+        print(prompt)
+        return
+
+    if getattr(args, "json", False):
+        out = {
+            "studio": slug,
+            "quests": [
+                {"id": q.id, "title": q.title, "branch": q.branch, "routes": routes_by_id.get(q.id, [])}
+                for q in merged_quests
+            ],
+            "isolated": [{"id": qid, "reason": reason} for qid, reason in isolated],
+            "conflict_policy": {
+                r["id"]: {
+                    "paperwork_branch_wins": r["paperwork"],
+                    "union_resolved": r["union"],
+                    "isolated": r["isolated"],
+                }
+                for r in reports
+            },
+            "worktree": str(wt_path),
+            "branch": branch_name,
+            "base": base_branch,
+            "port": port,
+            "runserver_url": runserver_url,
+            "freshness": {"verdict": fresh_verdict, "age_hours": freshness.get("age_hours"),
+                          "command": freshness.get("command"), "detail": freshness.get("detail")},
+            "model": model,
+            "provider": provider,
+            "brief_path": str(brief_path),
+            "prompt": prompt,
+            "task": {
+                "name": f"{slug} Combined Studio",
+                "branchName": branch_name,
+                "model": model,
+                "provider": provider,
+                "prompt": prompt,
+            },
+        }
+        print(json.dumps(out, indent=2))
+        return
+
+    if getattr(args, "standup", False):
+        spawn = standup_kilo_session(
+            wt_path,
+            agent="artist",
+            model=model,
+            prompt=prompt,
+            title=f"{slug} Combined Studio",
+            kilo_bin=kilo_bin,
+            provider_hint="artist",
+        )
+        session_id = spawn.get("session_id") or ""
+        # Record only REAL sessions (api/cli); the config-mode placeholder id
+        # ("kilo-artist", worktree merely pre-configured) is not a session.
+        if session_id and spawn.get("mode") in ("api", "cli"):
+            for quest in merged_quests:
+                quest.artist_session_id = session_id
+            store.save_many(
+                merged_quests,
+                f"court: record combined studio {slug} artist session {session_id}",
+                auto_commit=auto_commit,
+            )
+        print(f"🎨 Branch B spawn: {spawn.get('message')}")
+
+    merged_ids = ", ".join(q.id for q in merged_quests)
+    print("=" * 76)
+    print("🎨 COMBINED ARTIST STUDIO STOOD UP — DETERMINISTIC MULTI-QUEST REVIEW")
+    print("=" * 76)
+    print(f"Studio:      {slug}")
+    print(f"Quests:      {merged_ids}" + (f"  (isolated: {', '.join(qid for qid, _ in isolated)})" if isolated else ""))
+    print(f"Branch:      {branch_name} (cut from {base_branch})")
+    print(f"Worktree:    {wt_path}")
+    print(f"Runserver:   {runserver_url} (Port {port}) [{server_status}]")
+    print(f"Freshness:   {fresh_verdict}")
+    print(f"Model:       {model} ({provider})")
+    if env_note:
+        print(f"Env:         {env_note}")
+    print()
+    print("Live Preview URLs:")
+    for r in [x for routes in routes_by_id.values() for x in routes]:
+        url_line = f"{runserver_url}{r}" if not r.startswith("http") else r
+        print(f"  • {url_line}")
+    print()
+    print("Next Steps for M'Lord & Steward (both spawn paths stay documented):")
+    print("  BRANCH A (Agent Manager first): agent_manager start (mode: 'worktree',")
+    print(f"    branchName: '{branch_name}', model: '{model}', name: '{slug} Studio',")
+    print("    prompt: the rendered brief) — the --json task payload carries it verbatim;")
+    print("    then record the session: python3 -m court.cli set-field <id> artist_session_id <session_id>")
+    print("  BRANCH B (CLI fallback, argv-list per the double-eval rule):")
+    print(f"    kilo run --agent artist --model \"$(python3 -m court.cli model artist)\" --dir {wt_path} \"$(cat {brief_path})\"")
+    print("    (or `--standup` next time to let this command spawn and record it), or interactive:")
+    print(f"    cd {wt_path} && kilo   # default_agent already set to artist")
+    print(f"  Brief:    {brief_path} (also rendered above with --prompt-only)")
+    print()
+    print("🛡️ AFTER THE ROYAL SIGN-OFF (single-writer — no Gatekeeper in this worktree):")
+    print(f"  1. Sync the studio back per Quest: python3 -m court.cli studio {merged_ids} --sync-back")
+    print(f"     --branch {branch_name}")
+    print("  2. Collection remains the Steward's: levy/collect the signed-off Quests into a")
+    print("     Cog Ship as usual — the studio branch itself is never promoted directly.")
     print("=" * 76)
 
 
@@ -4977,6 +5687,27 @@ def build_parser():
     p_atelier.add_argument("--json", action="store_true", help="Output JSON format for agent_manager or scripts")
     p_atelier.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_atelier.set_defaults(func=cmd_atelier)
+
+    p_studio = sub.add_parser(
+        "studio",
+        help="Deterministic Multi-Quest Combined Studio (Q-2): cut an artist-studio worktree from "
+             "castle tip, merge N Quest branches with the established conflict policy (charter "
+             "paperwork branch-wins; code overlap disclosed-union), start the freshness-gated "
+             "runserver, and record the studio + session in the ledger",
+    )
+    add_quest_selector(p_studio, batchable=True, filters=("status", "app", "epic", "any-status"))
+    p_studio.add_argument("--base", default="castle", help="Base branch the studio worktree is cut from (default: castle)")
+    p_studio.add_argument("--branch", default=None, help="Studio branch override (default: artist/<ids>-ui-studio; must start with artist/)")
+    p_studio.add_argument("--model", default=None, help="Court Artist model override (default from .court/config.json models.artist)")
+    p_studio.add_argument("--provider", default=None, help="Court Artist provider override")
+    p_studio.add_argument("--port", type=int, help="Override worktree runserver port")
+    p_studio.add_argument("--no-server", action="store_true", help="Skip starting the studio dev server (and the freshness gate)")
+    p_studio.add_argument("--standup", action="store_true", help="Spawn the Court Artist session via Kilo CLI (Branch B fallback) and record it on every studio Quest")
+    p_studio.add_argument("--sync-back", action="store_true", help="Post-sign-off: merge the studio branch back into each selected Quest's own worktree branch (no auto-conflict-resolution)")
+    p_studio.add_argument("--prompt-only", action="store_true", help="Print only the rendered studio Court Artist prompt")
+    p_studio.add_argument("--json", action="store_true", help="Output JSON format for agent_manager or scripts")
+    p_studio.add_argument("--no-commit", action="store_true", help="Do not autocommit ledger changes")
+    p_studio.set_defaults(func=cmd_studio)
 
     p_stamp = sub.add_parser("stamp", help="Stamp Quests onto a Cog Ship convoy id (allocates next cogship-NNN unless --cogship given)")
     p_stamp.add_argument("quest_ids", help="Comma-separated Quest IDs (e.g. Q101,Q102,Q105)")

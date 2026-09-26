@@ -230,10 +230,11 @@ class TestCourtArtist(unittest.TestCase):
             mock_save.assert_called_once()
 
     @patch("court.ward.audit_quest")
+    @patch("court.store.save_many")
     @patch("court.store.stamp_cogship")
     @patch("court.store.save")
     @patch("court.cli.resolve_quest_selection")
-    def test_cmd_collect_skips_pending_ui_review(self, mock_resolve, mock_save, mock_stamp, mock_audit):
+    def test_cmd_collect_skips_pending_ui_review(self, mock_resolve, mock_save, mock_stamp, mock_save_many, mock_audit):
         """Test that court collect refuses to pack a Quest whose UI Review is PENDING."""
         q = Quest(
             id="Q907",
@@ -273,10 +274,11 @@ class TestCourtArtist(unittest.TestCase):
         mock_stamp.assert_not_called()
 
     @patch("court.ward.audit_quest")
+    @patch("court.store.save_many")
     @patch("court.store.stamp_cogship")
     @patch("court.store.save")
     @patch("court.cli.resolve_quest_selection")
-    def test_cmd_collect_allows_skip_ui_review(self, mock_resolve, mock_save, mock_stamp, mock_audit):
+    def test_cmd_collect_allows_skip_ui_review(self, mock_resolve, mock_save, mock_stamp, mock_save_many, mock_audit):
         """Test that court collect packs pending UI Quest when --skip-ui-review is passed."""
         q = Quest(
             id="Q908",

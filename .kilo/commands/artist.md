@@ -50,6 +50,9 @@ Follow the Court Artist Protocol:
      - The Court Artist makes live template/view edits and prompts M'Lord to refresh the browser.
      - Once satisfied, the Court Artist commits the artwork, updates the Tally, and prepares the Quest for Master of Coin audit and Gatehouse collection.
 
-5. **Multiple UI Quests Pending? Route to the Atelier Instead**:
-   - If several small UI-review-pending Quests are stacked up, do NOT spawn one artist session per Quest — roll them into a single convoy review via `/atelier <QID1>,<QID2>,...` (`court atelier` merges the branches pre-integration-test and spawns one Court Artist on the merged convoy branch).
+5. **Multiple UI Quests Pending? Combine Into a Studio or Atelier Instead**:
+   - If several UI-review-pending Quests are stacked up, do NOT spawn one artist session per Quest — merge them into ONE reviewed state with ONE artist:
+     - `/studio <QID1>,<QID2>,...` (`court studio`) — the **deterministic Combined Studio** (Q-2): cuts an `artist-studio-<ids>` worktree from the castle tip, merges the N quest branches with the established conflict policy (charter paperwork → branch-wins; genuine code overlap → disclosed union), boots the freshness-gated runserver, and records the studio + session in the ledger. Per-quest sync-back after sign-off; collection stays with the Steward.
+     - `/atelier <QID1>,<QID2>,...` (`court atelier`) — the **pre-collect Cog Ship convoy** variant: stamps the convoy and advances the quests to GATE; the Gatekeeper promotes the convoy branch into castle after the unified suite.
+   - The spawn protocol above (Branch A: Agent Manager; Branch B: CLI fallback) applies unchanged to the studio/atelier artist session — record its session id on every studio/atelier quest.
    - The per-Quest `/artist` flow above remains the right tool for a single Quest.

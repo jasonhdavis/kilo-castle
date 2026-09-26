@@ -105,3 +105,18 @@ earlier held 2 duplicate shopify pairs, dying with the window's sessions.
    removed from every prompt context.
 3. Remote Sentry MCPs are connection-only (no process) but still inject tool
    schemas; consider disabling sentry-dev on serf-heavy machines if not used.
+
+## 2026-09-26 — Epic Q003 chartered: pb-app Dev Console (VS Code cut from pipeline)
+
+M'Lord ASAP directive: build the console NOW; Agent Manager unreliable, artist
+sessions painful via Steward relay, memory a primary concern.
+
+- Q004-Castle-Dev-Console-Shell DISPATCHED (serf ses_f203ea317ffftXQ21GQxi1Ooph):
+  zero-dep `court ui` localhost console — sidebar sections/branches (castle trunk
+  top), session tabs per worktree (kilo.db ro), live process/RSS panel with
+  parentage-verified reap of orphaned MCP/chromium children.
+- Q005-Castle-Dev-Console-Composer PLANNED, GATED on Q001 transport probe.
+- Q006-Castle-Dev-Console-Mcp-Control PLANNED (after Q004): merged MCP inventory,
+  surgical kilo.json toggle, duplicate-spawn warning. Policy: shopify dev docs MCP
+  ON interactive / OFF headless serfs.
+- Pipeline now: Q001 scout WORKING, Q002 hygiene serf WORKING, Q004 shell serf WORKING.

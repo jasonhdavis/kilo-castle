@@ -1,8 +1,9 @@
 """Zero-dependency localhost web console for the court pipeline.
 
 Reads: .court quest files, git worktrees, the local kilo session DB (read-only),
-and the live process table. The only mutating endpoint is /api/reap, which
-terminates a process whose parent is a verified kilo process.
+and the live process table. Mutating endpoints: /api/reap (terminates a process
+whose parent is a verified kilo process) and /api/mcp (flips the enabled flag of
+an inventoried MCP server in its own config file, with a .bak backup).
 """
 
 import json
@@ -17,6 +18,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 COURT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KILO_DB = os.path.expanduser("~/.local/share/kilo/kilo.db")
 CHILD_PATTERNS = ("mcp", "npx", "npm", "chromium", "chrome", "pytest", "playwright")
+MCP_GLOBAL = os.path.expanduser("~/.config/kilo/kilo.jsonc")
+MCP_PB_APP = "/Users/scrummage/Python/pb-app"
+MCP_RUNNERS = {"npx", "npm", "node", "uvx", "uv", "pipx", "bun", "bunx", "docker",
+               "python", "python3", "exec", "run", "x", "start", "install", "i"}
+MCP_FLAG_VALUES = {"-e", "-v", "-w", "--env", "--volume", "--workdir"}
 STATUS_ORDER = [
     "WORKING", "TRIBUTE_READY", "GATE", "READY_TO_RAZE", "PLANNED", "OPEN",
     "PUNISHED", "ASHES",
@@ -128,6 +134,10 @@ button:hover{border-color:var(--red);color:var(--red);background:rgba(248,81,73,
 #drawer{position:fixed;right:0;top:0;bottom:0;width:48%;max-width:720px;background:var(--surface);
  border-left:1px solid var(--edge);display:none;flex-direction:column;z-index:10;
  box-shadow:var(--sh-2)}
+
+.dupwarn{display:flex;align-items:center;gap:8px;background:rgba(248,81,73,.1);color:var(--red);
+ border:1px solid rgba(248,81,73,.35);border-radius:var(--r-sm);padding:6px 12px;
+ margin-bottom:10px;font-size:11.5px;font-weight:500}
 #drawer.on{display:flex}
 #drawer .hd{padding:16px 20px;border-bottom:1px solid var(--edge);display:flex;
  justify-content:space-between;align-items:center}
@@ -183,10 +193,35 @@ function render(){
  const c=document.getElementById('content');
  if(selWt==='CASTLE'){selWt=S.repo_root}
  const wts=S.worktrees.filter(w=>selWt===null||w.path===selWt);
- c.innerHTML=wts.map(w=>{
+ c.innerHTML=(wts.map(w=>{
   const sess=S.sessions.filter(s=>s.directory&&s.directory.startsWith(w.path));
   return cardWt(w,sess);
- }).join('')||'<div class="card empty">select a section on the left</div>';
+ }).join('')||'<div class="card empty">select a section on the left</div>')+cardMcp();
+}
+function cardMcp(){
+ const list=S.mcp||[];
+ let h='<div class="card"><div class="hd"><h3>MCP SERVERS</h3>'
+  +'<span class="branch">merged from global + project configs</span></div><div class="bd">';
+ for(const d of list.filter(m=>m.type==='local'&&m.enabled&&m.count>=2)){
+  h+=`<div class="dupwarn">duplicate MCP spawns detected: ${esc(d.name)} x${d.count} (~${mb(d.rss)} each)</div>`;
+ }
+ h+='<table><tr><th>name</th><th>scope</th><th>type</th><th>enabled</th><th>running</th><th></th></tr>'+
+  list.map(m=>{
+   const run=m.running?`<span class="num" style="color:var(--green)">yes</span> <span class="num blue">${mb(m.rss)}</span>`
+    :'<span class="dim">no</span>';
+   const btn=`<button title="takes effect for sessions started after the change" onclick="mcpToggle(${
+    JSON.stringify(m.file).replace(/"/g,'&quot;')},${JSON.stringify(m.name)})">${m.enabled?'disable':'enable'}</button>`;
+   return `<tr><td class="mono">${esc(m.name)}</td><td class="dim">${esc(m.scope)}</td><td class="dim">${esc(m.type)}</td>`+
+    `<td>${m.enabled?'<span style="color:var(--green)">yes</span>':'no'}</td><td>${run}</td><td>${btn}</td></tr>`;
+  }).join('')+'</table>'+
+  `<div class="meta" style="padding-top:10px">toggles edit the config file (a .bak copy is kept) and take effect for sessions started after the change</div></div></div>`;
+ return h;
+}
+async function mcpToggle(file,name){
+ const m=(S.mcp||[]).find(x=>x.file===file&&x.name===name);
+ if(!m)return;
+ const r=await fetch('/api/mcp',{method:'POST',body:JSON.stringify({file,name,enabled:!m.enabled})});
+ if(!r.ok)alert('refused: '+(await r.text()));else poll();
 }
 function cardWt(w,sess){
  let h=`<div class="card"><div class="hd"><h3>${esc(w.branch||'trunk')}</h3>
@@ -214,8 +249,9 @@ async function reap(pid){
  if(!confirm(`terminate pid ${pid}?`))return;
  const r=await fetch('/api/reap',{method:'POST',body:JSON.stringify({pid})});
  if(!r.ok)alert('refused: '+(await r.text())); else poll();}
-poll();setInterval(poll,5000);
+ poll();setInterval(poll,5000);
 </script></body></html>"""
+PAGE = PAGE.replace("${json.dumps(STATUS_ORDER)}", json.dumps(STATUS_ORDER))
 
 
 def _quests():
@@ -328,31 +364,186 @@ def _sessions(limit=60):
     return out
 
 
-def _processes():
+def _ps_procs():
     try:
         r = subprocess.run(
             ["ps", "axo", "pid=,ppid=,rss=,etime=,args="],
             capture_output=True, text=True, timeout=5)
     except Exception:
-        return [], 0
-    procs, total, by_pid = [], 0, {}
+        return []
+    procs = []
     for ln in r.stdout.splitlines():
         parts = ln.strip().split(None, 4)
         if len(parts) < 5:
             continue
-        p = {"pid": int(parts[0]), "ppid": int(parts[1]), "rss": int(parts[2]) * 1024,
-             "etime": parts[3], "args": parts[4]}
-        by_pid[p["pid"]] = p
-        procs.append(p)
-        if "kilo" in p["args"] and ("serve" in p["args"] or "run" in p["args"]):
-            total += p["rss"]
+        procs.append({"pid": int(parts[0]), "ppid": int(parts[1]),
+                      "rss": int(parts[2]) * 1024, "etime": parts[3],
+                      "args": parts[4]})
+    return procs
+
+
+def _processes(procs=None):
+    if procs is None:
+        procs = _ps_procs()
+    total, by_pid = 0, {p["pid"]: p for p in procs}
     for p in procs:
         low = p["args"].lower()
+        if "kilo" in p["args"] and ("serve" in p["args"] or "run" in p["args"]):
+            total += p["rss"]
         parent = by_pid.get(p["ppid"])
         p["kilo_child"] = bool(parent and "kilo" in parent["args"])
         p["flag"] = p["kilo_child"] and any(pat in low for pat in CHILD_PATTERNS)
     flagged = [p for p in procs if p["flag"]]
     return flagged, total
+
+
+def _strip_jsonc(text):
+    out, i, n = [], 0, len(text)
+    in_str = esc = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+def _json_indent(raw):
+    indents = [len(m) for m in re.findall(r"(?m)^([ ]+)[\"{\[]", raw)]
+    return min(indents) if indents else 2
+
+
+def _mcp_files():
+    specs = []
+    if os.path.isfile(MCP_GLOBAL):
+        specs.append(("global", MCP_GLOBAL, "mcp"))
+    proj = os.path.join(COURT_DIR, "kilo.json")
+    if os.path.isfile(proj):
+        specs.append(("kilo-castle", proj, "mcp"))
+    if os.path.isdir(MCP_PB_APP):
+        for rel, key, scope in (("kilo.json", "mcp", "pb-app"),
+                                (".kilocode/mcp.json", "mcpServers", "pb-app-legacy"),
+                                (".roo/mcp.json", "mcpServers", "pb-app-legacy")):
+            p = os.path.join(MCP_PB_APP, rel)
+            if os.path.isfile(p):
+                specs.append((scope, p, key))
+    return specs
+
+
+def _mcp_argv(cfg):
+    if isinstance(cfg.get("command"), list):
+        return [str(a) for a in cfg["command"]]
+    if cfg.get("command"):
+        return [str(cfg["command"])] + [str(a) for a in cfg.get("args", [])]
+    return []
+
+
+def _mcp_package_token(cfg):
+    argv = _mcp_argv(cfg)
+    skip_val = False
+    for item in argv:
+        low = item.lower()
+        if skip_val:
+            skip_val = False
+            continue
+        if item.startswith("-"):
+            skip_val = item in MCP_FLAG_VALUES
+            continue
+        if low in MCP_RUNNERS:
+            continue
+        m = re.match(r"^(.+?)@(\d[\w.-]*|latest)$", item)
+        return m.group(1) if m else item
+    return None
+
+
+def _mcp_inventory(procs=None):
+    if procs is None:
+        procs = _ps_procs()
+    out = []
+    for scope, path, key in _mcp_files():
+        try:
+            with open(path) as f:
+                raw = f.read()
+            data = json.loads(_strip_jsonc(raw) if path.endswith(".jsonc") else raw)
+        except Exception:
+            continue
+        servers = data.get(key)
+        if not isinstance(servers, dict):
+            continue
+        for name, cfg in servers.items():
+            if not isinstance(cfg, dict):
+                continue
+            t = str(cfg.get("type", "")).lower()
+            if t in ("remote", "sse", "streamable-http"):
+                typ = "remote"
+            elif t in ("local", "stdio"):
+                typ = "local"
+            else:
+                typ = "remote" if cfg.get("url") else "local"
+            enabled = bool(cfg.get("enabled", not cfg.get("disabled", False)))
+            token = _mcp_package_token(cfg) if typ == "local" else None
+            matches = [p for p in procs if token and token in p["args"]]
+            mids = {m["pid"] for m in matches}
+            tops = [p for p in matches if p["ppid"] not in mids]
+            out.append({
+                "scope": scope, "file": path, "key": key, "name": name,
+                "type": typ, "enabled": enabled,
+                "command": cfg.get("url", "") if typ == "remote"
+                           else _mcp_argv(cfg)[:2],
+                "running": bool(matches),
+                "rss": max((m["rss"] for m in matches), default=0),
+                "count": len(tops),
+            })
+    return out
+
+
+def _mcp_toggle_write(file, name, enabled):
+    """Flip one MCP server's enabled flag; returns (http_code, payload)."""
+    if file.endswith(".jsonc"):
+        return 400, {"error": "JSONC config (comments would be lost by rewrite); edit manually"}
+    entry = next((e for e in _mcp_inventory()
+                  if e["file"] == file and e["name"] == name), None)
+    if entry is None:
+        return 403, {"error": "unknown mcp config file or server; refused"}
+    try:
+        with open(file) as f:
+            raw = f.read()
+        data = json.loads(_strip_jsonc(raw) if file.endswith(".jsonc") else raw)
+        servers = data.get(entry["key"])
+        if not isinstance(servers, dict) or name not in servers \
+                or not isinstance(servers[name], dict):
+            return 403, {"error": "server not found in config; refused"}
+        indent = _json_indent(raw)
+        with open(file + ".bak", "w") as f:
+            f.write(raw)
+        servers[name]["enabled"] = enabled
+        with open(file, "w") as f:
+            f.write(json.dumps(data, indent=indent) + "\n")
+    except Exception as exc:
+        return 500, {"error": f"mcp config write failed: {exc}"}
+    return 200, {"ok": True}
 
 
 def _session_messages(sid, limit=60):
@@ -410,13 +601,15 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path == "/api/state":
-            flagged, total = _processes()
+            procs = _ps_procs()
+            flagged, total = _processes(procs)
             self._json({
                 "repo_name": os.path.basename(COURT_DIR),
                 "repo_root": COURT_DIR,
                 "quests": _quests(),
                 "worktrees": _worktrees(),
                 "sessions": _sessions(),
+                "mcp": _mcp_inventory(procs),
                 "processes": [
                     {k: p[k] for k in ("pid", "ppid", "rss", "etime", "args")}
                     for p in flagged],
@@ -430,12 +623,33 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if self.path != "/api/reap":
+        if self.path == "/api/reap":
+            self._reap()
+        elif self.path == "/api/mcp":
+            self._mcp_toggle()
+        else:
             self.send_error(404)
-            return
+
+    def _read_body(self):
+        n = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(n) or b"{}")
+
+    def _mcp_toggle(self):
         try:
-            n = int(self.headers.get("Content-Length", 0))
-            pid = json.loads(self.rfile.read(n)).get("pid")
+            req = self._read_body()
+            file, name, enabled = req["file"], req["name"], bool(req["enabled"])
+        except Exception:
+            self._json({"error": "bad request"}, 400)
+            return
+        if not isinstance(file, str) or not isinstance(name, str):
+            self._json({"error": "bad request"}, 400)
+            return
+        code, payload = _mcp_toggle_write(file, name, enabled)
+        self._json(payload, code)
+
+    def _reap(self):
+        try:
+            pid = self._read_body().get("pid")
         except Exception:
             self._json({"error": "bad request"}, 400)
             return

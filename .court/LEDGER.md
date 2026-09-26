@@ -68,3 +68,40 @@ Estimated savings: 4–6 GB; disk: up to ~100 GB via db compaction.
 ### Next pipeline triggers
 - Q001 done → levy → recommendation feeds Castle UI epic chartering (Q-UI-1..4).
 - Q002 done → levy → MoC audit → GATE.
+
+## 2026-09-26 — MCP-per-session bloat: root cause diagnosed
+
+M'Lord correction: Castle UI epic serves the **pb-app development pipeline**, not
+castle-on-castle. UI quests will be pb-app quests; kilo-castle remains tooling.
+
+### Root cause (verified)
+Kilo config schema (app.kilo.ai/config.json): AgentConfig has NO `mcp` field —
+MCP servers CANNOT be scoped per agent. They boot per kilo PROCESS, at startup,
+for every enabled MCP in the merged config. Every headless `kilo run` (serf,
+scout, MoC, Gatekeeper) is its own kilo process.
+
+pb-app merges MCP definitions from THREE sources:
+- kilo.json: `shopify-dev` (local, npx @shopify/dev-mcp@latest) enabled
+- .kilocode/mcp.json: `shopify-dev-mcp` (DUPLICATE, different name → merged as a
+  second distinct server) + brevo (remote)
+- .roo/mcp.json: further legacy overlap
+- global ~/.config/kilo/kilo.jsonc: sentry-dev + sentry-picobarn-pb-app (remote)
+
+Net: EVERY pb-app session (interactive or headless serf) spawns TWO
+shopify-dev-mcp node process pairs (~230 MB each pair; ~480 MB observed under one
+serve window with 2 sessions). Serfs running in pb-app worktrees inherit this
+(worktrees contain pb-app's kilo.json; config resolution walks up from cwd).
+
+Live confirmation: kilo-castle defines ZERO MCPs — the three headless sessions
+dispatched today under kilo-castle have no MCP children. pb-app's serve process
+earlier held 2 duplicate shopify pairs, dying with the window's sessions.
+
+### Fix (the "easy solve")
+1. Delete legacy .kilocode/mcp.json + .roo/mcp.json (Q002, dispatched, in flight).
+2. One-line change: set `enabled: false` on shopify-dev in pb-app kilo.json —
+   schema supports `{"enabled": false}` shorthand. Headless serfs don't need
+   Shopify dev docs; enable it manually only in interactive Shopify sessions.
+   Savings: ~240 MB per session × N parallel serfs, plus duplicate tool schemas
+   removed from every prompt context.
+3. Remote Sentry MCPs are connection-only (no process) but still inject tool
+   schemas; consider disabling sentry-dev on serf-heavy machines if not used.

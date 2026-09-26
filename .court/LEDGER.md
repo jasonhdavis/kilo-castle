@@ -120,3 +120,23 @@ sessions painful via Steward relay, memory a primary concern.
   surgical kilo.json toggle, duplicate-spawn warning. Policy: shopify dev docs MCP
   ON interactive / OFF headless serfs.
 - Pipeline now: Q001 scout WORKING, Q002 hygiene serf WORKING, Q004 shell serf WORKING.
+
+## 2026-09-26 — Pivot to direct development (M'Lord: NO QUEST INFRASTRUCTURE)
+
+- Quest files Q001-Q006 removed from .court/ (numbering would collide with pb-app's
+  Q694+ sequence if migrated); quest worktrees + branches torn down; workers stopped.
+- RECOVERED LOST SESSION: pb-app .court/quests/Q694-Platform-Castle-Manager-Web-UI.md
+  ("Lightweight Castle Manager Web UI", chartered 21:11Z tonight) is the lost work.
+  Its serf had committed only paperwork; its charter design survived and is folded
+  into the direct build. Left in pb-app for M'Lord to raze or reuse.
+- DIRECT BUILD SHIPPED: `court ui` — court/ui_server.py + cli subcommand (commit
+  5a28ea4). Zero-dep stdlib server on 127.0.0.1:8300: quest sidebar (castle trunk
+  pinned), worktree cards with session tabs (kilo.db ro, bounded queries), message
+  drawer (/api/session), live process panel with kilo-child flags and
+  parentage-verified /api/reap. Verified live against real data.
+- IN FLIGHT (background subagents, no court ceremony):
+  - dev-console/mcp-panel worktree: MCP inventory + surgical toggle + backup +
+    duplicate-spawn warning (subagent ses_f2030e186ffewIZImZ2VUujAA1).
+  - kilo serve API probe (read-only research): auth token discovery, endpoint
+    inventory, headless run shape, transport recommendation for the composer
+    (subagent ses_f20311e99ffeA6fI8RPXwaJ027).

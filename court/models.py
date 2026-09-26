@@ -593,8 +593,21 @@ class Quest:
         aud = self.extract_audience()
         if not aud or _is_placeholder(aud):
             return False
-        cleaned = aud.strip().lower().rstrip(".")
-        if cleaned in ("none", "none required", "none outstanding", "no audience required", "no audience requested", "n/a"):
+        stripped = aud.strip()
+        # Reason: Serfs overwhelmingly write "None required. <reasoning why no
+        # decision was needed>" rather than the bare phrase alone — the trailing
+        # explanatory sentence is normal, expected style, not a hedge. Matching
+        # the whole paragraph verbatim against the "no decision" phrasings made
+        # every such well-formed Audience section a false-positive Pending Serf
+        # Audience flag. Only the LEADING clause/sentence carries the verdict;
+        # anything after it is rationale, so split it off before comparing.
+        first_clause = re.split(r"[.\n]", stripped, maxsplit=1)[0]
+        cleaned = first_clause.strip().lower().rstrip(".:")
+        none_phrases = (
+            "none", "none required", "none outstanding", "none otherwise",
+            "no audience required", "no audience requested", "n/a",
+        )
+        if cleaned in none_phrases:
             return False
         aud_log = self.body_sections.get("Audience Log", "").strip()
         if aud_log and not _is_placeholder(aud_log):

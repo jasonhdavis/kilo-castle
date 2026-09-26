@@ -1,12 +1,23 @@
 {
+  "_manifest_note": "Single source of truth for court-engine role configuration (Q455). models.<role> is the per-role model; models.<role>_provider is the Kilo CLI provider; model_aliases maps human/display model names to qualified provider/model IDs; suite.command is the canonical unified integration suite invocation used by git_ops suite detection (heuristics are fallback only).",
   "models": {
     "serf": "GLM-5.3-Flash",
     "serf_provider": "openrouter",
-    "master_of_coin": "openrouter/google/gemma-4-31b-it",
-    "gatekeeper": "openrouter/google/gemma-4-31b-it",
+    "master_of_coin": "openrouter/deepseek/deepseek-pro-latest",
+    "gatekeeper": "openrouter/deepseek/deepseek-pro-latest",
     "steward": "openrouter/google/gemini-3.7-flash",
     "artist": "openrouter/z-ai/glm-5.3",
+    "artist_provider": "openrouter",
     "scout": "openrouter/z-ai/glm-5.3-flash"
+  },
+  "model_aliases": {
+    "GLM-5.3-Flash": "openrouter/z-ai/glm-5.3-flash",
+    "GLM-5.3": "openrouter/z-ai/glm-5.3",
+    "Gemma-4-31b-It": "openrouter/google/gemma-4-31b-it",
+    "Gemini-3.7-Flash": "openrouter/google/gemini-3.7-flash"
+  },
+  "suite": {
+    "command": "python3 -m pytest tests -q"
   },
   "no_kilo_mode": false
 }

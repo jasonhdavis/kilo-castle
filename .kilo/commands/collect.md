@@ -17,6 +17,8 @@ Follow the Collect Protocol (absorbing gate progression):
 > actually ready to be packed here.
 >
 > **Precondition — UI Review before Collection**: If a candidate Quest modified templates or UI views and its UI Review status is PENDING, the Steward's recommended / automatic action before collection is to summon the **Court Artist** (`/artist <id>`). The Serf is permitted to create the initial UI, but M'Lord and the Court Artist refine the UI/UX with the live worktree runserver before collection. `court collect` will refuse candidates whose UI Review is still PENDING unless `--skip-ui-review` is explicitly passed.
+>
+> **Batched UI convoys**: when several small UI-review-pending Quests stack up, do NOT run per-quest `/artist` sessions — roll them into one Cog Ship with `/atelier <ids>` instead. The atelier merges their branches onto the convoy branch pre-integration-test and spawns one Court Artist on the merged (untested) branch; M'Lord reviews all UI (and may direct extra Royal Addendum polish) in a single session, and the Gatekeeper integrates the same convoy afterwards.
 
 1. **Pack the Convoy with One Composite Command** — `court collect` mechanizes the audit,
    Cog Ship stamp, and batch-advance-to-`GATE` in a single call, and REFUSES to pack any

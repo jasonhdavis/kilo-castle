@@ -165,7 +165,26 @@ Recommend adding automatic key deprecation cron.
     # 12. ship (Cog Ship deployment convoy summary)
     main(["advance", "Q001-Core-Jwt-Rotation", "GATE", "--force", "--note", "test setup"])
     capsys.readouterr()
-    main(["advance", "Q001-Core-Jwt-Rotation", "READY_TO_RAZE", "--force", "--verified-commit", head_sha, "--note", "Merged for ship test"])
+
+    # cogship-076/077 semantics: the quest branch tip itself must be an
+    # ancestor of castle with production content — an arbitrary reachable
+    # --verified-commit no longer proves promotion. Promote the branch for
+    # real, then advance without --force.
+    main(["set-field", "Q001-Core-Jwt-Rotation", "branch", "quest/q001-core-jwt-rotation"])
+    subprocess.check_call(["git", "-C", str(tmp_path), "checkout", "-q", "-b", "quest/q001-core-jwt-rotation"])
+    (tmp_path / "apps_core_jwt.py").write_text("JWT_ROTATION = True\n")
+    (tmp_path / "tests").mkdir(exist_ok=True)
+    (tmp_path / "tests" / "test_jwt.py").write_text("def test_jwt_rotation():\n    assert True\n")
+    subprocess.check_call(["git", "-C", str(tmp_path), "add", "apps_core_jwt.py", "tests/test_jwt.py"])
+    subprocess.check_call(["git", "-C", str(tmp_path), "commit", "-q", "-m", "quest/q001: jwt rotation fix"])
+    subprocess.check_call(["git", "-C", str(tmp_path), "checkout", "-q", "castle"])
+    subprocess.check_call(["git", "-C", str(tmp_path), "merge", "-q", "--no-ff", "-m", "promote q001", "quest/q001-core-jwt-rotation"])
+
+    # Engine-stamped suite proof (cogship-082 gate): the READY_TO_RAZE advance
+    # refuses without a real engine-run suite.
+    main(["runsuite", "Q001-Core-Jwt-Rotation", "--dir", str(tmp_path)])
+    capsys.readouterr()
+    main(["advance", "Q001-Core-Jwt-Rotation", "READY_TO_RAZE", "--note", "Merged for ship test"])
     capsys.readouterr()
 
     main(["ship"])

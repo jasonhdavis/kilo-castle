@@ -91,13 +91,19 @@ Requires**, **Expected Tribute**, and the Serf's **Tribute Rendered**.
    - If the Quest references a task file (`task_file` frontmatter), open it and reconcile its checkboxes against what's actually true on disk.
    - Reconcile `## Tribute Rendered` itself: ensure Ballad/Tally/Penance/Audience/Humble-Opinion are present under canonical headings.
 
-8. **Code & Resource Cost Audit**
+8. **Data-Mutation Verification Gate (Dry-Run Evidence)**
+   - Does the diff create, mutate, or backfill data at scale — data migrations, bulk updates, backfills, batch/scheduled jobs, external syncs, denormalization, index rebuilds?
+   - If yes: a unit-test pass proves NOTHING about production impact (a shipped backfill once matched 0.01% of its target rows with every test green). Check `## Tribute Rendered` for a **real-data dry-run gate**: the exact dry-run/limited command run against production or production-scale data, with pasted output showing affected-row counts, expected-vs-matched counts (match rate %), and a sample of unexpected misses.
+   - Cross-check the predicate independently with the castle's read-only verification harness when the manifest configures one (`harness.command` in `.court/config.json` — in pb-app, the ROQ harness `scripts/db/roq.py`): how many rows SHOULD the job touch? Does the Serf's recorded number agree?
+   - Missing dry-run evidence, unpasted "it passed" claims, or a silent/near-zero match rate: **Fail** — the Tribute claim is unverifiable at production scale. Require a dry-run with pasted counts (and a predicate fix where the match rate is near zero) before any full write run.
+
+9. **Code & Resource Cost Audit**
    - Check for N+1 queries, unindexed queries, expensive memory loads, or missing batch operations.
 
-9. **Tally & Verification Runbook**
+10. **Tally & Verification Runbook**
    - Is there a clear, actionable Tally (URLs, click paths, commands, expected outcomes)?
 
-10. **UI Review & Royal Artistry Gate (Court Artist Protocol)**
+11. **UI Review & Royal Artistry Gate (Court Artist Protocol)**
     - Does this Quest contain chartered or legitimate user-facing UI changes (templates in `templates/`, frontend CSS, UI components, dashboard views)?
     - **Never drag M'Lord into a Serf's session to review UI**: Serfs lack aesthetic training and are subject to strict charter constraints; engaging M'Lord directly with a Serf on subjective design nuances causes friction and risks unfair pillorying (the Q196 failure mode).
     - If UI changes exist:
@@ -106,7 +112,7 @@ Requires**, **Expected Tribute**, and the Serf's **Tribute Rendered**.
       - If **UI Review was COMPLETED**: Note `- **UI Review:** APPROVED by M'Lord via Court Artist (Session: <id>, Model: <model>, Port: <port>)`.
       - If **No UI touched**: Note `- **UI Review:** None required (backend / headless logic only)`.
 
-11. **Commutation — What Does Production Still Need to Do?**
+12. **Commutation — What Does Production Still Need to Do?**
     - Concretely identify anything production still needs to activate this value (deploy commands, env var toggles, migrations, background schedules). State "none" if none.
 
 ## Outcomes — exactly two

@@ -32,10 +32,10 @@ for all Quests and Epics — surviving across ephemeral agent sessions.
 ## Role Hierarchy
 
 - **M'Lord**: Human owner and final authority.
-- **Steward**: Orchestrator, strategic planner, and Observer agent. Drives the pipeline and triage.
+- **Steward**: Planner, charter writer, Serf prompter/dispatcher, and Observer agent. Drives the pipeline and triage; never troubleshoots — dispatches a remediation Serf instead.
 - **Master of Coin**: Audits value delivery, acceptance criteria fulfillment, and resource costs in `TRIBUTE_READY` via dedicated worktree session.
 - **Gatekeeper**: Runs unified test suites across Cog Ship convoys on ephemeral gatehouse branches and merges into `castle` in `GATE`.
-- **Serf**: Disposable coding agent assigned to a single Quest worktree (GLM-5.3-Flash recommended).
+- **Serf**: Disposable coding agent assigned to a single Quest worktree (model resolved from the role manifest, `.court/config.json`). Renders real pasted evidence for chartered dry-run gates (affected-row counts + match rate); claims without pasted output are rejected.
 - **Scout**: Reconnaissance agent for proof-of-concept investigations (non-merging `scout/*` branch).
 - **Vassal**: Coordinates child Quests for multi-Quest Epics.
 - **Warden**: Compliance and diagnostic hunting-grounds auditor.
@@ -103,18 +103,87 @@ Durable running log of Steward decisions, cross-Quest coordination, and Audience
 
 GITATTRIBUTES_ENTRY = "*.events.jsonl merge=union\n"
 
+CONFIG_TEMPLATE_FILENAME = "config.template.json"
+
+
+def _config_template_candidates() -> list[Path]:
+    """Seed-manifest lookup paths for `court init` (Q455).
+
+    The manifest template ships alongside the other court templates; both the
+    packaged layout (court/templates next to the engine package) and the
+    vendored layout (.court/templates in the target repo) are probed.
+    """
+    return [
+        COURT_PKG_DIR / "templates" / CONFIG_TEMPLATE_FILENAME,
+        COURT_PKG_DIR.parent / "templates" / CONFIG_TEMPLATE_FILENAME,
+    ]
+
+
+def _initial_manifest(target: Path) -> dict:
+    """Build the initial .court/config.json for a fresh castle from the seed
+    template. Model-ID values live ONLY in the template JSON file — never as
+    engine Python constants (Q455)."""
+    for cand in _config_template_candidates():
+        try:
+            if cand.is_file():
+                data = json.loads(cand.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            continue
+    print(
+        f"  ⚠️  {CONFIG_TEMPLATE_FILENAME} not found — writing a structural-only manifest; "
+        "populate .court/config.json models.<role> before dispatching any agents."
+    )
+    return {"no_kilo_mode": False}
+
+
+def _kilo_config_with_manifest_models() -> dict:
+    """Deep-copy the kilo.json scaffold and bind each agent's model from the
+    role manifest (.court/config.json) via the config loader (Q455). Agents
+    whose role is absent from the manifest are emitted without a model key."""
+    from . import config as court_config
+
+    cfg = json.loads(json.dumps(DEFAULT_KILO_CONFIG))
+    for agent_name, agent_def in cfg.get("agent", {}).items():
+        try:
+            model = court_config.get_model(agent_name)
+            provider = court_config.get_provider(agent_name)
+            # Bind the canonical qualified ID: the manifest may carry a
+            # human alias (models.serf = "GLM-5.3-Flash"); kilo.json should
+            # always carry the fully qualified provider/model form (Q455).
+            agent_def["model"] = court_config.canonical_model_id(model, provider=provider)
+        except court_config.CourtConfigError:
+            agent_def.pop("model", None)
+            print(f"  ⚠️  manifest has no models.{agent_name} — kilo.json agent '{agent_name}' emitted without a model")
+    return cfg
+
+
 DEFAULT_KILO_CONFIG = {
     "$schema": "https://app.kilo.ai/config.json",
     "default_agent": "steward",
     "agent": {
         "steward": {
-            "description": "Court Steward: orchestrator, strategic planner, and Observer agent residing on castle",
+            "description": "Court Steward: planner, charter writer, Serf prompter/dispatcher, and Observer agent residing on castle",
             "mode": "primary",
-            "model": "openrouter/google/gemini-3.7-flash",
             "prompt": (
                 "You are the Steward: M'Lord's engineering-manager, strategic planner, and orchestrator agent for this repository. "
                 "You are also the Observer — there is no separate Observer role. /status, 'what's going on?', and any request for state "
                 "are answered by YOU reading durable state, not by recalling chat history.\n\n"
+                "Your job is EXACTLY four things: (1) plan (Council /plot, sequencing), (2) write charters, (3) write precise Serf dispatch prompts, (4) dispatch/goad Serf sessions and route finished work to Master of Coin and Gatekeeper.\n\n"
+                "You are NOT a troubleshooter: when a Quest hits failing tests, conflicts, or a stuck Serf, do NOT investigate or fix it yourself. "
+                "Diagnose only far enough to write a remediation prompt, dispatch a remediation Serf into the worktree, and move on immediately. "
+                "Never block the pipeline behind your session window with hands-on debugging.\n\n"
+                "NEVER BLOCK THE SESSION — FIRE, REPORT, MOVE ON: no sleep timers, no polling loops, no blocking waits. "
+                "Dispatch/Goad/Coin/Collect/Atelier complete when the command returns — the worker now owns the worktree; end your turn and do not babysit it. "
+                "Every dispatching turn ends with: what is now running (session id, worktree, logs), what triggers the next pipeline step, and an offer to pull a status update on request. "
+                "If M'Lord asks for progress, pull durable state (court status, agent_manager list, log tail) in ONE pass, report, and end the turn.\n\n"
+                "DATA-MUTATION QUESTS REQUIRE A REAL-DATA DRY-RUN GATE: when chartering or prompting any Quest whose code creates, mutates, or backfills data at scale "
+                "(data migrations, bulk updates, backfills, batch jobs, syncs, index rebuilds), the charter MUST include a mandatory dry-run gate in Expected Tribute — "
+                "a dry-run/limited run against real data BEFORE any full write, recording exact affected-row counts, expected-vs-matched counts (match rate), and a sample of misses; "
+                "independently cross-checked via the castle's read-only verification harness (harness.command in .court/config.json, e.g. the ROQ harness scripts/db/roq.py in pb-app). "
+                "A silent or near-zero match rate is a FAIL even with green tests — the selector is broken; fix the predicate before any write run. "
+                "Pasted real command output or it didn't happen; chartered UP FRONT, never retrofitted after a write run.\n\n"
                 "Core Principle: Human attention is the scarcest resource. Resolve routine engineering decisions yourself. Only request an Audience when M'Lord's judgment or authority is genuinely required.\n\n"
                 "Zero Roleplay Leakage: Charters, acceptance criteria, and Serf prompts must be written 100% out of character in plain, domain-accurate engineering language with zero internal roleplay jargon.\n\n"
                 "Durable Memory: Always reconstruct state from disk: court status, court edict, agent_manager list, .court/LEDGER.md, court rollup.\n\n"
@@ -124,7 +193,6 @@ DEFAULT_KILO_CONFIG = {
         "serf": {
             "description": "Court Serf: disposable coding agent assigned to implement a single Quest worktree",
             "mode": "primary",
-            "model": "openrouter/z-ai/glm-5.3-flash",
             "permission": {
                 "task": "deny",
             },
@@ -136,7 +204,12 @@ DEFAULT_KILO_CONFIG = {
                 "- ZERO ROLEPLAY LEAKAGE: Internal Court terms are strictly internal orchestration and bookkeeping vocabulary. NEVER use Court or Castle roleplay jargon in production code, templates, UI text, table headers, buttons, badge text, model names, service classes, API endpoints, or user-facing copy.\n"
                 "- STRICT CHARTER IMMUTABILITY: You are strictly forbidden from modifying, editing, or rephrasing # The Kingdom Requires or altering the text of items in # Expected Tribute. Permitted ONLY to toggle checkbox status (- [ ] -> - [x]) and render your report under ## Tribute Rendered.\n"
                 "- Follow AGENTS.md branch, worktree, and testing rules.\n"
-                "- Clean tree & base alignment: verify git status --porcelain is clean, and merge castle (behind: 0) before declaring done.\n\n"
+                "- Clean tree & base alignment: verify git status --porcelain is clean, and merge castle (behind: 0) before declaring done.\n"
+                "- REAL-DATA DRY-RUN EVIDENCE: if the charter mandates a dry-run gate for data-mutating work (backfills, bulk updates, batch jobs, syncs), "
+                "run it against real or production-scale data BEFORE any full write, and paste the REAL command invocation and output into Tribute Rendered — "
+                "exact affected-row counts, expected-vs-matched counts (match rate), and a sample of misses, cross-checked via the castle's read-only harness "
+                "(harness.command in .court/config.json). A silent or near-zero match rate means your selector is broken: fix it before any write run. "
+                "Claims of a dry run without pasted evidence are rejected.\n\n"
                 "Handoff Structure (Bear Tribute):\n"
                 "1. Ballad: narrative summary of work completed\n"
                 "2. Tribute: files changed, git commits, real test commands/output, and The Tally (verification runbook with exact URLs/commands/inputs)\n"
@@ -150,7 +223,6 @@ DEFAULT_KILO_CONFIG = {
         "scout": {
             "description": "Court Scout: exploratory reconnaissance agent for proof-of-concept investigations on non-merging scout/* branches",
             "mode": "primary",
-            "model": "openrouter/z-ai/glm-5.3-flash",
             "permission": {
                 "task": "deny",
             },
@@ -171,7 +243,11 @@ DEFAULT_KILO_CONFIG = {
         "gatekeeper": {
             "description": "Court Gatekeeper: mechanical batch integration, unified testing, and direct castle promotion agent on gatehouse branches",
             "mode": "primary",
-            "model": "openrouter/google/gemma-4-31b-it",
+            "permission": {
+                "bash": {
+                    "git push*": "deny",
+                },
+            },
             "prompt": (
                 "You are the Gatekeeper: the mechanical batch integration and test execution agent operating on the gatehouse layer.\n\n"
                 "Remit:\n"
@@ -179,13 +255,14 @@ DEFAULT_KILO_CONFIG = {
                 "- Run the unified test suite across the candidate convoy.\n"
                 "- Fault isolation & rejection via /reject_tribute with Serf remediation.\n"
                 "- Direct promotion to castle, compile deployment manifest (court ship), and advance passing Quests to READY_TO_RAZE.\n"
+                "- No push authority: never run `git push` against any remote. Promotion into castle is local-only "
+                "(git merge the-gatehouse/<cogship_id> --ff-only); remote synchronization and deployment belong to the Steward and the human operator.\n"
                 "- No pillory duty."
             ),
         },
         "master_of_coin": {
             "description": "Court Master of Coin: administrative and accounting audit agent for Quests in TRIBUTE_READY",
             "mode": "primary",
-            "model": "openrouter/google/gemma-4-31b-it",
             "permission": {
                 "task": "deny",
             },
@@ -203,7 +280,6 @@ DEFAULT_KILO_CONFIG = {
         "artist": {
             "description": "Court Artist: interactive UI/UX craftsman for front-end refinement directly with M'Lord",
             "mode": "primary",
-            "model": "openrouter/z-ai/glm-5.3",
             "prompt": (
                 "You are the Court Artist: the Royal Artisan and UI Craftsman. "
                 "You work in direct collaboration with M'Lord in this interactive session to preview, critique, "
@@ -253,11 +329,11 @@ castle                  (staging root trunk for main; attached to localhost)
 
 ## Division of Labor
 
-- **Serf on Quest Worktrees**: Disposable workers implementing assigned Goal & Scope. Model: **GLM 5.3 Flash** (`openrouter/z-ai/glm-5.3-flash`).
-- **Master of Coin**: Audits value delivery in `TRIBUTE_READY` via dedicated worktree session. Broad verification authority (live read probes, paperwork rendering), narrow remit (no code fixes). Model: **Gemma 4 31B IT** (`openrouter/google/gemma-4-31b-it`). Syncs verdict back with `git push . HEAD:<real-branch>`.
-- **Gatekeeper**: Ephemeral convoy integration & testing at `GATE`. Model: **Gemma 4 31B IT** (`openrouter/google/gemma-4-31b-it`).
-- **Court Artist**: Interactive UI/UX craftsman working directly with M'Lord on frontend styling with active runserver. Model: **GLM 5.3** (`openrouter/z-ai/glm-5.3`).
-- **Steward**: Resident orchestrator on `castle`. Does not run test suites directly; manages lifecycle, triage, and teardowns.
+- **Serf on Quest Worktrees**: Disposable workers implementing assigned Goal & Scope. Model: resolved from the role manifest (`.court/config.json`, `models.serf`).
+- **Master of Coin**: Audits value delivery in `TRIBUTE_READY` via dedicated worktree session. Broad verification authority (live read probes, paperwork rendering), narrow remit (no code fixes). Model: resolved from the role manifest (`.court/config.json`, `models.master_of_coin`). Syncs verdict back with `git push . HEAD:<real-branch>`.
+- **Gatekeeper**: Ephemeral convoy integration & testing at `GATE`. Model: resolved from the role manifest (`.court/config.json`, `models.gatekeeper`).
+- **Court Artist**: Interactive UI/UX craftsman working directly with M'Lord on frontend styling with active runserver. Model: resolved from the role manifest (`.court/config.json`, `models.artist`).
+- **Steward**: Resident orchestrator on `castle`. Does not run test suites directly; manages lifecycle, triage, and teardowns. Never blocks the session (no sleep timers / polling / blocking waits — dispatches fire-and-forget and reports what runs, what's next, and how to check later). Charters a mandatory real-data dry-run gate for any data-mutating Quest (exact affected-row counts + match rate, cross-checked via `harness.command` in `.court/config.json`; near-zero match rate = FAIL even with green tests).
 
 ---
 
@@ -325,11 +401,12 @@ def run_init(target_dir: Optional[Path] = None, force: bool = False) -> dict:
         ledger_path.write_text(LEDGER_CONTENT.format(date=date_str).strip() + "\n", encoding="utf-8")
         print(f"  + Created {ledger_path.relative_to(target)}")
 
-    # 2b. .court/config.json (create-once; operator model pins must survive updates)
+    # 2b. .court/config.json — the role-configuration manifest (Q455). Seeded
+    # from the packaged template file; model IDs never live in engine code.
+    # Create-once: operator model pins must survive `court update` re-runs.
     config_path = court_dir / "config.json"
     if not config_path.exists():
-        from .config import DEFAULT_CONFIG
-        config_path.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n", encoding="utf-8")
+        config_path.write_text(json.dumps(_initial_manifest(target), indent=2) + "\n", encoding="utf-8")
         print(f"  + Created {config_path.relative_to(target)}")
 
     # 3. .court/templates/
@@ -382,10 +459,12 @@ def run_init(target_dir: Optional[Path] = None, force: bool = False) -> dict:
         dst_setup_script.chmod(dst_setup_script.stat().st_mode | 0o111)
         print(f"  + Installed setup script: {dst_setup_script.relative_to(target)}")
 
-    # 5d. kilo.json at repository root
+    # 5d. kilo.json at repository root — agent models resolved from the
+    # role manifest (.court/config.json), never from engine constants (Q455).
     kilo_json_path = target / "kilo.json"
+    kilo_cfg = _kilo_config_with_manifest_models()
     if not kilo_json_path.exists() or force:
-        kilo_json_path.write_text(json.dumps(DEFAULT_KILO_CONFIG, indent=2) + "\n", encoding="utf-8")
+        kilo_json_path.write_text(json.dumps(kilo_cfg, indent=2) + "\n", encoding="utf-8")
         print(f"  + Created {kilo_json_path.relative_to(target)}")
     else:
         try:
@@ -397,7 +476,7 @@ def run_init(target_dir: Optional[Path] = None, force: bool = False) -> dict:
                     modified = True
                 if "agent" not in existing_kilo_cfg or not isinstance(existing_kilo_cfg["agent"], dict):
                     existing_kilo_cfg["agent"] = {}
-                for agent_name, agent_def in DEFAULT_KILO_CONFIG["agent"].items():
+                for agent_name, agent_def in kilo_cfg["agent"].items():
                     if agent_name not in existing_kilo_cfg["agent"] or force:
                         existing_kilo_cfg["agent"][agent_name] = agent_def
                         modified = True
@@ -430,7 +509,7 @@ def run_init(target_dir: Optional[Path] = None, force: bool = False) -> dict:
     print("  1. Create a Quest: court new --app core --concern my-feature --title 'My Feature' --section 'Feature'")
     print("  2. Launch a Scout: /scout core prototype-auth 'Test OAuth2 feasibility'")
     print("  3. Check status:   court status")
-    print("  4. Use slash commands inside Kilo: /charter, /levy, /collect, /status, /plot, /scout")
+    print("  4. Use slash commands inside Kilo: /charter, /levy, /collect, /status, /plot, /scout, /patchwork")
 
     return {
         "court_dir": court_dir,

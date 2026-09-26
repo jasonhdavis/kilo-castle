@@ -41,22 +41,19 @@ from . import ward
 from . import branch_ops
 from . import config
 from . import migration_guard
+from . import migration_graph
 
 # The Ward's durable workspace: patrol ledger + Warden Report queue.
 WARD_DIR = Path(__file__).resolve().parent.parent / "ward"
 WARDENS_LOG_PATH = WARD_DIR / "WARDENS_LOG.md"
 WARD_REPORTS_DIR = WARD_DIR / "reports"
 
-# Role model defaults loaded from .court/config.json with standard fallbacks
-_CFG = config.load_config()
-DEFAULT_SERF_MODEL = _CFG["models"].get("serf", "GLM-5.3-Flash")
-SERF_PROVIDER = _CFG["models"].get("serf_provider", "openrouter")
-DEFAULT_MOC_MODEL = _CFG["models"].get("master_of_coin", "openrouter/google/gemma-4-31b-it")
-DEFAULT_GATEKEEPER_MODEL = _CFG["models"].get("gatekeeper", "openrouter/google/gemma-4-31b-it")
-DEFAULT_ARTIST_MODEL = _CFG["models"].get("artist", "openrouter/z-ai/glm-5.3")
-ARTIST_PROVIDER = _CFG["models"].get("artist_provider", "openrouter")
+# Q455: role models are resolved through the config loader against the single
+# manifest (.court/config.json) — no model-ID constants live in engine code.
+# Role list: config.KNOWN_ROLE_MODELS. Provider fallbacks: config.get_provider.
 SERF_DISPATCH_TEMPLATE = ".court/templates/serf_dispatch_prompt.md"
 ARTIST_DISPATCH_TEMPLATE = ".court/templates/court_artist_prompt.md"
+ATELIER_DISPATCH_TEMPLATE = ".court/templates/court_artist_convoy_prompt.md"
 REPO_ROOT = git_ops.get_repo_root()
 MANAGE_SERVERS_PATH = REPO_ROOT / ".kilo" / "manage_servers.sh"
 
@@ -153,24 +150,9 @@ def setup_worktree_agent_config(worktree_path: Path, agent: str = "serf") -> Non
     cfg_file.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 
 
-def canonical_model_id(model_str: str, provider: Optional[str] = None) -> str:
-    """Map human/display model names to fully qualified provider/model strings for Kilo CLI."""
-    if not model_str:
-        return "openrouter/z-ai/glm-5.3-flash"
-    m = model_str.strip()
-    if "/" in m:
-        return m
-    low = m.lower().replace(" ", "").replace("-", "").replace(".", "")
-    if "glm53flash" in low:
-        return "openrouter/z-ai/glm-5.3-flash"
-    if "glm53" in low:
-        return "openrouter/z-ai/glm-5.3"
-    if "gemma431bit" in low or "gemini38flash" in low:
-        return "openrouter/google/gemma-4-31b-it"
-    if "gemini37flash" in low:
-        return "openrouter/google/gemini-3.7-flash"
-    p = provider or "openrouter"
-    return f"{p}/{m}"
+# Q455: canonical_model_id moved to engine.config — alias resolution now reads
+# the manifest's model_aliases block instead of an engine-side hardcoded table.
+canonical_model_id = config.canonical_model_id
 
 
 def query_kilo_session_ids(worktree_path: Path) -> set[str]:
@@ -300,7 +282,8 @@ def standup_kilo_session(
 
     if bin_path and run_now:
         try:
-            qual_model = canonical_model_id(model, provider=SERF_PROVIDER)
+            pre_existing = query_kilo_session_ids(worktree_path)
+            qual_model = canonical_model_id(model, provider=config.get_provider("serf"))
             log_dir = worktree_path / ".kilo"
             log_dir.mkdir(parents=True, exist_ok=True)
             log_file = log_dir / f"{agent}.log"
@@ -330,7 +313,7 @@ def standup_kilo_session(
             finally:
                 log_out.close()
 
-            session_id = query_latest_kilo_session_id(worktree_path, timeout_seconds=2.5) or f"kilo-{agent}-{proc.pid}"
+            session_id = query_latest_kilo_session_id(worktree_path, timeout_seconds=2.5, exclude_ids=pre_existing) or f"kilo-{agent}-{proc.pid}"
             return {
                 "ok": True,
                 "mode": "cli",
@@ -383,7 +366,7 @@ DEDICATED_COMMAND_FIELDS: dict[str, str] = {
     "serf_model": (
         "use the dedicated command: court dispatch-complete <id> --session-id ID "
         "--branch BRANCH --worktree PATH [--serf-model MODEL] "
-        "(defaults to the standing GLM 5.3 Flash mandate)"
+        "(default: manifest models.serf in .court/config.json)"
     ),
     "pillory_of": (
         "use the dedicated command: court charter <successor_id> --pillory-of "
@@ -1337,6 +1320,34 @@ def cmd_advance(args):
             merge_res = git_ops.check_merged_status(target)
             is_scout = (quest.kind == "scout" or quest.section == "Investigation")
 
+            # cogship-082 gate (5th falsified-Gatekeeper incident): a Quest
+            # leaves GATE only with engine-stamped proof that the unified suite
+            # actually ran over the code being promoted. The Gatekeeper's own
+            # report is not evidence — its suite runs were dying on the shell
+            # tool's 120s timeout while it claimed success.
+            if not is_scout and not force:
+                head_sha = ""
+                if target:
+                    sha_res = git_ops._run(["git", "rev-parse", "HEAD"], Path(target)) if Path(target).is_dir() else {"stdout": ""}
+                    head_sha = (sha_res.get("stdout") or "").strip()
+                suite_check = git_ops.check_suite_proof(
+                    cogship_id=quest.cogship_id or "",
+                    quest_id=quest.id,
+                    head_sha=head_sha,
+                )
+                if not suite_check.get("valid"):
+                    print(
+                        f"ERROR: Cannot advance {quest.id} to READY_TO_RAZE: no valid unified-suite proof.\n"
+                        f"  {suite_check.get('reason')}\n\n"
+                        f"Run the suite via the engine (it stamps durable proof):\n"
+                        f"  python3 -m court.cli runsuite {'--cogship ' + quest.cogship_id if quest.cogship_id else quest.id}"
+                        f" --dir <gatehouse-or-quest worktree>\n\n"
+                        f"To bypass this check, use: python3 -m court.cli advance {quest.id} READY_TO_RAZE --force --note \"<reason>\" "
+                        f"(the ledger entry will be marked FORCED)",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+
             if not merge_res.get("clean_worktree"):
                 if not force:
                     print(
@@ -1360,40 +1371,43 @@ def cmd_advance(args):
                         file=sys.stderr,
                     )
                     sys.exit(1)
-                # Q185 truthfulness fix: --force alone used to be enough to
-                # declare a merge happened without it actually happening —
-                # the resulting ledger note looked identical to a real
-                # promotion to every downstream consumer (2026-09-05
-                # incident: 9 Quests force-advanced to READY_TO_RAZE, none
-                # were actually merged; caught only because the Steward
-                # happened to independently re-check merge-base by hand).
-                # A verified commit SHA is now required, and independently
-                # re-checked against castle — the caller can no longer just
-                # assert it, the CLI verifies it.
-                if not verified_commit:
+                # cogship-076/077 truthfulness fix (2026-09-13): the old
+                # --verified-commit hatch only proved *some* commit was
+                # reachable from castle. cogship-076 passed it with a
+                # backwards castle->convoy merge carrying pure bookkeeping;
+                # cogship-077 passed it for five quests against one hash while
+                # three manifest branches were never merged at all. The claim
+                # being forced is "this quest's branch was promoted", so the
+                # QUEST BRANCH TIP itself must be an ancestor of the trunk,
+                # and the branch must actually carry production content.
+                quest_branch = quest.branch or getattr(quest, "tree_branch", "")
+                if not quest_branch:
                     print(
-                        f"ERROR: --force on an unmerged READY_TO_RAZE also requires --verified-commit <sha> "
-                        f"naming the commit you're claiming is actually merged — the CLI independently "
-                        f"re-verifies it against castle rather than taking your word for it.\n\n"
+                        f"ERROR: --force on an unmerged READY_TO_RAZE requires a resolvable branch "
+                        f"(quest.branch is unset; set it with `court set-field {quest.id} branch <branch>`). "
+                        f"The branch tip itself — not an arbitrary commit — must be verifiable.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                promo = git_ops.verify_quest_promotion(quest_branch, trunk="castle")
+                if not promo.get("ok"):
+                    print(
+                        f"ERROR: --force refused: promotion claim for branch '{quest_branch}' failed verification.\n"
+                        f"  {promo.get('reason')}\n"
+                        f"An arbitrary --verified-commit SHA is no longer accepted: only the quest branch tip's "
+                        f"own ancestry plus real production content proves promotion.\n\n"
                         f"Recommendation: {merge_res.get('recommendation')}",
                         file=sys.stderr,
                     )
                     sys.exit(1)
-                proof = git_ops.verify_commit_is_ancestor(verified_commit, "castle")
-                if not proof.get("is_ancestor"):
-                    print(
-                        f"ERROR: --verified-commit {verified_commit} failed independent verification: "
-                        f"{proof.get('error')}\n"
-                        f"--force is refused — this is not a real merge, it cannot be declared into one.",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
                 forced_note = (
-                    f"(FORCED - UNMERGED, but --verified-commit {proof['resolved_sha'][:12]} independently "
-                    f"confirmed as an ancestor of castle) {args.note}"
+                    f"(FORCED - UNMERGED per merge-status; but branch tip {promo['tip'][:12]} independently "
+                    f"verified as an ancestor of castle via merge-base (branch-tip reachability only — this "
+                    f"proves the branch's commits are IN castle, not who merged them) with "
+                    f"{len(promo['production_files'])} production file(s) present on the branch) {args.note}"
                 ).strip()
                 quest.set_status(new_status, forced_note)
-                quest.cogship_promoted_commit = proof["resolved_sha"]
+                quest.cogship_promoted_commit = promo["tip"]
             else:
                 quest.set_status(new_status, args.note or "")
         else:
@@ -1467,6 +1481,21 @@ def cmd_commute(args):
     audit history.
     """
     quest = store.load(args.quest_id)
+    # cogship-076 gate: commutation paperwork must not outrun code. The
+    # retracted 03:0xZ logs (four quests) recorded production satisfaction for
+    # quests whose code never landed. A FORCED promotion marker demands the
+    # code-presence audit pass first.
+    if _last_ledger_entry_is_forced(quest) and not getattr(args, "force", False):
+        promo = _code_presence_check(quest)
+        if not promo.get("ok"):
+            print(
+                f"ERROR: {quest.id} carries a FORCED promotion marker and its code-presence audit failed:\n"
+                f"  {promo.get('reason')}\n"
+                f"Refusing to record commutation satisfaction for code that never landed.\n"
+                f"Re-verify with `court verify-manifest` or pass --force to override explicitly.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     if args.file:
         note = Path(args.file).read_text(encoding="utf-8")
     else:
@@ -1506,21 +1535,13 @@ def cmd_set_field(args):
 
 
 def cmd_model(args):
-    cfg = _CFG.get("models", {})
+    """Print the canonical model ID for a role, resolved from the manifest
+    (.court/config.json models map) via the config loader (Q455)."""
     role = args.role.replace("-", "_")
-    default_map = {
-        "master_of_coin": DEFAULT_MOC_MODEL,
-        "gatekeeper": DEFAULT_GATEKEEPER_MODEL,
-        "serf": DEFAULT_SERF_MODEL,
-        "artist": DEFAULT_ARTIST_MODEL,
-        "steward": cfg.get("steward", ""),
-        "scout": cfg.get("scout", ""),
-    }
-    if role not in default_map:
-        print(f"Unknown role: {args.role} (known: {', '.join(sorted(k for k in default_map if default_map[k]))})")
+    if role not in config.KNOWN_ROLE_MODELS:
+        print(f"Unknown role: {args.role} (known: {', '.join(config.KNOWN_ROLE_MODELS)})")
         return 2
-    model = cfg.get(role) or default_map[role]
-    print(canonical_model_id(model, provider=cfg.get(f"{role}_provider")))
+    print(canonical_model_id(config.get_model(role), provider=config.get_provider(role)))
     return 0
 
 
@@ -1553,10 +1574,10 @@ def _print_charter_next_steps(quest: Quest, am_section: str) -> None:
             f"   Zero persona prompt injection; zero prompt corruption.)",
             f"",
             f"   Alternatively, via Kilo CLI directly:",
-            f'   kilo --worktree {wt_name} --agent serf --model "{DEFAULT_SERF_MODEL}"',
+            f'   kilo --worktree {wt_name} --agent serf --model "{config.get_model("serf")}" --provider "{config.get_provider("serf")}"',
             f'   or:',
             f'   kilo worktree create {wt_name}',
-            f'   kilo run --agent serf --model "{DEFAULT_SERF_MODEL}" --dir <WORKTREE_PATH> "<TASK_PROMPT>"',
+            f'   kilo run --agent serf --model "{config.get_model("serf")}" --provider "{config.get_provider("serf")}" --dir <WORKTREE_PATH> "<TASK_PROMPT>"',
             f"",
             f"2. Or if manually spawning an Agent Manager UI session in section \"{section_display}\":",
             f"   python3 -m court.cli dispatch-complete {quest.id} \\",
@@ -1607,7 +1628,7 @@ def _print_migration_lane_advisory(chartered_quest: Quest, base_ref: str = "cast
     print(
         "   Sequence these lanes or consciously accept the merge path "
         "(Gatekeeper template → Migration Graph Doctrine); most of this "
-        "collision class dies at charter/dispatch time."
+        "collision class dies at dispatch time."
     )
 
 
@@ -1736,7 +1757,7 @@ def cmd_dispatch(args):
     standup = getattr(args, "standup", False)
     no_run = getattr(args, "no_run", False)
     run_now = not no_run
-    serf_model = getattr(args, "serf_model", None) or DEFAULT_SERF_MODEL
+    serf_model = getattr(args, "serf_model", None) or config.get_model("serf")
 
     kilo_bin = find_kilo_binary()
     root = git_ops.get_repo_root()
@@ -1864,6 +1885,205 @@ def cmd_dispatch_complete(args):
     return cmd_dispatch(args)
 
 
+def cmd_patchwork(args):
+    """Fast-track hotfix pipeline: one-shot intake, serf dispatch, inline test verification, and promotion."""
+    app = getattr(args, "app", None)
+    concern = getattr(args, "concern", None)
+    title = getattr(args, "title", None)
+    quest_id = getattr(args, "quest_id", None)
+    auto_commit = not getattr(args, "no_commit", False)
+    base_branch = getattr(args, "base", "castle") or "castle"
+
+    # 1. Intake & One-shot Creation + Dispatch
+    if app and concern and title:
+        qid = store.make_id(app, concern)
+        quest = Quest(
+            id=qid,
+            title=title,
+            kind="quest",
+            app=app,
+            concern=concern,
+            section="Bug fix",
+            tags=getattr(args, "tags", "") or "Bug fix,hotfix",
+            status="OPEN",
+        )
+        branch_candidate = getattr(args, "branch", None) or quest.tree_branch
+        is_valid, err = validate_branch_name(branch_candidate)
+        if not is_valid:
+            print(f"ERROR: {err}", file=sys.stderr)
+            sys.exit(1)
+        quest.branch = branch_candidate
+
+        goal = getattr(args, "goal", None) or f"Hotfix: {title}.\n\nApply targeted code fix for {concern} in {app}."
+        quest.set_section("The Kingdom Requires", goal)
+
+        test_cmd = getattr(args, "test_cmd", None) or "pytest"
+        self_advance_reminder = (
+            f"- [ ] **Self-advance (do this LAST)**: once Tribute is rendered and "
+            f"`git rev-list --count HEAD..castle` is 0, run "
+            f"`python3 -m court.cli advance {qid} TRIBUTE_READY` yourself. "
+            f"Nothing else flips the status out of WORKING."
+        )
+        checklist = [
+            f"- [ ] Implement minimal code fix for {title} (<= 100 lines diff, <= 3 files)",
+            f"- [ ] Verify clean test run: `{test_cmd}`",
+            f"- [ ] Verify zero roleplay leakage in production code, comments, and commit messages",
+            f"- [ ] Merge castle tip and ensure zero drift (behind: 0)",
+            self_advance_reminder,
+        ]
+        quest.set_section("Expected Tribute", "\n".join(checklist))
+        quest.log_ledger("-", quest.status, "Hotfix quest created via court patchwork")
+        store.save(quest, auto_commit=auto_commit, commit_msg=f"court: create {quest.id}")
+
+        quest.set_status("PLANNED", "Hotfix auto-chartered via court patchwork")
+        store.save(quest, auto_commit=auto_commit, commit_msg=f"court: charter {quest.id}")
+
+        print(f"⚡ Hotfix {quest.id} chartered: branch={quest.branch} section={quest.section}")
+        print("🚀 Dispatching focused Serf worker to worktree...")
+
+        setattr(args, "quest_id", quest.id)
+        setattr(args, "standup", True)
+        setattr(args, "section", "Bug fix")
+        setattr(args, "tags", quest.tags)
+        setattr(args, "branch", quest.branch)
+        cmd_dispatch(args)
+        return
+
+    if not quest_id:
+        print(
+            "ERROR: Provide either (--app, --concern, --title) to create a hotfix, "
+            "or specify a quest_id to inspect, verify, collect, or promote an existing hotfix.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    quest = store.load(quest_id)
+
+    # 2. In-tree Verification
+    if getattr(args, "verify", False):
+        wt = quest.worktree or (git_ops.get_repo_root() / ".kilo" / "worktrees" / quest.branch.replace("/", "-"))
+        if not Path(wt).is_dir():
+            wt_cand = git_ops.find_worktree_for_quest(quest)
+            if wt_cand and Path(wt_cand).is_dir():
+                wt = wt_cand
+            else:
+                print(f"ERROR: worktree not found at {wt}", file=sys.stderr)
+                sys.exit(1)
+        test_cmd = getattr(args, "test_cmd", None)
+        print(f"🔍 Running hotfix verification for {quest.id} in {wt}...")
+        if test_cmd:
+            res = git_ops.run_test_command(str(wt), test_cmd)
+            if res.get("ok"):
+                print(f"✅ In-tree verification PASSED:\n{res.get('stdout', '')}")
+            else:
+                print(f"❌ In-tree verification FAILED:\n{res.get('stderr') or res.get('stdout')}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            suite_res = git_ops.run_unified_suite(str(wt), quest_id=quest.id)
+            if suite_res.get("ok"):
+                print(f"✅ In-tree suite PASSED at {suite_res.get('head_sha', '')[:12]}")
+            else:
+                print(f"❌ In-tree suite FAILED: {suite_res.get('error')}", file=sys.stderr)
+                sys.exit(1)
+        return
+
+    # 3. Inline Collect & Gatehouse Pack
+    if getattr(args, "collect", False):
+        if quest.status == "WORKING":
+            tribute = quest.body_sections.get("Tribute Rendered", "").strip()
+            if tribute:
+                quest.set_status("TRIBUTE_READY", "Hotfix auto-advanced to TRIBUTE_READY")
+                store.save(quest, auto_commit=auto_commit, commit_msg=f"court: advance {quest.id} to TRIBUTE_READY")
+
+        if not quest.body_sections.get("Master of Coin's Audit", "").strip():
+            stat_text = ""
+            if quest.worktree and Path(quest.worktree).is_dir():
+                diff_info = git_ops.get_worktree_diff(quest.worktree, base=base_branch, stat_only=True)
+                stat_text = diff_info.get("diff", "").strip()
+            diff_block = f"\n- **Diff Footprint**:\n```\n{stat_text}\n```\n" if stat_text else "\n"
+            audit_text = (
+                "### Master of Coin Audit (Hotfix Fast-Track)\n"
+                "- **Verdict**: PASS (Hotfix inline verified)\n"
+                "- **Commutation**: None required / Deploy immediately\n"
+                "- **UI Review**: None required"
+                f"{diff_block}"
+            )
+            quest.set_section("Master of Coin's Audit", audit_text)
+            store.save(quest, auto_commit=auto_commit, commit_msg=f"court: inline hotfix audit {quest.id}")
+            print(f"🪙 Inline Master of Coin audit recorded for {quest.id}.")
+
+        if quest.status != "GATE":
+            cogship_id = store.stamp_cogship([quest], cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit)
+            quest.set_status("GATE", f"Hotfix packed in {cogship_id} for solo gatehouse promotion")
+            store.save(quest, auto_commit=auto_commit, commit_msg=f"court: advance {quest.id} to GATE in {cogship_id}")
+            print(f"🛡️  Advanced {quest.id} to GATE in {cogship_id}.")
+
+        print(f"✅ Hotfix {quest.id} is at GATE and ready for promotion.")
+        print(f"   To promote immediately: python3 -m court.cli patchwork {quest.id} --promote")
+        return
+
+    # 4. Inline Promote to castle
+    if getattr(args, "promote", False):
+        wt = quest.worktree or (git_ops.get_repo_root() / ".kilo" / "worktrees" / quest.branch.replace("/", "-"))
+        if not wt or not Path(wt).is_dir():
+            wt_cand = git_ops.find_worktree_for_quest(quest)
+            if wt_cand and Path(wt_cand).is_dir():
+                wt = wt_cand
+            else:
+                print(f"ERROR: worktree not found for {quest.id} at {wt}", file=sys.stderr)
+                sys.exit(1)
+
+        print(f"🧪 Running gate verification suite for hotfix {quest.id}...")
+        test_cmd = getattr(args, "test_cmd", None)
+        if test_cmd:
+            res = git_ops.run_test_command(str(wt), test_cmd)
+            if not res.get("ok"):
+                print(f"❌ Test verification failed:\n{res.get('stderr') or res.get('stdout')}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            suite_res = git_ops.run_unified_suite(str(wt), quest_id=quest.id)
+            if not suite_res.get("ok"):
+                print(f"❌ Integration suite failed: {suite_res.get('error')}", file=sys.stderr)
+                sys.exit(1)
+
+        # Merge branch into base_branch (e.g. castle)
+        root = git_ops.get_repo_root()
+        branch = quest.branch
+        print(f"🏰 Promoting hotfix {quest.id} ({branch}) into {base_branch}...")
+        merge_res = subprocess.run(["git", "-C", str(root), "merge", branch, "--ff-only"], capture_output=True, text=True)
+        if merge_res.returncode != 0:
+            merge_res = subprocess.run(["git", "-C", str(root), "merge", branch, "-m", f"court: promote hotfix {quest.id} ({quest.title})"], capture_output=True, text=True)
+            if merge_res.returncode != 0:
+                print(f"❌ Failed to merge {branch} into {base_branch}:\n{merge_res.stderr}", file=sys.stderr)
+                sys.exit(1)
+
+        if not quest.cogship_id:
+            cogship_id = store.stamp_cogship([quest], cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit)
+        if not quest.body_sections.get("Master of Coin's Audit", "").strip():
+            quest.set_section("Master of Coin's Audit", "### Master of Coin Audit (Hotfix Fast-Track)\n- **Verdict**: PASS (Hotfix inline verified)\n- **Commutation**: None required\n- **UI Review**: None required\n")
+        quest.set_status("READY_TO_RAZE", f"Hotfix promoted directly into {base_branch}")
+        store.save(quest, auto_commit=auto_commit, commit_msg=f"court: advance {quest.id} to READY_TO_RAZE")
+        print(f"🪦 Hotfix {quest.id} successfully promoted to {base_branch} and marked READY_TO_RAZE.")
+        print("📦 Next steps:")
+        print("   1. View deployment manifest: python3 -m court.cli ship")
+        print(f"   2. Teardown worktree:       python3 -m court.cli raze {quest.id}")
+        return
+
+    # Default show hotfix status
+    print(f"⚡ Hotfix Quest: {quest.id} — {quest.title}")
+    print(f"   Status: [{quest.status}] ({status_label(quest.status)})")
+    print(f"   Branch: {quest.branch or '-'}")
+    print(f"   Worktree: {quest.worktree or '-'}")
+    print(f"   Tags: {quest.tags or '-'}")
+    if quest.worktree and Path(quest.worktree).is_dir():
+        diff_info = git_ops.get_worktree_diff(quest.worktree, base=base_branch, stat_only=True)
+        print(f"   Diffstat vs {base_branch}:\n{diff_info.get('diff', 'none')}")
+    print("\nAvailable fast-track actions:")
+    print(f"   Verify in-tree  : python3 -m court.cli patchwork {quest.id} --verify")
+    print(f"   Collect & Gate  : python3 -m court.cli patchwork {quest.id} --collect")
+    print(f"   Promote to trunk: python3 -m court.cli patchwork {quest.id} --promote")
+
+
 def cmd_coin(args):
     """Dispatch Master of Coin into a Quest's worktree via Kilo CLI to audit Tribute."""
     quest = store.load(args.quest_id)
@@ -1884,7 +2104,7 @@ def cmd_coin(args):
         print("ERROR: Kilo binary not found. Cannot dispatch Master of Coin via CLI.", file=sys.stderr)
         sys.exit(1)
 
-    model = getattr(args, "model", None) or DEFAULT_MOC_MODEL
+    model = getattr(args, "model", None) or config.get_model("master_of_coin")
     qual_model = canonical_model_id(model)
 
     tmpl_path = config.find_court_dir() / "templates" / "master_of_coin_review_prompt.md"
@@ -1989,7 +2209,7 @@ def cmd_goad(args):
     is_scout = getattr(quest, "kind", "") == "scout" or getattr(quest, "section", "") == "Investigation"
     agent_role = "scout" if is_scout else "serf"
     role_label = "Scout" if is_scout else "Serf"
-    model = getattr(args, "model", None) or quest.serf_model or DEFAULT_SERF_MODEL
+    model = getattr(args, "model", None) or quest.serf_model or config.get_model("serf")
     qual_model = canonical_model_id(model)
 
     tmpl_path = config.find_court_dir() / "templates" / "goad_prompt.md"
@@ -2033,6 +2253,7 @@ def cmd_goad(args):
     ]
 
     auto_commit = not getattr(args, "no_commit", False)
+    pre_existing = query_kilo_session_ids(wt)
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(f"\n--- Goad {role_label}: {title} ({datetime.now().isoformat()}) ---\n")
     log_out = open(log_file, "a", encoding="utf-8")
@@ -2047,7 +2268,7 @@ def cmd_goad(args):
         )
     finally:
         log_out.close()
-    session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5) or f"kilo-{agent_role}-{proc.pid}"
+    session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5, exclude_ids=pre_existing) or f"kilo-{agent_role}-{proc.pid}"
     quest.serf_session_id = session_id
     store.save(quest, auto_commit=auto_commit, commit_msg=f"court: goad {role_label} session {session_id} for {quest.id}")
     print(f"⚡ Goaded {role_label} for {quest.id}:")
@@ -2162,8 +2383,8 @@ def cmd_artist(args):
         )
         sys.exit(1)
 
-    model = getattr(args, "model", None) or quest.artist_model or DEFAULT_ARTIST_MODEL
-    provider = getattr(args, "provider", None) or ARTIST_PROVIDER
+    model = getattr(args, "model", None) or quest.artist_model or config.get_model("artist")
+    provider = getattr(args, "provider", None) or config.get_provider("artist")
     port, runserver_url, server_status = _ensure_worktree_server(
         wt,
         port_override=getattr(args, "port", None),
@@ -2405,6 +2626,49 @@ def cmd_verify_merged(args):
         sys.exit(1)
 
 
+def _code_presence_check(quest: Quest, trunk: str = "castle") -> dict:
+    """Post-promotion code-presence audit for one Quest's branch (cogship-076/077).
+    Scouts are exempt (non-merging lane). Returns git_ops.verify_quest_promotion's dict."""
+    quest_branch = quest.branch or getattr(quest, "tree_branch", "")
+    if not quest_branch:
+        return {"ok": False, "reason": f"{quest.id} has no resolvable branch to verify"}
+    return git_ops.verify_quest_promotion(quest_branch, trunk=trunk)
+
+
+def cmd_verify_manifest(args):
+    """cogship-077 fix: after any convoy promotion, deterministically assert each
+    manifest Quest's BRANCH TIP is an ancestor of the promoted trunk AND carries
+    production content — one merge-base + diff per quest. This is the single
+    check that would have caught all six affected quests."""
+    cogship = getattr(args, "cogship", None)
+    if cogship:
+        quests = [q for q in store.list_all(include_archive=True)
+                  if store.normalize_cogship_id(q.cogship_id) == (store.normalize_cogship_id(cogship) or cogship)]
+        if not quests:
+            print(f"ERROR: no Quests stamped onto {cogship}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        quests = resolve_quest_selection(args, batchable=True, required=True)
+
+    trunk = getattr(args, "trunk", "castle") or "castle"
+    failures = []
+    print(f"🔎 POST-PROMOTION MANIFEST VERIFICATION against '{trunk}' ({len(quests)} Quest(s))")
+    for q in quests:
+        if q.kind == "scout" or q.section == "Investigation":
+            print(f"  ⏭️  {q.id} (scout — non-merging lane, exempt)")
+            continue
+        promo = _code_presence_check(q, trunk=trunk)
+        if promo.get("ok"):
+            print(f"  ✅ {q.id} tip {promo['tip'][:12]} ancestor of {trunk}; {len(promo['production_files'])} production file(s)")
+        else:
+            failures.append((q.id, promo.get("reason")))
+            print(f"  🔴 {q.id} — {promo.get('reason')}")
+    if failures:
+        print(f"\n❌ {len(failures)}/{len(quests)} manifest Quest(s) FAILED promotion verification — the trunk does not actually contain this convoy's code.")
+        sys.exit(1)
+    print(f"\n✅ All {len(quests)} manifest Quest(s) verified: branch tips reachable from {trunk} with production content present.")
+
+
 def cmd_raze(args):
     import json
     am_path = agent_manager_json_path()
@@ -2541,6 +2805,27 @@ def cmd_raze(args):
             )
             return
 
+        # cogship-076/077 gate: a FORCED promotion marker means the normal
+        # merge path was bypassed — require the code-presence audit to pass
+        # (branch tip reachable from castle AND production content on the
+        # branch) before the branch ref is deleted. Ref deletion is what made
+        # the shared-cache quest's branch unrecoverable except via the object
+        # graph. `--allow-forced` is the explicit royal override.
+        if (
+            not is_scout
+            and _last_ledger_entry_is_forced(quest)
+            and not getattr(args, "allow_forced", False)
+        ):
+            promo = _code_presence_check(quest)
+            if not promo.get("ok"):
+                print(
+                    f"❌ {quest.id}: FORCED promotion marker present and code-presence audit FAILED:\n"
+                    f"   {promo.get('reason')}\n"
+                    f"   Refusing to raze (raze deletes the branch ref — unrecoverable if the audit is wrong).\n"
+                    f"   Fix the promotion, or pass --allow-forced to raze anyway (explicit override)."
+                )
+                return
+
         # Sync worktree to castle if it exists (skip for scouts: their unique
         # spike commits are never merged, so a --ff-only/reset sync would either
         # fail or destroy the spike history before archival).
@@ -2589,6 +2874,60 @@ def cmd_raze(args):
         _raze_one(qid)
 
 
+def cmd_runsuite(args):
+    """Engine-executed unified integration suite (cogship-082 fix). The suite
+    runs HERE — inside court's own subprocess with a proper long timeout —
+    never inside an agent's shell tool (whose 120s cap killed every real run
+    and coerced the Gatekeeper into quoting Tribute text as "proof"). Stamps
+    durable proof that the READY_TO_RAZE gate independently re-verifies."""
+    cogship = getattr(args, "cogship", None) or ""
+    quests = []
+    if getattr(args, "quest_id", None):
+        quests = [store.load(args.quest_id)]
+    elif cogship:
+        quests = store.list_all()
+        cog_norm = store.normalize_cogship_id(cogship) or cogship
+        quests = [q for q in quests if store.normalize_cogship_id(q.cogship_id) == cog_norm]
+        if not quests:
+            print(f"ERROR: no Quests stamped onto {cogship}", file=sys.stderr)
+            sys.exit(1)
+
+    wt_arg = getattr(args, "dir", None)
+    if wt_arg:
+        wt = Path(wt_arg).resolve()
+    elif len(quests) == 1 and quests[0].worktree and Path(quests[0].worktree).is_dir():
+        wt = Path(quests[0].worktree)
+    elif len(quests) > 1:
+        print(
+            "ERROR: convoy of "
+            f"{len(quests)} Quest(s) runs in the ephemeral gatehouse worktree — "
+            f"pass --dir <gatehouse worktree path> (branch the-gatehouse/{cogship})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    else:
+        print("ERROR: no worktree resolved — pass --dir <worktree> or a quest id", file=sys.stderr)
+        sys.exit(1)
+
+    res = git_ops.run_unified_suite(
+        wt,
+        command=getattr(args, "command", None),
+        cogship_id=cogship,
+        quest_id=(quests[0].id if len(quests) == 1 else ""),
+        timeout=getattr(args, "timeout", 1800),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2))
+    else:
+        if res.get("proof_path"):
+            print(f"🧾 Proof stamped: {res['proof_path']}")
+        if res.get("ok"):
+            print(f"✅ Suite PASSED ({res.get('ran_tests')} tests, exit 0) at {res.get('head_sha', '')[:12]} — {res.get('command')}")
+        else:
+            print(f"❌ Suite FAILED (exit {res.get('exit_code')}) — {res.get('error') or 'see output above'}")
+            sys.exit(1)
+
+
 def cmd_collect(args):
     """Composite (Q185): mechanizes `collect.md`'s steps 1-2 — audit-and-select,
     stamp the Cog Ship convoy, batch-advance to GATE — the pure CLI plumbing
@@ -2631,15 +2970,32 @@ def cmd_collect(args):
             skipped.append((quest.id, f"status is [{quest.status}], not TRIBUTE_READY or GATE"))
             continue
         moc_audit = quest.body_sections.get("Master of Coin's Audit", "").strip()
+        is_hotfix = quest.is_hotfix or (getattr(args, "hotfix", False) is True)
         if not moc_audit:
-            skipped.append((
-                quest.id,
-                "no recorded Master of Coin's Audit content -- not yet reviewed; refusing to "
-                "pack unaudited tribute into a convoy (dispatch `/levy <id>` first)",
-            ))
-            continue
+            if is_hotfix:
+                stat_text = ""
+                if quest.worktree and Path(quest.worktree).is_dir():
+                    diff_info = git_ops.get_worktree_diff(quest.worktree, base=base_branch, stat_only=True)
+                    stat_text = diff_info.get("diff", "").strip()
+                diff_block = f"\n- **Diff Footprint**:\n```\n{stat_text}\n```\n" if stat_text else "\n"
+                audit_text = (
+                    "### Master of Coin Audit (Hotfix Fast-Track)\n"
+                    "- **Verdict**: PASS (Hotfix inline verified)\n"
+                    "- **Commutation**: None required / Deploy immediately\n"
+                    "- **UI Review**: None required"
+                    f"{diff_block}"
+                )
+                quest.set_section("Master of Coin's Audit", audit_text)
+                store.save(quest, auto_commit=auto_commit, commit_msg=f"court: inline hotfix audit {quest.id}")
+            else:
+                skipped.append((
+                    quest.id,
+                    "no recorded Master of Coin's Audit content -- not yet reviewed; refusing to "
+                    "pack unaudited tribute into a convoy (dispatch `/levy <id>` first)",
+                ))
+                continue
         ui_status = quest.extract_ui_review_status()
-        if ui_status.upper().startswith("PENDING") and not getattr(args, "skip_ui_review", False):
+        if ui_status.upper().startswith("PENDING") and not getattr(args, "skip_ui_review", False) and not is_hotfix:
             skipped.append((
                 quest.id,
                 f"UI Review is PENDING ({ui_status}) — royal review required before collection "
@@ -2684,11 +3040,14 @@ def cmd_collect(args):
 
     for quest in accepted:
         quest.set_status("GATE", f"Packed in {cogship_id}; dispatched to Gatekeeper")
-        store.save(quest, auto_commit=auto_commit, commit_msg=f"court: advance {quest.id} to GATE")
+    # One batched commit for the whole GATE advance (was: one commit per quest).
+    store.save_many(accepted, f"court: advance {len(accepted)} quest(s) to GATE in {cogship_id}", auto_commit=auto_commit)
+    for quest in accepted:
         print(f"{quest.id}: GATE")
 
     accepted_ids = ", ".join(q.id for q in accepted)
-    qual_gatekeeper = canonical_model_id(DEFAULT_GATEKEEPER_MODEL)
+    gatekeeper_model = config.get_model("gatekeeper")
+    qual_gatekeeper = canonical_model_id(gatekeeper_model)
     if len(accepted) == 1:
         solo_id = accepted[0].id
         solo_quest = accepted[0]
@@ -2703,10 +3062,13 @@ def cmd_collect(args):
             "",
             "1. Record the session:",
             f"   python3 -m court.cli set-field {solo_id} gatekeeper_session_id <session_id>",
-            f"   python3 -m court.cli set-field {solo_id} gatekeeper_model \"{DEFAULT_GATEKEEPER_MODEL}\"",
+            f"   python3 -m court.cli set-field {solo_id} gatekeeper_model \"{gatekeeper_model}\"",
             "",
             "2. On a clean suite run, promote directly into castle and advance to",
-            "   READY_TO_RAZE.",
+            "   READY_TO_RAZE. Run the suite via the ENGINE so it stamps proof",
+            "   (the advance gate refuses without it; an agent's own shell tool",
+            "   times out at 120s and cannot run a real suite):",
+            f"   python3 -m court.cli runsuite {solo_id} --dir {solo_quest.worktree or '<worktree>'}",
         ]
     else:
         wt_name = f"the-gatehouse-{cogship_id}"
@@ -2722,13 +3084,19 @@ def cmd_collect(args):
             f"   git -C .kilo/worktrees/{wt_name} branch -m {branch_name}",
             f"   kilo run --agent gatekeeper --model {qual_gatekeeper} --dir .kilo/worktrees/{wt_name} \"Act as Gatekeeper for {cogship_id}: merge in branches for {accepted_ids}, run unified suite once, promote clean remainder directly into castle.\"",
             "",
-            "2. Record the session on each packed Quest:",
-            f"   python3 -m court.cli set-field <id> gatekeeper_session_id <session_id>",
-            f"   python3 -m court.cli set-field <id> gatekeeper_model \"{DEFAULT_GATEKEEPER_MODEL}\"",
+            "2. Run the unified suite via the ENGINE in the convoy worktree (stamps the",
+            "   proof the READY_TO_RAZE gate requires; never run suites through an",
+            "   agent shell tool — its 120s timeout killed every cogship-082 run):",
+            f"   python3 -m court.cli runsuite --cogship {cogship_id} --dir .kilo/worktrees/{wt_name}",
             "",
-            "3. Tear the ephemeral worktree down once promoted.",
+            "3. Record the session on each packed Quest:",
+            f"   python3 -m court.cli set-field <id> gatekeeper_session_id <session_id>",
+            f"   python3 -m court.cli set-field <id> gatekeeper_model \"{gatekeeper_model}\"",
+            "",
+            "4. Tear the ephemeral worktree down once promoted.",
         ]
-
+    stood_up = False
+    standup_steps: list[str] = []
     if getattr(args, "standup", False):
         kilo_bin = find_kilo_binary()
         if kilo_bin:
@@ -2742,9 +3110,18 @@ def cmd_collect(args):
                     sid = res.get("session_id")
                     if sid:
                         solo.gatekeeper_session_id = sid
-                        solo.gatekeeper_model = DEFAULT_GATEKEEPER_MODEL
+                        solo.gatekeeper_model = gatekeeper_model
                         store.save(solo, auto_commit=auto_commit, commit_msg=f"court: record Gatekeeper {sid} for {solo.id}")
                         print(f"🛡️ Stood up Gatekeeper session {sid} for {solo.id} via Kilo CLI.")
+                        stood_up = True
+                        log_path = res.get("log") or f"{solo.worktree}/.kilo/gatekeeper.log"
+                        standup_steps = [
+                            f"- Gatekeeper session {sid} ({gatekeeper_model}) is integrating in",
+                            f"  {solo.worktree} on branch {solo.branch or '-'}.",
+                            "- Gatekeeper will merge castle in, run the unified suite via `court runsuite`, and merge into castle.",
+                            f"- Worker log: tail -f {log_path}",
+                            f"- Once promoted to castle and advanced to READY_TO_RAZE, raze the worktree: `court raze {solo.id}`",
+                        ]
             else:
                 root = git_ops.get_repo_root()
                 wt_name = f"the-gatehouse-{cogship_id}"
@@ -2765,13 +3142,324 @@ def cmd_collect(args):
                     if sid:
                         for q in accepted:
                             q.gatekeeper_session_id = sid
-                            q.gatekeeper_model = DEFAULT_GATEKEEPER_MODEL
+                            q.gatekeeper_model = gatekeeper_model
                             store.save(q, auto_commit=auto_commit, commit_msg=f"court: record Gatekeeper {sid} for {q.id}")
                         print(f"🛡️ Stood up Gatekeeper convoy session {sid} on {branch_name} via Kilo CLI.")
+                        stood_up = True
+                        log_path = res.get("log") or f"{wt_path}/.kilo/gatekeeper.log"
+                        standup_steps = [
+                            f"- Gatekeeper session {sid} ({gatekeeper_model}) is integrating convoy {cogship_id} in",
+                            f"  {wt_path} on branch {branch_name}.",
+                            f"- Quests packed: {accepted_ids}",
+                            "- Gatekeeper will merge candidate branches in, run the unified suite via `court runsuite`, and promote to castle.",
+                            f"- Worker log: tail -f {log_path}",
+                            "- Once promoted to castle and Quests advanced to READY_TO_RAZE, raze: `court raze <id>`",
+                        ]
                 except Exception as e:
                     print(f"⚠️ Could not auto-standup Gatekeeper: {e}")
 
-    _print_next_steps(f"🛡️ NEXT STEPS — SUMMON THE GATEKEEPER FOR {cogship_id}", next_steps)
+    if stood_up:
+        _print_next_steps(f"🛡️ NEXT STEPS — GATEKEEPER IS INTEGRATING {cogship_id}", standup_steps)
+    else:
+        _print_next_steps(f"🛡️ NEXT STEPS — SUMMON THE GATEKEEPER FOR {cogship_id}", next_steps)
+
+
+def _verify_branch_exists(branch: str, repo_root: Path) -> bool:
+    res = git_ops._run(["git", "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}"], repo_root)
+    return bool(res.get("ok") and (res.get("stdout") or "").strip())
+
+
+def _pack_quest_branches(quests: list, wt_path: Path, cogship_id: str) -> tuple[list, list]:
+    """Sequentially merge candidate Quest branches into the convoy worktree.
+
+    A branch that conflicts with earlier merges is isolated (merge aborted,
+    tree restored) and reported back — it stays stamped on the Cog Ship and
+    the Gatekeeper integrates it in the normal post-review pass.
+    """
+    merged: list = []
+    isolated: list[tuple[str, str]] = []
+    for quest in quests:
+        res = git_ops._run(
+            ["git", "merge", quest.branch, "--no-edit", "-m", f"court: pack {quest.id} into {cogship_id} (atelier)"],
+            wt_path,
+        )
+        if res.get("ok"):
+            merged.append(quest)
+            continue
+        git_ops._run(["git", "merge", "--abort"], wt_path)
+        git_ops._run(["git", "reset", "--hard", "HEAD"], wt_path)
+        reason = ((res.get("stderr") or "") + (res.get("stdout") or "")).strip().splitlines()
+        isolated.append((quest.id, reason[-1][:200] if reason else "merge failed"))
+    return merged, isolated
+
+
+def cmd_atelier(args):
+    """Royal UI Convoy Atelier: roll up multiple UI-review-pending Quests into one
+    Cog Ship convoy PRE-integration-test, merge their branches together into the
+    ephemeral gatehouse convoy worktree, and spawn ONE Court Artist session with a
+    live runserver on the merged (untested) branch.
+
+    Velocity rationale: UI changes are typically small, so reviewing each in its own
+    Quest worktree burns a full session round-trip per Quest. The atelier batches
+    them: branches are merged together first, M'Lord reviews all UI in one browser
+    session, and (uniquely in the whole pipeline) may direct ADDITIONAL unchartered
+    UI changes during the review ("Royal Addendum") — sanctioned here because the
+    convoy artist template forces per-commit attribution (commit trailers +
+    `## Royal Addendum` charter sections), so later MoC/Gatekeeper audits can see
+    exactly why the convoy diff contains commits belonging to no single Quest branch.
+
+    Single-writer sequencing is enforced by protocol: the artist is the sole writer
+    in the convoy worktree until sign-off; only then is the Gatekeeper stood up in
+    the same worktree for the unified integration suite and promotion. If the
+    Gatekeeper later isolates/rejects a Quest, addendum polish entangled with that
+    Quest's files is reverted alongside it (see gatekeeper_review_prompt.md).
+
+    Selection gates mirror `collect` EXCEPT the UI Review gate is inverted: only
+    Quests whose UI Review is PENDING are accepted — already-approved or
+    headless Quests have nothing for the artist and route through /collect.
+    """
+    base_branch = getattr(args, "base", "castle") or "castle"
+    auto_commit = not getattr(args, "no_commit", False)
+    candidates = resolve_quest_selection(args, batchable=True, required=True, default_status="TRIBUTE_READY,GATE")
+    repo_root = git_ops.get_repo_root()
+
+    accepted: list[Quest] = []
+    skipped: list[tuple[str, str]] = []
+    scan_warnings: list[str] = []
+    for quest in candidates:
+        if quest.status == "PUNISHED":
+            skipped.append((quest.id, "PUNISHED (side-state, frozen pending its pillory successor)"))
+            continue
+        if quest.status not in ("TRIBUTE_READY", "GATE"):
+            skipped.append((quest.id, f"status is [{quest.status}], not TRIBUTE_READY or GATE"))
+            continue
+        if not quest.body_sections.get("Master of Coin's Audit", "").strip():
+            skipped.append((
+                quest.id,
+                "no recorded Master of Coin's Audit content -- refusing to pack unaudited "
+                "tribute into a convoy (dispatch `/levy <id>` first)",
+            ))
+            continue
+        ui_status = quest.extract_ui_review_status()
+        if not ui_status.upper().startswith("PENDING"):
+            skipped.append((
+                quest.id,
+                f"UI Review is not PENDING ('{ui_status or 'not recorded'}') -- nothing for the "
+                "artist to review; route through /collect instead",
+            ))
+            continue
+        if not quest.branch or not _verify_branch_exists(quest.branch, repo_root):
+            skipped.append((quest.id, f"branch '{quest.branch or '-'}' not found in this repo -- nothing to merge"))
+            continue
+        audit = ward.audit_quest(quest, base_branch=base_branch)
+        if audit.git_status.get("dirty"):
+            skipped.append((quest.id, "dirty working tree"))
+            continue
+        if audit.violations:
+            skipped.append((quest.id, f"{len(audit.violations)} compliance violation(s): {'; '.join(audit.violations)}"))
+            continue
+        try:
+            contraband = migration_guard.scan_branch_contraband(repo_root, base_branch, quest.branch)
+        except Exception as e:
+            scan_warnings.append(f"{quest.id}: migration contraband scan failed ({e}); Gatekeeper graph check remains the backstop")
+        else:
+            if contraband:
+                skipped.append((quest.id, migration_guard.remediation_message(contraband, base_branch)))
+                continue
+        accepted.append(quest)
+
+    if skipped:
+        print(f"⏭️  Skipped {len(skipped)} candidate(s) (not atelier material):")
+        for qid, reason in skipped:
+            print(f"   - {qid}: {reason}")
+    for warning in scan_warnings:
+        print(f"⚠️  {warning}")
+
+    if not accepted:
+        print("(no UI-review-pending Quests ready to roll up into an atelier convoy)")
+        return
+
+    if len(accepted) == 1:
+        print(f"ℹ️  Only one UI Quest accepted ({accepted[0].id}) — for a single Quest the lighter "
+              f"per-Quest review is `/artist {accepted[0].id}` (no convoy worktree needed). "
+              "Proceeding with the atelier anyway for the Royal Addendum protocol.")
+
+    cogship_id = store.stamp_cogship(accepted, cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit)
+    print(f"🎨 Stamped {len(accepted)} UI Quest(s) onto {cogship_id} for the Royal Atelier (pre-integration review).")
+
+    for quest in accepted:
+        quest.set_status("GATE", f"Packed in {cogship_id}; routed to the Royal Atelier (convoy UI review before integration tests)")
+    store.save_many(accepted, f"court: advance {len(accepted)} quest(s) to GATE in {cogship_id} (atelier)", auto_commit=auto_commit)
+    for quest in accepted:
+        print(f"{quest.id}: GATE (atelier)")
+
+    # Ephemeral convoy worktree — same shape as a collect standup convoy, but it is
+    # MANDATORY here: the entire point is reviewing the merged (untested) branch.
+    wt_name = f"the-gatehouse-{cogship_id}"
+    branch_name = f"the-gatehouse/{cogship_id}"
+    wt_path = repo_root / ".kilo" / "worktrees" / wt_name
+    if wt_path.exists():
+        print(
+            f"ERROR: convoy worktree already exists at {wt_path} — an atelier/convoy is already "
+            f"stood up for {cogship_id}. Single-writer rule: tear the existing worktree down or "
+            "pass a different --cogship.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    kilo_bin = find_kilo_binary()
+    created = False
+    if kilo_bin:
+        try:
+            subprocess.run(
+                [str(kilo_bin), "worktree", "create", wt_name],
+                cwd=str(repo_root), capture_output=True, check=True, timeout=300,
+            )
+            git_ops.clear_git_cache()
+            subprocess.run(["git", "-C", str(wt_path), "branch", "-m", branch_name], capture_output=True, timeout=60)
+            created = True
+        except Exception as e:
+            print(f"⚠️ kilo worktree create failed ({e}); falling back to git worktree add")
+    if not created:
+        res = git_ops._run(["git", "worktree", "add", str(wt_path), "-b", branch_name, base_branch], repo_root)
+        if not res.get("ok"):
+            print(f"ERROR: could not create convoy worktree at {wt_path}: {res.get('stderr')}", file=sys.stderr)
+            sys.exit(1)
+
+    ff_res = git_ops._run(["git", "merge", base_branch, "--ff-only"], wt_path)
+    if not ff_res.get("ok"):
+        print(f"ERROR: convoy worktree could not fast-forward to {base_branch}: {ff_res.get('stderr')}", file=sys.stderr)
+        sys.exit(1)
+
+    merged_quests, isolated = _pack_quest_branches(accepted, wt_path, cogship_id)
+    for qid, reason in isolated:
+        print(f"⚠️  Isolated {qid}: branch merge conflict in convoy ({reason}). It stays stamped on "
+              f"{cogship_id}; the Gatekeeper integrates it in the normal post-review pass.")
+    if not merged_quests:
+        print("ERROR: every candidate branch failed to merge into the convoy — no merged state to review.", file=sys.stderr)
+        sys.exit(1)
+
+    setup_worktree_agent_config(wt_path, "artist")
+    port, runserver_url, server_status = _ensure_worktree_server(
+        wt_path,
+        port_override=getattr(args, "port", None),
+        no_server=getattr(args, "no_server", False),
+    )
+
+    model = getattr(args, "model", None) or config.get_model("artist")
+    provider = getattr(args, "provider", None) or config.get_provider("artist")
+
+    quest_blocks: list[str] = []
+    routes_by_id: dict[str, list[str]] = {}
+    for quest in merged_quests:
+        routes = _extract_target_routes(quest, worktree=wt_path)
+        routes_by_id[quest.id] = routes
+        route_str = "\n".join(f"  - {runserver_url}{r}" if not r.startswith("http") else f"  - {r}" for r in routes)
+        quest_blocks.append(
+            f"### {quest.id} — {quest.title}\n- Branch: `{quest.branch}`\n- Preview routes:\n{route_str}"
+        )
+
+    tmpl_path = REPO_ROOT / ATELIER_DISPATCH_TEMPLATE
+    if not tmpl_path.exists():
+        tmpl_path = Path(__file__).resolve().parent / "templates" / "court_artist_convoy_prompt.md"
+    if tmpl_path.exists():
+        tmpl_text = tmpl_path.read_text(encoding="utf-8")
+    else:
+        tmpl_text = (
+            "You are the Court Artist for atelier {{ cogship_id }}. Worktree: {{ worktree }}. "
+            "Runserver: {{ runserver_url }}. Quests: {{ quest_ids }}"
+        )
+
+    prompt = (
+        tmpl_text
+        .replace("{{ cogship_id }}", cogship_id)
+        .replace("{{ worktree }}", str(wt_path))
+        .replace("{{ branch }}", branch_name)
+        .replace("{{ runserver_url }}", runserver_url)
+        .replace("{{ port }}", str(port))
+        .replace("{{ target_routes }}", "\n".join(
+            f"- {runserver_url}{r}" if not r.startswith("http") else f"- {r}"
+            for r in [x for routes in routes_by_id.values() for x in routes]
+        ))
+        .replace("{{ quest_blocks }}", "\n\n".join(quest_blocks))
+        .replace("{{ quest_ids }}", ", ".join(q.id for q in accepted))
+    )
+
+    for quest in accepted:
+        quest.artist_model = model
+        note = f"Routed to the Royal Atelier ({cogship_id}) for convoy UI review with model {model} (runserver port {port})"
+        if qid_reason := next((r for i, r in isolated if i == quest.id), None):
+            note += f"; branch isolated from convoy merge ({qid_reason})"
+        quest.log_ledger("GATE", "GATE", note)
+    store.save_many(accepted, f"court: record atelier routing for {cogship_id}", auto_commit=auto_commit)
+
+    if getattr(args, "prompt_only", False):
+        print(prompt)
+        return
+
+    if getattr(args, "json", False):
+        out = {
+            "cogship_id": cogship_id,
+            "quests": [
+                {"id": q.id, "title": q.title, "branch": q.branch, "routes": routes_by_id.get(q.id, [])}
+                for q in accepted
+            ],
+            "isolated": [{"id": qid, "reason": reason} for qid, reason in isolated],
+            "worktree": str(wt_path),
+            "branch": branch_name,
+            "port": port,
+            "runserver_url": runserver_url,
+            "model": model,
+            "provider": provider,
+            "prompt": prompt,
+            "task": {
+                "name": f"{cogship_id} Atelier",
+                "branchName": branch_name,
+                "model": model,
+                "provider": provider,
+                "prompt": prompt,
+            },
+        }
+        print(json.dumps(out, indent=2))
+        return
+
+    short_id = cogship_id.removeprefix("cogship-")
+    merged_ids = ", ".join(q.id for q in merged_quests)
+    print("=" * 76)
+    print("🎨 ROYAL UI ATELIER STOOD UP — BATCHED CONVOY UI REVIEW")
+    print("=" * 76)
+    print(f"Cog Ship:    {cogship_id}")
+    print(f"Quests:      {merged_ids}" + (f"  (isolated: {', '.join(qid for qid, _ in isolated)})" if isolated else ""))
+    print(f"Branch:      {branch_name}")
+    print(f"Worktree:    {wt_path}")
+    print(f"Runserver:   {runserver_url} (Port {port}) [{server_status}]")
+    print(f"Model:       {model} ({provider})")
+    print()
+    print("Live Preview URLs:")
+    for r in [x for routes in routes_by_id.values() for x in routes]:
+        url_line = f"{runserver_url}{r}" if not r.startswith("http") else r
+        print(f"  • {url_line}")
+    print()
+    print("Next Steps for M'Lord & Steward:")
+    print("  1. Spawn the Court Artist session in the convoy worktree (it is pre-configured")
+    print(f"     as the sole writer there): `cd {wt_path} && kilo` (default_agent: artist),")
+    print(f"     or via Agent Manager: agent_manager start (mode: 'worktree', branchName: '{branch_name}',")
+    print(f"     model: '{model}', name: '{short_id} Atelier').")
+    print(f"     (Slash command: `/atelier {merged_ids}` drives this whole flow.)")
+    print(f"  2. Record the session on each packed Quest: python3 -m court.cli set-field <id> artist_session_id <session_id>")
+    print(f"  3. Open the live preview: {runserver_url} — review every Quest's UI in one session.")
+    print("  4. Direct any extra UI changes you want — the artist attributes them per the Royal")
+    print("     Addendum protocol (commit trailers + `## Royal Addendum` charter sections).")
+    print()
+    print("🛡️ AFTER THE ROYAL SIGN-OFF (single-writer: the Gatekeeper enters only then):")
+    print(f"  5. Run the unified integration suite via the ENGINE in the convoy worktree:")
+    print(f"     python3 -m court.cli runsuite --cogship {cogship_id} --dir {wt_path}")
+    print(f"  6. Hand the worktree to the Gatekeeper (candidate branches are already merged):")
+    print(f"     kilo run --agent gatekeeper --model \"$(python3 -m court.cli model gatekeeper)\" --dir {wt_path}")
+    print(f"     \"Act as Gatekeeper for {cogship_id}: candidate branches already merged; run the unified")
+    print(f"     suite via court runsuite, promote the clean convoy into castle, advance passing Quests")
+    print(f"     to READY_TO_RAZE, and pack the manifest with court ship.\"")
+    print("=" * 76)
 
 
 def cmd_stamp(args):
@@ -3279,6 +3967,21 @@ def cmd_ship(args):
     else:
         print("\n(no quests currently in READY_TO_RAZE or DONE matching filters)")
 
+    # cogship-077 gate: surface any manifest quest whose FORCED promotion
+    # marker failed the post-promotion code-presence audit — this manifest
+    # must not be treated as deployable paperwork until re-verified.
+    unverified_forced = []
+    for q in quests:
+        if _last_ledger_entry_is_forced(q):
+            promo = _code_presence_check(q)
+            if not promo.get("ok"):
+                unverified_forced.append((q.id, promo.get("reason")))
+    if unverified_forced:
+        print(f"\n🚫 UNVERIFIED FORCED PROMOTIONS ({len(unverified_forced)}) — deployable paperwork only, NOT verified code:")
+        for qid, reason in unverified_forced:
+            print(f"   * {qid}: {reason}")
+        print("   Run `court verify-manifest --cogship <id>` after re-promotion; raze/commute refuse these until verified.")
+
     # 1. Bard Chronicle
     if manifest["ballads"]:
         print("\n" + "-" * 76)
@@ -3451,6 +4154,18 @@ def _ship_preflight(main_wt: Path, base_branch: str, head_branch: str) -> tuple[
                 f"origin/{base_branch} is {behind_res['stdout']} commit(s) ahead of local {base_branch}; reconcile before shipping"
             )
 
+    # Q432: migration-graph integrity preflight. Django checkouts only — a
+    # non-Django castle has no migration graph to verify, so the stage is not
+    # applicable there. Fail closed: at a deploy gate, "could not verify" must
+    # never read as pass.
+    if (main_wt / "manage.py").is_file():
+        graph = migration_graph.check_migration_graph(main_wt)
+        if not graph.get("ok"):
+            problems.append(
+                "migration graph preflight failed: "
+                + (graph.get("reason") or "unknown graph failure")
+            )
+
     return (len(problems) == 0), problems
 
 
@@ -3596,6 +4311,7 @@ def cmd_levy(args):
     levied_list = []
     working_list = []
     violations_list = []
+    pending_saves: dict[str, Quest] = {}
 
     for q in target_quests:
         # Resolve this Quest's worktree exactly once per run and pass it down
@@ -3614,14 +4330,14 @@ def cmd_levy(args):
             if wt and Path(wt).is_dir():
                 rb = git_ops.rebase_worktree_onto_base(wt, base_branch=base_branch, own_quest_id=q.id)
                 if rb.get("merged"):
-                    auto_resolved = rb.get("auto_resolved_foreign_ledger_files") or []
+                    auto_resolved = rb.get("auto_resolved_files") or []
                     foreign_note = f" (auto-resolved {len(auto_resolved)} foreign ledger conflict(s) to {base_branch}'s side)" if auto_resolved else ""
                     rebase_notes[q.id] = (
                         f"🔄 Mechanically rebased onto {base_branch}: "
                         f"{rb.get('before_behind')} -> {rb.get('after_behind')} behind.{foreign_note}"
                     )
                 elif rb.get("conflict"):
-                    sample = ", ".join(rb.get("conflict_files", [])[:5]) or "unknown files"
+                    sample = ", ".join(rb.get("conflicting_files", [])[:5]) or "unknown files"
                     rebase_notes[q.id] = (
                         f"⚠️  Mechanical rebase onto {base_branch} hit conflicts in: {sample} "
                         f"— aborted cleanly, needs Serf resolution (`git merge {base_branch}` by hand)."
@@ -3630,8 +4346,12 @@ def cmd_levy(args):
                     rebase_notes[q.id] = "⚠️  Skipped mechanical rebase: worktree has uncommitted changes."
 
         # Step 1: Auto-sync tribute and frontmatter from worktree if present
+        # (write deferred to the end-of-run batched commit — castle's tip must
+        # not move mid-sweep or every subsequent quest's rebase goes stale).
         if getattr(args, "sync", True):
-            ward.sync_tribute_from_worktree(q, worktree_path=wt)
+            synced, _notes = ward.sync_tribute_from_worktree(q, worktree_path=wt, auto_commit=False)
+            if synced:
+                pending_saves[q.id] = q
 
         # Step 2: Sentry Audit — freshly re-reads git status now, so it sees
         # the rebase this quest just got (and any castle advance from an
@@ -3654,7 +4374,7 @@ def cmd_levy(args):
                 )
             else:
                 q.set_status("TRIBUTE_READY", "Levied: Tribute synced from worktree and verified compliant")
-                store.save(q)
+                pending_saves[q.id] = q
                 did_advance = True
 
         if audit.violations:
@@ -3663,6 +4383,17 @@ def cmd_levy(args):
             levied_list.append((q, audit, did_advance))
         else:
             working_list.append((q, audit))
+
+    # One batched commit for the whole levy sweep (was: one commit per synced/
+    # advanced quest). Deferred to here so castle's tip stays frozen during the
+    # sweep — every quest's mechanical rebase now sees the same castle tip,
+    # which removes the intra-run behind:1 race the Q149 note worked around.
+    if pending_saves:
+        store.save_many(
+            list(pending_saves.values()),
+            f"court: levy sweep (synced/advanced {len(pending_saves)} quest(s))",
+            auto_commit=not getattr(args, "no_commit", False),
+        )
 
     if rebase_notes and not getattr(args, "json", False):
         print("🔄 MECHANICAL REBASE SWEEP (per-quest, interleaved with advance)")
@@ -3799,11 +4530,11 @@ def cmd_rebase(args):
         elif r.get("already_up_to_date"):
             print(f"  ✅ {qid:36} already up to date (behind=0).  {title}")
         elif r.get("merged"):
-            auto_resolved = r.get("auto_resolved_foreign_ledger_files") or []
+            auto_resolved = r.get("auto_resolved_files") or []
             foreign_note = f"  [auto-resolved {len(auto_resolved)} foreign ledger conflict(s) -> {base_branch}]" if auto_resolved else ""
             print(f"  🔄 {qid:36} merged: {r.get('before_behind')} -> {r.get('after_behind')} behind.{foreign_note}  {title}")
         elif r.get("conflict"):
-            sample = ", ".join(r.get("conflict_files", [])[:5]) or "unknown files"
+            sample = ", ".join(r.get("conflicting_files", [])[:5]) or "unknown files"
             print(f"  🔴 {qid:36} CONFLICT in [{sample}] — aborted, needs manual resolution.  {title}")
         else:
             print(f"  ❓ {qid:36} {r.get('error', 'unknown result')}  {title}")
@@ -3940,6 +4671,36 @@ def build_parser():
     p_new.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_new.set_defaults(func=cmd_new)
 
+    p_patchwork = sub.add_parser(
+        "patchwork",
+        help="Fast-track hotfix pipeline: one-shot intake, serf dispatch, inline test verification, and promotion",
+    )
+    p_patchwork.add_argument("quest_id", nargs="?", default=None, help="Optional Quest ID to verify, collect, promote, or inspect")
+    p_patchwork.add_argument("--app", default=None, help="Application name for new hotfix")
+    p_patchwork.add_argument("--concern", default=None, help="Concern slug for new hotfix")
+    p_patchwork.add_argument("--title", default=None, help="Short title describing hotfix")
+    p_patchwork.add_argument("--goal", default=None, help="The Kingdom Requires / technical fix specification")
+    p_patchwork.add_argument("--test-cmd", default=None, help="Verification test command to run in worktree")
+    p_patchwork.add_argument("--branch", default=None, help="Branch name override (must start with quest/...)")
+    p_patchwork.add_argument("--tags", default="", help="Tags override (defaults to 'Bug fix,hotfix')")
+    p_patchwork.add_argument(
+        "--model", "--serf-model",
+        dest="serf_model",
+        default=None,
+        help="Worker model (default: manifest models.serf in .court/config.json)",
+    )
+    p_patchwork.add_argument("--base", default="castle", help="Base branch (default: castle)")
+    p_patchwork.add_argument("--cogship", default=None, help="Cog Ship ID for collection (default: auto-allocated)")
+    p_patchwork.add_argument("--verify", action="store_true", help="Run in-tree test verification for the hotfix")
+    p_patchwork.add_argument("--collect", action="store_true", help="Inline gatehouse pack & audit for hotfix")
+    p_patchwork.add_argument("--promote", action="store_true", help="Inline test verification, merge to castle, and Cog Ship stamp")
+    p_patchwork.add_argument("--run", action="store_true", default=True, help="Run kilo headless command immediately (default: True)")
+    p_patchwork.add_argument("--no-run", action="store_true", help="Configure worktree without launching background session")
+    p_patchwork.add_argument("--native", action="store_true", help="Force native git worktree without Kilo CLI")
+    p_patchwork.add_argument("--create-worktree", action="store_true", help="Create native git worktree automatically")
+    p_patchwork.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
+    p_patchwork.set_defaults(func=cmd_patchwork)
+
     p_charter = sub.add_parser(
         "charter",
         help="Composite: fold M'Lord's notes, idempotently advance to PLANNED, compute branch, print Serf-dispatch NEXT STEPS (Q183)",
@@ -3982,8 +4743,8 @@ def build_parser():
     p_dispatch.add_argument(
         "--model", "--serf-model",
         dest="serf_model",
-        default=DEFAULT_SERF_MODEL,
-        help="Worker model",
+        default=None,
+        help="Worker model (default: manifest models.serf in .court/config.json)",
     )
     p_dispatch.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_dispatch.set_defaults(func=cmd_dispatch)
@@ -3993,7 +4754,7 @@ def build_parser():
         help="Dispatch Master of Coin into a Quest's worktree via Kilo CLI to audit Tribute",
     )
     p_coin.add_argument("quest_id", help="Quest ID to audit (must be in TRIBUTE_READY unless --force)")
-    p_coin.add_argument("--model", default=DEFAULT_MOC_MODEL, help=f"Model for Master of Coin (default: {DEFAULT_MOC_MODEL})")
+    p_coin.add_argument("--model", default=None, help="Model for Master of Coin (default: manifest models.master_of_coin in .court/config.json)")
     p_coin.add_argument("--force", action="store_true", help="Audit even if not currently in TRIBUTE_READY")
     p_coin.add_argument("--wait", action="store_true", help="Run synchronously and wait for completion instead of background")
     p_coin.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
@@ -4019,8 +4780,8 @@ def build_parser():
     p_dispatch_complete.add_argument(
         "--model", "--serf-model",
         dest="serf_model",
-        default=DEFAULT_SERF_MODEL,
-        help="Serf model (default: the standing GLM 5.3 Flash mandate; --model and --serf-model are aliases)",
+        default=None,
+        help="Serf model (default: manifest models.serf in .court/config.json; --model and --serf-model are aliases)",
     )
     p_dispatch_complete.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_dispatch_complete.set_defaults(func=cmd_dispatch_complete)
@@ -4032,13 +4793,13 @@ def build_parser():
     p_artist.add_argument("quest_id", help="Quest ID (e.g. Q196)")
     p_artist.add_argument(
         "--model",
-        default=DEFAULT_ARTIST_MODEL,
-        help=f"Model for Court Artist (default: {DEFAULT_ARTIST_MODEL})",
+        default=None,
+        help="Model for Court Artist (default: manifest models.artist in .court/config.json)",
     )
     p_artist.add_argument(
         "--provider",
-        default=ARTIST_PROVIDER,
-        help=f"Provider for Court Artist model (default: {ARTIST_PROVIDER})",
+        default=None,
+        help="Provider for Court Artist model (default: manifest models.artist_provider in .court/config.json)",
     )
     p_artist.add_argument("--port", type=int, help="Override worktree runserver port")
     p_artist.add_argument("--no-server", action="store_true", help="Skip starting the worktree dev server")
@@ -4153,6 +4914,7 @@ def build_parser():
     add_quest_selector(p_raze, batchable=True, filters=("status",))
     p_raze.add_argument("--archive-pruned", dest="archive_pruned", action="store_true", default=True, help="Auto-archive already-pruned quests (default: on)")
     p_raze.add_argument("--no-archive-pruned", dest="archive_pruned", action="store_false", help="Do not auto-archive already-pruned quests")
+    p_raze.add_argument("--allow-forced", dest="allow_forced", action="store_true", help="Explicit override: raze a FORCED-promotion quest even if its code-presence audit fails")
     p_raze.set_defaults(func=cmd_raze)
 
     p_teardown = sub.add_parser("teardown-list", help="List worktrees ready for M'Lord to prune")
@@ -4194,10 +4956,27 @@ def build_parser():
     p_collect.add_argument("--cogship", default=None, help="Existing Cog Ship ID to stamp (e.g. cogship-002); omit or pass 'new' to allocate the next id")
     p_collect.add_argument("--base", default="castle", help="Base branch for the compliance audit (default: castle)")
     p_collect.add_argument("--skip-ui-review", action="store_true", help="Bypass pending UI review check when packing into Cog Ship")
+    p_collect.add_argument("--hotfix", action="store_true", help="Allow hotfix fast-track inline audit and pack")
     p_collect.add_argument("--standup", action="store_true", help="Automatically stand up the Gatekeeper worktree and session via Kilo CLI")
     p_collect.add_argument("--force", action="store_true", help="Force packing even if checks warn/fail")
     p_collect.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_collect.set_defaults(func=cmd_collect)
+
+    p_atelier = sub.add_parser(
+        "atelier",
+        help="Royal UI Convoy Atelier: roll up UI-review-pending Quests into one Cog Ship, merge their branches pre-integration-test, and spawn the Court Artist on the merged (untested) branch",
+    )
+    add_quest_selector(p_atelier, batchable=True, filters=("status", "app", "epic"))
+    p_atelier.add_argument("--cogship", default=None, help="Existing Cog Ship ID to stamp (e.g. cogship-002); omit to allocate the next id")
+    p_atelier.add_argument("--base", default="castle", help="Base branch the convoy worktree is cut from (default: castle)")
+    p_atelier.add_argument("--model", default=None, help="Court Artist model override (default from .court/config.json models.artist)")
+    p_atelier.add_argument("--provider", default=None, help="Court Artist provider override")
+    p_atelier.add_argument("--port", type=int, help="Override worktree runserver port")
+    p_atelier.add_argument("--no-server", action="store_true", help="Skip starting the convoy dev server")
+    p_atelier.add_argument("--prompt-only", action="store_true", help="Print only the rendered convoy Court Artist prompt")
+    p_atelier.add_argument("--json", action="store_true", help="Output JSON format for agent_manager or scripts")
+    p_atelier.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
+    p_atelier.set_defaults(func=cmd_atelier)
 
     p_stamp = sub.add_parser("stamp", help="Stamp Quests onto a Cog Ship convoy id (allocates next cogship-NNN unless --cogship given)")
     p_stamp.add_argument("quest_ids", help="Comma-separated Quest IDs (e.g. Q101,Q102,Q105)")
@@ -4258,6 +5037,27 @@ def build_parser():
     p_rebase.add_argument("--json", action="store_true", help="Output JSON format")
     p_rebase.set_defaults(func=cmd_rebase)
 
+    p_runsuite = sub.add_parser(
+        "runsuite",
+        help="Run the unified integration suite via the ENGINE (long timeout, immune to agent shell limits) and stamp durable proof for the READY_TO_RAZE gate",
+    )
+    p_runsuite.add_argument("quest_id", nargs="?", default=None, help="Quest ID for a size-1 convoy (runs in its own worktree)")
+    p_runsuite.add_argument("--cogship", default=None, help="Cog Ship ID the suite run is stamped against (e.g. cogship-082)")
+    p_runsuite.add_argument("--dir", default=None, help="Worktree to run in (REQUIRED for convoys: the ephemeral gatehouse worktree)")
+    p_runsuite.add_argument("--command", default=None, help="Override suite command (default: manifest suite.command in .court/config.json, then pytest/Django auto-detect)")
+    p_runsuite.add_argument("--timeout", type=int, default=1800, help="Engine timeout in seconds (default 1800 — an agent's 120s shell cap can never run a real suite)")
+    p_runsuite.add_argument("--json", action="store_true", help="Output JSON format")
+    p_runsuite.set_defaults(func=cmd_runsuite)
+
+    p_verify_manifest = sub.add_parser(
+        "verify-manifest",
+        help="Post-promotion integrity: assert each manifest Quest's branch TIP is an ancestor of the trunk AND carries production content (would have caught cogship-076/077)",
+    )
+    p_verify_manifest.add_argument("--cogship", default=None, help="Verify every Quest stamped onto this Cog Ship ID")
+    p_verify_manifest.add_argument("--trunk", default="castle", help="Promoted trunk branch to verify against (default: castle)")
+    add_quest_selector(p_verify_manifest, batchable=True)
+    p_verify_manifest.set_defaults(func=cmd_verify_manifest)
+
     p_diff = sub.add_parser("diff", help="Display structured worktree diff and file statistics vs base")
     p_diff.add_argument("quest_id", help="Quest ID to diff")
     p_diff.add_argument("--base", default="castle", help="Base branch/ref to diff against (default: castle)")
@@ -4302,10 +5102,38 @@ def build_parser():
     return p
 
 
+# Castle-contention fix (2026-09-13): mutating commands serialize on the
+# court-wide write lock so concurrent roles (Steward, Master of Coin,
+# Gatekeeper, raze/commute) queue cleanly instead of colliding on the shared
+# checkout's index / dirty tree. Read-only reporting commands never take it.
+_READ_ONLY_COMMANDS = {
+    "status", "show", "list", "tally", "ward", "ship", "diff", "timber",
+    "model", "verify-merged", "verify-manifest", "runsuite",
+}
+
+
 def main(argv=None):
     parser = build_parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
-    args.func(args)
+    command_name = next((tok for tok in argv if not tok.startswith("-")), "")
+    if command_name in _READ_ONLY_COMMANDS or not hasattr(args, "func"):
+        try:
+            args.func(args)
+        except config.CourtConfigError as e:
+            # Q455: a missing manifest entry fails loudly and names the fix —
+            # role models resolve only from .court/config.json now.
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(2)
+        return
+    with git_ops.court_write_lock():
+        try:
+            args.func(args)
+        except config.CourtConfigError as e:
+            # Q455: a missing manifest entry fails loudly and names the fix —
+            # role models resolve only from .court/config.json now.
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(2)
 
 
 if __name__ == "__main__":

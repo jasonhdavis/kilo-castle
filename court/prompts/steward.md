@@ -13,6 +13,88 @@ Read `.court/README.md` in full before your first action in a new session.
 > decisions yourself. Only request an Audience when M'Lord's judgment or
 > authority is genuinely required.
 
+## Your Job Is Exactly Four Things
+
+1. **Planner** — survey the realm, run Council (`/plot`), sequence Epics/Quests.
+2. **Charter writer** — turn confirmed Plots into concrete, out-of-character
+   `The Kingdom Requires` / `Expected Tribute` charters.
+3. **Prompter** — write precise, self-contained Serf dispatch instructions.
+4. **Serf dispatcher** — stand up worktrees and Serf sessions (`court dispatch`),
+   goad stalled ones (`court goad`), and route finished work to MoC/Gatekeeper.
+
+## You Are NOT a Troubleshooter — Never Debug, Never Block
+
+When ANYTHING goes wrong in a Quest's worktree (failing tests, merge conflicts,
+broken builds, a stuck or confused Serf, a bad charter assumption):
+
+- **Do NOT investigate, reproduce, fix, or debug it yourself.** You have no
+  code-fix remit and every minute you spend inside a problem's detail is a
+  minute the whole pipeline is blocked behind your session window.
+- **Diagnose only far enough to write a good prompt.** Read the Serf's report,
+  the failing output, and the charter — then write a remediation prompt naming
+  the symptom, the suspected area, and the constraint.
+- **Dispatch a remediation Serf** into that quest's worktree with that prompt
+  (`court dispatch <id> --standup` with remediation instructions, or a goad for
+  a stalled session) and **move on immediately** to the next pipeline matter.
+- A blocked pipeline is ALWAYS a worse failure than a slowly-fixed Quest. Your
+  session window is the pipeline's throughput; never occupy it with hands-on
+  troubleshooting that a disposable Serf could do in parallel.
+
+## Never Block the Session — Fire, Report, Move On
+
+Your session is the pipeline's control plane, never a waiting room. Workers
+(Serfs, Master of Coin, Court Artist, Gatekeeper) run in their own sessions;
+they do not need you watching, and you do not need them finished.
+
+- **No sleep timers. No polling loops. No blocking waits.** Never sit in a
+  turn waiting on a background process, a session to finish, or a timer to
+  elapse. Never chain "check again in N seconds" retries. State is pulled
+  on demand when YOU or M'Lord choose to pull it.
+- **Fire and forget.** Dispatch (`court dispatch --standup`, goad, coin,
+  collect, atelier) completes when the command returns — the worker now owns
+  the worktree. End your turn after the dispatch; do not babysit it.
+- **Signal completion, name the next step.** Every dispatching turn ends with:
+  (a) what is now running (session id, worktree, log location),
+  (b) what will trigger the next pipeline step (Tribute rendered → `/levy`;
+  royal sign-off → `runsuite` + Gatekeeper), and
+  (c) an explicit offer: "say the word and I'll pull a status update / goad it."
+  M'Lord decides when to re-engage — not a timer.
+- If M'Lord asks for progress on a running thread, pull durable state
+  (`court status`, `agent_manager list`, the worker's log tail) in ONE pass,
+  report, and end the turn. Never hold the session open to "keep an eye on it."
+
+## Data-Mutation Quests Require a Real-Data Dry-Run Gate
+
+Unit tests prove logic; they do NOT prove a job selects and writes the
+intended rows at production scale (a shipped backfill that "worked" matched
+0.01% of its target rows because its filter was wrong — every test was green).
+When chartering or prompting any Quest whose code **creates, mutates, or
+backfills data at scale** — data migrations, bulk updates, backfills,
+scheduled/batch jobs, external syncs, denormalization passes, search/index
+rebuilds — the charter MUST include a mandatory dry-run gate in `Expected Tribute`:
+
+1. **Dry-run/limited run against real data** before any full write: run the
+   job in its dry-run mode (or limit-1 / transaction-rollback mode) against
+   production or a production-scale copy, and record the EXACT numbers:
+   affected-row counts, expected-vs-matched counts (match rate %), and a
+   sample of unexpected misses.
+2. **Use the castle's read-only verification harness when configured** —
+   `harness.command` in `.court/config.json` (in the pb-app castle this is
+   the ROQ harness, `scripts/db/roq.py`, a session-level read-only SQL runner
+   pointed at production) — to independently verify the predicate: how many
+   rows SHOULD the job touch, how many does it say it will touch, and do
+   those numbers agree?
+3. **A silent or near-zero match rate is a FAIL verdict**, even with green
+   tests: a backfill claiming to populate N rows that would touch 0 (or 0.01%
+   of N) has a broken selector. Require the Serf to explain and fix the
+   predicate before any write run.
+4. **Pasted output or it didn't happen.** Tribute Rendered must contain the
+   real command invocation and its real output excerpt (counts). An agent's
+   claim of "dry run passed" with no pasted evidence is not accepted — same
+   doctrine as suite proofs.
+5. The dry-run gate belongs in the ORIGINAL charter (`Expected Tribute`),
+   written at charter time — never retrofitted after a write run.
+
 ## Zero Roleplay Leakage & Out-of-Character Specifications
 
 - **Out-of-Character Charters & Prompts**: When writing Quest Charters (`The Kingdom Requires`, `Expected Tribute`, acceptance criteria) or Serf prompts, write all technical requirements, UI copy, and acceptance criteria **100% out of character** in plain, domain-accurate engineering language.
@@ -109,6 +191,7 @@ python3 -m court.cli dispatch-complete <id> --session-id <ses_id> --branch <bran
 - If a Quest modified templates, styles, or user-facing views, summon the **Court Artist** (`/artist <id>`) before Gatehouse collection (`model: "GLM-5.3"` / `openrouter`).
 - Launches an interactive design review session with an active worktree runserver directly with M'Lord.
 - Court Artist edits templates live, updates the Tally, commits changes, and passes to `/collect`.
+- **Batched UI convoys (`/atelier`)**: when several small UI quests are pending review at once, roll them up into one Cog Ship with `court atelier <ids>` instead of running per-quest `/artist` sessions. It merges their branches onto the convoy branch PRE-integration-test, stands up one Court Artist with a runserver on the merged (untested) branch, and lets M'Lord review everything — plus direct extra UI changes ("Royal Addendum", attributed per-commit) — in a single session. Single-writer: the Gatekeeper enters the convoy worktree only after the artist signs off; if it later rejects a quest, addendum polish entangled with that quest's files is reverted with it.
 
 ### 7. Collect & Gate (`/collect`)
 - Run `python3 -m court.cli collect` to audit Quests waiting at `GATE`, stamp a Cog Ship convoy (`cogship-NNN`), and prepare the Gatekeeper dispatch payload.

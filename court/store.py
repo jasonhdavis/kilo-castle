@@ -151,6 +151,7 @@ def stamp_cogship(
 ) -> str:
     """Stamp a cogship_id onto a batch of Quest objects and persist them."""
     root = court_root or get_court_root()
+    quests = list(quests)
     if cogship_id is None:
         cogship_id = next_cogship_id(root)
     else:
@@ -171,8 +172,13 @@ def stamp_cogship(
             f"Stamped onto {cogship_id}"
             + (f" (reassigned from {prior})" if prior and prior != cogship_id else ""),
         )
-        msg = commit_msg or f"court: stamp {q.id} onto {cogship_id}"
-        save(q, court_root=root, auto_commit=auto_commit, commit_msg=msg)
+    # One batched commit for the whole stamp batch instead of one per quest.
+    save_many(
+        list(quests),
+        commit_msg or f"court: stamp batch onto {cogship_id}",
+        auto_commit=auto_commit,
+        court_root=root,
+    )
     return cogship_id
 
 
@@ -233,6 +239,27 @@ def _load_from_path(p: Path) -> Quest:
     return Quest.from_markdown(p.read_text(encoding="utf-8"))
 
 
+def _write(quest: Quest, root: Path) -> list[Path]:
+    """Persist a quest/epic file (plus any new event-log entries) WITHOUT
+    committing. Returns the list of paths that changed on disk."""
+    p = path_for(quest, root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    ev_path = eventlog.events_path_for(p)
+    prior_events = eventlog.read_events(ev_path)
+    prior_quest = eventlog.fold_events(prior_events, quest.id, quest.kind) if prior_events else None
+    ts = quest.updated_at or now_iso()
+    new_events = eventlog.build_events_for_save(quest, prior_quest, ts)
+
+    paths_to_commit = [p]
+    if new_events:
+        eventlog.append_events(ev_path, new_events)
+        paths_to_commit.append(ev_path)
+
+    p.write_text(quest.to_markdown(), encoding="utf-8")
+    return paths_to_commit
+
+
 def save(
     quest: Quest,
     court_root: Optional[Path] = None,
@@ -251,20 +278,8 @@ def save(
             file=sys.stderr,
         )
         return p
-    p.parent.mkdir(parents=True, exist_ok=True)
 
-    ev_path = eventlog.events_path_for(p)
-    prior_events = eventlog.read_events(ev_path)
-    prior_quest = eventlog.fold_events(prior_events, quest.id, quest.kind) if prior_events else None
-    ts = quest.updated_at or now_iso()
-    new_events = eventlog.build_events_for_save(quest, prior_quest, ts)
-
-    paths_to_commit = [p]
-    if new_events:
-        eventlog.append_events(ev_path, new_events)
-        paths_to_commit.append(ev_path)
-
-    p.write_text(quest.to_markdown(), encoding="utf-8")
+    paths_to_commit = _write(quest, root)
 
     if auto_commit:
         msg = commit_msg or f"court: save {quest.id}"
@@ -273,6 +288,41 @@ def save(
             warning = res.get("warning") or res.get("stderr") or "unknown git error"
             print(f"WARNING: autocommit failed for {p.name}: {warning}", file=sys.stderr)
     return p
+
+
+def save_many(
+    quests: Iterable[Quest],
+    commit_msg: str,
+    auto_commit: bool = True,
+    court_root: Optional[Path] = None,
+) -> list[Quest]:
+    """Batched save (castle commit-noise fix): persist every quest, then make
+    ONE commit covering all changed files instead of one commit per quest.
+    Commit-noise was heaviest exactly here: convoy packing and levy sweeps
+    each minted 2N+ commits per run."""
+    root = court_root or get_court_root()
+    all_paths: list[Path] = []
+    saved: list[Quest] = []
+    warned_branches: set[str] = set()
+    for q in quests:
+        if auto_commit and not _commit_allowed_here(q, court_root=root):
+            current = _current_repo_branch(root.parent) or "(unknown/detached)"
+            if current not in warned_branches:
+                warned_branches.add(current)
+                print(
+                    f"WARNING: refusing to save from branch '{current}' (not a protected "
+                    f"trunk and not the quest's own branch); writing without commit.",
+                    file=sys.stderr,
+                )
+            no_commit = True
+        else:
+            no_commit = False
+        all_paths.extend(_write(q, root))
+        if not no_commit:
+            saved.append(q)
+    if auto_commit and all_paths:
+        git_ops.git_commit_paths(all_paths, commit_msg, cwd=root.parent)
+    return saved
 
 
 def load(quest_id: str, court_root: Optional[Path] = None) -> Quest:

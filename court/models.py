@@ -298,6 +298,11 @@ class Quest:
             return f"quest/{parent_short}/{short_id}-{slug}"
         return f"quest/{short_id}-{slug}"
 
+    @property
+    def is_hotfix(self) -> bool:
+        """True if tagged or designated as a fast-track hotfix."""
+        return "hotfix" in (self.tags or "").lower()
+
     def to_markdown(self) -> str:
         fm_lines = []
         for f in FRONTMATTER_FIELDS:
@@ -467,6 +472,31 @@ class Quest:
 
         if target_canonical == "tribute" and not subsections:
             return raw
+
+        # Bold-label fallback (parser-gap fix, 2026-09-13): the documented 5-part
+        # tribute embeds sections as bold label lines rather than headings — e.g.
+        # '**The Tally (Production & UI Verification Runbook):**' nested inside
+        # '### 2. Tribute'. Nine TRIBUTE_READY quests failed the deterministic
+        # gate with "missing: tally" purely because of this formatting split
+        # between the AGENTS.md 5-part template and this heading-only parser.
+        # Scan for bold-label section markers and capture until the next marker.
+        bold_label_re = re.compile(
+            r"^\s*\*\*\s*(?:the\s+)?(?P<name>ballad|tribute|tally|penance|audience|opinion|survey|map|dangers|plot)\b(?P<rest>[^*]*)\*\*",
+            re.IGNORECASE,
+        )
+        lines = raw.splitlines()
+        for i, line in enumerate(lines):
+            m = bold_label_re.match(line)
+            if not m or canonical_map.get(m.group("name").lower(), m.group("name").lower()) != target_canonical:
+                continue
+            buf = [re.sub(r"^\s*\*\*[^*]*\*\*\s*[:—\-]?\s*", "", line)]
+            for later in lines[i + 1:]:
+                if later.startswith("#") or bold_label_re.match(later):
+                    break
+                buf.append(later)
+            val = "\n".join(buf).strip()
+            if val and not _is_placeholder(val):
+                return val
 
         return ""
 

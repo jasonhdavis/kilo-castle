@@ -51,13 +51,32 @@ class TestDispatchNative(unittest.TestCase):
         self.assertTrue(mock_create_wt.called)
 
     def test_config_defaults_and_override(self):
-        # Default config
+        # Q455: DEFAULT_CONFIG is structural only — role models live solely in
+        # the manifest (.court/config.json); a missing role is a loud error.
+        with self.assertRaises(config.CourtConfigError):
+            config.get_model("serf", court_dir=self.court_dir)
+
+        # Manifest provides role models; loader surfaces them.
+        cfg_file = self.court_dir / "config.json"
+        cfg_file.write_text(json.dumps({
+            "models": {
+                "serf": "GLM-5.3-Flash",
+                "serf_provider": "openrouter",
+            },
+            "model_aliases": {"GLM-5.3-Flash": "openrouter/z-ai/glm-5.3-flash"},
+            "no_kilo_mode": False,
+        }), encoding="utf-8")
+
         cfg = config.load_config(self.court_dir)
         self.assertEqual(cfg["models"]["serf"], "GLM-5.3-Flash")
         self.assertFalse(cfg["no_kilo_mode"])
+        self.assertEqual(config.get_model("serf", court_dir=self.court_dir), "GLM-5.3-Flash")
+        self.assertEqual(
+            config.canonical_model_id("GLM-5.3-Flash", court_dir=self.court_dir),
+            "openrouter/z-ai/glm-5.3-flash",
+        )
 
         # Override via config.json
-        cfg_file = self.court_dir / "config.json"
         cfg_file.write_text(json.dumps({
             "models": {
                 "serf": "claude-3-5-sonnet",
@@ -70,6 +89,7 @@ class TestDispatchNative(unittest.TestCase):
         self.assertEqual(cfg_custom["models"]["serf"], "claude-3-5-sonnet")
         self.assertEqual(cfg_custom["models"]["serf_provider"], "anthropic")
         self.assertTrue(cfg_custom["no_kilo_mode"])
+        self.assertEqual(config.get_model("serf", court_dir=self.court_dir), "claude-3-5-sonnet")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ Follow the Charter Protocol in `.kilo/prompts/steward.md` §"Charter":
 1. **Load and Inspect the Quest**:
    - Run `python3 -m court.cli show <id>`. It may be in `OPEN` (newly created via `/quest`).
    - **Out-of-Character Check**: Ensure `# The Kingdom Requires` and `# Expected Tribute` are written **100% out of character** in clean, domain-accurate engineering language with zero Castle/Court roleplay metaphors.
+   - **Data-Mutation Dry-Run Gate (mandatory when relevant)**: if the Quest's code will create/mutate/backfill data at scale (data migrations, bulk updates, backfills, batch/scheduled jobs, external syncs, index rebuilds), `Expected Tribute` MUST include a dry-run gate BEFORE any full write: a dry-run/limited run against real data recording exact affected-row counts, expected-vs-matched counts (match rate %), and a sample of unexpected misses — cross-checked via the castle's read-only verification harness (`harness.command` in `.court/config.json`, e.g. the ROQ harness in pb-app). The gate is chartered UP FRONT, never retrofitted after a write run.
 
 2. **Charter in One Command (fold notes → advance to PLANNED → compute branch)**:
    - The old two-invocation pre-dispatch plumbing (`set-section --append` + `advance PLANNED`) is replaced by the composite command:
@@ -37,3 +38,4 @@ Follow the Charter Protocol in `.kilo/prompts/steward.md` §"Charter":
 5. **Report to M'Lord**:
    - Confirm the Serf is toiling at Working (rendered with `status_label()` as Working).
    - **Look-ahead**: Note what is ready for `/levy` next.
+   - **Fire-and-forget**: end the turn after reporting what is running (session id, worktree, logs), what triggers the next step (`/levy` once the Serf reports done), and an offer to pull a status update later — no polling, no waiting.

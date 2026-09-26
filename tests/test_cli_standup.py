@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from court import store
+from court import config
 from court.cli import (
     build_serf_task_prompt,
     cmd_charter,
@@ -227,7 +228,9 @@ class TestCliStandup(unittest.TestCase):
         self.assertIn("--agent", cmd_called)
         self.assertIn("master_of_coin", cmd_called)
         self.assertIn("--model", cmd_called)
-        self.assertIn("openrouter/google/gemma-4-31b-it", cmd_called)
+        # Q455: role models resolve only from the manifest — assert the resolved
+        # value, never a hardcoded ID.
+        self.assertIn(config.get_model("master_of_coin"), cmd_called)
         q = store.load("Q123-Core-Standup", court_root=self.court_dir)
         self.assertEqual(q.master_of_coin_session_id, "ses_coin_999")
 
@@ -251,18 +254,85 @@ class TestCliStandup(unittest.TestCase):
         fake_bin.chmod(0o755)
 
         with patch("court.cli.find_kilo_binary", return_value=fake_bin):
-            with patch("court.cli.query_latest_kilo_session_id", return_value="ses_goad_777"):
-                with patch("court.store.find_path") as mock_find:
-                    mock_find.return_value = self.quests_dir / "Q123-Core-Standup.md"
-                    rc = main(["goad", "Q123-Core-Standup", "--no-commit"])
+            with patch("court.cli.query_kilo_session_ids", return_value={"ses_old_1"}) as mock_query_ids:
+                with patch("court.cli.query_latest_kilo_session_id", return_value="ses_goad_777") as mock_query_latest:
+                    with patch("court.store.find_path") as mock_find:
+                        mock_find.return_value = self.quests_dir / "Q123-Core-Standup.md"
+                        rc = main(["goad", "Q123-Core-Standup", "--no-commit"])
 
         self.assertIn(rc, (0, None))
         self.assertTrue(mock_popen.called)
+        self.assertTrue(mock_query_ids.called)
+        mock_query_latest.assert_called_once_with(wt_path.resolve(), timeout_seconds=2.5, exclude_ids={"ses_old_1"})
         cmd_called = mock_popen.call_args[0][0]
         self.assertIn("--agent", cmd_called)
         self.assertIn("serf", cmd_called)
         q = store.load("Q123-Core-Standup", court_root=self.court_dir)
         self.assertEqual(q.serf_session_id, "ses_goad_777")
+
+    @patch("court.cli.subprocess.Popen")
+    def test_standup_kilo_session_excludes_pre_existing_sessions(self, mock_popen):
+        """Verify standup_kilo_session passes pre-existing session IDs to exclude_ids."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+        mock_popen.return_value = mock_proc
+
+        wt_dir = self.tmp_path / "worktree_pre_existing"
+        wt_dir.mkdir(parents=True)
+        fake_bin = self.tmp_path / "kilo"
+        fake_bin.write_text("#!/bin/sh\nexit 0", encoding="utf-8")
+        fake_bin.chmod(0o755)
+
+        with patch("court.cli.query_kilo_session_ids", return_value={"ses_moc_prev"}) as mock_query_ids:
+            with patch("court.cli.query_latest_kilo_session_id", return_value="ses_gatekeeper_new") as mock_query_latest:
+                res = standup_kilo_session(
+                    worktree_path=wt_dir,
+                    agent="gatekeeper",
+                    model="openrouter/google/gemma-4-31b-it",
+                    prompt="Do gatekeeping",
+                    title="Gatekeeper Test",
+                    kilo_bin=fake_bin,
+                    run_now=True,
+                )
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["session_id"], "ses_gatekeeper_new")
+        self.assertTrue(mock_query_ids.called)
+        mock_query_latest.assert_called_once_with(wt_dir, timeout_seconds=2.5, exclude_ids={"ses_moc_prev"})
+
+    @patch("court.cli.standup_kilo_session")
+    @patch("court.store.get_court_root")
+    def test_collect_standup_solo(self, mock_court_root, mock_standup):
+        """Verify court collect --standup on solo quest sets gatekeeper session ID."""
+        mock_court_root.return_value = self.court_dir
+        wt_path = self.tmp_path / "wt_collect"
+        wt_path.mkdir(parents=True)
+        self.quest.worktree = str(wt_path)
+        self.quest.status = "TRIBUTE_READY"
+        self.quest.body_sections["Master of Coin's Audit"] = "### Master of Coin Audit\n- **Verdict**: PASS\n"
+        store.save(self.quest, court_root=self.court_dir, auto_commit=False)
+
+        fake_bin = self.tmp_path / "kilo"
+        fake_bin.write_text("#!/bin/sh\nexit 0", encoding="utf-8")
+        fake_bin.chmod(0o755)
+
+        mock_standup.return_value = {
+            "ok": True,
+            "mode": "cli",
+            "session_id": "ses_gk_456",
+            "log": str(wt_path / ".kilo" / "gatekeeper.log"),
+        }
+
+        with patch("court.cli.find_kilo_binary", return_value=fake_bin):
+            with patch("court.ward.audit_quest") as mock_audit:
+                mock_audit.return_value = MagicMock(violations=[], git_status={"dirty": False})
+                rc = main(["collect", "Q123-Core-Standup", "--standup", "--no-commit"])
+
+        self.assertIn(rc, (0, None))
+        q = store.load("Q123-Core-Standup", court_root=self.court_dir)
+        self.assertEqual(q.status, "GATE")
+        self.assertEqual(q.gatekeeper_session_id, "ses_gk_456")
+        self.assertTrue(mock_standup.called)
 
 
 class TestAgentDefinitions(unittest.TestCase):

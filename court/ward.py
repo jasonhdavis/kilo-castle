@@ -704,6 +704,7 @@ def sync_tribute_from_worktree(
     worktree_path: Optional[Path | str] = None,
     cwd: Optional[Path | str] = None,
     court_root: Optional[Path] = None,
+    auto_commit: bool = True,
 ) -> tuple[bool, str]:
     """Auto-sync `# Tribute Rendered`, `# Expected Tribute`, and frontmatter from a worktree into master quest file."""
     wt = None
@@ -756,6 +757,21 @@ def sync_tribute_from_worktree(
         modified = True
         notes.append("Synced Expected Tribute")
 
+    # Worktree-side audit paperwork (Master of Coin verdict, Gatekeeper/Cogship
+    # log) is written into the worktree's own quest copy; without this sync it
+    # never reaches castle's master file and the two copies diverge.
+    for section_name in ("Master of Coin's Audit", "Cogship Log"):
+        wt_section = wt_quest.body_sections.get(section_name, "").strip()
+        master_section = quest.body_sections.get(section_name, "").strip()
+        if (
+            wt_section
+            and not _is_placeholder_or_empty(wt_section)
+            and wt_section != master_section
+        ):
+            quest.body_sections[section_name] = wt_section
+            modified = True
+            notes.append(f"Synced {section_name}")
+
     _legacy_status_aliases = {"REVIEW": "TRIBUTE_READY"}
     _forward_sync_order = {
         "OPEN": 0,
@@ -765,13 +781,15 @@ def sync_tribute_from_worktree(
         "QUESTING": 3,
         "WORKING": 3,
         "TRIBUTE_READY": 4,
+        "GATE": 5,
+        "READY_TO_RAZE": 6,
     }
     wt_status_raw = (wt_quest.status or "").strip()
     wt_status = _legacy_status_aliases.get(wt_status_raw, wt_status_raw)
     current_rank = _forward_sync_order.get(quest.status, -1)
     wt_rank = _forward_sync_order.get(wt_status, -1)
     if (
-        quest.status in ("CHARTERED", "DISPATCHED", "QUESTING", "WORKING")
+        quest.status in ("CHARTERED", "DISPATCHED", "QUESTING", "WORKING", "TRIBUTE_READY", "GATE")
         and wt_rank > current_rank
         and wt_status in STATUSES
     ):

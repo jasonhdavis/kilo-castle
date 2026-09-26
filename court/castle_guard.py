@@ -24,10 +24,28 @@ EXEMPTIONS
  * Commits on any non-`castle` branch (Serf quest worktrees, gatehouse
    convoy worktrees, ward/epic branches) are never subject to this guard.
 
+PUSH POLICY (pre-push)
+======================
+Pipeline-internal refs never leave the local machine, and the trunk mirror
+on a hosted remote can only ever track the real local `castle`:
+
+ * Local-path remotes (`git push . HEAD:<branch>`, worktree-to-worktree
+   sync) are always allowed — the Master of Coin's local sync-back depends
+   on this.
+ * On hosted (URL) remotes:
+   * Pushing any `quest/*`, `scout/*`, or `the-gatehouse/*` branch to a
+     hosted remote is rejected — pipeline internals are local-only
+     (cogship incident: a quest branch pushed straight onto origin/castle).
+   * Updating a hosted `castle` ref from anything other than the local
+     `castle` branch is rejected (no branch laundering onto the trunk ref).
+   * Non-fast-forward updates of a hosted `castle` ref (history rewrites)
+     are rejected; fast-forward realignment and first creation are allowed.
+
 ENFORCEMENT POINTS
 ==================
 * `.githooks/pre-commit`         — plain `git commit` on `castle`.
 * `.githooks/pre-merge-commit`   — non-fast-forward `git merge` into `castle`.
+* `.githooks/pre-push`           — pipeline-ref / trunk-mirror push policy.
 * `castle_guard.py audit-castle` — post-hoc history scan that also catches
   `git commit --no-verify` bypasses.
 
@@ -77,6 +95,14 @@ SERF_ONLY_BLACKLIST: tuple[str, ...] = (
 
 GATEHOUSE_PREFIX: str = "the-gatehouse/"
 GUARDED_BRANCHES: tuple[str, ...] = ("castle",)
+
+# Branch namespaces that exist only inside the local machine (Serf quest
+# worktrees, scout spikes, ephemeral gatehouse convoys). They must never be
+# pushed to a hosted remote.
+PIPELINE_REF_PREFIXES: tuple[str, ...] = ("quest/", "scout/", GATEHOUSE_PREFIX)
+
+TRUNK_BRANCH: str = "castle"
+ZERO_SHA: str = "0" * 40
 
 WHITELIST = "whitelist"
 BLACKLIST = "blacklist"
@@ -339,6 +365,131 @@ def audit_castle(cwd: Optional[Path] = None, max_count: int = 50) -> list[dict]:
     return violations
 
 
+def is_local_remote_url(url: str) -> bool:
+    """True when a push destination is a local path (same repo, another
+    worktree, or a file:// URL). Local sync between local refs is always
+    permitted — only hosted (URL) remotes are subject to the push policy."""
+    u = (url or "").strip()
+    if not u:
+        return True
+    if u.startswith("file://"):
+        return True
+    if u in (".", ".."):
+        return True
+    if u.startswith(("/", "./", "../")):
+        return True
+    return False
+
+
+def _short_ref(ref: str) -> str:
+    for prefix in ("refs/heads/", "refs/tags/"):
+        if ref.startswith(prefix):
+            return ref[len(prefix):]
+    return ref
+
+
+def evaluate_pre_push(
+    lines: Iterable[str],
+    remote_url: str,
+    cwd: Optional[Path] = None,
+) -> dict:
+    """Evaluate a `pre-push` stdin payload (one `<local-ref> <local-sha>
+    <remote-ref> <remote-sha>` line per pushed ref) against the push policy.
+
+    Local-path remotes are always allowed. Hosted remotes reject pushes of
+    pipeline-internal branches (quest/*, scout/*, the-gatehouse/*), any
+    update of the hosted `castle` ref from a non-castle local branch, and
+    non-fast-forward rewrites of the hosted `castle` ref.
+    """
+    if is_local_remote_url(remote_url):
+        return _decision(True, f"local remote ({remote_url or 'local path'}) — push policy not applied")
+
+    offenders: list[dict] = []
+    for line in lines:
+        parts = str(line).split()
+        if len(parts) == 4:
+            src_ref, src_sha, dst_ref, dst_sha = parts
+        elif len(parts) == 2:
+            src_ref, src_sha, dst_ref, dst_sha = "", "", parts[0], parts[1]
+        else:
+            continue
+
+        src_name = _short_ref(src_ref) if src_ref else ""
+        dst_name = _short_ref(dst_ref)
+
+        if not src_ref:  # remote ref deletion
+            if dst_name == TRUNK_BRANCH or dst_name.startswith(PIPELINE_REF_PREFIXES):
+                offenders.append(
+                    {
+                        "path": f"delete {dst_name}",
+                        "verdict": BLACKLIST,
+                        "why": "deleting a pipeline-internal or trunk ref on a hosted remote is forbidden",
+                    }
+                )
+            continue
+
+        if src_ref.startswith("refs/heads/") and src_name.startswith(PIPELINE_REF_PREFIXES):
+            offenders.append(
+                {
+                    "path": f"{src_name} -> {dst_name}",
+                    "verdict": BLACKLIST,
+                    "why": "pipeline-internal branches (quest/*, scout/*, the-gatehouse/*) never leave the local machine",
+                }
+            )
+            continue
+
+        if dst_name == TRUNK_BRANCH:
+            if src_name != TRUNK_BRANCH:
+                offenders.append(
+                    {
+                        "path": f"{src_name or src_sha[:12]} -> {dst_name}",
+                        "verdict": BLACKLIST,
+                        "why": "only the local castle branch may update a hosted castle ref (no branch laundering onto the trunk)",
+                    }
+                )
+                continue
+            if dst_sha != ZERO_SHA:
+                rc, _, _ = _git(
+                    ["merge-base", "--is-ancestor", dst_sha, src_sha], cwd
+                )
+                if rc != 0:
+                    offenders.append(
+                        {
+                            "path": f"{src_name} -> {dst_name}",
+                            "verdict": BLACKLIST,
+                            "why": "non-fast-forward rewrite of a hosted castle ref is forbidden (fast-forward realignment only)",
+                        }
+                    )
+
+    if offenders:
+        return _decision(
+            False,
+            "push rejected by castle push guard: pipeline refs are local-only "
+            "and hosted castle may only fast-forward from local castle. "
+            "Promotion is local (git merge the-gatehouse/<cogship> --ff-only); "
+            "remote synchronization and deployment belong to the Steward/human.",
+            offenders,
+        )
+    return _decision(True, "all pushed refs satisfy the castle push policy")
+
+
+def run_pre_push_hook(
+    remote_name: Optional[str],
+    stdin_lines: Optional[list[str]] = None,
+    cwd: Optional[Path] = None,
+    url_fallback: Optional[str] = None,
+) -> dict:
+    """Resolve the push destination URL and evaluate the pre-push payload."""
+    if stdin_lines is None:
+        raw = "" if sys.stdin.isatty() else sys.stdin.read()
+        stdin_lines = [ln for ln in raw.splitlines() if ln.strip()]
+    url = remote_name or url_fallback or ""
+    if remote_name:
+        rc, out, _ = _git(["remote", "get-url", remote_name], cwd)
+        url = out.strip() if rc == 0 and out.strip() else (url_fallback or remote_name)
+    return evaluate_pre_push(stdin_lines or [], url, cwd=cwd)
+
+
 def _repo_config_get(key: str, cwd: Optional[Path] = None) -> str:
     rc, out, _ = _git(["config", "--get", key], cwd)
     return out.strip() if rc == 0 else ""
@@ -360,6 +511,11 @@ def status(cwd: Optional[Path] = None) -> int:
     print(f"core.hooksPath   : {hooks_path or '(unset — guard INERT)'}")
     print(f"guard module     : {engine}")
     print(f"guarded branches : {', '.join(GUARDED_BRANCHES)}")
+    print(
+        "push policy      : pipeline refs ("
+        + ", ".join(PIPELINE_REF_PREFIXES)
+        + ") local-only; hosted castle fast-forward-from-castle only"
+    )
     live_gatehouses = gatehouse_branches(cwd)
     print(
         f"gatehouse prefix : {GATEHOUSE_PREFIX}* "
@@ -387,7 +543,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_hook = sub.add_parser("hook", help="hook entry point (used by .githooks/*)")
-    p_hook.add_argument("hook_name", choices=["pre-commit", "pre-merge-commit"])
+    p_hook.add_argument("hook_name", choices=["pre-commit", "pre-merge-commit", "pre-push"])
+    p_hook.add_argument(
+        "remote", nargs="?", default=None, help="remote name or URL (pre-push only)"
+    )
+    p_hook.add_argument(
+        "remote_url", nargs="?", default=None, help="remote URL (pre-push $2, informational)"
+    )
 
     p_check = sub.add_parser("check-commit", help="evaluate an existing commit against the castle policy")
     p_check.add_argument("sha")
@@ -404,7 +566,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.cmd == "hook":
-        res = evaluate_pending_commit(hook_name=args.hook_name)
+        if args.hook_name == "pre-push":
+            res = run_pre_push_hook(
+                args.remote, url_fallback=getattr(args, "remote_url", None)
+            )
+        else:
+            res = evaluate_pending_commit(hook_name=args.hook_name)
         print(_fmt_decision(res))
         return 0 if res["allowed"] else 1
     if args.cmd == "check-commit":

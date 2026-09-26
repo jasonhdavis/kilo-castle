@@ -1,0 +1,4 @@
+#!/bin/sh
+# Castle guard: pipeline refs (quest/*, scout/*, the-gatehouse/*) never leave
+# the machine; hosted castle fast-forwards only from local castle.
+exec python3 -m court.castle_guard hook pre-push "$@"

@@ -5,12 +5,19 @@ wrappers that return plain dicts/booleans.
 """
 from __future__ import annotations
 
+import fcntl
+import json
 import re
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+from . import migration_graph
+from .config import get_suite_command
 
 # Short-TTL process-level cache for the two most repeated git lookups
 # (`rev-parse --show-toplevel` and `worktree list`). A single levy/collect run
@@ -45,13 +52,28 @@ _CONFLICT_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 _HISTORY_ROW_RE = re.compile(r"^\|\s*([0-9T:\-Z]+)\s*\|.*\|\s*$")
+_LEDGER_BULLET_ROW_RE = re.compile(r"^[-*]\s+\*\*\[?\(?([0-9T:\-Z]+)\)?\]?\*\*\s*[—:-]")
+
+
+def _ledger_row_timestamp(line: str) -> Optional[str]:
+    m = _HISTORY_ROW_RE.match(line)
+    if m:
+        return m.group(1)
+    m = _LEDGER_BULLET_ROW_RE.match(line)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _is_ledger_row(line: str) -> bool:
+    return _ledger_row_timestamp(line) is not None
 
 
 def _reconcile_history_only_conflict(path: Path) -> bool:
     """For a Quest/Epic ledger file conflicted *only* in its History-table
-    rows and/or its `updated_at:` frontmatter line, resolve by taking the
-    union of both sides' History rows (deduped, sorted by timestamp) and the
-    later `updated_at`."""
+    rows / bulleted Castle Ledger rows and/or its `updated_at:` frontmatter
+    line, resolve by taking the union of both sides' rows (deduped, sorted by
+    timestamp) and the later `updated_at`."""
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -73,9 +95,9 @@ def _reconcile_history_only_conflict(path: Path) -> bool:
             return f"updated_at: {max(ours_ts, theirs_ts)}"
 
         all_rows = [l for l in ours_lines + theirs_lines if l.strip()]
-        if all_rows and all(_HISTORY_ROW_RE.match(l) for l in all_rows):
+        if all_rows and all(_is_ledger_row(l) for l in all_rows):
             merged = list(dict.fromkeys(ours_lines + theirs_lines))
-            merged.sort(key=lambda l: _HISTORY_ROW_RE.match(l).group(1))
+            merged.sort(key=lambda l: _ledger_row_timestamp(l) or "")
             return "\n".join(merged)
 
         return None
@@ -740,6 +762,56 @@ def run_test_command(worktree_path: str, test_cmd: str, timeout: int = 600) -> d
     return result
 
 
+# Court-wide write lock (castle-contention fix, 2026-09-13): every mutating
+# court operation (advance, collect, coin sync-back, raze, stamp...) shares one
+# checkout of the repo root. Concurrent writers collided on git's index.lock
+# and on each other's dirty tree. This advisory flock serializes them cleanly;
+# read paths never take it.
+_COURT_LOCK_NAME = ".court/.write.lock"
+_COURT_LOCK_TIMEOUT = 180
+_lock_depth = 0
+_lock_depth_guard = threading.Lock()
+
+
+@contextmanager
+def court_write_lock(timeout: int = _COURT_LOCK_TIMEOUT, cwd: Optional[Path | str] = None):
+    """Exclusive advisory lock over all castle paperwork mutations. Re-entrant
+    within a process (nested callers no-op) so a held batch lock can safely
+    wrap inner git_commit_paths calls."""
+    global _lock_depth
+    with _lock_depth_guard:
+        _lock_depth += 1
+        outermost = _lock_depth == 1
+    f = None
+    try:
+        if outermost:
+            root = get_repo_root(cwd)
+            lock_path = root / _COURT_LOCK_NAME
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            f = open(lock_path, "a+")
+            deadline = time.time() + timeout
+            while True:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.time() > deadline:
+                        raise TimeoutError(
+                            f"court write lock still held by another process after {timeout}s "
+                            f"({lock_path}) — another Court role is mid-write; retry shortly"
+                        )
+                    time.sleep(0.1)
+        yield
+    finally:
+        if f is not None:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            finally:
+                f.close()
+        with _lock_depth_guard:
+            _lock_depth -= 1
+
+
 def can_fast_forward(worktree_path: str, base_branch: str = "castle") -> dict:
     p = Path(worktree_path)
     fetch = _run(["git", "fetch", "origin", base_branch], p, timeout=60)
@@ -786,6 +858,10 @@ def rebase_worktree_onto_base(
         return result
 
     behind_res = _run(["git", "rev-list", "--count", f"HEAD..{base_branch}"], p)
+    before_behind = None
+    if behind_res.get("ok") and behind_res.get("stdout", "").strip().isdigit():
+        before_behind = int(behind_res["stdout"].strip())
+    result["before_behind"] = before_behind
     if behind_res.get("ok") and behind_res.get("stdout", "").strip() == "0":
         result["ok"] = True
         result["already_current"] = True
@@ -795,6 +871,7 @@ def rebase_worktree_onto_base(
     if merge_res.get("ok"):
         result["ok"] = True
         result["merged"] = True
+        result["after_behind"] = 0
         return result
 
     conflict_res = _run(["git", "diff", "--name-only", "--diff-filter=U"], p)
@@ -836,6 +913,7 @@ def rebase_worktree_onto_base(
                     result["merged"] = True
                     result["conflict"] = False
                     result["conflicting_files"] = []
+                    result["after_behind"] = 0
                     return result
         conflict_files = remaining_conflicts
 
@@ -870,6 +948,7 @@ def rebase_worktree_onto_base(
                     result["merged"] = True
                     result["conflict"] = False
                     result["conflicting_files"] = []
+                    result["after_behind"] = 0
                     return result
         conflict_files = remaining_after_union
 
@@ -907,58 +986,59 @@ def git_commit_paths(
 ) -> dict:
     """Stage and commit specific file paths atomically without touching other files."""
     p = cwd or get_repo_root()
-    if isinstance(paths, (str, Path)):
-        path_list = [Path(paths)]
-    else:
-        path_list = [Path(x) for x in paths]
+    with court_write_lock(cwd=p):
+        if isinstance(paths, (str, Path)):
+            path_list = [Path(paths)]
+        else:
+            path_list = [Path(x) for x in paths]
 
-    diff_before = _run(["git", "diff", "--cached", "--name-only"], p)
-    staged_prior = [
-        line.strip() for line in diff_before.get("stdout", "").splitlines() if line.strip()
-    ] if diff_before.get("ok") else []
+        diff_before = _run(["git", "diff", "--cached", "--name-only"], p)
+        staged_prior = [
+            line.strip() for line in diff_before.get("stdout", "").splitlines() if line.strip()
+        ] if diff_before.get("ok") else []
 
-    unstage_needed = bool(staged_prior)
+        unstage_needed = bool(staged_prior)
 
-    rel_paths = []
-    for target in path_list:
-        try:
-            rel = target.relative_to(p)
-            rel_paths.append(str(rel))
-        except ValueError:
-            rel_paths.append(str(target))
+        rel_paths = []
+        for target in path_list:
+            try:
+                rel = target.relative_to(p)
+                rel_paths.append(str(rel))
+            except ValueError:
+                rel_paths.append(str(target))
 
-    add_res = _run(["git", "add", "--"] + rel_paths, p)
-    if not add_res.get("ok"):
+        add_res = _run(["git", "add", "--"] + rel_paths, p)
+        if not add_res.get("ok"):
+            return {
+                "ok": False,
+                "exit_code": add_res.get("exit_code"),
+                "stdout": add_res.get("stdout", ""),
+                "stderr": add_res.get("stderr", ""),
+                "cmd": add_res.get("cmd", ""),
+            }
+
+        commit_res = _run(["git", "commit", "-m", commit_msg, "--"] + rel_paths, p)
+        out_stdout = commit_res.get("stdout", "")
+        out_stderr = commit_res.get("stderr", "")
+
+        if unstage_needed and commit_res.get("ok"):
+            _run(["git", "restore", "--staged", "."], p)
+
+        is_no_changes = (
+            "nothing to commit" in out_stdout.lower()
+            or "nothing to commit" in out_stderr.lower()
+            or "no changes added to commit" in out_stdout.lower()
+            or "no changes added to commit" in out_stderr.lower()
+        )
+
         return {
-            "ok": False,
-            "exit_code": add_res.get("exit_code"),
-            "stdout": add_res.get("stdout", ""),
-            "stderr": add_res.get("stderr", ""),
-            "cmd": add_res.get("cmd", ""),
+            "ok": commit_res.get("ok") or is_no_changes,
+            "no_changes": is_no_changes,
+            "exit_code": commit_res.get("exit_code"),
+            "stdout": out_stdout,
+            "stderr": out_stderr,
+            "cmd": commit_res.get("cmd", ""),
         }
-
-    commit_res = _run(["git", "commit", "-m", commit_msg, "--"] + rel_paths, p)
-    out_stdout = commit_res.get("stdout", "")
-    out_stderr = commit_res.get("stderr", "")
-
-    if unstage_needed and commit_res.get("ok"):
-        _run(["git", "restore", "--staged", "."], p)
-
-    is_no_changes = (
-        "nothing to commit" in out_stdout.lower()
-        or "nothing to commit" in out_stderr.lower()
-        or "no changes added to commit" in out_stdout.lower()
-        or "no changes added to commit" in out_stderr.lower()
-    )
-
-    return {
-        "ok": commit_res.get("ok") or is_no_changes,
-        "no_changes": is_no_changes,
-        "exit_code": commit_res.get("exit_code"),
-        "stdout": out_stdout,
-        "stderr": out_stderr,
-        "cmd": commit_res.get("cmd", ""),
-    }
 
 
 def check_proof_of_landing(quest: Any, cwd: Optional[Path | str] = None) -> dict:
@@ -1014,6 +1094,125 @@ def check_proof_of_landing(quest: Any, cwd: Optional[Path | str] = None) -> dict
         "proofs": found_proofs,
         "proof_count": len(found_proofs),
     }
+
+
+def resolve_branch_tip(branch: str, cwd: Optional[Path | str] = None) -> Optional[str]:
+    tip = _run(["git", "rev-parse", "--verify", f"refs/heads/{branch}"], get_repo_root(cwd))
+    if tip.get("ok") and tip.get("stdout"):
+        return tip["stdout"].strip()
+    return None
+
+
+_PRODUCTION_FILE_EXCLUDES = (".court/", "tasks/")
+
+
+def verify_quest_promotion(
+    branch: str,
+    trunk: str = "castle",
+    require_code: bool = True,
+    cwd: Optional[Path | str] = None,
+) -> dict:
+    """cogship-076/077 promotion-integrity check (three-layer incident, 2026-09-13).
+
+    Verifies the promotion claim for one Quest's branch, direction-aware:
+      1. BRANCH-TIP ancestry: the quest branch TIP itself (not an arbitrary
+         --verified-commit) must be an ancestor of the trunk. Cogship-077's
+         partially-packed convoy passed the old check because *some* commit
+         was reachable from castle while three manifest branches were never
+         merged at all.
+      2. Production-content presence on the branch: the branch's diff vs its
+         merge-base with the trunk must contain at least one non-bookkeeping
+         file (anything outside .court/ and tasks/). Cogship-076's "promotion"
+         was a backwards merge (castle -> convoy) whose diffstat was pure
+         .court/ bookkeeping — the old ancestry check passed mechanically.
+
+    Returns {ok, branch, tip, is_ancestor, production_files, bookkeeping_files, reason}.
+    """
+    result: dict = {
+        "ok": False, "branch": branch, "tip": None, "is_ancestor": False,
+        "production_files": [], "bookkeeping_files": [], "reason": None,
+    }
+    root = get_repo_root(cwd)
+    tip = resolve_branch_tip(branch, root)
+    if not tip:
+        result["reason"] = f"branch '{branch}' does not resolve — cannot verify any promotion claim"
+        return result
+    result["tip"] = tip
+
+    anc = _run(["git", "merge-base", "--is-ancestor", tip, trunk], root)
+    result["is_ancestor"] = anc.get("exit_code") == 0
+    if not result["is_ancestor"]:
+        result["reason"] = (
+            f"branch tip {tip[:12]} is NOT an ancestor of {trunk} — the branch was never "
+            f"promoted (a backwards castle->convoy merge or a partial pack leaves it outside)"
+        )
+        return result
+
+    if require_code:
+        # Branch-unique commits (by patch-id): '+' means the patch is NOT in
+        # trunk, '-' means an equivalent patch is present there.
+        cherry = _run(["git", "cherry", trunk, tip], root)
+        lines = [l for l in cherry.get("stdout", "").splitlines() if l.strip()]
+        plus = [l[1:].strip() for l in lines if l.startswith("+")]
+        minus = [l[1:].strip() for l in lines if l.startswith("-")]
+
+        if plus:
+            # Not patch-equivalent in trunk. Allow the squash-merge case: the
+            # squashed commit's patch-id differs, but if the files the branch
+            # touches are content-identical in trunk, the code did land.
+            plus_files_res = _run(["git", "log", "--name-only", "--pretty=format:", *plus], root)
+            plus_files = sorted({l.strip() for l in plus_files_res.get("stdout", "").splitlines() if l.strip()})
+            if plus_files:
+                same_res = _run(["git", "diff", "--quiet", tip, trunk, "--", *plus_files], root)
+                if same_res.get("exit_code") != 0:
+                    result["reason"] = (
+                        f"{len(plus)} branch commit(s) are NOT in {trunk} (not patch-equivalent, "
+                        f"files differ) — the branch was never promoted: {', '.join(c[:12] for c in plus[:3])}"
+                    )
+                    return result
+            else:
+                result["reason"] = f"{len(plus)} branch commit(s) are NOT in {trunk} — the branch was never promoted"
+                return result
+
+        # Production-content presence among the branch's own unique commits.
+        if minus:
+            files_res = _run(["git", "log", "--name-only", "--pretty=format:", *minus], root)
+            files = [l.strip() for l in files_res.get("stdout", "").splitlines() if l.strip()]
+        else:
+            # Shas preserved by the promotion (merge --no-ff or fast-forward):
+            # locate the promotion merge commit (second parent == tip) and use
+            # its first-parent diffstat; a pure fast-forward has none.
+            merges = _run(
+                ["git", "log", "--merges", "--ancestry-path", "--pretty=format:%H %P", f"{tip}..{trunk}"],
+                root,
+            )
+            promo_sha = None
+            for line in merges.get("stdout", "").splitlines():
+                parts = line.strip().split()
+                if len(parts) == 3 and parts[2] == tip:
+                    promo_sha = parts[0]
+                    break
+            if promo_sha:
+                diff_res = _run(["git", "diff", "--name-only", f"{promo_sha}^1", promo_sha], root)
+                files = [l.strip() for l in diff_res.get("stdout", "").splitlines() if l.strip()]
+            else:
+                # Fast-forward promotion: ancestry already proves content
+                # presence in trunk; nothing further to verify.
+                result["ok"] = True
+                return result
+
+        result["bookkeeping_files"] = [f for f in files if f.startswith(_PRODUCTION_FILE_EXCLUDES)]
+        result["production_files"] = [f for f in files if not f.startswith(_PRODUCTION_FILE_EXCLUDES)]
+        if not result["production_files"]:
+            result["reason"] = (
+                f"branch tip {tip[:12]} is reachable from {trunk} but carries ZERO production "
+                f"files (only bookkeeping: {', '.join(result['bookkeeping_files'][:5]) or 'none'}) "
+                "— this is bookkeeping drift, not a code promotion"
+            )
+            return result
+
+    result["ok"] = True
+    return result
 
 
 def create_git_worktree(
@@ -1122,3 +1321,230 @@ def check_charter_integrity(quest: Any, worktree_path: str | Path, base: str = "
         "violations": violations,
         "base_file_found": True,
     }
+
+
+_SUITE_PROOF_DIRNAME = ".court/suites"
+
+# Q377/cogship-082 (5th falsified-Gatekeeper incident): the Gatekeeper agent
+# claimed a unified suite pass that never ran — every attempt died on its
+# shell tool's 120-second timeout — and nothing engine-side could tell the
+# difference between a real run and quoted Tribute text. The suite must now
+# be executed BY the engine (`court runsuite`), which stamps a durable proof
+# file (command, HEAD sha, exit code, test counts, output tail) that the
+# READY_TO_RAZE gate independently re-verifies.
+
+_PYTEST_COUNT_RE = re.compile(r"(?<![\w.])(\d+)\s+passed(?:[,\s]|$)", re.MULTILINE)
+_DJANGO_RAN_RE = re.compile(r"Ran\s+(\d+)\s+tests?")
+
+
+def _suite_proof_path(cwd: Optional[Path | str] = None, cogship_id: str = "", quest_id: str = "") -> Optional[Path]:
+    root = get_repo_root(cwd)
+    name = (cogship_id or quest_id or "").strip()
+    if not name:
+        return None
+    return root / _SUITE_PROOF_DIRNAME / f"{name}.json"
+
+
+def _detect_suite_command(worktree_path: Path) -> str:
+    # Q455: the canonical unified integration suite command lives in the
+    # manifest (.court/config.json `suite.command` — the same value stamped
+    # into the cogship suite proofs). The manage.py/pytest probe below is only
+    # a fallback for castles whose manifest predates the suite block.
+    manifest_cmd = get_suite_command()
+    if manifest_cmd:
+        return manifest_cmd
+    if (worktree_path / "manage.py").exists():
+        return "python3 manage.py test"
+    return "python3 -m pytest -q"
+
+
+def run_unified_suite(
+    worktree_path: str | Path,
+    command: Optional[str] = None,
+    cogship_id: str = "",
+    quest_id: str = "",
+    timeout: int = 1800,
+    cwd: Optional[Path | str] = None,
+) -> dict:
+    """Run the unified integration suite in a worktree via the ENGINE (never an
+    agent's shell tool, whose short timeout is what falsified cogship-082) and
+    stamp durable proof to `.court/suites/<cogship-or-quest>.json`.
+
+    Q432: the suite's stage 1 is the DB-free migration-graph check
+    (`ROLE=web python manage.py makemigrations --check --dry-run`). Its
+    verdict is stamped as `migration_graph_ok` into the proof JSON, and a
+    failure makes the suite exit non-zero (exit code 2, vs the test
+    command's own code on test failures) — the 2026-09-14 v1383 deploy
+    failed on a same-parent migration fork invisible to git and to
+    per-quest test suites, so the graph must gate here too. On a graph
+    failure the expensive test battery is skipped (fail fast): a broken
+    graph is terminal for the convoy and its own test noise adds nothing.
+    """
+    p = Path(worktree_path)
+    result: dict = {
+        "ok": False,
+        "exit_code": None,
+        "proof_path": None,
+        "error": None,
+        "migration_graph_ok": None,
+    }
+    if not p.exists() or not p.is_dir():
+        result["error"] = f"worktree path does not exist: {worktree_path}"
+        return result
+
+    head_res = _run(["git", "rev-parse", "HEAD"], p)
+    head_sha = head_res.get("stdout", "").strip()
+
+    started = datetime.now(timezone.utc).isoformat()
+
+    # Stage 1 — migration-graph integrity (DB-free, seconds). Only applies to
+    # Django checkouts (manage.py present); a non-Django castle has no
+    # migration graph to verify, so the stage is not applicable there.
+    if (p / "manage.py").is_file():
+        graph = migration_graph.check_migration_graph(p)
+        migration_graph_ok = bool(graph.get("ok"))
+        result["migration_graph_ok"] = migration_graph_ok
+
+        if not migration_graph_ok:
+            finished = datetime.now(timezone.utc).isoformat()
+            graph_reason = graph.get("reason") or "unknown graph failure"
+            proof = {
+                "cogship_id": cogship_id or "",
+                "quest_id": quest_id or "",
+                "worktree": str(p),
+                "command": graph.get("command", migration_graph.MIGRATION_GRAPH_SHELL_COMMAND),
+                "head_sha": head_sha,
+                "exit_code": 2,
+                "ran_tests": None,
+                "migration_graph_ok": False,
+                "migration_graph_mode": graph.get("mode"),
+                "migration_graph_reason": graph_reason,
+                "started": started,
+                "finished": finished,
+                "output_tail": graph.get("output_tail", "")[-4000:],
+            }
+            proof_path = _suite_proof_path(cwd, cogship_id=cogship_id, quest_id=quest_id)
+            if proof_path:
+                proof_path.parent.mkdir(parents=True, exist_ok=True)
+                proof_path.write_text(json.dumps(proof, indent=2), encoding="utf-8")
+                result["proof_path"] = str(proof_path)
+            result.update({
+                "ok": False,
+                "exit_code": 2,
+                "ran_tests": None,
+                "head_sha": head_sha,
+                "command": proof["command"],
+                "error": f"migration graph preflight failed: {graph_reason}",
+            })
+            return result
+    else:
+        graph = {"mode": "not_applicable"}
+        result["migration_graph_ok"] = None
+
+    # Stage 2 — the test battery itself.
+    cmd_str = command or _detect_suite_command(p)
+    argv = cmd_str.split()
+    try:
+        proc = subprocess.run(argv, cwd=str(p), capture_output=True, text=True, timeout=timeout)
+        exit_code = proc.returncode
+        output = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+    except subprocess.TimeoutExpired as e:
+        exit_code = -1
+        output = f"suite run exceeded engine timeout ({timeout}s)"
+        if isinstance(e.stdout, str):
+            output += "\n" + e.stdout
+    except FileNotFoundError:
+        result["error"] = f"suite command not found: {argv[0]}"
+        return result
+    finished = datetime.now(timezone.utc).isoformat()
+
+    m_pytest = _PYTEST_COUNT_RE.search(output)
+    m_dj = _DJANGO_RAN_RE.search(output)
+    ran_tests = int(m_pytest.group(1)) if m_pytest else (int(m_dj.group(1)) if m_dj else None)
+
+    proof = {
+        "cogship_id": cogship_id or "",
+        "quest_id": quest_id or "",
+        "worktree": str(p),
+        "command": cmd_str,
+        "head_sha": head_sha,
+        "exit_code": exit_code,
+        "ran_tests": ran_tests,
+        "migration_graph_ok": result["migration_graph_ok"],
+        "migration_graph_mode": graph.get("mode"),
+        "started": started,
+        "finished": finished,
+        "output_tail": output[-4000:],
+    }
+
+    proof_path = _suite_proof_path(cwd, cogship_id=cogship_id, quest_id=quest_id)
+    if proof_path:
+        proof_path.parent.mkdir(parents=True, exist_ok=True)
+        proof_path.write_text(json.dumps(proof, indent=2), encoding="utf-8")
+        result["proof_path"] = str(proof_path)
+
+    result.update({
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "ran_tests": ran_tests,
+        "head_sha": head_sha,
+        "command": cmd_str,
+    })
+    return result
+
+
+def check_suite_proof(
+    cogship_id: str = "",
+    quest_id: str = "",
+    head_sha: str = "",
+    cwd: Optional[Path | str] = None,
+) -> dict:
+    """Independently verify a stamped suite proof: exit code 0, a real test
+    count, and a head_sha that is either the branch tip being promoted or an
+    ancestor of `castle` (i.e. the run covered the code that actually landed)."""
+    fail = {"ok": False, "valid": False, "reason": None, "proof": None}
+    candidates = []
+    for name in (cogship_id, quest_id):
+        name = (name or "").strip()
+        if name:
+            proof_path = _suite_proof_path(cwd, cogship_id="", quest_id=name)
+            if proof_path and proof_path.exists():
+                candidates.append(proof_path)
+    if not candidates:
+        fail["reason"] = (
+            f"no engine-stamped suite proof at {get_repo_root(cwd) / _SUITE_PROOF_DIRNAME}/"
+            f"<{cogship_id or quest_id}.json> — the unified suite was never run via "
+            "`court runsuite`; an agent's claim of a pass is not proof"
+        )
+        return fail
+    proof_path = candidates[0]
+    try:
+        proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        fail["reason"] = f"suite proof unreadable/corrupt: {e}"
+        return fail
+    fail["proof"] = {k: proof.get(k) for k in ("command", "head_sha", "exit_code", "ran_tests", "finished")}
+
+    if proof.get("exit_code") != 0:
+        fail["reason"] = f"suite proof shows exit_code={proof.get('exit_code')} (not a pass)"
+        return fail
+    if not proof.get("ran_tests"):
+        fail["reason"] = "suite proof contains no parsed test count — cannot confirm real tests ran"
+        return fail
+    if not proof.get("head_sha"):
+        fail["reason"] = "suite proof has no HEAD sha — cannot tie the run to any code"
+        return fail
+
+    if head_sha and proof["head_sha"] == head_sha:
+        return {"ok": True, "valid": True, "reason": None, "proof": fail["proof"]}
+
+    root = get_repo_root(cwd)
+    anc = _run(["git", "merge-base", "--is-ancestor", proof["head_sha"], "castle"], root)
+    if anc.get("exit_code") == 0:
+        return {"ok": True, "valid": True, "reason": None, "proof": fail["proof"]}
+
+    fail["reason"] = (
+        f"suite proof HEAD {proof['head_sha'][:12]} is neither the branch tip nor an "
+        "ancestor of castle — the suite did not run over the code being promoted"
+    )
+    return fail

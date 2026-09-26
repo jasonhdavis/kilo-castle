@@ -1,0 +1,3 @@
+#!/bin/sh
+# Castle guard: only the-gatehouse/* sources may merge into castle.
+exec python3 -m court.castle_guard hook pre-merge-commit "$@"

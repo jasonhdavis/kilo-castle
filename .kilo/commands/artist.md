@@ -49,3 +49,7 @@ Follow the Court Artist Protocol:
      - M'Lord provides visual direction directly to the Court Artist.
      - The Court Artist makes live template/view edits and prompts M'Lord to refresh the browser.
      - Once satisfied, the Court Artist commits the artwork, updates the Tally, and prepares the Quest for Master of Coin audit and Gatehouse collection.
+
+5. **Multiple UI Quests Pending? Route to the Atelier Instead**:
+   - If several small UI-review-pending Quests are stacked up, do NOT spawn one artist session per Quest — roll them into a single convoy review via `/atelier <QID1>,<QID2>,...` (`court atelier` merges the branches pre-integration-test and spawns one Court Artist on the merged convoy branch).
+   - The per-Quest `/artist` flow above remains the right tool for a single Quest.

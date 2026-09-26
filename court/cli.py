@@ -4295,6 +4295,15 @@ def cmd_timber(args):
         print("-" * 78)
 
 
+def cmd_ui(args):
+    from court import ui_server
+    if args.open:
+        import threading, webbrowser
+        threading.Timer(
+            0.8, lambda: webbrowser.open(f"http://127.0.0.1:{args.port}")).start()
+    ui_server.serve(port=args.port)
+
+
 def cmd_teardown_list(args):
     import json
     am_path = agent_manager_json_path()
@@ -5629,6 +5638,11 @@ def build_parser():
 
     p_teardown = sub.add_parser("teardown-list", help="List worktrees ready for M'Lord to prune")
     p_teardown.set_defaults(func=cmd_teardown_list)
+
+    p_ui = sub.add_parser("ui", help="Serve the localhost dev console (zero dependencies)")
+    p_ui.add_argument("--port", type=int, default=8300)
+    p_ui.add_argument("--open", action="store_true", help="Open the browser on start")
+    p_ui.set_defaults(func=cmd_ui)
 
     p_fork_teardown = sub.add_parser(
         "fork-teardown-list",

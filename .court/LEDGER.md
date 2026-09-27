@@ -581,6 +581,26 @@ sandbox flags).
 - Verified live: meta now returns ctx_limit 1310720 for the glm session.
   Committed with ledger.
 
+## 2026-09-27 13:24Z — pb-app root session prune (the real "100+ on castle" backlog)
+
+Royal report "still seeing over 100 sessions on castle": console trunk card renders
+sessionsFor(repo root) over the 200 most-recent sessions GLOBALLY — the castle card
+itself caps at 22 (kilo-castle DB total: 23 sessions, 0 stale — already clean from
+this morning's prune). The 100+ surface is the **pb-app `castle` trunk card**:
+pb-app ROOT directory held 3,556 sessions (historic serfs/gatekeepers/MoCs/stewards
+all parked at root), 3,325 stale >48h, **0 referenced in pb-app .court/.kilo
+paperwork**, 231 fresh protected (incl. the live pb-app steward session, 1.1h).
+
+Execution: `kilo session delete` (single-id yargs contract verified — batch form
+prints help, deletes nothing). Pass 1 xargs -P12 (10-min tool cap): 668 ok, 206
+contention failures. Persistent self-healing worker bgp_0e31b006900152KJFKlBHjRfHi
+(/var/folders/ry/qr45fv891c5bjk1ydwzh9bbr0000gn/T/kilo/pb_prune_loop.sh): recomputes
+the stale set each round (newest-stale-first so the trunk card empties visibly
+fast), xargs -P12, up to 30 rounds, DONE marker when remaining=0.
+Protections: 48h predicate keeps everything active paperwork cites; fresh pb-app
+steward/console sessions untouched; kilo-castle quest/ledger references checked
+both sides. Console card updates on its normal poll — no restart needed.
+
 ## 2026-09-27 12:38Z — Castle session prune + VACUUM completed (royal directive, dry-run gated)
 
 ROYAL PRUNE (>48h inactivity, castle branch): survey first caught a UNIT BUG —

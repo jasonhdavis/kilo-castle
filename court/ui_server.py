@@ -2,8 +2,11 @@
 
 Reads: .court quest files, git worktrees, the local kilo session DB (read-only),
 and the live process table. Mutating endpoints: /api/reap (terminates a process
-whose parent is a verified kilo process) and /api/mcp (flips the enabled flag of
-an inventoried MCP server in its own config file, with a .bak backup).
+whose parent is a verified kilo process), /api/mcp (flips the enabled flag of
+an inventoried MCP server in its own config file, with a .bak backup), and
+/api/annotation (appends one studio-annotation JSON line to the target
+worktree's .kilo/studio-annotations.jsonl; served CORS-open for the managed
+studio browser).
 """
 
 import glob
@@ -34,6 +37,7 @@ STATUS_ORDER = [
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Court Console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230d1117'/%3E%3Ctext x='32' y='53' font-size='48' text-anchor='middle' fill='%23ffb300' font-family='Georgia,serif'%3E%E2%99%9C%3C/text%3E%3C/svg%3E">
 <style>
 :root{
  --bg:#0d1117; --surface:#161b22; --surface-2:#1c2129; --edge:#2d333b;
@@ -55,8 +59,7 @@ header{display:flex;align-items:center;gap:14px;padding:0 20px;height:52px;
  background:var(--surface);border-bottom:1px solid var(--edge);box-shadow:var(--sh-1);z-index:2}
 .brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:13px;
  letter-spacing:.12em;text-transform:uppercase}
-.brand .glyph{width:26px;height:26px;border-radius:var(--r-md);display:grid;place-items:center;
- background:linear-gradient(135deg,#ffb300,#d29922);color:#1a1205;font-size:13px}
+.brand .glyph{display:grid;place-items:center;color:var(--primary);font-size:21px;line-height:1}
 .brand em{color:var(--primary);font-style:normal}
 .chip{display:inline-flex;align-items:center;gap:5px;padding:2px 10px;border-radius:999px;
  font-size:11px;font-weight:500;background:var(--surface-2);border:1px solid var(--edge);
@@ -98,6 +101,13 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
 .q .row1{display:flex;align-items:center;gap:7px;font-weight:500;font-size:12.5px}
 .q .row2{color:var(--dim);font-size:11px;margin-top:1px;white-space:nowrap;overflow:hidden;
  text-overflow:ellipsis}
+.qnum{font-family:ui-monospace,Menlo,monospace;font-size:14.5px;font-weight:700;
+ color:var(--primary);flex:none;letter-spacing:.02em}
+.qbadge{flex:none;font-size:8.5px;padding:1px 6px;border-radius:4px;font-weight:700;
+ letter-spacing:.1em;text-transform:uppercase;background:rgba(88,166,255,.1);
+ border:1px solid rgba(88,166,255,.35);color:var(--blue)}
+.qslug{color:var(--dim);font-size:11.5px;flex:1;min-width:0;overflow:hidden;
+ text-overflow:ellipsis;white-space:nowrap}
 .badge{font-size:9.5px;padding:1px 7px;border-radius:999px;background:rgba(248,81,73,.12);
  color:var(--red);font-weight:600;letter-spacing:.06em;text-transform:uppercase}
 .st{display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;font-size:9.5px;
@@ -105,21 +115,45 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
 
 #chat{display:flex;flex-direction:column;overflow:hidden}
 #chatbar{display:flex;align-items:center;gap:10px;padding:10px 20px;
- background:var(--surface);border-bottom:1px solid var(--edge);min-height:52px}
-#chatbar .wt{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--ink)}
+ background:var(--surface);border-bottom:1px solid var(--edge);min-height:52px;position:relative}
+#chatbar .wt{display:inline-flex;align-items:center;gap:7px;min-width:0;font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--ink)}
 #chatbar .wt .dim{color:var(--dim)}
+#chatbar .qnum{font-size:15px}
+#chatbar .qslug{color:var(--ink);font-size:12.5px;font-family:"Inter","Roboto",-apple-system,"Segoe UI",sans-serif}
+.hgrp{margin-left:auto;display:flex;gap:6px;flex:none;align-items:center}
 .iconbtn{width:30px;height:30px;border-radius:var(--r-md);display:grid;place-items:center;
  cursor:pointer;background:var(--surface-2);border:1px solid var(--edge);color:var(--dim);
- transition:all .12s ease;font-size:14px}
+ transition:all .12s ease;font-size:14px;position:relative;flex:none}
 .iconbtn:hover{border-color:var(--primary);color:var(--primary)}
-.tabs{display:flex;gap:5px;flex-wrap:wrap;margin-left:auto;max-width:55%}
-.tab{display:inline-flex;align-items:center;gap:6px;padding:3px 12px;border:1px solid var(--edge);
- border-radius:999px;cursor:pointer;font-size:11px;color:var(--dim);background:var(--surface-2);
- max-width:200px;white-space:nowrap;overflow:hidden;transition:all .12s ease}
-.tab .tl{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
-.tab .tx{opacity:0;color:var(--red);font-weight:700;cursor:pointer;padding:0 2px;flex:none}
-.tab:hover .tx{opacity:1}
-.tab .tx:hover{color:var(--ink)}
+.iconbtn.on{border-color:var(--blue);color:var(--blue)}
+.iconbtn .bcount{position:absolute;top:-5px;right:-6px;background:var(--blue);color:#0d1117;
+ font-size:8.5px;font-weight:700;border-radius:999px;padding:0 4px;line-height:12px}
+#sessmenu{display:none;position:absolute;top:calc(100% + 8px);right:14px;width:400px;
+ max-height:calc(100vh - 150px);overflow-y:auto;background:var(--surface);
+ border:1px solid var(--edge);border-radius:var(--r-lg);box-shadow:var(--sh-2);padding:10px;z-index:40}
+#sessmenu.on{display:block}
+.smenuhd{font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+ color:var(--faint);margin:0 2px 8px;display:flex;align-items:center;gap:8px}
+.smenuhd .dim{font-weight:400;letter-spacing:0;text-transform:none;overflow:hidden;
+ text-overflow:ellipsis;white-space:nowrap}
+.scard{position:relative;background:var(--surface-2);border:1px solid var(--edge-soft);
+ border-radius:var(--r-md);padding:8px 11px;margin-bottom:6px;cursor:pointer;
+ transition:border-color .12s ease}
+.scard:hover{border-color:var(--blue)}
+.scard.on{border-color:rgba(88,166,255,.55);background:rgba(88,166,255,.06)}
+.scard .sc1{display:flex;align-items:center;gap:8px}
+.scard .sagent{font-weight:700;font-size:10.5px;color:var(--primary);
+ text-transform:uppercase;letter-spacing:.08em}
+.scard .swhen{margin-left:auto;color:var(--faint);font-size:10px;
+ font-variant-numeric:tabular-nums;white-space:nowrap}
+.scard .ssnip{color:var(--dim);font-size:11px;margin-top:3px;display:-webkit-box;
+ -webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.scard .smeta{color:var(--faint);font-size:9.5px;margin-top:3px;font-variant-numeric:tabular-nums}
+.scard .sx{position:absolute;top:4px;right:7px;opacity:0;color:var(--red);font-weight:700;
+ cursor:pointer;padding:0 3px;font-size:11px}
+.scard:hover .sx{opacity:1}
+.scard .sx:hover{color:var(--ink)}
+.scard.snew{border-style:dashed;text-align:center;color:var(--blue);font-weight:600;font-size:11.5px}
 #composer .send.stop{background:var(--red);color:#fff;flex:none}
 #composer .send.stop:hover{background:#ff7875;color:#fff}
 .dots i{display:inline-block;width:4px;height:4px;border-radius:50%;background:var(--primary);
@@ -130,9 +164,6 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
 .livedot{width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;
  animation:pulse 1.1s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
-.tab:hover{border-color:var(--blue);color:var(--ink)}
-.tab.on{background:var(--blue);border-color:var(--blue);color:#0d1117;font-weight:600}
-.tab.newtab{border-style:dashed}
 
 #transcript{flex:1;overflow-y:auto;padding:18px 26px;display:flex;flex-direction:column;gap:12px}
 .msg{max-width:80%;padding:10px 14px;border-radius:var(--r-lg);background:var(--surface);
@@ -233,20 +264,25 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 .bcol h3{font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
  color:var(--primary);margin:2px 4px 8px}
 .bcard{background:var(--surface-2);border:1px solid var(--edge-soft);border-radius:var(--r-md);
- padding:8px 10px;margin-bottom:6px;transition:border-color .12s ease}
+ padding:8px 10px;margin-bottom:6px;transition:border-color .12s ease;display:flex;
+ flex-direction:column}
 .bcard.attn{border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.05)}
 .bcard.attn .bid{color:var(--red)}
-.bops{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap}
+.bops{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap;margin-top:auto;padding-top:6px}
 .bops button{padding:2px 8px;font-size:9px}
 .bops button.go{border-color:rgba(63,185,80,.4);color:var(--green)}
 .bops button.go:hover{border-color:var(--green);color:var(--green);background:rgba(63,185,80,.08)}
 .bops button.warn{border-color:rgba(248,81,73,.4);color:var(--red)}
-.bchips{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
+.bchips{display:flex;gap:4px;flex-wrap:wrap;align-items:center}
 .bchip{font-size:9px;padding:1px 6px;border-radius:4px;background:var(--surface);
  border:1px solid var(--edge-soft);color:var(--dim)}
 .bchip.ok{color:var(--green);border-color:rgba(63,185,80,.3)}
 .bchip.bad{color:var(--red);border-color:rgba(248,81,73,.35)}
 .bchip.warn{color:var(--amber);border-color:rgba(210,153,34,.35)}
+.btop{display:flex;flex-wrap:wrap;align-items:center;gap:4px;min-width:0}
+.bapp{flex:none;display:inline-block;font-size:9px;padding:1px 6px;border-radius:4px;font-weight:600;
+ background:rgba(255,179,0,.1);border:1px solid rgba(255,179,0,.35);color:var(--primary);
+ margin-right:6px;text-transform:uppercase;letter-spacing:.06em;vertical-align:1px}
 #jobout{font-family:ui-monospace,Menlo,monospace;font-size:11px;white-space:pre-wrap;
  word-break:break-word;background:var(--bg);border:1px solid var(--edge);
  border-radius:var(--r-md);padding:10px 12px;max-height:52vh;overflow-y:auto;margin-top:10px}
@@ -260,16 +296,22 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 .srow{display:flex;gap:8px;align-items:baseline;padding:6px 4px;border-bottom:1px solid var(--edge-soft);
  font-size:11.5px;cursor:pointer}
 .srow:hover{background:var(--surface-2)}
+.annrow{border-bottom:1px solid var(--edge-soft);padding:9px 2px}
+.annrow:last-child{border-bottom:none}
+.annmeta{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;min-width:0}
+.annmeta .bchip{flex:none}
+.annsel{color:var(--blue);cursor:pointer}
+.annsel:hover{text-decoration:underline}
+.anntext{color:var(--dim);font-size:11.5px;margin-top:4px;white-space:pre-wrap;
+ word-break:break-word;max-height:58px;overflow:hidden}
+.annnote{color:var(--ink);font-size:12.5px;font-weight:500;margin-top:4px;
+ white-space:pre-wrap;word-break:break-word}
 @media (prefers-reduced-motion:reduce){.livedot,.dots i{animation:none}}
 .bcard.click{cursor:pointer}
 .bcard:hover{border-color:var(--blue)}
 .bid{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--blue);
  display:flex;align-items:center;gap:6px}
-.bt{font-size:12px;margin:3px 0 0;color:var(--ink)}
-.brow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:5px}
-.brow .chip{font-size:9.5px;padding:1px 8px}
-.bmono{font-family:ui-monospace,Menlo,monospace;font-size:10px;color:var(--faint);
- overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:150px}
+.bt{font-size:12px;margin:5px 0 0;color:var(--ink)}
 .bempty{color:var(--faint);font-size:11px;text-align:center;padding:6px 0}
 .q .livedot{flex:none}
 #composer{position:relative}
@@ -282,6 +324,23 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 .cmddesc{color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sessmeta{color:var(--faint);font-size:10.5px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .sessmeta b{color:var(--blue);font-weight:600}
+#drawer{position:fixed;top:52px;right:0;bottom:0;width:min(600px,55vw);background:var(--surface);
+ border-left:1px solid var(--edge);box-shadow:var(--sh-2);display:none;flex-direction:column;z-index:25}
+#drawer.on{display:flex}
+#drawer .dh{display:flex;justify-content:space-between;align-items:center;gap:10px;
+ padding:12px 16px;border-bottom:1px solid var(--edge)}
+#drawer .dh b{color:var(--primary);font-size:12.5px;letter-spacing:.04em;overflow:hidden;
+ text-overflow:ellipsis;white-space:nowrap}
+#drawer .dh span{cursor:pointer;color:var(--dim);font-size:10.5px;flex:none;letter-spacing:.06em}
+#drawer .dh span:hover{color:var(--ink)}
+#drawer .db{flex:1;overflow-y:auto;padding:14px 18px 24px}
+.qdoc{max-width:none;background:transparent;border:none;padding:0;white-space:normal;
+ font-size:12.5px;flex:1}
+.qdoc .who{display:none}
+.dother{padding:7px 10px;border:1px solid var(--edge-soft);border-radius:var(--r-md);
+ margin-bottom:6px;cursor:pointer;font-size:12px;transition:border-color .12s ease}
+.dother:hover{border-color:var(--blue)}
+.dother b{color:var(--blue);font-family:ui-monospace,Menlo,monospace;font-size:11px;margin-right:6px}
 </style></head><body>
 <header><div class="brand"><span class="glyph">♜</span>COURT <em>CONSOLE</em></div>
 <div class="vtabs"><div class="app on" id="v_chat" onclick="setView('chat')">chat</div>
@@ -297,16 +356,21 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
   <div id="chatbar">
    <span class="wt" id="wt_label">select a worktree</span>
    <span id="wt_badge"></span>
+   <span id="easel_chip" class="chip" style="display:none;cursor:pointer" data-easel="1" title=""></span>
    <span id="live_chip" class="chip" style="display:none"><span class="livedot"></span>&nbsp;agent working</span>
    <span id="sess_meta" class="sessmeta"></span>
-   <div class="iconbtn" title="MCP servers" onclick="openMcp()">⚙</div>
-   <div class="iconbtn" id="sess_del" title="delete this session" style="display:none" onclick="delSess(selSess)">✕</div>
-   <div class="tabs" id="sess_tabs"></div>
+   <div class="hgrp">
+    <div class="iconbtn" title="open quest charter in drawer" onclick="toggleDoc(event)">▤</div>
+    <div class="iconbtn" title="MCP servers" onclick="openMcp()">⚙</div>
+    <div class="iconbtn" id="sess_del" title="delete this session" style="display:none" onclick="delSess(selSess)">✕</div>
+    <div class="iconbtn" id="sess_burger" title="sessions in this worktree" onclick="toggleSessMenu(event)">☰</div>
+   </div>
+   <div id="sessmenu"></div>
   </div>
  <div id="transcript"><div class="notice">select a branch, then a session — the chat loads here</div></div>
  <div id="composer">
   <div id="cmdlist"></div>
-  <div class="cont" id="c_cont">new session — pick a worktree, or click a session tab to continue it</div>
+  <div class="cont" id="c_cont">new session — pick a worktree, or open the ☰ sessions menu to continue one</div>
   <div class="row">
    <textarea id="c_prompt" placeholder="message the agent… (Enter to send, Shift+Enter for newline)"></textarea>
    <input id="c_model" list="model_dl" value="openrouter/z-ai/glm-5.3-flash" spellcheck="false"
@@ -324,10 +388,14 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
  <div id="boardbar" style="padding:10px 20px;border-bottom:1px solid var(--edge);background:var(--surface)"></div>
  <div id="boardcols"></div>
 </section></main>
+<div id="drawer"><div class="dh"><b id="drawer_title">quest charter</b>
+ <span onclick="toggleDoc(event)">CLOSE ✕</span></div>
+ <div class="db" id="drawer_bd"></div></div>
 <div id="modal"><div class="box"><div class="hd"><b>MCP SERVERS — merged inventory</b>
 <span onclick="closeMcp()">CLOSE ✕</span></div><div class="bd" id="modal_bd"></div></div></div>
 <script>
 let S=null, selRepo=null, selWt=null, selSess=null, msgs=[], TURN=null, turns=[];
+let LANESEQ=0, curLane=null;
 let view='chat', boardApp='all', boardKey='', CMDS=[], cmdIdx=0;
 const TURNSEQ=[0];
 const foldMemo={};
@@ -342,6 +410,30 @@ const ago=ts=>{if(!ts)return'';const d=(Date.now()-ts)/1000;
  return d<60?`${d|0}s`:(d<3600?`${d/60|0}m`:(d<86400?`${d/3600|0}h`:`${d/86400|0}d`))};
 const $=id=>document.getElementById(id);
 const TRUNKS=['main','castle','master','trunk'];
+const KIND_NAMES={quest:'quest',epic:'epic',scout:'scout',artist:'artist','the-gatehouse':'gate'};
+function qparse(b){
+ if(!b||!b.includes('/'))return null;
+ const seg=b.split('/');
+ const leaf=seg[seg.length-1];
+ const m=leaf.match(/^(?:([A-Za-z]+)[-_]?)?(\d[\w]*)[-_]?(.*)$/);
+ if(!m||/^\./.test(m[3]||''))return null;
+ const pfx=m[1]||'';
+ const rest=[];
+ if(pfx.length>2)rest.push(pfx);
+ if(seg.length>2)rest.push(seg.slice(1,-1).join('/'));
+ if(m[3])rest.push(m[3]);
+ return {badge:KIND_NAMES[seg[0]]||seg[0].replace(/^the-/,''),
+  big:(pfx.length<=2?pfx.toUpperCase():'')+m[2],rest:rest.join(' · ')};
+}
+function setWtLabel(branch,path){
+ const p=qparse(branch);
+ $('wt_label').innerHTML=p?
+  `<span class="qnum">${esc(p.big)}</span> <span class="qbadge">${esc(p.badge)}</span> <span class="qslug">${esc(p.rest||'')}</span>`
+  :esc(branch||path&&path.split('/').pop()||'?');
+}
+const fmtWhen=t=>{if(!t)return'—';const d=new Date(t);
+ return d.toLocaleDateString([],{month:'short',day:'numeric'})+' · '+
+  d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})};
 const STATUS_ORDER=__STATUS_ORDER__;
 function repo(){return S.repos.find(r=>r.key===selRepo)||S.repos[0]}
 function hashState(){
@@ -364,11 +456,10 @@ function applyHash(){
  if(p.wt){
   const r=repo();
   const w=(r.worktrees||[]).find(x=>x.path===p.wt)||(r.worktrees||[]).find(x=>x.branch===p.wt);
-  if(w){selWt=w.path;hit=true;
-   const wi=(repo().worktrees||[]).find(x=>x.path===w.path);
-   $('wt_label').innerHTML=esc(wi&&wi.branch||w.path.split('/').pop())+
-    ` <span class="dim">· ${esc(w.path.replace('/Users/scrummage/Python/',''))}</span>`;
-   $('wt_badge').innerHTML=wi&&wi.dirty?'<span class="badge">dirty</span>':'';
+   if(w){selWt=w.path;hit=true;
+    const wi=(repo().worktrees||[]).find(x=>x.path===w.path);
+    setWtLabel(wi&&wi.branch||w.branch||w.path.split('/').pop(),w.path);
+    $('wt_badge').innerHTML=wi&&wi.dirty?'<span class="badge">dirty</span>':'';
    renderNav();renderSessionsBar();
     if(p.sess&&/^[\w-]+$/.test(p.sess))openSess(p.sess);
     else{const s=sessionsFor(selWt);if(s.length)openSess(s[0].id);else newSess();}
@@ -391,7 +482,7 @@ function applyHash(){
   const ty=S.today||{};
   $('t_today').innerHTML=`$ <b>${(ty.cost||0).toFixed(2)}</b> today`;
   $('clock').textContent=new Date().toLocaleTimeString();
-  syncComposer();syncSessMeta();
+  syncComposer();syncSessMeta();syncEaselChip();
   if(view==='board'){
    const key=boardApp+'|'+(S.quests||[]).map(q=>q.id+q.status+(q.dirty?'d':'')+(q.app||'')).join(',');
    if(key!==boardKey){boardKey=key;renderBoard();}}
@@ -412,18 +503,24 @@ function renderNav(){
   for(const b of r.branches){
    const ns=b.includes('/')?b.split('/')[0]:'(root)';
    if(TRUNKS.includes(b))continue;
+   if(!byBranch[b])continue;
    (secs[ns]??=[]).push(b);
   }
   for(const ns of Object.keys(secs).sort((a,b)=>secs[b].length-secs[a].length)){
+   if(!secs[ns].length)continue;
    h+=`<h2>${esc(ns)} · ${secs[ns].length}</h2>`;
    for(const b of secs[ns].slice(0,30)){
     const w=byBranch[b];
-    const working=w&&act.has(w.path);
+    const working=act.has(w.path);
     const mark=(working?'<span class="livedot" title="agent working"></span>':'')+
-     (w?(w.dirty?'<span class="badge">dirty</span>':''):'<span class="st">no wt</span>');
-    h+=`<div class="q ${selWt&&w&&selWt===w.path?'sel':''}"${w?` data-wt="${esc(w.path)}"`:''} data-branch="${esc(b)}">
-    <div class="row1">${esc(b.includes('/')?b.slice(b.indexOf('/')+1):b)}${mark}</div>
-    <div class="row2">${esc(b)}</div></div>`;
+     (w.dirty?'<span class="badge">dirty</span>':'');
+    const p=qparse(b);
+    const inner=p?
+     `<div class="row1"><span class="qnum">${esc(p.big)}</span><span class="qbadge">${esc(p.badge)}</span>`+
+     `<span class="qslug">${esc(p.rest||'')}</span>${mark}</div>`
+     :`<div class="row1">${esc(b.includes('/')?b.slice(b.indexOf('/')+1):b)}${mark}</div>`+
+      `<div class="row2">${esc(b)}</div>`;
+    h+=`<div class="q ${selWt&&selWt===w.path?'sel':''}" title="${esc(b)}" data-wt="${esc(w.path)}" data-branch="${esc(b)}">${inner}</div>`;
    }
    if(secs[ns].length>30)h+=`<div class="q dim" style="cursor:default">… ${secs[ns].length-30} more</div>`;
   }
@@ -435,9 +532,9 @@ $('nav').addEventListener('click',e=>{
   const wt=e.target.closest('[data-wt]');
   if(wt){pickWt(wt.dataset.wt||null,wt.dataset.branch||null);}
 });
-function switchApp(key){selRepo=key;selWt=null;selSess=null;msgs=[];
+function switchApp(key){selRepo=key;selWt=null;selSess=null;msgs=[];curLane=null;
  $('wt_label').textContent='select a worktree';$('wt_badge').innerHTML='';
- $('c_cont').innerHTML='new session — pick a worktree, or click a session tab to continue it';
+ $('c_cont').innerHTML='new session — pick a worktree, or open the ☰ sessions menu to continue one';
  CMDS=[];renderCmdList();
  renderNav();renderTranscript();syncHash();syncComposer();}
 let cmdSeq=0;
@@ -453,18 +550,17 @@ function pickWt(path,branch){
  selWt=path;selSess=null;msgs=[];
  if(path){
   const w=(repo().worktrees||[]).find(x=>x.path===path);
-  $('wt_label').innerHTML=esc(branch||w&&w.branch||path.split('/').pop())+
-   ` <span class="dim">· ${esc(path.replace('/Users/scrummage/Python/',''))}</span>`;
+  setWtLabel(branch||w&&w.branch||path.split('/').pop(),path);
   $('wt_badge').innerHTML=w&&w.dirty?'<span class="badge">dirty</span>':'';
  }else{
   $('wt_label').innerHTML=esc(branch||'?')+' <span class="dim">· no worktree</span>';
   $('wt_badge').innerHTML='';
  }
- renderNav();renderSessionsBar();renderTranscript();syncComposer();syncSessMeta();
- $('c_cont').innerHTML='new session — pick a worktree, or click a session tab to continue it';
+  renderNav();renderSessionsBar();renderTranscript();syncComposer();syncSessMeta();syncEaselChip();
+  $('c_cont').innerHTML='new session — pick a worktree, or click a session tab to continue it';
  const sess=sessionsFor(path);
  if(sess.length)openSess(sess[0].id);
- else{selSess=null;renderTranscript();
+ else{selSess=null;msgs=[];curLane='L'+(++LANESEQ);renderTranscript();
   $('c_cont').innerHTML='new session — no sessions in this worktree yet';}
  loadCmds();
  syncHash();
@@ -476,26 +572,63 @@ function sessMeta(s){
  return `tok ${ktop((s.tokens_input||0)+(s.tokens_output||0))} · $${(s.cost||0).toFixed(2)}`;
 }
 function renderSessionsBar(){
-  const sess=sessionsFor(selWt).slice(0,8);
-  $('sess_tabs').innerHTML=
-   sess.map(s=>`<div class="tab ${selSess===s.id?'on':''}" data-sid="${esc(s.id)}"
-    title="${esc(s.title||s.id)} · ${sessMeta(s)}"><span class="tl">${esc(s.agent||'?')}: ${esc((s.title||s.id).slice(0,26))}</span>`+
-    `<span class="tx" title="delete session" data-act="del" data-sid="${esc(s.id)}">✕</span></div>`).join('')+
-    `<div class="tab newtab ${selSess===null?'on':''}" onclick="newSess()" title="start a fresh session">＋ new</div>`;
+ const sess=sessionsFor(selWt);
+ const b=$('sess_burger');
+ if(!b)return;
+ b.innerHTML='☰'+(sess.length?`<span class="bcount">${sess.length}</span>`:'');
+ if($('sessmenu').classList.contains('on'))fillSessMenu();
 }
-$('sess_tabs').addEventListener('click',e=>{
-  const del=e.target.closest('[data-act="del"]');
-  if(del){delSess(del.dataset.sid);return;}
-  const tab=e.target.closest('[data-sid]');
-  if(tab)openSess(tab.dataset.sid);
+let sessMenuSeq=0;
+async function fillSessMenu(){
+ const seq=++sessMenuSeq;
+ const sess=sessionsFor(selWt);
+ const m=$('sessmenu');
+ const head=`<div class="smenuhd">sessions <span class="dim">· ${esc(selWt?selWt.split('/').pop():'no worktree')}</span></div>`;
+ m.innerHTML=head+(sess.length?'':
+  '<div class="scard" style="cursor:default;color:var(--faint)">no sessions in this worktree yet</div>');
+ let starts={};
+ if(sess.length)try{
+  starts=await (await fetch('/api/session/starts?ids='+sess.map(s=>s.id).join(','))).json();
+ }catch(e){}
+ if(seq!==sessMenuSeq)return;
+ m.innerHTML=head+sess.map(s=>{
+  const st=starts[s.id]||{};
+  const snip=String(st.start||s.title||s.id);
+  return `<div class="scard ${selSess===s.id?'on':''}" data-sid="${esc(s.id)}" title="${esc(s.title||s.id)}">
+   <div class="sc1"><span class="sagent">${esc(s.agent||'?')}</span><span class="swhen">${esc(fmtWhen(s.time_updated))}</span></div>
+   <div class="ssnip">${esc(snip.length>120?snip.slice(0,120)+'…':snip)}</div>
+   <div class="smeta">${esc(sessMeta(s))}${s.model?' · '+esc(s.model.split('/').pop()):''}</div>
+   <span class="sx" data-act="del" data-sid="${esc(s.id)}" title="delete session">✕</span></div>`;
+ }).join('')+
+ `<div class="scard snew ${selSess===null?'on':''}" data-act="new">＋ new session</div>`;
+}
+function toggleSessMenu(ev){
+ if(ev)ev.stopPropagation();
+ const m=$('sessmenu'),b=$('sess_burger');
+ const on=m.classList.toggle('on');
+ b.classList.toggle('on',on);
+ if(on)fillSessMenu();
+}
+function closeSessMenu(){
+ const m=$('sessmenu');if(!m)return;
+ m.classList.remove('on');$('sess_burger').classList.remove('on');
+}
+$('sessmenu').addEventListener('click',e=>{
+ const del=e.target.closest('[data-act="del"]');
+ if(del){delSess(del.dataset.sid);return;}
+ if(e.target.closest('[data-act="new"]')){closeSessMenu();newSess();return;}
+ const card=e.target.closest('[data-sid]');
+ if(card){closeSessMenu();openSess(card.dataset.sid);}
 });
-function newSess(){selSess=null;msgs=[];
+document.addEventListener('click',e=>{
+ if(!e.target.closest('#sessmenu')&&!e.target.closest('#sess_burger'))closeSessMenu();});
+function newSess(){selSess=null;msgs=[];curLane='L'+(++LANESEQ);
  $('c_cont').innerHTML='new session in <b>'+esc(selWt?selWt.replace('/Users/scrummage/Python/',''):'?')+'</b> <span class="dim">— agent replies as a fresh session</span>';
  renderSessionsBar();renderTranscript();syncHash();syncComposer();syncSessMeta();}
 let sessOpenSeq=0;
 async function openSess(id){
  const seq=++sessOpenSeq;
- selSess=id;msgs=[];
+ selSess=id;msgs=[];curLane=id;
  $('c_cont').innerHTML=`continuing <b>${esc(id.slice(0,24))}…</b> <span class="x" onclick="newSess()">start new instead</span>`;
  renderSessionsBar();renderTranscript();syncHash();syncComposer();syncSessMeta();
  $('transcript').innerHTML='<div class="notice">loading…</div>';
@@ -542,7 +675,8 @@ function turnForView(){
     const T=turns[i];
     if(T.wt!==selWt)continue;
     if(T.sess){if(selSess===T.sess)return T;continue;}
-    if(selSess===null||selSess===T.sid)return T;
+    if(selSess===T.sid)return T;
+    if(selSess===null&&T.lane===curLane)return T;
   }
   return null;
 }
@@ -687,7 +821,7 @@ function autosizeTa(){
 }
 async function dispatch(wt,sess,agent,model,prompt){
   const T={id:++TURNSEQ[0],wt,sess,sid:null,job:null,evs:0,ran:false,done:false,
-   t0:Date.now(),blocks:[{cls:'user',text:prompt}],queue:null,
+   lane:sess||curLane,t0:Date.now(),blocks:[{cls:'user',text:prompt}],queue:null,
    histHTML:msgs.map(msgHTML).join(''),stopping:false,stopped:false,
    shown:0,spinEl:null};
   TURN=T;turns.push(T);
@@ -878,13 +1012,12 @@ function renderBoard(){
     if(a.commutation_done)chips+='<span class="bchip ok">commuted</span>';
    }
    cols+=`<div class="bcard ${q.worktree?'click':''} ${attn(q)?'attn':''}" ${q.worktree?`data-wt="${esc(q.worktree)}"`:''}>
-    <div class="bid">${esc(q.id)}${q.dirty?' <span class="badge">dirty</span>':''}${on?' <span class="livedot" title="agent working"></span>':''}</div>
-    <div class="bt">${esc(q.title||'')}</div>
-    ${chips?`<div class="bchips">${chips}</div>`:''}
-    ${ops.length?`<div class="bops">${ops.map(o=>
-     `<button class="${o[2]==='warn'?'warn':'go'}" data-op="${o[0]}" data-id="${esc(q.id)}"${o[0]==='advance'?` data-status="${o[3]}"`:''}>${esc(o[1])}</button>`).join('')}</div>`:''}
-    <div class="brow"><span class="chip">${esc(q.app||q.repo||'—')}</span>`+
-    `<span class="bmono">${esc(q.branch||'')}</span></div></div>`;
+    <div class="btop"><span class="bid">${esc(q.id)}</span>${q.dirty?'<span class="badge">dirty</span>':''}${on?'<span class="livedot" title="agent working"></span>':''}`+
+    (chips?`<span class="bchips">${chips}</span>`:'')+'</div>'+
+    `<div class="bt"><span class="bapp">${esc(q.app||q.repo||'—')}</span>${esc(q.title||'')}</div>`+
+    (ops.length?`<div class="bops">${ops.map(o=>
+     `<button class="${o[2]==='warn'?'warn':'go'}" data-op="${o[0]}" data-id="${esc(q.id)}"${o[0]==='advance'?` data-status="${o[3]}"`:''}>${esc(o[1])}</button>`).join('')}</div>`:'')+
+    '</div>';
   }
   cols+=items.length?'':'<div class="bempty">—</div>';
   cols+='</div>';
@@ -968,6 +1101,36 @@ function openModal(title, body){
 }
 function closeModal(){$('modal').classList.remove('on');}
 function closeMcp(){closeModal();}
+function toggleDoc(ev){
+ if(ev)ev.stopPropagation();
+ const d=$('drawer');
+ if(d.classList.contains('on')){d.classList.remove('on');return;}
+ d.classList.add('on');
+ loadQuestDoc('');
+}
+async function loadQuestDoc(qid){
+ const bd=$('drawer_bd');
+ bd.innerHTML='<div class="dim">loading…</div>';
+ const r=repo();
+ try{
+  const j=await (await fetch('/api/quest?app='+encodeURIComponent(r?r.key:'')+
+   '&id='+encodeURIComponent(qid||'')+'&wt='+encodeURIComponent(selWt||''))).json();
+  if(j.error){
+   $('drawer_title').textContent='quest charter';
+   bd.innerHTML='<div class="dim" style="margin-bottom:8px">'+esc(j.error)+' — pick a charter:</div>'+
+    (j.others||[]).map(q=>`<div class="dother" data-qid="${esc(q.id)}"><b>${esc(q.id)}</b>${esc(q.title||'')}`+
+     `<span class="dim" style="margin-left:8px;font-size:10px">${esc(String(q.status||'').toLowerCase())}</span></div>`).join('');
+   return;}
+  $('drawer_title').textContent=(j.quest.id?j.quest.id.toUpperCase()+' · ':'')+
+   (j.quest.title||'quest charter')+' — '+String(j.quest.status||'').toLowerCase();
+  const md=String(j.md||'').replace(/^---\n[\s\S]*?\n---\s*\n?/,'');
+  bd.innerHTML='<div class="msg md qdoc">'+mdRender(md||'(empty charter)')+'</div>';
+  bd.scrollTop=0;
+ }catch(e){bd.innerHTML='<div class="dim">failed to load: '+esc(e)+'</div>';}
+}
+$('drawer_bd').addEventListener('click',e=>{
+ const o=e.target.closest('[data-qid]');
+ if(o)loadQuestDoc(o.dataset.qid);});
 function openMcp(){
   const list=S.mcp||[];
  let h='';
@@ -986,8 +1149,12 @@ function openMcp(){
   openModal('MCP SERVERS — merged inventory', h);
 }
 $('modal_bd').addEventListener('click',e=>{
- const b=e.target.closest('[data-file]');
- if(b){mcpToggle(b.dataset.file,b.dataset.name);return;}
+  const c=e.target.closest('[data-copy]');
+  if(c){navigator.clipboard.writeText(c.dataset.copy).then(()=>{
+    const t=c.textContent;c.textContent='copied!';
+    setTimeout(()=>{c.textContent=t;},1200);});return;}
+  const b=e.target.closest('[data-file]');
+  if(b){mcpToggle(b.dataset.file,b.dataset.name);return;}
  const p=e.target.closest('[data-pid]');
  if(p){reapProc(p.dataset.pid);return;}
  const t=e.target.closest('[data-sid2]');
@@ -996,7 +1163,47 @@ $('modal_bd').addEventListener('click',e=>{
 $('modal').addEventListener('click',e=>{
  if(e.target.id==='modal')closeModal();});
 document.addEventListener('keydown',e=>{
- if(e.key==='Escape')closeModal();});
+  if(e.key==='Escape'){closeModal();closeSessMenu();$('drawer').classList.remove('on');}});
+function syncEaselChip(){
+ const el=$('easel_chip');if(!el)return;
+ const w=selWt&&S?(S.worktrees||[]).find(x=>x.path===selWt):null;
+ if(w&&w.easel&&w.easel.port){
+  el.style.display='';
+  el.innerHTML='<span style="color:var(--blue)">⌖</span> easel <b>:'+w.easel.port+
+   '</b> · <b>'+(w.annotations||0)+'</b> notes';
+  el.title='studio easel'+(w.easel.cdp_url?' — '+w.easel.cdp_url:'')+
+   ' — click to review pinned annotations';
+ }else{el.style.display='none';el.title='';}
+}
+$('chatbar').addEventListener('click',e=>{
+ if(e.target.closest('[data-easel]'))openEaselNotes();});
+let annSeq=0;
+async function openEaselNotes(){
+ const wt=selWt;const seq=++annSeq;
+ openModal('PINNED ANNOTATIONS — studio easel','<div id="annlist" class="dim">loading…</div>');
+ let j=null;
+ try{j=await (await fetch('/api/annotations?wt='+encodeURIComponent(wt||''))).json();}
+ catch(e){}
+ if(seq!==annSeq)return;
+ const el=$('annlist');if(!el)return;
+ const items=(j&&j.items)||[];
+ if(!items.length){el.className='';
+  el.innerHTML='<div class="empty-note">No annotations pinned in this worktree yet.</div>';
+  return;}
+ el.className='';
+ el.innerHTML=items.map(a=>{
+  const sel=String(a.selector||'');
+  const route=String(a.route||'');
+  return `<div class="annrow">
+   <div class="annmeta"><span class="tmono">${esc(a.ts||'')}</span>
+    <span class="bchip">${esc(a.tag||'note')}</span>
+    ${route?`<span class="tmono" title="${esc(route)}">${esc(route.length>42?'…'+route.slice(-42):route)}</span>`:''}
+    ${sel?`<span class="annsel tmono" data-copy="${esc(sel)}" title="click to copy selector">${esc(sel.length>60?'…'+sel.slice(-60):sel)}</span>`:''}
+   </div>`+
+   (a.text?`<div class="anntext">${esc(a.text)}</div>`:'')+
+   `<div class="annnote">${esc(a.note||'')}</div></div>`;
+ }).join('');
+}
 function reapProc(pid){
  if(!confirm('Terminate pid '+pid+'? (parent is a verified kilo process)'))return;
  fetch('/api/reap',{method:'POST',body:JSON.stringify({pid:parseInt(pid,10)})})
@@ -1062,13 +1269,10 @@ function jumpToSession(sid){
  if(!s){alert('session not in recent list; use search');return;}
  const r=(S.repos||[]).find(r=>s.directory&&s.directory.startsWith(r.root));
  if(r)selRepo=r.key;
- if(s.directory){
-  const w=(r&&r.worktrees||[]).find(w=>s.directory.startsWith(w.path));
-  if(w){selWt=w.path;
-   $('wt_label').innerHTML=esc(w.branch||w.path.split('/').pop())+
-    ` <span class="dim">· ${esc(w.path.replace('/Users/scrummage/Python/',''))}</span>`;
+  if(s.directory){
+   const w=(r&&r.worktrees||[]).find(w=>s.directory.startsWith(w.path));
+   if(w){selWt=w.path;setWtLabel(w.branch||w.path.split('/').pop(),w.path);}
   }
- }
  selSess=sid;
  setView('chat');
  openSess(sid);
@@ -1157,7 +1361,7 @@ def _quests(root, ttl=20):
                 "status": fm.get("status", "OPEN"), "app": app,
                 "branch": fm.get("branch", ""), "worktree": wt,
                 "epic": fm.get("parent_epic", ""),
-                "dirty": _wt_dirty(wt),
+                "dirty": _wt_dirty(wt), "path": path,
             })
     quests.sort(key=lambda q: (
         STATUS_ORDER.index(q["status"]) if q["status"] in STATUS_ORDER else 99,
@@ -1181,6 +1385,41 @@ def _all_quests():
             else:
                 out.append(dict(q, repo=r["key"]))
     return out
+
+
+def _quest_doc(root, wt, qid):
+    """Charter markdown for the doc drawer: match by quest id when given,
+    else by the selected worktree path; the repo's quest list always rides
+    along so the client can fall back to a picker."""
+    quests = _quests(root)
+
+    def norm(p):
+        return os.path.normpath(p or "")
+
+    q = None
+    if qid:
+        ql = qid.strip().lower()
+        q = next((x for x in quests if x["id"].lower() == ql), None)
+        if q is None:
+            cands = [x for x in quests if x["id"].lower().startswith(ql)]
+            if len(cands) == 1:
+                q = cands[0]
+    if q is None and wt:
+        q = next((x for x in quests if norm(x["worktree"]) == norm(wt)), None)
+    others = [{"id": x["id"], "title": x["title"], "status": x["status"]}
+              for x in quests]
+    if q is None:
+        return {"error": "no quest matches this worktree or id",
+                "others": others}
+    try:
+        with open(q["path"]) as f:
+            md = f.read()
+    except OSError as exc:
+        return {"error": f"charter unreadable: {exc}", "others": others}
+    return {"quest": {"id": q["id"], "title": q["title"],
+                      "status": q["status"], "app": q["app"],
+                      "branch": q["branch"]},
+            "md": md, "others": others}
 
 
 _AUDIT_CACHE = {}  # repo root -> {"t": ts, "data": {quest_id: audit}, "busy": bool}
@@ -1651,6 +1890,46 @@ def _session_messages(sid, limit=60):
             out.append({"role": r,
                         "time_created": tc,
                         "text": text[:4000]})
+    return out
+
+
+def _session_starts(sids, limit=200):
+    """First user text snippet per session id, for the session-menu cards.
+    Bounded: max 12 ids, oldest 6 messages scanned per id."""
+    sids = [s for s in (sids or [])
+            if isinstance(s, str) and re.fullmatch(r"[\w-]+", s)][:12]
+    if not sids or not os.path.exists(KILO_DB):
+        return {}
+    out = {}
+    try:
+        db = sqlite3.connect(f"file:{KILO_DB}?mode=ro", uri=True, timeout=3)
+        db.execute("pragma query_only=1")
+        for sid in sids:
+            rows = db.execute(
+                "select id, json_extract(data,'$.role') from message"
+                " where session_id=? order by time_created asc limit 6",
+                (sid,)).fetchall()
+            roles = {r[0]: r[1] for r in rows}
+            mids = [r[0] for r in rows]
+            texts = {}
+            if mids:
+                q = ",".join("?" * len(mids))
+                for mid, pdata in db.execute(
+                        f"select message_id, data from part"
+                        f" where message_id in ({q})", mids):
+                    try:
+                        p = json.loads(pdata)
+                    except Exception:
+                        continue
+                    if p.get("type") == "text" and p.get("text"):
+                        texts.setdefault(mid, p["text"])
+            for mid in mids:
+                if roles.get(mid) == "user" and mid in texts:
+                    out[sid] = {"start": texts[mid][:limit]}
+                    break
+        db.close()
+    except Exception:
+        return out
     return out
 
 
@@ -2153,17 +2432,96 @@ def _expand_command(prompt, directory):
             "agent": agent if agent in _ALLOWED_AGENTS else None}, None
 
 
+_ANNOTATION_BODY_CAP = 16_384
+_ANNOTATION_FILE_CAP = 2_000_000
+_ANNOTATION_FIELD_CAPS = {"url": 2000, "route": 500, "selector": 300,
+                          "tag": 40, "text": 300, "ts": 40}
+
+
+def _annotation_wt_ok(path):
+    """An annotation target must be a real git checkout: an absolute, existing
+    directory that contains .git itself, or nests under a known repo root
+    (same roots the _worktrees/_quests scans already know)."""
+    if not isinstance(path, str) or not path:
+        return False
+    p = os.path.normpath(path)
+    if not os.path.isabs(p) or not os.path.isdir(p):
+        return False
+    if os.path.exists(os.path.join(p, ".git")):
+        return True
+    return any(p == os.path.normpath(r["root"])
+               or p.startswith(os.path.normpath(r["root"]) + os.sep)
+               for r in _repos())
+
+
+def _annotation_file(worktree):
+    return os.path.join(os.path.normpath(worktree), ".kilo",
+                        "studio-annotations.jsonl")
+
+
+def _annotation_rows(worktree):
+    """Bounded studio-annotations.jsonl read: (items newest-first, capped at
+    the last 200) plus the total line count. Tolerates a truncated final
+    line; a mid-file seek cap drops the partial line it landed in."""
+    raw = b""
+    try:
+        with open(_annotation_file(worktree), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - _ANNOTATION_FILE_CAP))
+            raw = f.read(_ANNOTATION_FILE_CAP)
+            if size > _ANNOTATION_FILE_CAP:
+                nl = raw.find(b"\n")
+                raw = raw[nl + 1:] if nl >= 0 else b""
+    except OSError:
+        return [], 0
+    lines = [ln for ln in raw.decode("utf-8", "replace").split("\n")
+             if ln.strip()]
+    items = []
+    for ln in reversed(lines[-200:]):
+        try:
+            items.append(json.loads(ln))
+        except Exception:
+            continue
+    return items, len(lines)
+
+
+def _annotation_append(rec):
+    """Append one JSON line (JSONL: append-only, no read-modify-write);
+    creates the .kilo dir when needed. Returns the running total."""
+    path = _annotation_file(rec["worktree"])
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    _, total = _annotation_rows(rec["worktree"])
+    return total
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _json(self, obj, code=200):
+    def _json(self, obj, code=200, cors=False):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        if cors:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        # CORS preflight for the studio-browser annotator (served on another
+        # localhost port, posting to /api/annotation)
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self):
         if self.path == "/":
@@ -2201,6 +2559,35 @@ class Handler(BaseHTTPRequestHandler):
                  "branches": _branches(r["root"]),
                  "worktrees": _worktrees(r["root"])}
                 for r in _repos()]
+            # easel/annotations reflect the files right now — worktree dicts
+            # are TTL-cached and shared, so decorate fresh copies per request
+            # (two stat/read calls per worktree, no extra walking)
+            all_wts = []
+            for r in repos:
+                fresh = []
+                for w in r["worktrees"]:
+                    w = dict(w)
+                    p = w["path"]
+                    wb = os.path.join(p, ".worktree-browser")
+                    if os.path.isfile(wb):
+                        try:
+                            with open(wb) as f:
+                                data = json.loads(f.read(2048))
+                            port = int(data.get("port") or 0)
+                            if 0 < port < 65536:
+                                w["easel"] = {
+                                    "port": port,
+                                    "annotator": bool(data.get("annotator")),
+                                    "cdp_url": str(data.get("cdp_url") or "")}
+                        except Exception:
+                            pass
+                    ann = os.path.join(p, ".kilo", "studio-annotations.jsonl")
+                    if os.path.isfile(ann):
+                        _, ann_total = _annotation_rows(p)
+                        w["annotations"] = ann_total
+                    fresh.append(w)
+                r["worktrees"] = fresh
+                all_wts.extend(fresh)
             active = {a["dir"]: a for a in _running_agents(procs)}
             for k, j in _JOBS.items():
                 d = j.get("dir", "")
@@ -2215,7 +2602,7 @@ class Handler(BaseHTTPRequestHandler):
                 _JOBS.pop(k, None)
             self._json({
                 "repos": repos,
-                "worktrees": [w for r in repos for w in r["worktrees"]],
+                "worktrees": all_wts,
                 "sessions": _sessions(),
                 "quests": _all_quests(),
                 "today": _today_totals(),
@@ -2239,6 +2626,21 @@ class Handler(BaseHTTPRequestHandler):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
             self._json(_session_meta(qs.get("id", [""])[0]))
+        elif self.path.startswith("/api/session/starts"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            ids = [s for s in (qs.get("ids", [""])[0] or "").split(",") if s]
+            self._json(_session_starts(ids))
+        elif self.path.startswith("/api/quest"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            root = next((r["root"] for r in _repos()
+                         if r["key"] == qs.get("app", [""])[0]), None)
+            if root is None:
+                self._json({"error": "unknown app"}, 404)
+            else:
+                self._json(_quest_doc(
+                    root, qs.get("wt", [""])[0], qs.get("id", [""])[0]))
         elif self.path.startswith("/api/turns"):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
@@ -2247,6 +2649,16 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 lim = 60
             self._json(_journal_tail(lim))
+        elif self.path.startswith("/api/annotations"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            wt = qs.get("wt", [""])[0]
+            if not _annotation_wt_ok(wt):
+                self._json({"ok": False,
+                            "error": "unknown worktree"}, 403)
+            else:
+                items, total = _annotation_rows(wt)
+                self._json({"ok": True, "items": items, "total": total})
         elif self.path.startswith("/api/sessions"):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
@@ -2271,8 +2683,58 @@ class Handler(BaseHTTPRequestHandler):
             self._court()
         elif self.path == "/api/session/delete":
             self._session_delete()
+        elif self.path == "/api/annotation":
+            self._annotation_add()
         else:
             self.send_error(404)
+
+    def _annotation_add(self):
+        """Studio-browser annotator ingest (CORS-open, agent-adjacent user
+        content): stored verbatim, later rendered only through esc()."""
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            n = 0
+        if n > _ANNOTATION_BODY_CAP:
+            self._json({"ok": False, "error": "annotation body too large"},
+                       413, cors=True)
+            return
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            self._json({"ok": False, "error": "malformed JSON body"},
+                       400, cors=True)
+            return
+        if not isinstance(body, dict):
+            self._json({"ok": False, "error": "body must be a JSON object"},
+                       400, cors=True)
+            return
+        wt = body.get("worktree")
+        if not _annotation_wt_ok(wt):
+            self._json({"ok": False,
+                        "error": "worktree is not an existing git checkout"},
+                       400, cors=True)
+            return
+        note = body.get("note")
+        if not isinstance(note, str) or not note.strip():
+            self._json({"ok": False,
+                        "error": "note must be a non-empty string"},
+                       400, cors=True)
+            return
+        rec = {"worktree": os.path.normpath(wt), "url": "", "route": "",
+               "selector": "", "tag": "", "text": "", "ts": "",
+               "note": note[:2000]}
+        for k, cap in _ANNOTATION_FIELD_CAPS.items():
+            v = body.get(k)
+            rec[k] = v[:cap] if isinstance(v, str) else ""
+        try:
+            total = _annotation_append(rec)
+        except OSError as exc:
+            self._json({"ok": False,
+                        "error": f"annotation write failed: {exc}"},
+                       500, cors=True)
+            return
+        self._json({"ok": True, "total": total}, cors=True)
 
     def _court(self):
         try:

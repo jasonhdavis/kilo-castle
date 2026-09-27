@@ -171,3 +171,30 @@ sessions painful via Steward relay, memory a primary concern.
   follow-up optimization when per-turn spawn overhead matters.
 - Serve-API probe subagent resumed (final write-up of preserved context) to
   supplement endpoint inventory; no longer blocking anything.
+
+## 2026-09-27 — Serve probe complete: endpoint inventory + architecture tradeoff
+
+Probe findings (static extraction from kilo binary + extension.js; auth verified
+live by Steward separately):
+- Auth confirmed: Basic `kilo:$KILO_SERVER_PASSWORD`; also accepts
+  `?auth_token=<b64>`; serve WITHOUT that env var runs unsecured. Extension
+  generates 32-byte hex password at spawn; never persisted to disk (auth.json =
+  provider creds only). serve has a parent-watchdog (KILO_PARENT_PID) — dies with
+  its VS Code window. Legacy daemon file (~/.local/state/kilo/daemon.json) absent.
+- 200+ HTTP ops behind auth, directory-scoped via x-kilo-directory header. Key:
+  GET /session, /session/:id/message, /config, /project, /mcp/status,
+  kilocode/agentManager; GET /event = SSE (session.created, message.part.updated,
+  step-start/finish, session.error, permission.asked); POST /session (create),
+  POST /session/:id/prompt_async (204 + SSE delivery), /session/:id/message
+  (sync streaming), /abort, /fork.
+- kilo run: prompt positional + appended from stdin when non-TTY; NDJSON events
+  via --format json; --attach <url> -u/-p to a running serve; --session/-c reuse.
+- ARCHITECTURE TRADEOFF (Steward analysis on top of probe recommendation):
+  probe recommends console-owned serve + SSE thin client (warm model cache,
+  native SSE fidelity, one server for all sessions). BUT a resident serve costs
+  ~1.1-1.5 GB while M'Lord's primary concern is memory; headless per-turn
+  (current composer) boots an embedded server per turn (~2-4 s + cache refetch)
+  but keeps IDLE memory at ~zero when no turn is running. DECISION: keep
+  headless per-turn as default (memory-first); add optional `--serve` mode
+  (console-owned serve, prompt_async+SSE) as follow-up for heavy interactive
+  use. Revisit when M'Lord weighs latency vs resident memory.

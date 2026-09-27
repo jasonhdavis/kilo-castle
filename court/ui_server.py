@@ -234,6 +234,33 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
  color:var(--primary);margin:2px 4px 8px}
 .bcard{background:var(--surface-2);border:1px solid var(--edge-soft);border-radius:var(--r-md);
  padding:8px 10px;margin-bottom:6px;transition:border-color .12s ease}
+.bcard.attn{border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.05)}
+.bcard.attn .bid{color:var(--red)}
+.bops{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap}
+.bops button{padding:2px 8px;font-size:9px}
+.bops button.go{border-color:rgba(63,185,80,.4);color:var(--green)}
+.bops button.go:hover{border-color:var(--green);color:var(--green);background:rgba(63,185,80,.08)}
+.bops button.warn{border-color:rgba(248,81,73,.4);color:var(--red)}
+.bchips{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
+.bchip{font-size:9px;padding:1px 6px;border-radius:4px;background:var(--surface);
+ border:1px solid var(--edge-soft);color:var(--dim)}
+.bchip.ok{color:var(--green);border-color:rgba(63,185,80,.3)}
+.bchip.bad{color:var(--red);border-color:rgba(248,81,73,.35)}
+.bchip.warn{color:var(--amber);border-color:rgba(210,153,34,.35)}
+#jobout{font-family:ui-monospace,Menlo,monospace;font-size:11px;white-space:pre-wrap;
+ word-break:break-word;background:var(--bg);border:1px solid var(--edge);
+ border-radius:var(--r-md);padding:10px 12px;max-height:52vh;overflow-y:auto;margin-top:10px}
+#jobout .err{color:var(--red)}
+.turnrow{display:flex;gap:8px;align-items:baseline;padding:5px 4px;border-bottom:1px solid var(--edge-soft);
+ font-size:11px;cursor:pointer}
+.turnrow:hover{background:var(--surface-2)}
+.turnrow .tmono{font-family:ui-monospace,Menlo,monospace;font-size:10px;color:var(--faint);
+ overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.turnrow.fail .tex{color:var(--red)}
+.srow{display:flex;gap:8px;align-items:baseline;padding:6px 4px;border-bottom:1px solid var(--edge-soft);
+ font-size:11.5px;cursor:pointer}
+.srow:hover{background:var(--surface-2)}
+@media (prefers-reduced-motion:reduce){.livedot,.dots i{animation:none}}
 .bcard.click{cursor:pointer}
 .bcard:hover{border-color:var(--blue)}
 .bid{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--blue);
@@ -260,7 +287,10 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 <div class="vtabs"><div class="app on" id="v_chat" onclick="setView('chat')">chat</div>
 <div class="app" id="v_board" onclick="setView('board')">board</div></div>
 <div class="vdiv"></div><div id="totals" style="display:flex;gap:8px"></div>
-<div class="spacer"></div><div class="chip rss">kilo RSS <b id="t_rss">—</b></div>
+<div class="spacer"></div><span class="chip" id="t_today" title="sessions active since local midnight — cost / tokens"></span>
+<div class="chip rss">kilo RSS <b id="t_rss">—</b></div>
+<div class="iconbtn" title="recent turns" onclick="openTurns()">≡</div>
+<div class="iconbtn" title="search sessions" onclick="openSearch()">⌕</div>
 <div id="clock"></div></header>
 <main><nav id="nav"></nav>
 <section id="chat">
@@ -354,10 +384,12 @@ function applyHash(){
   selRepo=(S.repos.find(r=>r.key==='app')||S.repos[0]).key;
   applyHash();renderNav();
  }else{renderNav();if(selWt)renderSessionsBar();}
- $('totals').innerHTML=`<span class="chip">sessions <b>${S.sessions.length}</b></span>
+  $('totals').innerHTML=`<span class="chip">sessions <b>${S.sessions.length}</b></span>
   <span class="chip">worktrees <b>${S.worktrees.length}</b></span>`+
-  ((S.processes||[]).length?`<span class="chip" style="border-color:rgba(248,81,73,.4)"><b style="color:var(--red)">${S.processes.length} flagged</b></span>`:'');
+  ((S.processes||[]).length?`<span class="chip" style="border-color:rgba(248,81,73,.4);cursor:pointer" onclick="openProcs()"><b style="color:var(--red)">${S.processes.length} flagged</b></span>`:'');
   $('t_rss').textContent=mb(S.proc_total_rss);
+  const ty=S.today||{};
+  $('t_today').innerHTML=`$ <b>${(ty.cost||0).toFixed(2)}</b> today`;
   $('clock').textContent=new Date().toLocaleTimeString();
   syncComposer();syncSessMeta();
   if(view==='board'){
@@ -660,6 +692,10 @@ async function dispatch(wt,sess,agent,model,prompt){
    shown:0,spinEl:null};
   TURN=T;turns.push(T);
   syncComposer();
+  try{
+   if(typeof Notification!=='undefined'&&Notification.permission==='default')
+    Notification.requestPermission();
+  }catch(e){}
   if(turnForView()===T)renderLive();
   try{
    const r=await fetch('/api/send',{method:'POST',body:JSON.stringify({
@@ -711,6 +747,20 @@ async function finishTurn(T,err,lastSt){
   if(wasViewing)renderLive(T);
   if(T.spinEl){T.spinEl.remove();T.spinEl=null;}
   syncComposer();
+  if(!wasViewing||document.hidden){
+   const secs=((Date.now()-T.t0)/1000)|0;
+   const failed=!!err||(!!exit&&exit!==0);
+   const ok=!failed&&!T.stopped;
+   document.title=(ok?'✓':'✕')+' turn '+(ok?'done':'failed')+' — Court Console';
+   if(window.notifyTO)clearTimeout(window.notifyTO);
+   window.notifyTO=setTimeout(()=>{document.title='Court Console';},8000);
+   try{
+    if(typeof Notification!=='undefined'&&Notification.permission==='granted')
+     new Notification(ok?'Agent turn done':'Agent turn failed',
+      {body:(T.wt||'').split('/').pop()+' · '+secs+'s'});
+   }catch(e){}
+  }
+  window.addEventListener('focus',()=>{document.title='Court Console';},{once:true});
   const q=(T.ran&&T.queue)?T.queue:null;
   if(wasViewing&&T.ran&&(T.sid||T.sess)){
    await openSess(T.sid||T.sess);
@@ -793,14 +843,22 @@ function openQuestWt(p){
  if(p&&((repo().worktrees||[]).some(w=>w.path===p)))pickWt(p);
  else poll();
 }
+const BOARD_OPS={WORKING:[["goad","goad","go"]],
+ TRIBUTE_READY:[["coin","coin","go"],["advance","advance","GATE",""]],
+ GATE:[["collect","collect","go"]],
+ READY_TO_RAZE:[["raze","raze","warn"]],
+ PLANNED:[["dispatch","dispatch","go"]]};
 function renderBoard(){
  if(view!=='board')return;
  const qs=S.quests||[];
  const apps={};for(const q of qs){const a=q.app||q.repo||'other';apps[a]=(apps[a]||0)+1;}
  if(boardApp!=='all'&&!(boardApp in apps))boardApp='all';
  const act=activeDirs();
+ const attn=q=>{const a=q.audit;return a&&(a.violations>0||a.pending_audience||a.forced_transition);};
+ const nAttn=qs.filter(attn).length;
  let h='<div class="bfil"><span class="chipx '+(boardApp==='all'?'on':'')+'" data-app="all">all · '+qs.length+'</span>'+
-  Object.keys(apps).sort().map(a=>`<span class="chipx ${a===boardApp?'on':''}" data-app="${esc(a)}">${esc(a)} · ${apps[a]}</span>`).join('')+'</div>';
+  Object.keys(apps).sort().map(a=>`<span class="chipx ${a===boardApp?'on':''}" data-app="${esc(a)}">${esc(a)} · ${apps[a]}</span>`).join('')+
+  (nAttn?`<span class="chipx" style="border-color:rgba(248,81,73,.5);color:var(--red)">${nAttn} need attention</span>`:'')+'</div>';
  $('boardbar').innerHTML=h;
  let cols='';
  for(const st of STATUS_ORDER){
@@ -808,9 +866,23 @@ function renderBoard(){
   cols+=`<div class="bcol"><h3>${esc(st.toLowerCase())} · ${items.length}</h3>`;
   for(const q of items){
    const on=!!(q.worktree&&act.has(q.worktree));
-   cols+=`<div class="bcard ${q.worktree?'click':''}" ${q.worktree?`data-wt="${esc(q.worktree)}"`:''}>
+   const a=q.audit;
+   const ops=BOARD_OPS[q.status]||[];
+   let chips='';
+   if(a){
+    if(a.tasks_total)chips+=`<span class="bchip ${a.tasks_pct>=100?'ok':''}">${a.tasks_done}/${a.tasks_total} tasks</span>`;
+    chips+=a.tribute_present?'<span class="bchip ok">tribute</span>':'';
+    if(a.violations)chips+=`<span class="bchip bad">${a.violations} viol</span>`;
+    if(a.pending_audience)chips+='<span class="bchip warn">audience</span>';
+    if(a.forced_transition)chips+='<span class="bchip warn">forced</span>';
+    if(a.commutation_done)chips+='<span class="bchip ok">commuted</span>';
+   }
+   cols+=`<div class="bcard ${q.worktree?'click':''} ${attn(q)?'attn':''}" ${q.worktree?`data-wt="${esc(q.worktree)}"`:''}>
     <div class="bid">${esc(q.id)}${q.dirty?' <span class="badge">dirty</span>':''}${on?' <span class="livedot" title="agent working"></span>':''}</div>
     <div class="bt">${esc(q.title||'')}</div>
+    ${chips?`<div class="bchips">${chips}</div>`:''}
+    ${ops.length?`<div class="bops">${ops.map(o=>
+     `<button class="${o[2]==='warn'?'warn':'go'}" data-op="${o[0]}" data-id="${esc(q.id)}"${o[0]==='advance'?` data-status="${o[3]}"`:''}>${esc(o[1])}</button>`).join('')}</div>`:''}
     <div class="brow"><span class="chip">${esc(q.app||q.repo||'—')}</span>`+
     `<span class="bmono">${esc(q.branch||'')}</span></div></div>`;
   }
@@ -822,7 +894,56 @@ function renderBoard(){
 $('boardbar').addEventListener('click',e=>{
  const c=e.target.closest('[data-app]');if(c)boardFilter(c.dataset.app);});
 $('boardcols').addEventListener('click',e=>{
+ const op=e.target.closest('[data-op]');
+ if(op){courtOp(op.dataset.op,op.dataset.id,op.dataset.status||'');return;}
  const c=e.target.closest('[data-wt]');if(c)openQuestWt(c.dataset.wt);});
+function courtOp(op,id,status){
+ const verb={goad:'GOAD (spawns a serf turn in its worktree)',
+  coin:'COIN (runs a Master-of-Coin audit session)',
+  collect:'COLLECT (packs the GATE convoy)',
+  raze:'RAZE (verify merge + queue for teardown)',
+  dispatch:'DISPATCH --standup (creates worktree + starts serf)',
+  advance:'ADVANCE to '+status}[op];
+ if(!confirm(verb+'\n\n'+id+' — proceed?'))return;
+ fetch('/api/court',{method:'POST',body:JSON.stringify({op,id,status})})
+  .then(r=>r.json()).then(d=>{
+   if(d.error){alert('refused: '+d.error);return;}
+   watchJob(d.job,op.toUpperCase()+' '+id);}).catch(e=>alert('failed: '+e));
+}
+let JOBW=null;
+function watchJob(job,title){
+ openModal(esc(title||'court op'),'<div id="jobout">starting…</div>'+
+  '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">'+
+  '<button id="jobstop">STOP</button><button id="jobclose">CLOSE</button></div>');
+ $('jobclose').onclick=()=>{closeModal();};
+ $('jobstop').onclick=()=>{fetch('/api/stop',{method:'POST',body:JSON.stringify({job})});};
+ if(JOBW)clearInterval(JOBW.iv);
+ JOBW={job,shown:0,iv:setInterval(pollJob,700)};
+ pollJob();
+}
+async function pollJob(){
+ if(!JOBW)return;
+ let st;
+ try{st=await (await fetch('/api/send/'+JOBW.job+'?since='+JOBW.shown)).json();}
+ catch(e){return;}
+ const out=$('jobout');if(!out){clearInterval(JOBW.iv);JOBW=null;return;}
+ const evs=st.events||[];
+ JOBW.shown=st.total!=null?st.total:(JOBW.shown+evs.length);
+ for(const ev of evs){
+  if(!ev.text)continue;
+  const d=document.createElement('div');
+  if(ev.type==='error'){d.className='err';}
+  d.textContent=ev.text;
+  out.appendChild(d);
+ }
+ out.scrollTop=out.scrollHeight;
+ if(st.done){
+  clearInterval(JOBW.iv);JOBW=null;
+  out.insertAdjacentHTML('beforeend',
+   `<div class="${st.exit?'err':''}">— finished (exit ${st.exit==null?'?':st.exit}) —</div>`);
+  poll();
+ }
+}
 document.getElementById('c_prompt').addEventListener('input',()=>{cmdIdx=0;autosizeTa();renderCmdList();});
 document.getElementById('c_prompt').addEventListener('keydown',e=>{
  const list=$('cmdlist');
@@ -840,6 +961,13 @@ document.getElementById('c_prompt').addEventListener('keydown',e=>{
   if(listOpen&&!$('c_prompt').value.includes(' ')){e.preventDefault();
    const m=cmdMatches();if(m.length)completeCmd(m[cmdIdx].name);return;}
   e.preventDefault();renderCmdList();sendComposer();}});
+function openModal(title, body){
+  document.querySelector('#modal .hd b').textContent=title;
+  $('modal_bd').innerHTML=body;
+  $('modal').classList.add('on');
+}
+function closeModal(){$('modal').classList.remove('on');}
+function closeMcp(){closeModal();}
 function openMcp(){
   const list=S.mcp||[];
  let h='';
@@ -855,13 +983,99 @@ function openMcp(){
     `<td>${m.enabled?'<span class="num" style="color:var(--green)">yes</span>':'<span class="dim">no</span>'}</td><td>${run}</td><td>${btn}</td></tr>`;
   }).join('')+'</tbody></table>'+
   '<div class="dim" style="padding-top:10px;font-size:11px">toggles edit the config file (a .bak copy is kept) and take effect for sessions started after the change</div>';
- $('modal_bd').innerHTML=h;
- $('modal').classList.add('on');
+  openModal('MCP SERVERS — merged inventory', h);
 }
-function closeMcp(){$('modal').classList.remove('on');}
 $('modal_bd').addEventListener('click',e=>{
  const b=e.target.closest('[data-file]');
- if(b)mcpToggle(b.dataset.file,b.dataset.name);});
+ if(b){mcpToggle(b.dataset.file,b.dataset.name);return;}
+ const p=e.target.closest('[data-pid]');
+ if(p){reapProc(p.dataset.pid);return;}
+ const t=e.target.closest('[data-sid2]');
+ if(t){jumpToSession(t.dataset.sid2);return;}
+});
+$('modal').addEventListener('click',e=>{
+ if(e.target.id==='modal')closeModal();});
+document.addEventListener('keydown',e=>{
+ if(e.key==='Escape')closeModal();});
+function reapProc(pid){
+ if(!confirm('Terminate pid '+pid+'? (parent is a verified kilo process)'))return;
+ fetch('/api/reap',{method:'POST',body:JSON.stringify({pid:parseInt(pid,10)})})
+  .then(r=>r.json()).then(d=>{
+   if(d.error){alert('refused: '+d.error);return;}
+   poll();openProcs();}).catch(e=>alert('failed: '+e));
+}
+function openProcs(){
+ const list=S.processes||[];
+ let h=list.length?'<table><thead><tr><th>pid</th><th>rss</th><th>etime</th><th>args</th><th></th></tr></thead><tbody>'+
+  list.map(p=>`<tr><td class="mono">${p.pid}</td><td class="num">${mb(p.rss)}</td><td class="mono">${esc(p.etime||'')}</td>`+
+   `<td class="mono" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.args.slice(0,140))}</td>`+
+   `<td><button data-pid="${p.pid}">reap</button></td></tr>`).join('')+'</tbody></table>'
+  :'<div class="empty-note">no flagged orphan processes right now</div>';
+ openModal('ORPHANED PROCESSES — kilo children', h);
+}
+function openTurns(){
+ openModal('RECENT TURNS — console + court ops', '<div id="turnlist">loading…</div>');
+ fetch('/api/turns?limit=80').then(r=>r.json()).then(rows=>{
+  const el=$('turnlist');
+  el.innerHTML=rows.length?rows.map(t=>{
+   const fail=t.exit&&t.exit!==0;
+   const label=t.source==='court'?`${t.op} ${t.id||''}`:`${t.agent||'?'}`;
+   const when=new Date(t.ts||0).toLocaleTimeString();
+   return `<div class="turnrow ${fail?'fail':''}" ${t.sid?`data-sid2="${esc(t.sid)}"`:''}>
+    <span class="tex" style="flex:none;font-weight:600">${fail?'✕':'✓'} ${esc(String(t.exit==null?'?':t.exit))}</span>
+    <span style="flex:none">${esc(label)}</span>
+    <span class="tmono">${esc((t.dir||'').split('/').slice(-2).join('/'))}</span>
+    <span class="tmono" style="flex:none">${esc(when)} · ${t.duration_s==null?'?':t.duration_s}s</span>
+    <span class="tmono" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc((t.prompt_head||t.error_tail||'').slice(0,70))}</span>
+   </div>`;}).join('')
+  :'<div class="empty-note">no turns journaled yet</div>';
+ }).catch(()=>{$('turnlist').textContent='failed to load';});
+}
+function openSearch(){
+ openModal('SEARCH SESSIONS — kilo.db titles',
+  '<input id="sq" placeholder="title / directory / agent — Enter to search" style="width:100%;background:var(--bg);border:1px solid var(--edge);color:var(--ink);border-radius:8px;padding:8px 10px;font-size:12.5px">'+
+  '<div id="sres" style="margin-top:8px;max-height:50vh;overflow-y:auto"></div>');
+ const inp=$('sq');
+ inp.focus();
+ inp.addEventListener('keydown',e=>{
+  if(e.key==='Enter')doSearch(inp.value.trim());});
+}
+async function doSearch(q){
+ const el=$('sres');if(!el)return;
+ if(!q){el.innerHTML='';return;}
+ el.innerHTML='<div class="dim">searching…</div>';
+ let rows=[];
+ try{rows=await (await fetch('/api/sessions?q='+encodeURIComponent(q))).json();}
+ catch(e){el.textContent='search failed';return;}
+ el.innerHTML=rows.length?rows.map(s=>
+  `<div class="srow" data-sid2="${esc(s.id)}">
+   <span style="flex:none;font-weight:600">${esc(s.agent||'?')}</span>
+   <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc((s.title||s.id).slice(0,70))}</span>
+   <span class="tmono">${esc((s.directory||'').split('/').slice(-2).join('/'))}</span>
+   <span class="tmono" style="flex:none">$${(s.cost||0).toFixed(2)}</span>
+  </div>`).join('')
+ :'<div class="empty-note">no matches</div>';
+}
+function jumpToSession(sid){
+ const s=(S.sessions||[]).find(x=>x.id===sid);
+ closeModal();
+ if(!s){alert('session not in recent list; use search');return;}
+ const r=(S.repos||[]).find(r=>s.directory&&s.directory.startsWith(r.root));
+ if(r)selRepo=r.key;
+ if(s.directory){
+  const w=(r&&r.worktrees||[]).find(w=>s.directory.startsWith(w.path));
+  if(w){selWt=w.path;
+   $('wt_label').innerHTML=esc(w.branch||w.path.split('/').pop())+
+    ` <span class="dim">· ${esc(w.path.replace('/Users/scrummage/Python/',''))}</span>`;
+  }
+ }
+ selSess=sid;
+ setView('chat');
+ openSess(sid);
+ loadCmds();
+ syncHash();
+ poll();
+}
 async function mcpToggle(file,name){
  const m=(S.mcp||[]).find(x=>x.file===file&&x.name===name);
  if(!m)return;
@@ -959,9 +1173,64 @@ def _quests(root, ttl=20):
 def _all_quests():
     out = []
     for r in _repos():
+        audit = _court_audit(r["root"])
         for q in _quests(r["root"]):
-            out.append(dict(q, repo=r["key"]))
+            a = audit.get(q["id"])
+            if a:
+                out.append(dict(q, repo=r["key"], audit=a))
+            else:
+                out.append(dict(q, repo=r["key"]))
     return out
+
+
+_AUDIT_CACHE = {}  # repo root -> {"t": ts, "data": {quest_id: audit}, "busy": bool}
+_AUDIT_LOCK = threading.Lock()
+
+
+def _court_audit(root, ttl=120):
+    """`court status --json` per repo, background-refreshed; returns the last
+    good {quest_id: audit-subset} map (empty map until the first refresh)."""
+    now = time.time()
+    hit = _AUDIT_CACHE.get(root)
+    if hit and now - hit["t"] < ttl and not hit.get("busy"):
+        return hit["data"]
+    with _AUDIT_LOCK:
+        hit = _AUDIT_CACHE.get(root)
+        if hit and (now - hit["t"] < ttl or hit.get("busy")):
+            return hit["data"]
+        entry = _AUDIT_CACHE.setdefault(root, {"t": 0.0, "data": {}})
+        entry["busy"] = True
+
+    def _bg():
+        try:
+            r = subprocess.run(
+                ["python3", "-m", "court.cli", "status", "--json"],
+                capture_output=True, text=True, timeout=120, cwd=root)
+            data = json.loads(r.stdout or "{}")
+            subset = {}
+            for q in data.get("quests", []):
+                tp = q.get("task_progress") or {}
+                subset[q["id"]] = {
+                    "tasks_done": tp.get("checked", 0),
+                    "tasks_total": tp.get("total", 0),
+                    "tasks_pct": tp.get("percent", 0),
+                    "tribute_present": bool(q.get("tribute_present")),
+                    "violations": len(q.get("violations") or []),
+                    "warnings": len(q.get("warnings") or []),
+                    "pending_audience": bool(q.get("pending_audience")),
+                    "forced_transition": bool(q.get("forced_transition")),
+                    "commutation_done": bool(q.get("commutation_done")),
+                    "serf_session_id": q.get("serf_session_id", ""),
+                }
+            entry["t"] = time.time()
+            entry["data"] = subset
+        except Exception:
+            entry["t"] = time.time()  # back off until next TTL window
+        finally:
+            entry["busy"] = False
+
+    threading.Thread(target=_bg, daemon=True).start()
+    return entry["data"]
 
 
 def _repos():
@@ -1104,6 +1373,48 @@ def _running_agents(procs=None):
                     "agent": am.group(1) if am else "?",
                     "pid": p["pid"], "etime": p["etime"], "source": "ps"})
     return out
+
+
+def _sessions_search(q, limit=40):
+    q = (q or "").strip()
+    if not os.path.exists(KILO_DB) or not q:
+        return []
+    like = f"%{q[:120]}%"
+    try:
+        db = sqlite3.connect(f"file:{KILO_DB}?mode=ro", uri=True, timeout=3)
+        db.execute("pragma query_only=1")
+        rows = db.execute(
+            "select id, title, agent, model, directory, time_updated,"
+            " cost from session where title like ? or directory like ?"
+            " or agent like ? order by time_updated desc limit ?",
+            (like, like, like, limit)).fetchall()
+        db.close()
+    except Exception:
+        return []
+    return [{"id": sid, "title": title or "", "agent": agent or "",
+             "directory": directory or "", "time_updated": tu,
+             "cost": round(cost or 0.0, 4)}
+            for sid, title, agent, _model, directory, tu, cost in rows]
+
+
+def _today_totals():
+    """Aggregate cost/tokens for sessions active since local midnight."""
+    if not os.path.exists(KILO_DB):
+        return {"sessions": 0, "cost": 0.0, "tokens": 0}
+    lt = time.localtime()
+    midnight_ms = (time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                                0, 0, 0, 0, 0, -1))) * 1000
+    try:
+        db = sqlite3.connect(f"file:{KILO_DB}?mode=ro", uri=True, timeout=3)
+        db.execute("pragma query_only=1")
+        n, cost, toks = db.execute(
+            "select count(*), coalesce(sum(cost),0),"
+            " coalesce(sum(tokens_input+tokens_output),0) from session"
+            " where time_updated >= ?", (midnight_ms,)).fetchone()
+        db.close()
+    except Exception:
+        return {"sessions": 0, "cost": 0.0, "tokens": 0}
+    return {"sessions": n, "cost": round(cost or 0.0, 2), "tokens": toks or 0}
 
 
 def _ps_procs():
@@ -1403,6 +1714,132 @@ def _kilo_bin():
 
 
 _ALLOWED_AGENTS = ("steward", "code", "serf", "scout", "artist")
+
+TURN_JOURNAL = os.path.expanduser(
+    "~/.local/share/kilo-castle/console_turns.jsonl")
+
+
+def _journal_append(rec):
+    try:
+        os.makedirs(os.path.dirname(TURN_JOURNAL), exist_ok=True)
+        try:
+            if os.path.getsize(TURN_JOURNAL) > 2_000_000:
+                os.replace(TURN_JOURNAL, TURN_JOURNAL + ".1")
+        except OSError:
+            pass
+        with open(TURN_JOURNAL, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
+def _journal_tail(limit=100):
+    out = []
+    try:
+        with open(TURN_JOURNAL) as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln:
+                    out.append(ln)
+    except OSError:
+        return []
+    out = out[-limit:]
+    out.reverse()
+    res = []
+    for ln in out:
+        try:
+            res.append(json.loads(ln))
+        except Exception:
+            continue
+    return res
+
+
+_COURT_OP_ARITY = {
+    "goad": ("goad", "{id}"),
+    "coin": ("coin", "{id}"),
+    "collect": ("collect",),
+    "raze": ("raze", "{id}"),
+    "dispatch": ("dispatch", "{id}", "--standup"),
+}
+
+
+def _find_quest_repo(qid):
+    qid = (qid or "").strip()
+    if not re.fullmatch(r"[QqEeSs]?\d[\w-]{0,60}", qid):
+        return None
+    matches = [q for q in _all_quests()
+               if q["id"].lower() == qid.lower()
+               or q["id"].lower().startswith(qid.lower())]
+    if len(matches) != 1:
+        return None
+    for r in _repos():
+        if r["key"] == matches[0]["repo"]:
+            return {"quest": matches[0], "root": r["root"]}
+    return None
+
+
+def _court_op(job, op, qid, status, note):
+    try:
+        found = _find_quest_repo(qid)
+        if not found and op == "collect":
+            found = {"root": COURT_DIR}
+        if not found:
+            job["events"].append({"type": "error",
+                                  "text": f"unknown or ambiguous quest id {qid!r}"})
+            job["done"] = True
+            job["ended"] = time.time()
+            return
+        root = found["root"]
+        if op == "advance":
+            if status not in STATUS_ORDER:
+                job["events"].append({"type": "error",
+                                      "text": f"status {status!r} not allowed"})
+                job["done"] = True
+                job["ended"] = time.time()
+                return
+            argv = ["python3", "-m", "court.cli", "advance", found["quest"]["id"],
+                    status, "--note", note or "advanced via court console"]
+        else:
+            tmpl = _COURT_OP_ARITY[op]
+            argv = ["python3", "-m", "court.cli"] + [
+                a.replace("{id}", found["quest"]["id"] if found.get("quest") else "")
+                for a in tmpl]
+        job["events"].append({"type": "status", "text": "$ " + " ".join(argv) +
+                              f"   (cwd {root})"})
+        proc = subprocess.Popen(
+            argv, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, start_new_session=True)
+        job["proc"] = proc
+        for ln in proc.stdout:
+            ln = ln.rstrip()
+            if ln:
+                if len(ln) > 400:
+                    ln = ln[:400] + " …"
+                job["events"].append({"type": "text", "text": ln})
+        # goad/coin/dispatch wrap a full agent turn — no timeout; stop via /api/stop
+        long_op = op in ("goad", "coin", "dispatch")
+        try:
+            rc = proc.wait(None if long_op else 180)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            rc = -99
+            job["events"].append({"type": "error", "text": "court op timed out"})
+        job["exit"] = rc
+        job["ended"] = time.time()
+        job["done"] = True
+        _journal_append({"ts": int(time.time() * 1000), "source": "court",
+                         "op": op, "id": qid, "dir": root, "exit": rc,
+                         "duration_s": round(job["ended"] - job["started"], 1)})
+        _QUESTS_CACHE[root] = (0, {})  # force quest re-scan (status may have changed)
+        _AUDIT_CACHE.pop(root, None)
+    except Exception as exc:
+        job["events"].append({"type": "error", "text": f"court op failed: {exc}"})
+        job["exit"] = -98
+        job["ended"] = time.time()
+        job["done"] = True
 _JOBS = {}
 _JOB_SEQ = [0]
 
@@ -1542,6 +1979,17 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
     job["exit"] = rc
     job["ended"] = time.time()
     job["done"] = True
+    err_tail = ""
+    for e in reversed(job["events"]):
+        if e.get("type") == "error":
+            err_tail = e.get("text", "")[:300]
+            break
+    _journal_append({
+        "ts": int(time.time() * 1000), "source": "console",
+        "dir": directory, "agent": agent, "model": model,
+        "sid": job.get("sid"), "exit": rc,
+        "duration_s": round(job["ended"] - job["started"], 1),
+        "prompt_head": prompt[:200], "error_tail": err_tail})
 
 
 def _validate_send(directory, agent):
@@ -1699,6 +2147,7 @@ class Handler(BaseHTTPRequestHandler):
                 "worktrees": [w for r in repos for w in r["worktrees"]],
                 "sessions": _sessions(),
                 "quests": _all_quests(),
+                "today": _today_totals(),
                 "active": sorted(active.values(),
                                  key=lambda a: a.get("started") or 0),
                 "mcp": _mcp_inventory(procs),
@@ -1719,6 +2168,18 @@ class Handler(BaseHTTPRequestHandler):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
             self._json(_session_meta(qs.get("id", [""])[0]))
+        elif self.path.startswith("/api/turns"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                lim = min(int(qs.get("limit", ["60"])[0]), 200)
+            except Exception:
+                lim = 60
+            self._json(_journal_tail(lim))
+        elif self.path.startswith("/api/sessions"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            self._json(_sessions_search(qs.get("q", [""])[0]))
         elif self.path.startswith("/api/session"):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
@@ -1735,10 +2196,37 @@ class Handler(BaseHTTPRequestHandler):
             self._send()
         elif self.path == "/api/stop":
             self._stop()
+        elif self.path == "/api/court":
+            self._court()
         elif self.path == "/api/session/delete":
             self._session_delete()
         else:
             self.send_error(404)
+
+    def _court(self):
+        try:
+            body = self._read_body()
+            op = str(body.get("op", ""))
+            qid = str(body.get("id", ""))
+            status = str(body.get("status", ""))
+            note = str(body.get("note", ""))[:200]
+        except Exception:
+            self._json({"error": "bad request"}, 400)
+            return
+        if op not in _COURT_OP_ARITY and op != "advance":
+            self._json({"error": "op not allowed"}, 403)
+            return
+        if op == "advance" and status not in STATUS_ORDER:
+            self._json({"error": "status not allowed"}, 403)
+            return
+        _JOB_SEQ[0] += 1
+        jid = _JOB_SEQ[0]
+        job = {"events": [], "done": False, "started": time.time(),
+               "dir": "", "agent": "court:" + op, "op": op, "qid": qid}
+        _JOBS[str(jid)] = job
+        threading.Thread(target=_court_op, daemon=True,
+                         args=(job, op, qid, status, note)).start()
+        self._json({"ok": True, "job": str(jid)})
 
     def _stop(self):
         try:

@@ -979,7 +979,7 @@ def cmd_status(args):
                 "tags": q.tags,
                 "status": q.status,
                 "branch": q.branch,
-                "worktree": audit.worktree,
+                "worktree": audit.worktree_path,
                 "serf_session_id": q.serf_session_id,
                 "serf_model": q.serf_model,
                 "master_of_coin_session_id": q.master_of_coin_session_id,

@@ -503,6 +503,61 @@ RIL1w68UmCEWt6).
   journal JSONL; process/reap panel UI; turn-complete notifications; session
   search; today-cost rollups. Ranked adoption next rounds.
 
+## 2026-09-27 (10:4x) — Console round 2 (royal assent): board attention signals, action runner, turn journal, procs panel, notifications, search, $today
+
+All five queued items shipped. Direct on trunk.
+
+- PB-APP ENGINE BUG (fixed in BOTH copies): `court status --json` crashed —
+  `cmd_status` read `audit.worktree` but WardAudit defines `worktree_path`.
+  pb-app commit 91a20c83a (castle trunk, only that hunk — an unrelated
+  in-flight raze try/except in the working tree was left alone);
+  kilo-castle cli.py fixed same line (latent, would crash identically).
+  pb-app/court is a SYMLINK to .court/engine — engine is the tracked source.
+- BOARD ATTENTION: `_court_audit(root, ttl=120)` — background-refreshed
+  subprocess `python3 -m court.cli status --json` per repo (pb-app first run
+  ~13s, cached; stale-serve pattern), merged into /api/state quests as
+  `audit` {tasks_done/total/pct, tribute_present, violations, warnings,
+  pending_audience, forced_transition, commutation_done, serf_session_id}.
+  Board cards: red outline + red id for attention (viol/audience/forced);
+  chips (tasks x/y, tribute ✓, viol count, audience/forced/commuted); board
+  bar "N need attention". Live: 87/87 audited, 32 attention.
+- ACTION RUNNER: POST /api/court {op,id,status?,note?} — strict whitelist
+  (goad/coin/collect/raze/dispatch via _COURT_OP_ARITY fixed argv templates +
+  advance with status validated against STATUS_ORDER); quest id resolved
+  server-side against the quest map (exact or unique prefix; unknown→error
+  event); runs with cwd=quest's repo root; goad/coin/dispatch have NO timeout
+  (they wrap whole agent turns — /api/stop is the kill path); short ops 180s.
+  Streams stdout into the job event buffer; watchJob() renders a live job
+  console modal (same /api/send/<job>?since polling); court-op completions
+  journaled + quest/audit caches invalidated. Negative paths verified: bad op
+  403, bad status 403, unknown id → in-stream error. Card buttons per status:
+  WORKING→goad, TRIBUTE_READY→coin+advance(GATE), GATE→collect,
+  READY_TO_RAZE→raze, PLANNED→dispatch --standup; all confirm() first.
+- TURN JOURNAL: ~/.local/share/kilo-castle/console_turns.jsonl (2MB rotate to
+  .1); one line per completed console turn (ts, dir, agent, model, sid, exit,
+  duration, prompt_head, error_tail) and court op (op, id, exit). GET
+  /api/turns → ≡ header button modal, fail rows red, click-through to session.
+- PROCS PANEL: header "N flagged" chip now opens the reap table (pid/rss/
+  etime/args + REAP per row → /api/reap). Backend finally has its UI back.
+- NOTIFICATIONS: finishTurn — if turn finished while not viewing or tab
+  hidden: document.title flash (✓/✕, 8s) + Notification (permission asked on
+  first dispatch); focus resets title.
+- SESSION SEARCH: ⌕ header button → modal, /api/sessions?q= LIKE over
+  title/directory/agent (limit 40, read-only); row click jumps
+  repo+worktree+session (jumpToSession).
+- $TODAY: /api/state.today = {sessions, cost, tokens} since local midnight;
+  header chip. Live: $4.64 / 9.75M tokens / 55 sessions.
+- Modal shell generalized (openModal/closeModal; MCP/procs/turns/search
+  share it); backdrop-click + Escape close. Reduced-motion media guard.
+- Units: journal roundtrip, today totals, search, _find_quest_repo
+  (Q602→pb-app root; ambiguous/unknown→None) all green; node --check clean;
+  server restarted persistent (pid 79386).
+
+### Deferred for round 3 (if wanted)
+- a11y pass beyond Escape/backdrop (roles/aria-live/reduced-motion done only
+  for pulse); hung-turn watchdog; last-good snapshot on transient DB errors;
+  board epic grouping; job console for dispatch streaming serf.log tail.
+
 ## 2026-09-27 — kilo.db cleanup: 104G file → ~11G live (royal assent given)
 
 - M'Lord requested a review: "kilo db is like 11gb". Actual: `kilo.db` was

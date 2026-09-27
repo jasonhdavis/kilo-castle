@@ -368,6 +368,69 @@ live by Steward separately):
   CLI/git patterns to agent definitions (permissions resolve from agent
   config per opencode.log `action.source=agent`); keep --auto meanwhile.
 
+## 2026-09-27 (04:xx) — Console v0.9: royal review round; scroll/thinking/composer fixed; board + slash commands + ctx/cost shipped
+
+M'Lord directive: serious pre-v1 review of the UI platform + (a) pulsing green
+dot on quest cards, (b) thinking auto-expand + broken expand click, (c) status
+dashboard with app-tag filtering, (d) slash commands mirroring VS Code, (e)
+context-window + cost metrics. Mid-build bug reports: stream scroll snapping,
+QUEUE state leaking across session switches, Enter-queue silent drop.
+
+### Root causes + fixes (direct on castle trunk, court/ui_server.py)
+- SCROLL SNAP: renderLive rebuilt the whole transcript innerHTML every 700ms
+  poll — DOM destruction reset the browser scroll anchor each rebuild.
+  FIX: incremental rendering — append-only blocks, persistent spinner element
+  updated in place, dataset.turn guard rebuilds once after any foreign render,
+  autoscroll still near-bottom only.
+- THINKING: was auto-collapsed >700 chars and the expand click was wiped by the
+  next full rebuild. FIX: auto-EXPANDED by default; click-to-collapse persisted
+  via foldMemo keyed by foldKey(text) + data-fk attrs; survives re-renders and
+  DB reloads.
+- COMPOSER STATE LEAK: composing/TURN were global — switching sessions while a
+  turn ran kept QUEUE + live chip; Enter-queue before job-id assignment was
+  silently dropped and invisible when not viewing the turn. FIX: turns[] list +
+  turnForView() (per viewed wt/sess); parallel turns across worktrees allowed;
+  syncComposer() re-derives SEND/QUEUE/STOP/chip on every state change; queue
+  allowed pre-job-id and always renders a visible "queued next" block.
+- GREEN DOTS (royal item): /api/state now exposes `active` — DERIVED FROM PS
+  (kilo run --dir/--agent regex), so dots on trunk/worktree/board cards are
+  truthful for console AND court-CLI dispatches/goads (verified live: external
+  pb-app steward detected). Console jobs union in for the pre-spawn window.
+- BOARD (royal item): #board view (header CHAT/BOARD vtabs) — kanban columns
+  per STATUS_ORDER, app-tag filter chips (tag = frontmatter app or Q-id
+  segment), quest cards (id/title/branch/dirty/dot) click-through to the
+  worktree in chat view; server /api/state.quests = per-repo .court/{quests,
+  epics} scan with TTL caches (_QUESTS_CACHE/_wt_dirty). 87 pb-app quests live.
+- SLASH COMMANDS (royal item): /api/commands?dir= lists <dir>/.kilo/{commands,
+  command} + global ~/.config/kilo; composer "/" autocomplete (#cmdlist,
+  Tab/Arrow/Enter) — prompt sent verbatim, server _expand_command substitutes
+  $ARGUMENTS (or appends) and routes agent per command frontmatter (validated
+  against allowlist). Unit-checked: /status --tree, /goad Q123, unknown-cmd 400.
+- CTX/COST (royal item): session tokens are CUMULATIVE in kilo.db — true
+  context = last step-finish part tokens.total. New /api/session/meta?id=
+  returns ctx + model + session cost; chatbar shows "ctx 96k/200k (48%) · $x"
+  (client ctxLim heuristic by model family); tab tooltips show cumulative
+  tok + cost. Dead PAGE.replace("${json.dumps(STATUS_ORDER)}") replaced with
+  working __STATUS_ORDER__ injection.
+- Stray empty file `{}` at repo root removed.
+
+### Verification
+node --check on extracted PAGE JS (clean); module import clean; live curl:
+/api/state (repos/quests/active/sessions+meta), /api/commands (34), /api/
+session/meta; persistent server restarted twice cleanly (now pid 62338,
+bgp_0e0ec160e001RIL1w68UmCEWt6).
+
+### In flight / next
+- Three background review agents launched (backend, frontend/UX, product
+  gaps); product review returned: TOP finding was the ps-truth dot gap (fixed
+  in this round). Pending adoption: board cards fed by `court status --json`
+  (attention signals), /api/court action buttons (goad/coin/advance/collect),
+  persistent turn journal JSONL, process/reap panel restore, turn-complete
+  notifications, session search. Triage after remaining reviews land.
+- Review agents: ses_f1ef1d07affeOk8ppyrxfPCoeW (product, done),
+  ses_f1ef1d07effeXDx7UaRhGxAVtO (frontend/UX), ses_f1ef3b9d3ffeFurNGbhvbuI3No
+  (backend) — results to be triaged into next console round.
+
 ## 2026-09-27 — kilo.db cleanup: 104G file → ~11G live (royal assent given)
 
 - M'Lord requested a review: "kilo db is like 11gb". Actual: `kilo.db` was

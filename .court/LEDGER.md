@@ -157,3 +157,17 @@ sessions painful via Steward relay, memory a primary concern.
   Serve-API probe still useful for attach-mode (kilo run --attach) later.
 - Console live at http://127.0.0.1:8300: sidebar, session tabs, message drawer,
   process panel w/ reap, MCP panel, composer.
+
+## 2026-09-27 — Serve API auth solved (direct probe, console-independent)
+
+- Mechanism: HTTP **Basic auth** — user `kilo`, password = `KILO_SERVER_PASSWORD`
+  env var held by the `kilo serve` process itself (verified: 401 unauthenticated →
+  200 with `-u kilo:$KILO_SERVER_PASSWORD` on /config; config JSON returned).
+- Implications for the console: attach-mode is viable — console can start its OWN
+  standalone `kilo serve` (independent of VS Code) and run turns via
+  `kilo run --attach http://127.0.0.1:<port> -u kilo -p <pw>`, giving one shared
+  server + session continuity, instead of a spawn per turn. Current headless
+  per-turn transport stays default (works, validated); attach-mode is the
+  follow-up optimization when per-turn spawn overhead matters.
+- Serve-API probe subagent resumed (final write-up of preserved context) to
+  supplement endpoint inventory; no longer blocking anything.

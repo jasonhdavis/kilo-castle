@@ -198,3 +198,33 @@ live by Steward separately):
   headless per-turn as default (memory-first); add optional `--serve` mode
   (console-owned serve, prompt_async+SSE) as follow-up for heavy interactive
   use. Revisit when M'Lord weighs latency vs resident memory.
+
+## 2026-09-27 (later) — Composer frozen-frame bug fixed; URL state tokens; auto session continuity
+
+- FROZEN FRAME ROOT CAUSE: commit e657543 added a live elapsed timer to the
+  composer's poll loop referencing an UNDEFINED `t0` — ReferenceError killed the
+  `while` polling loop on its first iteration, right after the "spawning agent"
+  notice rendered. `composing` stayed true forever: send button dead, frame
+  frozen at "spawning", nothing updated. Server-side transport was never at
+  fault (verified: trivial turn streams step_start→text→step_finish, exit 0).
+- Fixes in sendComposer: define `t0`; wrap poll loop in try/catch (a loop error
+  can no longer permanently disable the composer); handle unknown-job 404
+  (`st.error`); show non-zero exit codes as error notice; elapsed timer only
+  while pre-first-event (`dispatching… Ns`), turn-complete notice shows total.
+- URL STATE TOKENS: selection is now encoded in the location hash
+  `#app=<repokey>&wt=<encpath>&sess=<sessionid>` via syncHash()
+  (history.replaceState — no history spam) on switchApp/pickWt/openSess/newSess;
+  on first /api/state load applyHash() restores repo (by key), worktree (by
+  path, falling back to branch name match), and session. Browser refresh now
+  returns to the exact app/worktree/session. Round-trip unit-tested in node.
+- AUTO SESSION CONTINUITY: /api/send/<job> now returns `sid`; after a new-
+  session turn completes the client adopts it (selSess=sid, continue-line
+  updated, hash updated) so the next send continues the SAME session instead of
+  spawning a fresh one every send. Also removed the events[-80:] server cap —
+  it silently desynced the client's `seen` index on long turns (events skipped).
+- switchApp/pickWt now clear the transcript + composer continue-line properly.
+- Verified live end-to-end via curl (both turns exit 0): new-session turn
+  ("Reply with exactly: OK" → "OK"), then continue on the returned sid → model
+  recalled the exact first-turn answer. Two-level continue now proven through
+  the console transport. PAGE made a raw string (kills the SyntaxWarning from
+  the JS `[\w-]+` regex).

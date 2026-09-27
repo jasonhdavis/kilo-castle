@@ -29,7 +29,7 @@ STATUS_ORDER = [
     "PUNISHED", "ASHES",
 ]
 
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Court Console</title>
 <style>
 :root{
@@ -206,17 +206,49 @@ const ago=ts=>{if(!ts)return'';const d=(Date.now()-ts)/1000;
 const $=id=>document.getElementById(id);
 const TRUNKS=['main','castle','master','trunk'];
 function repo(){return S.repos.find(r=>r.key===selRepo)||S.repos[0]}
+function hashState(){
+ const h=location.hash.replace(/^#/,'');const p={};
+ for(const kv of h.split('&')){const i=kv.indexOf('=');
+  if(i>0)p[kv.slice(0,i)]=decodeURIComponent(kv.slice(i+1));}
+ return p;
+}
+function syncHash(){
+ const p=[];
+ if(selRepo)p.push('app='+encodeURIComponent(selRepo));
+ if(selWt)p.push('wt='+encodeURIComponent(selWt));
+ if(selSess)p.push('sess='+encodeURIComponent(selSess));
+ history.replaceState(null,'','#'+p.join('&'));
+}
+function applyHash(){
+ const p=hashState();let hit=false;
+ if(p.app&&S.repos.some(r=>r.key===p.app)){selRepo=p.app;hit=true;}
+ if(p.wt){
+  const r=repo();
+  const w=(r.worktrees||[]).find(x=>x.path===p.wt)||(r.worktrees||[]).find(x=>x.branch===p.wt);
+  if(w){selWt=w.path;hit=true;
+   const wi=(repo().worktrees||[]).find(x=>x.path===w.path);
+   $('wt_label').innerHTML=esc(wi&&wi.branch||w.path.split('/').pop())+
+    ` <span class="dim">· ${esc(w.path.replace('/Users/scrummage/Python/',''))}</span>`;
+   $('wt_badge').innerHTML=wi&&wi.dirty?'<span class="badge">dirty</span>':'';
+   renderNav();renderSessionsBar();
+   if(p.sess&&/^[\w-]+$/.test(p.sess))openSess(p.sess);
+   else{const s=sessionsFor(selWt);if(s.length)openSess(s[0].id);else newSess();}
+  }
+ }
+ return hit;
+}
 
 async function poll(){
  try{S=await (await fetch('/api/state')).json();}catch(e){return;}
- if(!selRepo&&S.repos.length)selRepo=S.repos.find(r=>r.key==='app')? 'app':S.repos[0].key;
+ if(!selRepo&&S.repos.length){
+  selRepo=(S.repos.find(r=>r.key==='app')||S.repos[0]).key;
+  if(!applyHash())renderNav();
+ }else{renderNav();if(selWt)renderSessionsBar();}
  $('totals').innerHTML=`<span class="chip">sessions <b>${S.sessions.length}</b></span>
   <span class="chip">worktrees <b>${S.worktrees.length}</b></span>`+
   ((S.processes||[]).length?`<span class="chip" style="border-color:rgba(248,81,73,.4)"><b style="color:var(--red)">${S.processes.length} flagged</b></span>`:'');
  $('t_rss').textContent=mb(S.proc_total_rss);
  $('clock').textContent=new Date().toLocaleTimeString();
- renderNav();
- if(selWt)renderSessionsBar();
 }
 function renderNav(){
  const r=repo(); if(!r){$('nav').innerHTML='';return;}
@@ -249,18 +281,26 @@ function renderNav(){
 }
 function switchApp(key){selRepo=key;selWt=null;selSess=null;msgs=[];
  $('wt_label').textContent='select a worktree';$('wt_badge').innerHTML='';
- renderNav();}
+ $('c_cont').innerHTML='new session — pick a worktree, or click a session tab to continue it';
+ renderNav();renderTranscript();syncHash();}
 function pickWt(path,branch){
  selWt=path;selSess=null;msgs=[];
- const w=(repo().worktrees||[]).find(x=>x.path===path);
- $('wt_label').innerHTML=esc(branch||w&&w.branch||path.split('/').pop())+
-  ` <span class="dim">· ${esc(path.replace('/Users/scrummage/Python/',''))}</span>`;
- $('wt_badge').innerHTML=w&&w.dirty?'<span class="badge">dirty</span>':'';
- renderNav();renderSessionsBar();
+ if(path){
+  const w=(repo().worktrees||[]).find(x=>x.path===path);
+  $('wt_label').innerHTML=esc(branch||w&&w.branch||path.split('/').pop())+
+   ` <span class="dim">· ${esc(path.replace('/Users/scrummage/Python/',''))}</span>`;
+  $('wt_badge').innerHTML=w&&w.dirty?'<span class="badge">dirty</span>':'';
+ }else{
+  $('wt_label').innerHTML=esc(branch||'?')+' <span class="dim">· no worktree</span>';
+  $('wt_badge').innerHTML='';
+ }
+ renderNav();renderSessionsBar();renderTranscript();
+ $('c_cont').innerHTML='new session — pick a worktree, or click a session tab to continue it';
  const sess=sessionsFor(path);
  if(sess.length)openSess(sess[0].id);
  else{selSess=null;renderTranscript();
   $('c_cont').innerHTML='new session — no sessions in this worktree yet';}
+ syncHash();
 }
 function sessionsFor(path){
  return S.sessions.filter(s=>s.directory&&(s.directory===path||s.directory.startsWith(path+'/')));
@@ -274,11 +314,11 @@ function renderSessionsBar(){
 }
 function newSess(){selSess=null;msgs=[];
  $('c_cont').innerHTML='new session in <b>'+esc(selWt?selWt.replace('/Users/scrummage/Python/',''):'?')+'</b> <span class="dim">— agent replies as a fresh session</span>';
- renderSessionsBar();renderTranscript();}
+ renderSessionsBar();renderTranscript();syncHash();}
 async function openSess(id){
  selSess=id;msgs=[];
  $('c_cont').innerHTML=`continuing <b>${esc(id.slice(0,24))}…</b> <span class="x" onclick="newSess()">start new instead</span>`;
- renderSessionsBar();renderTranscript();
+ renderSessionsBar();renderTranscript();syncHash();
  $('transcript').innerHTML='<div class="notice">loading…</div>';
  try{msgs=await (await fetch('/api/session?id='+id)).json();}catch(e){msgs=[];}
  renderTranscript();
@@ -305,6 +345,7 @@ async function sendComposer(){
  const prompt=ta.value.trim();
  if(!prompt||!selWt)return;
  ta.value='';composing=true;$('c_send').disabled=true;
+ const wasCont=!!selSess;
  chatAppend('user',prompt);
  chatAppend('notice','dispatching…');
  let job;
@@ -315,28 +356,42 @@ async function sendComposer(){
   job=(await r.json()).job;
  }catch(e){chatAppend('error','dispatch failed: '+e);composing=false;$('c_send').disabled=false;return;}
  const nEl=[...document.querySelectorAll('#transcript .notice')].pop();
- let seen=0, err=null;
- while(true){
-  let st;
-  try{st=await (await fetch('/api/send/'+job)).json();}
-  catch(e){err=e;break;}
-  const evs=st.events.slice(seen);seen=st.events.length;
-  for(const e of evs){
-   if(nEl)nEl.remove();
-   if(e.type==='text'&&e.text)chatAppend('assistant',e.text);
-   else if(e.type==='reasoning'&&e.text)chatAppend('thinking',e.text);
-   else if(e.type==='status')chatAppend('notice',e.text);
-   else if(e.type==='step')chatAppend('notice',e.text);
-   else if(e.type==='step_finish')chatAppend('notice',e.text||'step done');
-   else if(e.type==='tool')chatAppend('tool',`tool · ${e.tool} ${e.brief||''}`);
-   else if(e.type==='error')chatAppend('error',e.text||'unknown error');
+ const t0=Date.now();
+ let seen=0, err=null, hardErr=null, sid=null, st=null;
+ try{
+  while(true){
+   try{st=await (await fetch('/api/send/'+job)).json();}
+   catch(e){err=e;break;}
+   if(st.error){hardErr=st.error;break;}
+   const evs=(st.events||[]).slice(seen);seen=(st.events||[]).length;
+   if(seen&&nEl&&nEl.isConnected)nEl.remove();
+   for(const e of evs){
+    if(e.type==='text'&&e.text)chatAppend('assistant',e.text);
+    else if(e.type==='reasoning'&&e.text)chatAppend('thinking',e.text);
+    else if(e.type==='status')chatAppend('notice',e.text);
+    else if(e.type==='step')chatAppend('notice',e.text);
+    else if(e.type==='step_finish')chatAppend('notice',e.text||'step done');
+    else if(e.type==='tool')chatAppend('tool',`tool · ${e.tool} ${e.brief||''}`);
+    else if(e.type==='error')chatAppend('error',e.text||'unknown error');
+   }
+   if(st.sid)sid=st.sid;
+   if(!st.done&&seen===0&&nEl&&nEl.isConnected)
+    nEl.textContent=`dispatching… ${((Date.now()-t0)/1000)|0}s`;
+   if(st.done)break;
+   await new Promise(res=>setTimeout(res,700));
   }
-  if(nEl&&!st.done)nEl.textContent=`working… ${((Date.now()-t0)/1000)|0}s`;
-  if(st.done)break;
-  await new Promise(res=>setTimeout(res,700));
- }
+ }catch(loopErr){hardErr=hardErr||('console error: '+loopErr);}
+ const exit=st&&typeof st.exit==='number'?st.exit:null;
  if(err)chatAppend('error','stream failed: '+err);
- else chatAppend('notice','turn complete');
+ else if(hardErr)chatAppend('error',hardErr);
+ else if(exit)chatAppend('error',`turn process exited with code ${exit} — see notices above`);
+ else chatAppend('notice',`turn complete · ${((Date.now()-t0)/1000)|0}s`);
+ if(sid&&!wasCont){
+  selSess=sid;
+  $('c_cont').innerHTML=`continuing <b>${esc(sid.slice(0,24))}…</b> <span class="x" onclick="newSess()">start new instead</span>`;
+  renderSessionsBar();
+ }
+ syncHash();
  composing=false;$('c_send').disabled=false;
  poll();
 }
@@ -892,8 +947,8 @@ class Handler(BaseHTTPRequestHandler):
             if not job:
                 self._json({"error": "unknown job"}, 404)
             else:
-                self._json({"events": job["events"][-80:], "done": job["done"],
-                            "exit": job.get("exit")})
+                self._json({"events": job["events"], "done": job["done"],
+                            "exit": job.get("exit"), "sid": job.get("sid")})
         elif self.path == "/api/compose-meta":
             self._json({"agents": list(_ALLOWED_AGENTS),
                         "dirs": _known_dirs()})

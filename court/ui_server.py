@@ -36,8 +36,8 @@ STATUS_ORDER = [
 ]
 
 PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Court Console</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230d1117'/%3E%3Ctext x='32' y='53' font-size='48' text-anchor='middle' fill='%23ffb300' font-family='Georgia,serif'%3E%E2%99%9C%3C/text%3E%3C/svg%3E">
+<html lang="en"><head><meta charset="utf-8"><title>Castle</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 448 512'%3E%3Cpath fill='%23000' d='M32 192L32 48c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 40c0 4.4 3.6 8 8 8l32 0c4.4 0 8-3.6 8-8l0-40c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 40c0 4.4 3.6 8 8 8l32 0c4.4 0 8-3.6 8-8l0-40c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 144c0 10.1-4.7 19.6-12.8 25.6L352 256l16 144L80 400 96 256 44.8 217.6C36.7 211.6 32 202.1 32 192zm176 96l32 0c8.8 0 16-7.2 16-16l0-48c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 48c0 8.8 7.2 16 16 16zM22.6 473.4L64 432l320 0 41.4 41.4c4.2 4.2 6.6 10 6.6 16c0 12.5-10.1 22.6-22.6 22.6L38.6 512C26.1 512 16 501.9 16 489.4c0-6 2.4-11.8 6.6-16z'/%3E%3C/svg%3E">
 <style>
 :root{
  --bg:#0d1117; --surface:#161b22; --surface-2:#1c2129; --edge:#2d333b;
@@ -59,7 +59,8 @@ header{display:flex;align-items:center;gap:14px;padding:0 20px;height:52px;
  background:var(--surface);border-bottom:1px solid var(--edge);box-shadow:var(--sh-1);z-index:2}
 .brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:13px;
  letter-spacing:.12em;text-transform:uppercase}
-.brand .glyph{display:grid;place-items:center;color:var(--primary);font-size:21px;line-height:1}
+.brand .glyph{display:grid;place-items:center;color:var(--primary);line-height:1}
+.brand .glyph svg{width:24px;height:27px;display:block}
 .brand em{color:var(--primary);font-style:normal}
 .chip{display:inline-flex;align-items:center;gap:5px;padding:2px 10px;border-radius:999px;
  font-size:11px;font-weight:500;background:var(--surface-2);border:1px solid var(--edge);
@@ -106,6 +107,14 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
 .qbadge{flex:none;font-size:8.5px;padding:1px 6px;border-radius:4px;font-weight:700;
  letter-spacing:.1em;text-transform:uppercase;background:rgba(88,166,255,.1);
  border:1px solid rgba(88,166,255,.35);color:var(--blue)}
+.qbadge.app-shops{background:rgba(63,185,80,.1);border-color:rgba(63,185,80,.35);color:var(--green)}
+.qbadge.app-orders{background:rgba(210,153,34,.12);border-color:rgba(210,153,34,.35);color:var(--amber)}
+.qbadge.app-common,.qbadge.app-intelligence{background:rgba(188,140,255,.1);
+ border-color:rgba(188,140,255,.35);color:#bc8cff}
+.qbadge.app-inventory{background:rgba(248,81,73,.1);border-color:rgba(248,81,73,.3);color:var(--red)}
+.qtitle{color:var(--ink);font-size:11.5px;flex:1;min-width:0;overflow:hidden;
+ text-overflow:ellipsis;white-space:nowrap}
+.qmeta{display:flex;gap:4px;flex-wrap:wrap;margin:4px 2px 1px}
 .qslug{color:var(--dim);font-size:11.5px;flex:1;min-width:0;overflow:hidden;
  text-overflow:ellipsis;white-space:nowrap}
 .badge{font-size:9.5px;padding:1px 7px;border-radius:999px;background:rgba(248,81,73,.12);
@@ -119,6 +128,7 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
 #chatbar .wt{display:inline-flex;align-items:center;gap:7px;min-width:0;font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--ink)}
 #chatbar .wt .dim{color:var(--dim)}
 #chatbar .qnum{font-size:15px}
+#chatbar .qtitle{font-size:12.5px;font-weight:500}
 #chatbar .qslug{color:var(--ink);font-size:12.5px;font-family:"Inter","Roboto",-apple-system,"Segoe UI",sans-serif}
 .hgrp{margin-left:auto;display:flex;gap:6px;flex:none;align-items:center}
 .iconbtn{width:30px;height:30px;border-radius:var(--r-md);display:grid;place-items:center;
@@ -221,6 +231,19 @@ button{background:var(--surface-2);border:1px solid var(--edge);color:var(--dim)
  letter-spacing:.06em;text-transform:uppercase;transition:all .12s ease}
 button:hover{border-color:var(--red);color:var(--red);background:rgba(248,81,73,.08)}
 .empty-note{color:var(--faint);text-align:center;padding:40px;font-size:12.5px}
+.welcome{margin:auto;text-align:center;max-width:540px;padding:24px}
+.wc-glyph{color:var(--primary);margin-bottom:8px;line-height:1}
+.wc-glyph svg{width:40px;height:46px;display:inline-block}
+.wc-hi{font-size:17px;font-weight:700}
+.wc-sub{color:var(--dim);font-size:12.5px;margin:6px 0 18px}
+.wc-sub b{color:var(--primary)}
+.wc-cards{display:flex;flex-direction:column;gap:8px;text-align:left}
+.wcard{background:var(--surface);border:1px solid var(--edge);border-radius:var(--r-md);
+ padding:10px 14px;cursor:pointer;transition:all .12s ease}
+.wcard:hover{border-color:var(--primary);background:rgba(255,179,0,.05)}
+.wl-t{font-weight:600;font-size:12.5px;color:var(--ink)}
+.wl-d{color:var(--dim);font-size:11px;margin-top:2px}
+.wc-hint{color:var(--faint);font-size:10.5px;margin-top:14px}
 .msg.md{white-space:normal}
 .msg.md p{margin:3px 0}
 .msg.md p:first-child{margin-top:0}
@@ -342,7 +365,7 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 .dother:hover{border-color:var(--blue)}
 .dother b{color:var(--blue);font-family:ui-monospace,Menlo,monospace;font-size:11px;margin-right:6px}
 </style></head><body>
-<header><div class="brand"><span class="glyph">♜</span>COURT <em>CONSOLE</em></div>
+<header><div class="brand"><span class="glyph"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><path fill="currentColor" d="M32 192L32 48c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 40c0 4.4 3.6 8 8 8l32 0c4.4 0 8-3.6 8-8l0-40c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 40c0 4.4 3.6 8 8 8l32 0c4.4 0 8-3.6 8-8l0-40c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 144c0 10.1-4.7 19.6-12.8 25.6L352 256l16 144L80 400 96 256 44.8 217.6C36.7 211.6 32 202.1 32 192zm176 96l32 0c8.8 0 16-7.2 16-16l0-48c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 48c0 8.8 7.2 16 16 16zM22.6 473.4L64 432l320 0 41.4 41.4c4.2 4.2 6.6 10 6.6 16c0 12.5-10.1 22.6-22.6 22.6L38.6 512C26.1 512 16 501.9 16 489.4c0-6 2.4-11.8 6.6-16z"/></svg></span><em>CASTLE</em></div>
 <div class="vtabs"><div class="app on" id="v_chat" onclick="setView('chat')">chat</div>
 <div class="app" id="v_board" onclick="setView('board')">board</div></div>
 <div class="vdiv"></div><div id="totals" style="display:flex;gap:8px"></div>
@@ -367,7 +390,9 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
    </div>
    <div id="sessmenu"></div>
   </div>
- <div id="transcript"><div class="notice">select a branch, then a session — the chat loads here</div></div>
+ <div id="transcript"><div class="welcome"><div class="wc-glyph" id="boot_glyph"></div>
+  <div class="wc-hi" id="boot_hi"></div>
+  <div class="wc-sub">the court is waking — worktrees and ledger loading…</div></div></div>
  <div id="composer">
   <div id="cmdlist"></div>
   <div class="cont" id="c_cont">new session — pick a worktree, or open the ☰ sessions menu to continue one</div>
@@ -425,10 +450,31 @@ function qparse(b){
  return {badge:KIND_NAMES[seg[0]]||seg[0].replace(/^the-/,''),
   big:(pfx.length<=2?pfx.toUpperCase():'')+m[2],rest:rest.join(' · ')};
 }
+function qnumOf(id){const m=String(id||'').match(/^[A-Za-z]+\d+/);return m?m[0].toUpperCase():'';}
+const APP_LABELS={platform:'Platform',shops:'Shops',orders:'Orders',common:'Common',
+ inventory:'Inventory',intelligence:'Intel',forecasting:'Forecast',tasks:'Tasks',
+ purchases:'Purchases',crm:'CRM',core:'Core'};
+function appBadge(app){
+ const a=String(app||'').trim().toLowerCase();
+ if(!a)return '';
+ return APP_LABELS[a]||a.replace(/_/g,' ').replace(/^./,c=>c.toUpperCase());
+}
+function questFor(repoKey,wt,branch){
+ if(!S)return null;
+ const qs=(S.quests||[]).filter(q=>!repoKey||q.repo===repoKey);
+ return qs.find(q=>wt&&q.worktree===wt)||qs.find(q=>branch&&q.branch===branch)||null;
+}
+function questTitleHTML(q){
+ return `<span class="qnum">${esc(qnumOf(q.id)||q.id)}</span> `+
+  (appBadge(q.app)?`<span class="qbadge app-${esc(String(q.app||'').toLowerCase())}">${esc(appBadge(q.app))}</span> `:'')+
+  `<span class="qtitle">${esc(q.title||'')}</span>`;
+}
 function setWtLabel(branch,path){
+ const q=questFor(selRepo,path,branch);
+ if(q){$('wt_label').innerHTML=questTitleHTML(q);return;}
  const p=qparse(branch);
  $('wt_label').innerHTML=p?
-  `<span class="qnum">${esc(p.big)}</span> <span class="qbadge">${esc(p.badge)}</span> <span class="qslug">${esc(p.rest||'')}</span>`
+  `<span class="qnum">${esc(p.big)}</span> <span class="qslug">${esc(p.rest||'')}</span>`
   :esc(branch||path&&path.split('/').pop()||'?');
 }
 const fmtWhen=t=>{if(!t)return'—';const d=new Date(t);
@@ -448,11 +494,13 @@ function syncHash(){
  if(selRepo)p.push('app='+encodeURIComponent(selRepo));
  if(selWt)p.push('wt='+encodeURIComponent(selWt));
  if(selSess)p.push('sess='+encodeURIComponent(selSess));
+ if(view==='board')p.push('view=board');
  history.replaceState(null,'','#'+p.join('&'));
 }
 function applyHash(){
  const p=hashState();let hit=false;
  if(p.app&&S.repos.some(r=>r.key===p.app)){selRepo=p.app;hit=true;}
+ if(p.view==='board')setView('board');
  if(p.wt){
   const r=repo();
   const w=(r.worktrees||[]).find(x=>x.path===p.wt)||(r.worktrees||[]).find(x=>x.branch===p.wt);
@@ -474,6 +522,7 @@ function applyHash(){
  if(!selRepo&&S.repos.length){
   selRepo=(S.repos.find(r=>r.key==='app')||S.repos[0]).key;
   applyHash();renderNav();
+  if(!selWt)renderTranscript();
  }else{renderNav();if(selWt)renderSessionsBar();}
   $('totals').innerHTML=`<span class="chip">sessions <b>${S.sessions.length}</b></span>
   <span class="chip">worktrees <b>${S.worktrees.length}</b></span>`+
@@ -514,13 +563,26 @@ function renderNav(){
     const working=act.has(w.path);
     const mark=(working?'<span class="livedot" title="agent working"></span>':'')+
      (w.dirty?'<span class="badge">dirty</span>':'');
+    const q=questFor(r.key,w.path,b);
     const p=qparse(b);
-    const inner=p?
-     `<div class="row1"><span class="qnum">${esc(p.big)}</span><span class="qbadge">${esc(p.badge)}</span>`+
-     `<span class="qslug">${esc(p.rest||'')}</span>${mark}</div>`
-     :`<div class="row1">${esc(b.includes('/')?b.slice(b.indexOf('/')+1):b)}${mark}</div>`+
+    let inner;
+    if(q){
+     inner=`<div class="row1">${questTitleHTML(q)}${mark}</div>`;
+     const nsess=sessionsFor(w.path).length;
+     const a=q.audit;
+     let chips='';
+     if(a&&a.tasks_total)chips+=`<span class="bchip ${a.tasks_pct>=100?'ok':''}">${a.tasks_done}/${a.tasks_total} tasks</span>`;
+     if(a&&a.tribute_present)chips+='<span class="bchip ok">tribute</span>';
+     chips+=`<span class="bchip${nsess?'':' dim'}">${nsess} session${nsess===1?'':'s'}</span>`;
+     inner+=`<div class="qmeta">${chips}</div>`;
+    }else if(p){
+     inner=`<div class="row1"><span class="qnum">${esc(p.big)}</span>`+
+      `<span class="qslug">${esc(p.rest||'')}</span>${mark}</div>`;
+    }else{
+     inner=`<div class="row1">${esc(b.includes('/')?b.slice(b.indexOf('/')+1):b)}${mark}</div>`+
       `<div class="row2">${esc(b)}</div>`;
-    h+=`<div class="q ${selWt&&selWt===w.path?'sel':''}" title="${esc(b)}" data-wt="${esc(w.path)}" data-branch="${esc(b)}">${inner}</div>`;
+    }
+    h+=`<div class="q ${selWt===w.path?'sel':''}" title="${esc(b)}" data-wt="${esc(w.path)}" data-branch="${esc(b)}">${inner}</div>`;
    }
    if(secs[ns].length>30)h+=`<div class="q dim" style="cursor:default">… ${secs[ns].length-30} more</div>`;
   }
@@ -566,7 +628,9 @@ function pickWt(path,branch){
  syncHash();
 }
 function sessionsFor(path){
- return S.sessions.filter(s=>s.directory&&(s.directory===path||s.directory.startsWith(path+'/')));
+ // exact-directory match only: a repo-root (trunk) card must show ONLY its own
+ // root sessions, never the sessions of nested quest/artist worktrees.
+ return S.sessions.filter(s=>s.directory&&s.directory===path);
 }
 function sessMeta(s){
  return `tok ${ktop((s.tokens_input||0)+(s.tokens_output||0))} · $${(s.cost||0).toFixed(2)}`;
@@ -666,10 +730,60 @@ function msgHTML(m){
 function renderTranscript(){
   const t=$('transcript');
   delete t.dataset.turn;
-  if(!msgs.length){t.innerHTML='<div class="empty-note">no messages yet — say something below</div>';return;}
+  if(!msgs.length){
+   if(!turnForView()){t.innerHTML=welcomeHTML();return;}
+   t.innerHTML='<div class="empty-note">working — live output streams here</div>';return;}
   t.innerHTML=msgs.map(msgHTML).join('')||'<div class="empty-note">no text messages in this session yet</div>';
   t.scrollTop=t.scrollHeight;
 }
+const LAUNCHES=[
+ {t:'Plan the next quest',d:'Ledger + board review — the Steward drafts a charter for your approval',
+  p:'Review .court/LEDGER.md and run `python3 -m court.cli status`. Identify the highest-value next piece of work, draft a quest charter for it (goal, scope, expected tribute), and present the draft for approval. Do not dispatch any agents yet.'},
+ {t:'Survey the realm',d:'Full triage: stalled serfs, tribute ready, gates queued, violations',
+  p:'Run `python3 -m court.cli status` and survey the quests across all repos. Report: active quests and their progress, serfs that appear stalled, quests at TRIBUTE_READY or GATE, and any audit violations or pending audiences. Finish with a recommended order of operations.'},
+ {t:'Ledger briefing',d:'What shipped recently, open threads, promises unfulfilled',
+  p:'Read .court/LEDGER.md and the recent Cog Ship manifests under .court/. Summarize what shipped recently, which threads remain open, and anything promised but unfinished. Keep it to a short briefing.'}
+];
+const ROOK='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><path fill="currentColor" d="M32 192L32 48c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 40c0 4.4 3.6 8 8 8l32 0c4.4 0 8-3.6 8-8l0-40c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 40c0 4.4 3.6 8 8 8l32 0c4.4 0 8-3.6 8-8l0-40c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 144c0 10.1-4.7 19.6-12.8 25.6L352 256l16 144L80 400 96 256 44.8 217.6C36.7 211.6 32 202.1 32 192zm176 96l32 0c8.8 0 16-7.2 16-16l0-48c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 48c0 8.8 7.2 16 16 16zM22.6 473.4L64 432l320 0 41.4 41.4c4.2 4.2 6.6 10 6.6 16c0 12.5-10.1 22.6-22.6 22.6L38.6 512C26.1 512 16 501.9 16 489.4c0-6 2.4-11.8 6.6-16z"/></svg>';
+function greet(){
+ const h=new Date().getHours();
+ return h<5?"Burning the midnight oil, M'lord":h<12?"Good morning, M'lord":
+  h<18?"Good afternoon, M'lord":"Good evening, M'lord";
+}
+function welcomeHTML(){
+ if(!S)return '<div class="notice">summoning the court…</div>';
+ const qs=S.quests||[];
+ const working=qs.filter(q=>q.status==='WORKING').length;
+ const act=(S.active||[]).length;
+ const g=greet();
+ const sub=(working||act)?
+  `The court is in motion — <b>${working}</b> quest${working===1?'':'s'} underway, <b>${act}</b> agent${act===1?'':'s'} working. What does M'lord require?`
+  :"The court is quiet, M'lord — no quests underway. Shall we raise one?";
+ return `<div class="welcome">
+  <div class="wc-glyph">${ROOK}</div>
+  <div class="wc-hi">${esc(g)}</div>
+  <div class="wc-sub">${sub}</div>
+  <div class="wc-cards">`+
+  LAUNCHES.map((l,i)=>`<div class="wcard" data-launch="${i}">
+   <div class="wl-t">${esc(l.t)}</div><div class="wl-d">${esc(l.d)}</div></div>`).join('')+
+  `</div>
+  <div class="wc-hint">suggestions launch a steward session in the castle trunk — or pick any worktree on the left</div>
+ </div>`;
+}
+function launchSuggestion(i){
+ const L=LAUNCHES[i];if(!L)return;
+ const cr=S?S.repos.find(r=>r.key==='castle'):null;
+ const wt=cr&&cr.root?cr.root:selWt;
+ if(!wt)return;
+ if(cr)selRepo=cr.key;
+ pickWt(wt,cr&&cr.branch||null);
+ newSess();
+ $('c_agent').value='steward';
+ dispatch(wt,null,'steward',$('c_model').value.trim(),L.p);
+}
+$('transcript').addEventListener('click',e=>{
+ const c=e.target.closest('[data-launch]');
+ if(c)launchSuggestion(+c.dataset.launch);});
 function turnForView(){
   for(let i=turns.length-1;i>=0;i--){
     const T=turns[i];
@@ -885,16 +999,16 @@ async function finishTurn(T,err,lastSt){
    const secs=((Date.now()-T.t0)/1000)|0;
    const failed=!!err||(!!exit&&exit!==0);
    const ok=!failed&&!T.stopped;
-   document.title=(ok?'✓':'✕')+' turn '+(ok?'done':'failed')+' — Court Console';
+   document.title=(ok?'✓':'✕')+' turn '+(ok?'done':'failed')+' — Castle';
    if(window.notifyTO)clearTimeout(window.notifyTO);
-   window.notifyTO=setTimeout(()=>{document.title='Court Console';},8000);
+   window.notifyTO=setTimeout(()=>{document.title='Castle';},8000);
    try{
     if(typeof Notification!=='undefined'&&Notification.permission==='granted')
      new Notification(ok?'Agent turn done':'Agent turn failed',
       {body:(T.wt||'').split('/').pop()+' · '+secs+'s'});
    }catch(e){}
   }
-  window.addEventListener('focus',()=>{document.title='Court Console';},{once:true});
+  window.addEventListener('focus',()=>{document.title='Castle';},{once:true});
   const q=(T.ran&&T.queue)?T.queue:null;
   if(wasViewing&&T.ran&&(T.sid||T.sess)){
    await openSess(T.sid||T.sess);
@@ -968,6 +1082,7 @@ function setView(v){
  renderCmdList();
  renderNav();
  if(v==='board'){boardKey='';renderBoard();}
+ syncHash();
 }
 function boardFilter(a){boardApp=a;renderBoard();}
 function openQuestWt(p){
@@ -1282,15 +1397,21 @@ function jumpToSession(sid){
 }
 async function mcpToggle(file,name){
  const m=(S.mcp||[]).find(x=>x.file===file&&x.name===name);
- if(!m)return;
- const r=await fetch('/api/mcp',{method:'POST',body:JSON.stringify({file,name,enabled:!m.enabled})});
- if(!r.ok)alert('refused: '+(await r.text()));else poll();
+ if(!m){openMcp();return;}
+ let r;
+ try{r=await fetch('/api/mcp',{method:'POST',body:JSON.stringify({file,name,enabled:!m.enabled})});}
+ catch(e){alert('toggle failed: '+e);return;}
+ if(!r.ok){alert('refused: '+(await r.text()));return;}
+ await poll();
+ openMcp();
 }
 (async()=>{try{META=await (await fetch('/api/compose-meta')).json();
  $('c_agent').innerHTML=META.agents.map(x=>`<option>${x}</option>`).join('');
  if(META.models&&META.models.length)
   $('model_dl').innerHTML=META.models.map(m=>`<option value="${esc(m)}"></option>`).join('');
 }catch(e){}})();
+const bootHi=$('boot_hi');if(bootHi)bootHi.textContent=greet();
+const bootGl=$('boot_glyph');if(bootGl)bootGl.innerHTML=ROOK;
 poll();setInterval(poll,5000);
 </script></body></html>
 """
@@ -1560,20 +1681,7 @@ def _compute_worktrees(repo):
     return out
 
 
-def _sessions(limit=200):
-    if not os.path.exists(KILO_DB):
-        return []
-    try:
-        db = sqlite3.connect(f"file:{KILO_DB}?mode=ro", uri=True, timeout=3)
-        db.execute("pragma query_only=1")
-        rows = db.execute(
-            "select id, title, agent, model, directory, time_updated,"
-            " tokens_input, tokens_output, tokens_cache_read,"
-            " tokens_cache_write, cost from session"
-            " order by time_updated desc limit ?", (limit,)).fetchall()
-        db.close()
-    except Exception:
-        return []
+def _session_rows(rows):
     out = []
     for sid, title, agent, model, directory, tu, ti, to, tcr, tcw, cost in rows:
         m = ""
@@ -1591,6 +1699,44 @@ def _sessions(limit=200):
             "cost": round(cost or 0.0, 4),
         })
     return out
+
+
+def _sessions(limit=200):
+    if not os.path.exists(KILO_DB):
+        return []
+    try:
+        db = sqlite3.connect(f"file:{KILO_DB}?mode=ro", uri=True, timeout=3)
+        db.execute("pragma query_only=1")
+        rows = db.execute(
+            "select id, title, agent, model, directory, time_updated,"
+            " tokens_input, tokens_output, tokens_cache_read,"
+            " tokens_cache_write, cost from session"
+            " order by time_updated desc limit ?", (limit,)).fetchall()
+        db.close()
+    except Exception:
+        return []
+    return _session_rows(rows)
+
+
+def _sessions_for_wt(wt, limit=200):
+    """All sessions rooted at one worktree path. The global 200-most-recent
+    cap in _sessions() hides older quest sessions from the console sidebar."""
+    if not wt or not os.path.exists(KILO_DB):
+        return []
+    try:
+        db = sqlite3.connect(f"file:{KILO_DB}?mode=ro", uri=True, timeout=3)
+        db.execute("pragma query_only=1")
+        rows = db.execute(
+            "select id, title, agent, model, directory, time_updated,"
+            " tokens_input, tokens_output, tokens_cache_read,"
+            " tokens_cache_write, cost from session"
+            " where directory=? or directory like ?"
+            " order by time_updated desc limit ?",
+            (wt, wt + "/%", limit)).fetchall()
+        db.close()
+    except Exception:
+        return []
+    return _session_rows(rows)
 
 
 def _running_agents(procs=None):
@@ -2662,7 +2808,11 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/sessions"):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
-            self._json(_sessions_search(qs.get("q", [""])[0]))
+            wt = qs.get("wt", [""])[0]
+            if wt:
+                self._json(_sessions_for_wt(wt))
+            else:
+                self._json(_sessions_search(qs.get("q", [""])[0]))
         elif self.path.startswith("/api/session"):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)

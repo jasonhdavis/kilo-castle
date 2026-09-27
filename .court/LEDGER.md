@@ -616,6 +616,25 @@ NEXT on their completion: review diffs, commit, restart persistent console serve
 (8300) to activate the new endpoints, then first real studio run exercises the
 whole chain (browser + MCP attach + annotations + vision screenshots).
 
+### Follow-up royal request (12:27Z): message back-out / recall & resend
+
+M'Lord wants: recall a sent message, put its text back into the chat box, edit,
+resend. Transport facts probed: `kilo session` has NO revert subcommand (list/
+delete only); `kilo run --fork` EXISTS (fork the session before continuing;
+requires --continue/--session). Design:
+- Back (⤺) button on user message rows → exact text refills composer, editable.
+- SEND continues the SAME session (model sees original + correction — right for
+  typo/direction fixes).
+- Composer FORK toggle ("branch on send"): when on with a session targeted,
+  /api/send adds `--fork` → turn runs on a fresh copy, console adopts the
+  returned fork sid (existing adoption path), original session preserved
+  untouched. Closest sanctioned thing to rewind on the headless transport.
+- True history truncation is NOT offered headless — serve/attach-mode follow-up
+  if ever wanted.
+QUEUED behind CONSOLE agent (same file, ui_server.py); dispatch on its completion
+notification. Scope: ui_server.py only (server fork pass-through + back-out UI +
+fork toggle + queue-rides-along semantics).
+
 ## 2026-09-27 — kilo.db cleanup: 104G file → ~11G live (royal assent given)
 
 - M'Lord requested a review: "kilo db is like 11gb". Actual: `kilo.db` was

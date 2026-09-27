@@ -581,6 +581,26 @@ sandbox flags).
 - Verified live: meta now returns ctx_limit 1310720 for the glm session.
   Committed with ledger.
 
+## 2026-09-27 12:38Z — Castle session prune + VACUUM completed (royal directive, dry-run gated)
+
+ROYAL PRUNE (>48h inactivity, castle branch): survey first caught a UNIT BUG —
+kilo.db session timestamps are MILLISECONDS (first pass read them as seconds and
+reported "0 stale"); corrected before any delete. Castle-root: 40 sessions →
+20 stale >48h (7.5–19.4d old), 20 fresh protected (in-flight agents, probes,
+ledger-cited work). Reference check: 0 of the 20 stale ids appear anywhere in
+.court/ or .kilo/. Executed `kilo session delete` ×20: deleted=20 failed=0;
+verified 0 rows remain, castle-root 40→20, total 5561→5541. (Gotcha: zsh does
+not word-split unquoted vars — first loop passed all ids as ONE argv, failed
+cleanly, no effect; rerun line-per-id.)
+
+VACUUM: the earlier attempt (started ~11:xxZ) DIED session-scoped with no log,
+process, or temp trace — same failure class as the console outage. Relaunched
+persistent bgp_0e2e707a20014MibPC3zFxTpig → **done in 390s: kilo.db 104G →
+13.88 GB, freelist 0.00 GB** (~90G reclaimed). Snapshot dir (7.5G) is
+kilo-managed with NO mapping table in kilo.db — left alone. Standing guidance
+unchanged: re-run `court.db_prune vacuum --apply` (persistent lifetime!) when
+file exceeds ~2× live.
+
 ## 2026-09-27 (late) — Royal Easel v2: shared browser, annotations, vision artist (assent given)
 
 M'Lord assented to the artist-studio upgrade plan. Three probes run first (all PASS):
@@ -641,6 +661,29 @@ requires --continue/--session). Design:
 QUEUED behind CONSOLE agent (same file, ui_server.py); dispatch on its completion
 notification. Scope: ui_server.py only (server fork pass-through + back-out UI +
 fork toggle + queue-rides-along semantics).
+
+### Royal session-prune + vacuum relaunch (12:38Z)
+
+- Survey correction: kilo.db session.time_updated is MILLISECONDS — the first
+  survey divided as seconds and wrongly reported 0 stale. Corrected: castle ROOT
+  directory had 40 sessions, 20 stale >48h (7.5–19.4d), 0 referenced anywhere in
+  .court/ or .kilo/ (deterministic grep gate). Deleted all 20 via
+  `kilo session delete` (sanctioned CLI; live serve unaffected): 20/20 OK,
+  0 rows remain for those ids, castle-root now 20 (all fresh, incl. in-flight
+  subagent + console probe sessions). zsh gotcha: unquoted $VAR does NOT
+  word-split — first delete attempt was one garbage id (clean failure, no harm).
+- VACUUM from the earlier cleanup round NEVER completed (104G still on disk,
+  90.01G reclaimable freelist, live ~13.96G; dead process, no log/temp leftovers —
+  it was session-scoped, same death class as the console outage). Relaunched
+  PERSISTENT: bgp_0e2e707a20014MibPC3zFxTpig (pid 22925,
+  `python3 -m court.db_prune vacuum --apply`). Headroom OK (52.7G free vs ~14G
+  live image). Contention: kilo serve pid 66641 holds a connection; db_prune
+  retries on busy; subagent kilo probe turns may interleave. Expect file
+  104G → ~14G after completion; re-check with court.db_prune report.
+- Snapshot dir (7.5G) is kilo-managed; no mapping table in kilo.db → no
+  deterministic orphan check → left untouched.
+- Prune doctrine for the future: guard ms-vs-s in any staleness math; scope
+  deletion to directory-scoped candidates + repo-text reference gate.
 
 ## 2026-09-27 — kilo.db cleanup: 104G file → ~11G live (royal assent given)
 

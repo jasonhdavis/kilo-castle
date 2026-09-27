@@ -757,3 +757,26 @@ every subsequent navigation/new document hits the deferred path → dead.
   the injector alone is NOT enough. Full stop + relaunch required:
   `python3 -m court.cli browser stop` then `browser start --annotate <wt>`
   (or the console launch button). Persistent profile survives; open tabs lost.
+
+### 23:23Z — RESOLVED: fix verified end-to-end on the real chain; committed 8926e5d
+
+- Remediation subagent fixed annotator.js (wireUi() inside buildUi mount path,
+  wired-guard; top-level wiring removed) and proved it with a stubbed-DOM node
+  harness: baseline reproduced the dead buttons, fixed file ALL PASS on both
+  mount paths (deferred + immediate).
+- Steward real-chain E2E (throwaway headless Chrome, CDP
+  addScriptToEvaluateOnNewDocument → navigate → trusted input events):
+  PASS — deferred-path mount, Ctrl+Shift+A mode toggle, panel opens with
+  correct meta, Cancel closes (0 POSTs), Save posts payload (selector #bigbtn,
+  note intact) and closes panel, Esc exits (badge "1 saved"). Harness:
+  /var/folders/.../T/kilo/annotator_e2e.py. Harness gotchas (for future CDP
+  probes): DOM.getDocument needs {"pierce":true,"depth":-1} (default depth=1
+  is shallow); class lives in the attributes array, not a className key;
+  scope node searches to shadowRoots or page elements pollute matches; fixed
+  elements can be offscreen in headless (default viewport < window-size flag)
+  — click from real pierced box coords, plus --window-size.
+- Live probe of M'Lord's browser (CDP 9335, read-only): unified-orders tab
+  still pinned with the OLD script (injector 42400 started 19:04, caches the
+  script at start) — hence "still doesn't work" at 23:07 was expected until
+  browser stop+start. Activation pending M'Lord's go (tabs close; login
+  persists).

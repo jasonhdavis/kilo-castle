@@ -733,3 +733,27 @@ fork toggle + queue-rides-along semantics).
   (`court.db_prune report` shows live vs freelist), with Kilo quiescent.
 - NOT committed (other session's in-flight work): `court/ui_server.py` mods,
   `court/db_prune.py` itself, stray `{}` file at repo root.
+
+## 2026-09-27 22:55Z — BUG: easel annotator panel buttons dead (remediation dispatched)
+
+M'Lord reported: the browser annotation modal ("Add a note") renders but its
+Cancel / "Save note" buttons do nothing. Root cause (diagnosed, not hand-fixed):
+`court/assets/annotator.js` wires the panel node listeners at TOP LEVEL
+(`ui.cancelBtn.addEventListener(…)`) right after `buildUi()`, but pinned
+scripts (`Page.addScriptToEvaluateOnNewDocument`) run BEFORE `<body>` exists,
+so `buildUi()` defers via its retry timer and returns with `ui.cancelBtn`
+undefined → TypeError swallowed by the outer catch → Cancel/Save/textarea
+wiring never attaches. Document-level listeners (lines 503-505) attach before
+the throw, which is why the badge/hover/panel-open all work while the buttons
+are dead. First pin via `Runtime.evaluate` into a live document worked;
+every subsequent navigation/new document hits the deferred path → dead.
+- Fix: move node wiring into `buildUi()`'s mount-success path (both sync and
+  retry-timer paths), guarded against double-wiring.
+- Remediation dispatched to background subagent ses_f1ae62447ffeGca7gzx7y6MaCh
+  (annotator.js only, no commit; node --check + stubbed-DOM harness proof of
+  both mount paths required before Steward review/commit).
+- Activation after the fix lands: injector reads annotator.js ONCE at injector
+  start, and old pinned scripts stay registered per page target — restarting
+  the injector alone is NOT enough. Full stop + relaunch required:
+  `python3 -m court.cli browser stop` then `browser start --annotate <wt>`
+  (or the console launch button). Persistent profile survives; open tabs lost.

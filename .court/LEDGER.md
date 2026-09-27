@@ -609,6 +609,13 @@ IN FLIGHT (background subagents, no commits yet; I review+commit on completion):
   pollution at sync-back).
 - CONSOLE agent ses_f1d302568ffewsnOm7DGnDwN6C: ui_server.py /api/annotation,
   /api/annotations, easel chip + annotations modal, /api/state easel key.
+  DONE 12:33Z — 26/26 endpoint checks green on temp port; live 8300 restarted by
+  another session (pid 97200) and NOW SERVES the endpoints (verified: 200 + CORS
+  204). Committed 3faac63 (ui_server.py, carries prior in-flight trunk work) +
+  5c0ff31 (db_prune.py, the royal-assented cleanup tool).
+- BACK-OUT agent ses_f1d228381ffeEfAfHeUzLTqqEu (dispatched on CONSOLE completion):
+  message recall → composer refill → resend, CONTINUE vs --fork branch toggle,
+  fork-sid adoption (viewing-guarded), live throwaway-session fork probe.
 Direct-edit ownership split avoids collisions: EASEL owns cli.py/browser.py/assets,
 CONSOLE owns ui_server.py, Steward owns config/templates/kilo.json/ledger.
 

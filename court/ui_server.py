@@ -121,6 +121,10 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
  border:1px solid var(--edge-soft);white-space:pre-wrap;word-break:break-word;font-size:13px}
 .msg.user{align-self:flex-end;background:rgba(255,179,0,.08);border:1px solid rgba(255,179,0,.25)}
 .msg.assistant{align-self:flex-start;border-left:3px solid var(--blue)}
+.msg.notice{align-self:center;font-size:11px;color:var(--faint);
+ background:transparent;border:none;padding:2px}
+.msg.thinking{align-self:flex-start;font-size:12px;color:var(--dim);font-style:italic;
+ background:var(--surface-2);border:1px dashed var(--edge);max-width:80%}
 .msg.tool{align-self:center;font-size:11px;color:var(--dim);background:var(--surface-2);
  border:1px dashed var(--edge);padding:4px 12px;max-width:90%}
 .msg.error{align-self:center;border-left:3px solid var(--red);color:var(--red);font-size:12px}
@@ -284,7 +288,7 @@ function renderTranscript(){
  if(!msgs.length){t.innerHTML='<div class="empty-note">no messages yet — say something below</div>';return;}
  t.innerHTML=msgs.map(m=>{
   if(!m.text)return '';
-  const cls=m.role==='user'?'user':(m.role==='assistant'?'assistant':'tool');
+  const cls=m.role==='user'?'user':(m.role==='assistant'?'assistant':(m.role==='reasoning'?'thinking':'tool'));
   return `<div class="msg ${cls}"><div class="who">${esc(m.role)}</div>${esc(m.text)}</div>`;
  }).join('')||'<div class="empty-note">no text messages in this session yet</div>';
  t.scrollTop=t.scrollHeight;
@@ -320,9 +324,14 @@ async function sendComposer(){
   for(const e of evs){
    if(nEl)nEl.remove();
    if(e.type==='text'&&e.text)chatAppend('assistant',e.text);
+   else if(e.type==='reasoning'&&e.text)chatAppend('thinking',e.text);
+   else if(e.type==='status')chatAppend('notice',e.text);
+   else if(e.type==='step')chatAppend('notice',e.text);
+   else if(e.type==='step_finish')chatAppend('notice',e.text||'step done');
    else if(e.type==='tool')chatAppend('tool',`tool · ${e.tool} ${e.brief||''}`);
    else if(e.type==='error')chatAppend('error',e.text||'unknown error');
   }
+  if(nEl&&!st.done)nEl.textContent=`working… ${((Date.now()-t0)/1000)|0}s`;
   if(st.done)break;
   await new Promise(res=>setTimeout(res,700));
  }
@@ -768,6 +777,10 @@ def _known_dirs():
 
 
 def _start_run(job, directory, agent, prompt, session_id):
+    mode = f"continue {session_id[:18]}..." if session_id else "new session"
+    job["events"].append({"type": "status", "text": (
+        f"spawning agent - {agent} - {mode} - "
+        f"{directory.replace('/Users/scrummage/Python/', '')}")})
     cmd = [KILO_BIN, "run", "--dir", directory, "--agent", agent,
            "--format", "json", "--title", prompt.strip()[:60] or "console turn"]
     if session_id:
@@ -785,7 +798,10 @@ def _start_run(job, directory, agent, prompt, session_id):
         return
 
     def _reader():
+        connected = False
+        raw_tail = ""
         for line in proc.stdout:
+            raw_tail = line[-300:]
             line = line.strip()
             if not line:
                 continue
@@ -793,21 +809,41 @@ def _start_run(job, directory, agent, prompt, session_id):
                 ev = json.loads(line)
             except Exception:
                 continue
+            if not connected:
+                connected = True
+                job["events"].append({"type": "status",
+                                      "text": "agent connected - streaming"})
+            if ev.get("sessionID") and not job.get("sid"):
+                job["sid"] = ev["sessionID"]
+                job["events"].append({"type": "status",
+                                      "text": f"session {ev['sessionID'][:22]}..."})
             kind = ev.get("type")
+            part = ev.get("part") or {}
             if kind == "text":
-                job["events"].append({"type": "text", "text": ev["part"].get("text", "")})
+                job["events"].append({"type": "text", "text": part.get("text", "")})
+            elif kind == "reasoning":
+                txt = (part.get("text") or "").strip()
+                if txt:
+                    job["events"].append({"type": "reasoning", "text": txt[:1500]})
+            elif kind == "step_start":
+                job["events"].append({"type": "step", "text": "thinking..."})
             elif kind == "tool":
-                part = ev.get("part", {})
                 state = part.get("state") or {}
                 inp = state.get("input") if isinstance(state, dict) else {}
                 brief = json.dumps(inp)[:160] if inp else ""
                 job["events"].append({"type": "tool", "tool": part.get("tool", "?"),
                                       "brief": brief})
             elif kind == "step_finish":
-                job["events"].append({"type": "step_finish"})
+                toks = part.get("tokens") or part.get("metrics") or {}
+                job["events"].append({
+                    "type": "step_finish",
+                    "text": f"step done - {json.dumps(toks)[:120]}" if toks else "step done"})
             elif kind == "error":
                 job["events"].append({"type": "error",
-                                      "text": str(ev.get("part", ev))[:300]})
+                                      "text": str(part or ev)[:300]})
+        if not connected and raw_tail:
+            job["events"].append({"type": "error",
+                                  "text": "agent exited before responding: " + raw_tail})
 
     reader = threading.Thread(target=_reader, daemon=True)
     reader.start()
@@ -817,6 +853,8 @@ def _start_run(job, directory, agent, prompt, session_id):
     except (ProcessLookupError, PermissionError):
         pass
     reader.join(timeout=3)
+    job["events"].append({"type": "status",
+                          "text": f"turn process exited ({rc})"})
     job["exit"] = rc
     job["done"] = True
 

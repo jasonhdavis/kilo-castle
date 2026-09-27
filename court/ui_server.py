@@ -172,6 +172,32 @@ button{background:var(--surface-2);border:1px solid var(--edge);color:var(--dim)
  letter-spacing:.06em;text-transform:uppercase;transition:all .12s ease}
 button:hover{border-color:var(--red);color:var(--red);background:rgba(248,81,73,.08)}
 .empty-note{color:var(--faint);text-align:center;padding:40px;font-size:12.5px}
+.msg.md{white-space:normal}
+.msg.md p{margin:3px 0}
+.msg.md p:first-child{margin-top:0}
+.msg.md p:last-child{margin-bottom:0}
+.msg.md h3,.msg.md h4,.msg.md h5{margin:8px 0 4px;color:var(--ink)}
+.msg.md h3{font-size:14px}.msg.md h4{font-size:13px}.msg.md h5{font-size:12.5px}
+.msg.md ul,.msg.md ol{margin:4px 0;padding-left:20px}
+.msg.md li{margin:2px 0}
+.msg.md blockquote{border-left:3px solid var(--edge);padding:2px 10px;color:var(--dim);margin:4px 0}
+.msg.md hr{border:none;border-top:1px solid var(--edge);margin:8px 0}
+.msg.md table{margin:6px 0;width:auto;min-width:40%;font-size:12px}
+.msg.md th,.msg.md td{border:1px solid var(--edge);padding:4px 10px}
+.codebox{background:var(--bg);border:1px solid var(--edge);border-radius:var(--r-md);margin:6px 0;overflow:hidden}
+.codebar{display:flex;justify-content:space-between;align-items:center;background:var(--surface-2);
+ padding:3px 10px;font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:.08em}
+.codebar .cpy{cursor:pointer;color:var(--blue);text-transform:lowercase;letter-spacing:0;font-weight:600}
+.codebar .cpy:hover{color:var(--ink)}
+.codebox pre{margin:0;padding:10px 12px;overflow-x:auto}
+.codebox code{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:var(--ink)}
+code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var(--surface-2);
+ border:1px solid var(--edge);border-radius:4px;padding:0 5px}
+.msg.thinking .who{display:block}
+.msg.thinking.folded{max-height:120px;overflow:hidden;cursor:pointer;position:relative}
+.msg.thinking.folded::after{content:"⌄ expand";position:absolute;bottom:4px;right:8px;font-size:9.5px;
+ color:var(--blue);background:var(--surface-2);border:1px solid var(--edge);border-radius:6px;
+ padding:0 6px;font-style:normal}
 </style></head><body>
 <header><div class="brand"><span class="glyph">♜</span>COURT <em>CONSOLE</em></div>
 <div class="vdiv"></div><div id="totals" style="display:flex;gap:8px"></div>
@@ -190,6 +216,11 @@ button:hover{border-color:var(--red);color:var(--red);background:rgba(248,81,73,
   <div class="cont" id="c_cont">new session — pick a worktree, or click a session tab to continue it</div>
   <div class="row">
    <textarea id="c_prompt" placeholder="message the agent… (Enter to send, Shift+Enter for newline)"></textarea>
+   <input id="c_model" list="model_dl" value="openrouter/z-ai/glm-5.3-flash" spellcheck="false"
+    autocomplete="off" placeholder="model" title="model id — type to filter (kilo/provider/model or provider/model)"
+    style="width:240px;height:46px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);
+    border-radius:8px;padding:0 10px;font:11.5px ui-monospace,Menlo,monospace">
+   <datalist id="model_dl"></datalist>
    <select id="c_agent" style="height:46px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);border-radius:8px;padding:0 8px"></select>
    <button class="send" id="c_send" onclick="sendComposer()">SEND</button>
   </div>
@@ -328,17 +359,94 @@ function renderTranscript(){
  if(!msgs.length){t.innerHTML='<div class="empty-note">no messages yet — say something below</div>';return;}
  t.innerHTML=msgs.map(m=>{
   if(!m.text)return '';
-  const cls=m.role==='user'?'user':(m.role==='assistant'?'assistant':(m.role==='reasoning'?'thinking':'tool'));
-  return `<div class="msg ${cls}"><div class="who">${esc(m.role)}</div>${esc(m.text)}</div>`;
+  let cls,content;
+  if(m.role==='user'){cls='user';content=esc(m.text);}
+  else if(m.role==='reasoning'){cls='thinking';content=mdRender(m.text);}
+  else if(m.role==='assistant'){cls='assistant';content=mdRender(m.text);}
+  else{cls='tool';content=esc(m.text);}
+  const fold=cls==='thinking'&&m.text.length>700?' folded':'';
+  return `<div class="msg ${cls}${cls==='user'||cls==='tool'?'':' md'}${fold}"><div class="who">${esc(m.role)}</div>${content}</div>`;
  }).join('')||'<div class="empty-note">no text messages in this session yet</div>';
  t.scrollTop=t.scrollHeight;
 }
-function chatAppend(cls,text){
+function chatAppend(cls,text,md){
  const t=$('transcript');
  if(t.querySelector('.empty-note'))t.innerHTML='';
- t.insertAdjacentHTML('beforeend',`<div class="msg ${cls}">${esc(text)}</div>`);
+ const fold=cls==='thinking'&&text.length>700?' folded':'';
+ const content=md?mdRender(text):esc(text);
+ t.insertAdjacentHTML('beforeend',
+  `<div class="msg ${cls}${md?' md':''}${fold}"><div class="who">${cls==='thinking'?'reasoning':cls}</div>${content}</div>`);
  t.scrollTop=t.scrollHeight;
 }
+function mdInline(s){
+ s=s.replace(/`([^`\n]+)`/g,(m,c)=>'<code class="ic">'+c+'</code>');
+ s=s.replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>');
+ s=s.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g,'$1<i>$2</i>');
+ s=s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+ return s;
+}
+function mdTable(rows){
+ const cells=r=>r.replace(/^\s*\|/,'').replace(/\|\s*$/,'')
+  .split(/(?<!\\)\|/).map(c=>mdInline(c.trim().replace(/\\\|/g,'|')));
+ let body=rows.slice(1);
+ if(body.length&&/^[\s:|-]+$/.test(body[0]))body=body.slice(1);
+ return '<table><thead><tr>'+cells(rows[0]).map(c=>'<th>'+c+'</th>').join('')+'</tr></thead><tbody>'+
+  body.map(r=>'<tr>'+cells(r).map(c=>'<td>'+c+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+}
+function codeHTML(b){
+ return `<div class="codebox"><div class="codebar"><span>${esc(b.lang||'code')}</span>`+
+  `<span class="cpy" onclick="copyCode(this)">copy</span></div>`+
+  `<pre><code>${b.code.replace(/\n$/,'')}</code></pre></div>`;
+}
+function copyCode(el){
+ const c=el.closest('.codebox').querySelector('code').textContent;
+ navigator.clipboard.writeText(c).then(()=>{el.textContent='copied';
+  setTimeout(()=>{el.textContent='copy';},1200);});
+}
+function mdRender(src){
+ src=esc(src);
+ const blocks=[];
+ src=src.replace(/```([^\n`]*)\n?([\s\S]*?)```/g,(m,lang,code)=>{
+  blocks.push({lang:lang.trim(),code});return '\x00B'+(blocks.length-1)+'\x00';});
+ const lines=src.split('\n');
+ const out=[];let para=[],list=null,quote=null,rows=null;
+ const closeList=()=>{if(list){out.push('<'+list.tag+'>'+list.items.map(x=>'<li>'+mdInline(x)+'</li>').join('')+'</'+list.tag+'>');list=null;}};
+ const flush=()=>{closeList();
+  if(para.length){out.push('<p>'+mdInline(para.join('<br>'))+'</p>');para=[];}
+  if(quote!==null){out.push('<blockquote>'+mdInline(quote.join('<br>'))+'</blockquote>');quote=null;}
+  if(rows){out.push(mdTable(rows));rows=null;}};
+ for(let i=0;i<lines.length;i++){
+  const ln=lines[i];
+  const bm=ln.match(/^\x00B(\d+)\x00\s*$/);
+  if(bm){flush();out.push(codeHTML(blocks[+bm[1]]));continue;}
+  if(/^\s*$/.test(ln)){flush();continue;}
+  if(quote!==null||/^(&gt;|>)\s?/.test(ln)){
+   if(quote===null)quote=[];
+   quote.push(ln.replace(/^(&gt;|>)\s?/,''));continue;}
+  if(/^\s*(?:[-*_]\s*){3,}$/.test(ln)){flush();out.push('<hr>');continue;}
+  const hm=ln.match(/^(#{1,4})\s+(.*)$/);
+  if(hm){flush();const lv=hm[1].length+2;out.push('<h'+lv+'>'+mdInline(hm[2])+'</h'+lv+'>');continue;}
+  if(rows===null&&ln.includes('|')&&i+1<lines.length&&
+     lines[i+1].includes('-')&&/^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i+1])){
+   flush();rows=[ln];i++;rows.push(lines[i]);continue;}
+  if(rows!==null&&ln.includes('|')){rows.push(ln);continue;}
+  if(rows!==null)flush();
+  const lm=ln.match(/^\s*[-*+]\s+(.+)$/);
+  const om=ln.match(/^\s*\d+[.)]\s+(.+)$/);
+  if(lm||om){
+   if(para.length||quote!==null)flush();
+   const tag=lm?'ul':'ol';
+   if(list&&list.tag!==tag)closeList();
+   if(!list)list={tag,items:[]};
+   list.items.push((lm||om)[1]);continue;}
+  closeList();para.push(ln);
+ }
+ flush();
+ return out.join('');
+}
+$('transcript').addEventListener('click',e=>{
+ const m=e.target.closest('.msg.thinking');
+ if(m&&!e.target.closest('.codebox'))m.classList.toggle('folded');});
 async function sendComposer(){
  if(composing)return;
  const ta=$('c_prompt');
@@ -351,7 +459,8 @@ async function sendComposer(){
  let job;
  try{
   const r=await fetch('/api/send',{method:'POST',body:JSON.stringify({
-   dir:selWt, agent:$('c_agent').value, prompt, session_id:selSess||null})});
+   dir:selWt, agent:$('c_agent').value, prompt, session_id:selSess||null,
+   model:$('c_model').value.trim()})});
   if(!r.ok){chatAppend('error','refused: '+await r.text());composing=false;$('c_send').disabled=false;return;}
   job=(await r.json()).job;
  }catch(e){chatAppend('error','dispatch failed: '+e);composing=false;$('c_send').disabled=false;return;}
@@ -366,8 +475,8 @@ async function sendComposer(){
    const evs=(st.events||[]).slice(seen);seen=(st.events||[]).length;
    if(seen&&nEl&&nEl.isConnected)nEl.remove();
    for(const e of evs){
-    if(e.type==='text'&&e.text)chatAppend('assistant',e.text);
-    else if(e.type==='reasoning'&&e.text)chatAppend('thinking',e.text);
+    if(e.type==='text'&&e.text)chatAppend('assistant',e.text,true);
+    else if(e.type==='reasoning'&&e.text)chatAppend('thinking',e.text,true);
     else if(e.type==='status')chatAppend('notice',e.text);
     else if(e.type==='step')chatAppend('notice',e.text);
     else if(e.type==='step_finish')chatAppend('notice',e.text||'step done');
@@ -423,7 +532,10 @@ async function mcpToggle(file,name){
  if(!r.ok)alert('refused: '+(await r.text()));else poll();
 }
 (async()=>{try{META=await (await fetch('/api/compose-meta')).json();
- $('c_agent').innerHTML=META.agents.map(x=>`<option>${x}</option>`).join('');}catch(e){}})();
+ $('c_agent').innerHTML=META.agents.map(x=>`<option>${x}</option>`).join('');
+ if(META.models&&META.models.length)
+  $('model_dl').innerHTML=META.models.map(m=>`<option value="${esc(m)}"></option>`).join('');
+}catch(e){}})();
 poll();setInterval(poll,5000);
 </script></body></html>
 """
@@ -790,7 +902,7 @@ def _session_messages(sid, limit=60):
             " where session_id=? order by time_created desc limit ?",
             (sid, limit)).fetchall()
         mids = [r[0] for r in rows]
-        texts = {}
+        parts = {}
         if mids:
             q = ",".join("?" * len(mids))
             for mid, pdata in db.execute(
@@ -800,16 +912,19 @@ def _session_messages(sid, limit=60):
                     p = json.loads(pdata)
                 except Exception:
                     continue
-                if p.get("type") == "text" and p.get("text"):
-                    texts[mid] = texts.get(mid, "") + p["text"] + "\n"
+                t = p.get("type")
+                if t in ("text", "reasoning") and p.get("text"):
+                    parts.setdefault(mid, []).append((t, p["text"]))
         db.close()
     except Exception:
         return []
     out = []
     for mid, role, tc in reversed(rows):
-        out.append({"role": role or "system",
-                    "time_created": tc,
-                    "text": texts.get(mid, "")[:2000]})
+        for ptype, text in parts.get(mid, []):
+            r = "reasoning" if ptype == "reasoning" else (role or "system")
+            out.append({"role": r,
+                        "time_created": tc,
+                        "text": text[:4000]})
     return out
 
 
@@ -818,6 +933,25 @@ KILO_BIN = os.path.expanduser(
     "~/.vscode/extensions/kilocode.kilo-code-7.8.1-darwin-arm64/bin/kilo")
 _JOBS = {}
 _JOB_SEQ = [0]
+
+
+_MODEL_CACHE = {"t": 0.0, "list": []}
+
+
+def _models(ttl=600):
+    hit = _MODEL_CACHE
+    if hit["list"] and time.time() - hit["t"] < ttl:
+        return hit["list"]
+    try:
+        r = subprocess.run(
+            [KILO_BIN, "models"], capture_output=True, text=True, timeout=60)
+        out = sorted({ln.strip() for ln in r.stdout.splitlines() if ln.strip()})
+    except Exception:
+        out = hit["list"]
+    if out:
+        hit["t"] = time.time()
+        hit["list"] = out
+    return out
 
 
 def _known_dirs():
@@ -831,16 +965,19 @@ def _known_dirs():
     return sorted(dirs)
 
 
-def _start_run(job, directory, agent, prompt, session_id):
+def _start_run(job, directory, agent, prompt, session_id, model=""):
     mode = f"continue {session_id[:18]}..." if session_id else "new session"
     job["events"].append({"type": "status", "text": (
         f"spawning agent - {agent} - {mode} - "
         f"{directory.replace('/Users/scrummage/Python/', '')}")})
     cmd = [KILO_BIN, "run", "--dir", directory, "--agent", agent,
-           "--format", "json", "--title", prompt.strip()[:60] or "console turn"]
+           "--format", "json", "--thinking",
+           "--title", prompt.strip()[:60] or "console turn"]
     if session_id:
         cmd += ["--session", session_id]
-    else:
+    if model:
+        cmd += ["--model", model]
+    elif not session_id:
         cmd += ["--model", "openrouter/z-ai/glm-5.3-flash"]
     cmd.append(prompt[:20000])
     try:
@@ -879,7 +1016,9 @@ def _start_run(job, directory, agent, prompt, session_id):
             elif kind == "reasoning":
                 txt = (part.get("text") or "").strip()
                 if txt:
-                    job["events"].append({"type": "reasoning", "text": txt[:1500]})
+                    if len(txt) > 4000:
+                        txt = txt[:4000] + " …[truncated]"
+                    job["events"].append({"type": "reasoning", "text": txt})
             elif kind == "step_start":
                 job["events"].append({"type": "step", "text": "thinking..."})
             elif kind == "tool":
@@ -951,7 +1090,8 @@ class Handler(BaseHTTPRequestHandler):
                             "exit": job.get("exit"), "sid": job.get("sid")})
         elif self.path == "/api/compose-meta":
             self._json({"agents": list(_ALLOWED_AGENTS),
-                        "dirs": _known_dirs()})
+                        "dirs": _known_dirs(),
+                        "models": _models()})
         elif self.path == "/api/state":
             procs = _ps_procs()
             flagged, total = _processes(procs)
@@ -997,6 +1137,10 @@ class Handler(BaseHTTPRequestHandler):
         agent = body.get("agent", "")
         prompt = str(body.get("prompt", "")).strip()
         session_id = body.get("session_id") or None
+        model = str(body.get("model") or "").strip()
+        if model and (len(model) > 120 or not re.fullmatch(r"[\w.~@/-]+", model)):
+            self._json({"error": "bad model id"}, 400)
+            return
         if not prompt:
             self._json({"error": "empty prompt"}, 400)
             return
@@ -1012,7 +1156,8 @@ class Handler(BaseHTTPRequestHandler):
         _JOBS[str(_JOB_SEQ[0])] = job
         threading.Thread(
             target=_start_run,
-            args=(job, directory, agent, prompt, session_id), daemon=True).start()
+            args=(job, directory, agent, prompt, session_id, model),
+            daemon=True).start()
         self._json({"ok": True, "job": str(_JOB_SEQ[0])})
 
     def _read_body(self):

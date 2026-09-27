@@ -228,3 +228,37 @@ live by Steward separately):
   recalled the exact first-turn answer. Two-level continue now proven through
   the console transport. PAGE made a raw string (kills the SyntaxWarning from
   the JS `[\w-]+` regex).
+
+## 2026-09-27 (latest) — Thinking surfaced, markdown/code rendering, model picker
+
+- STREAMING REALITY (probed, don't re-litigate): `kilo run --format json` does
+  NOT stream token deltas — every part (text, reasoning) is emitted ONCE,
+  complete, when the part finishes (verified: 3877-char text = single event at
+  +19.5s; 2473-char reasoning = single event at +14.2s). Live token streaming
+  requires the serve+SSE path (message.part.updated) — the deferred attach-mode.
+  Within a multi-step turn the frame still updates per step/part completion.
+- THINKING: `--thinking` flag now passed on every composer turn (without it the
+  model's reasoning parts never reach the NDJSON stream at all — verified).
+  Reasoning capped at 4000 chars with …[truncated] marker. `_session_messages`
+  now returns PER-PART entries (text + reasoning types from the part table), so
+  reloading a session shows thinking blocks interleaved user→reasoning→assistant.
+- MARKDOWN (hand-rolled, zero-dep, XSS-safe escape-first): mdRender covers
+  fenced code blocks (language chip + copy button via navigator.clipboard),
+  inline code, bold, asterisk-italic, http(s) links (noopener, javascript: URLs
+  never hyperlinked), h3-h5 headings, ul/ol lists, blockquotes (CommonMark lazy
+  continuation), hr, pipe tables with \| escapes. Applied to assistant +
+  thinking bubbles (streamed and history); user bubbles stay plain pre-wrap.
+  Unit-tested in node against XSS/script-injection samples (all escaped).
+- BLOCKQUOTE GOTCHA: `>` must be matched as `(&gt;|>)` AFTER esc() — escaping
+  runs before line parsing.
+- MODEL PICKER: /api/compose-meta now includes `models` — parsed from
+  `kilo models` (712 entries, kilo/<provider>/<model> form), cached 600s.
+  Composer gets a datalist-backed input (type-to-filter, native, zero-dep),
+  default openrouter/z-ai/glm-5.3-flash. /api/send accepts `model`
+  (regex-validated) and passes --model for BOTH new and continue sessions.
+  VERIFIED LIVE: continue turn with --model kilo/z-ai/glm-5.3-flash on an
+  openrouter-created session → exit 0, same sid, model self-identified. Both
+  ID forms (openrouter/... and kilo/...) accepted by the CLI.
+- Live e2e: thinking turn (reasoning 1017 chars + fenced code + md table in
+  text, exit 0) and model-override continue turn both green; /api/session
+  shows reasoning rows. No orphaned kilo children after turns (killpg reaps).

@@ -1,5 +1,5 @@
 ---
-description: Court Artist: interactive UI/UX craftsman for front-end refinement directly with M'Lord
+description: "Court Artist: interactive UI/UX craftsman for front-end refinement directly with M'Lord"
 mode: primary
 model: openrouter/z-ai/glm-5.3
 ---

@@ -67,6 +67,34 @@ The development server is running and bound to this studio worktree:
 
 *(If the server needs restarting: `bash .kilo/manage_servers.sh start {{ worktree }}` or `ROLE=web python manage.py runserver 0.0.0.0:{{ port }} --noreload`)*
 
+## The Shared Browser (one Chromium, one login, one easel)
+
+A managed Chromium instance is dedicated to this studio — it is NOT M'Lord's
+personal browser profile. M'Lord's authenticated session for the dev app lives in
+this browser, so you can see exactly what M'Lord sees, including logged-in views.
+
+{{ browser_mcp_line }}
+
+Rules of engagement:
+1. Drive the browser ONLY within the studio runserver origin(s) listed above.
+   Never log out of the dev app, never touch sessions on unrelated sites.
+2. Use it to verify your edits the way M'Lord sees them: navigate, screenshot,
+   read the DOM, click through the flow BEFORE asking M'Lord to refresh.
+3. Screenshots captured as evidence go in `.kilo/studio-shots/` (gitignored).
+
+## Royal Annotations (M'Lord's margin notes on live pages)
+
+While reviewing, M'Lord pins annotations directly onto live pages: toggle annotate
+mode, click an element, type a note. Every annotation is appended to one file:
+
+- `{{ annotations_file }}` — one JSON object per line: `ts`, `url`, `selector`, `tag`, `text`, `note`
+
+Read that file at review start and after every change batch. Each `selector` is an
+exact pointer to what M'Lord wants changed; the `note` is the instruction. When a
+note is purely visual, take a screenshot of that selector and read it with your
+vision model (`{{ vision_model }}`). The file is append-only margin notes — never
+rewrite or delete lines.
+
 ## Design System & Style Guidelines
 
 All interfaces adhere strictly to the project's design system:

@@ -581,6 +581,41 @@ sandbox flags).
 - Verified live: meta now returns ctx_limit 1310720 for the glm session.
   Committed with ledger.
 
+## 2026-09-27 (late) — Royal Easel v2: shared browser, annotations, vision artist (assent given)
+
+M'Lord assented to the artist-studio upgrade plan. Three probes run first (all PASS):
+- VISION: headless `kilo run -f <png> -m openrouter/google/gemini-3.7-flash` read a
+  PIL-rendered image exactly ("EASEL PROBE 42 / ROYAL BANNER VERIFICATION") — image
+  attachments work headless; `models.artist_vision` pinned to gemini-3.7-flash.
+- CDP: branded Chrome 154 accepts --remote-debugging-port + dedicated user-data-dir.
+- MCP: `chrome-devtools-mcp@latest` supports `--browserUrl http://127.0.0.1:<port>`.
+
+Design ratified: ONE managed headed Chromium with dedicated persistent profile
+(~/.local/share/kilo-castle/studio-chrome-profile — NOT M'Lord's personal profile;
+M'Lord logs into the dev app once, auth persists across studios); artist attaches
+via chrome-devtools MCP; court-owned injector pins an annotation overlay into every
+page via CDP (Page.addScriptToEvaluateOnNewDocument); M'Lord pins selector+note
+margin notes; annotations append to <studio-worktree>/.kilo/studio-annotations.jsonl;
+console (8300) gains /api/annotation (CORS) + /api/annotations + easel chip/modal.
+`court artist-say <qid> "<instruction>"` = headless nudge to the live artist session.
+Studio brief template gains Shared Browser + Royal Annotations sections
+({{ browser_mcp_line }}, {{ annotations_file }}, {{ vision_model }}).
+
+IN FLIGHT (background subagents, no commits yet; I review+commit on completion):
+- EASEL agent ses_f1d30c4baffehI6ZhEUs66utqi: court/browser.py (browser manager,
+  stdlib WS client injector), court/assets/annotator.js, cli.py (browser verbs,
+  studio auto-start + .worktree-browser, artist-say), MCP config-location probe
+  (.kilo/kilo.json vs root kilo.json — root-only would NOT be wired; tracked-file
+  pollution at sync-back).
+- CONSOLE agent ses_f1d302568ffewsnOm7DGnDwN6C: ui_server.py /api/annotation,
+  /api/annotations, easel chip + annotations modal, /api/state easel key.
+Direct-edit ownership split avoids collisions: EASEL owns cli.py/browser.py/assets,
+CONSOLE owns ui_server.py, Steward owns config/templates/kilo.json/ledger.
+
+NEXT on their completion: review diffs, commit, restart persistent console server
+(8300) to activate the new endpoints, then first real studio run exercises the
+whole chain (browser + MCP attach + annotations + vision screenshots).
+
 ## 2026-09-27 — kilo.db cleanup: 104G file → ~11G live (royal assent given)
 
 - M'Lord requested a review: "kilo db is like 11gb". Actual: `kilo.db` was

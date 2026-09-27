@@ -8,6 +8,7 @@
     "steward": "openrouter/google/gemini-3.7-flash",
     "artist": "openrouter/z-ai/glm-5.3",
     "artist_provider": "openrouter",
+    "artist_vision": "openrouter/google/gemini-3.7-flash",
     "scout": "openrouter/z-ai/glm-5.3-flash"
   },
   "model_aliases": {

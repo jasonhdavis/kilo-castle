@@ -335,7 +335,7 @@ const foldKey=t=>'F'+t.length+':'+t.slice(0,80);
 const CTXLIM=[[/(gemini|1m)/i,1e6],[/(gpt-5|gpt-4\.1|o[34]|grok)/i,4e5],
  [/(qwen|kimi|llama)/i,256e3],[/(claude|glm|deepseek|mistral|mini)/i,2e5]];
 function ctxLim(m){if(!m)return 2e5;for(const[r,l]of CTXLIM)if(r.test(m))return l;return 2e5;}
-const ktop=t=>((t||0)/1024).toFixed(t>=1048576?0:1)+'k';
+const ktop=t=>{t=t||0;return t>=1e6?(t/1e6).toFixed(1)+'M':Math.round(t/1e3)+'k';};
 const esc=s=>String(s??'').replace(/[&<>"'\0]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','\0':''}[c]));
 const mb=r=>r==null||r===undefined?'—':(r/1048576).toFixed(0)+' MB';
 const ago=ts=>{if(!ts)return'';const d=(Date.now()-ts)/1000;
@@ -514,7 +514,7 @@ async function syncSessMeta(){
  let m={};
  try{m=await (await fetch('/api/session/meta?id='+sid)).json();}catch(e){}
  if(seq!==sessMetaSeq||selSess!==sid)return;
- const lim=ctxLim(m.model||'');
+ const lim=m.ctx_limit||ctxLim(m.model||'');
  const pct=m.ctx?` (${Math.min(100,Math.round(100*m.ctx/lim))}%)`:'';
  $('sess_meta').innerHTML=`ctx <b>${ktop(m.ctx||0)}</b>/${ktop(lim)}${pct} · $${(m.cost||0).toFixed(2)}`;
 }
@@ -1658,6 +1658,7 @@ def _session_meta(sid):
     """True context-window usage (last step-finish tokens.total) + session cost."""
     if not os.path.exists(KILO_DB) or not re.fullmatch(r"[\w-]+", sid):
         return {}
+    _ctx_limits_bg()
     out = {}
     try:
         db = sqlite3.connect(f"file:{KILO_DB}?mode=ro", uri=True, timeout=3)
@@ -1676,6 +1677,7 @@ def _session_meta(sid):
             out["model"] = (json.loads(model) or {}).get("id", "") or str(model)
         except Exception:
             out["model"] = str(model or "")
+        out["ctx_limit"] = _model_ctx_limit(out["model"])
     # bounded scan: newest 30 messages' parts only — never a full-session
     # json_extract pass over the 100GB DB
     try:
@@ -1711,6 +1713,75 @@ def _kilo_bin():
         return max(cands, key=lambda p: os.path.getmtime(os.path.dirname(
             os.path.dirname(p))))
     return shutil.which("kilo") or "kilo"
+
+
+_CTX_FALLBACKS = [
+    (re.compile(r"gemini", re.I), 1_000_000),
+    (re.compile(r"gpt-5|gpt-4\.1|o[34]|grok", re.I), 400_000),
+    (re.compile(r"qwen|kimi|llama", re.I), 256_000),
+    (re.compile(r"claude|glm|deepseek|mistral|mini", re.I), 200_000),
+]
+
+
+def _ctx_fallback(model):
+    for rx, lim in _CTX_FALLBACKS:
+        if rx.search(model or ""):
+            return lim
+    return 200_000
+
+
+def _model_ctx_limit(model):
+    """Resolve a model id -> real context length (OpenRouter catalog,
+    background-fetched and cached 24h); family heuristic as fallback."""
+    limits = _CTX_LIMITS["map"]
+    norm = (model or "").lower()
+    for pre in ("openrouter/", "kilo/", "~"):
+        if norm.startswith(pre):
+            norm = norm[len(pre):]
+    if norm in limits:
+        return limits[norm]
+    # alias tolerance: claude-sonnet-latest -> claude-sonnet-4 etc.
+    base = re.sub(r"-latest$", "", norm)
+    for mid, lim in limits.items():
+        if mid == base or mid.startswith(base) or base.startswith(mid):
+            return lim
+    return _ctx_fallback(norm)
+
+
+_CTX_LIMITS = {"t": 0.0, "map": {}, "busy": False}
+
+
+def _ctx_limits_bg(ttl=86400):
+    now = time.time()
+    if _CTX_LIMITS["map"] and now - _CTX_LIMITS["t"] < ttl:
+        return
+    if _CTX_LIMITS["busy"]:
+        return
+    _CTX_LIMITS["busy"] = True
+
+    def _fetch():
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "https://openrouter.ai/api/v1/models",
+                headers={"User-Agent": "court-console/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode())
+            out = {}
+            for m in data.get("data", []):
+                cl = m.get("context_length") or m.get("top_provider", {}).get(
+                    "context_length")
+                if m.get("id") and cl:
+                    out[str(m["id"]).lower()] = int(cl)
+            if out:
+                _CTX_LIMITS["map"] = out
+                _CTX_LIMITS["t"] = time.time()
+        except Exception:
+            pass
+        finally:
+            _CTX_LIMITS["busy"] = False
+
+    threading.Thread(target=_fetch, daemon=True).start()
 
 
 _ALLOWED_AGENTS = ("steward", "code", "serf", "scout", "artist")

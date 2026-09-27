@@ -558,6 +558,29 @@ All five queued items shipped. Direct on trunk.
   for pulse); hung-turn watchdog; last-good snapshot on transient DB errors;
   board epic grouping; job console for dispatch streaming serf.log tail.
 
+## 2026-09-27 (11:4x) — Context limit truth: real per-model windows from OpenRouter catalog (royal bug: "193.4k/195.3k (99%)")
+
+M'Lord's chatbar showed 99% of a 200k cap on a glm-5.3-flash session. Two
+defects: (1) `ktop()` divided tokens by 1024 — "193.4k" was actually ~198k
+tokens with a misleading label; (2) the 200k cap was a model-FAMILY GUESS —
+no context-window metadata exists anywhere in the local stack (kilo.db has no
+model table; `kilo models` outputs bare ids; session metadata holds only
+sandbox flags).
+
+- FIX: `_ctx_limits_bg()` fetches OpenRouter's public /api/v1/models
+  (stdlib urllib, 24h cache, stale-serve, no auth needed) → 458 models with
+  real context_length. `_model_ctx_limit()` normalizes openrouter//kilo/~
+  prefixes, exact match, then ±prefix alias match (claude-x-latest), then
+  family fallback. Exposed as `ctx_limit` in /api/session/meta; client uses
+  it before the heuristic.
+- REAL LIMITS (catalog): glm-5.3-flash = 1,310,720 (6.5× the guess);
+  claude-sonnet-4.5 = 1,000,000; gemini-2.5-pro = 1,048,576; gpt-5 = 400,000.
+  The reported session is actually ~175k/1.31M ≈ 13%, not 99%.
+- `ktop` now decimal (k=1000, M=1e6). First ~5s after server start serves the
+  fallback until the catalog lands (corrects on next poll).
+- Verified live: meta now returns ctx_limit 1310720 for the glm session.
+  Committed with ledger.
+
 ## 2026-09-27 — kilo.db cleanup: 104G file → ~11G live (royal assent given)
 
 - M'Lord requested a review: "kilo db is like 11gb". Actual: `kilo.db` was

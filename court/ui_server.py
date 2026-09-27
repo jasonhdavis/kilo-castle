@@ -109,9 +109,23 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
  transition:all .12s ease;font-size:14px}
 .iconbtn:hover{border-color:var(--primary);color:var(--primary)}
 .tabs{display:flex;gap:5px;flex-wrap:wrap;margin-left:auto;max-width:55%}
-.tab{padding:3px 12px;border:1px solid var(--edge);border-radius:999px;cursor:pointer;
- font-size:11px;color:var(--dim);background:var(--surface-2);max-width:200px;
- white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:all .12s ease}
+.tab{display:inline-flex;align-items:center;gap:6px;padding:3px 12px;border:1px solid var(--edge);
+ border-radius:999px;cursor:pointer;font-size:11px;color:var(--dim);background:var(--surface-2);
+ max-width:200px;white-space:nowrap;overflow:hidden;transition:all .12s ease}
+.tab .tl{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.tab .tx{opacity:0;color:var(--red);font-weight:700;cursor:pointer;padding:0 2px;flex:none}
+.tab:hover .tx{opacity:1}
+.tab .tx:hover{color:var(--ink)}
+#composer .send.stop{background:var(--red);color:#fff;flex:none}
+#composer .send.stop:hover{background:#ff7875;color:#fff}
+.dots i{display:inline-block;width:4px;height:4px;border-radius:50%;background:var(--primary);
+ margin:0 1px;vertical-align:middle;animation:dotp 1.2s infinite ease-in-out}
+.dots i:nth-child(2){animation-delay:.15s}
+.dots i:nth-child(3){animation-delay:.3s}
+@keyframes dotp{0%,80%,100%{transform:scale(.6);opacity:.35}40%{transform:scale(1);opacity:1}}
+.livedot{width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;
+ animation:pulse 1.1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
 .tab:hover{border-color:var(--blue);color:var(--ink)}
 .tab.on{background:var(--blue);border-color:var(--blue);color:#0d1117;font-weight:600}
 .tab.newtab{border-style:dashed}
@@ -205,12 +219,14 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 <div id="clock"></div></header>
 <main><nav id="nav"></nav>
 <section id="chat">
- <div id="chatbar">
-  <span class="wt" id="wt_label">select a worktree</span>
-  <span id="wt_badge"></span>
-  <div class="iconbtn" title="MCP servers" onclick="openMcp()">⚙</div>
-  <div class="tabs" id="sess_tabs"></div>
- </div>
+  <div id="chatbar">
+   <span class="wt" id="wt_label">select a worktree</span>
+   <span id="wt_badge"></span>
+   <span id="live_chip" class="chip" style="display:none"><span class="livedot"></span>&nbsp;agent working</span>
+   <div class="iconbtn" title="MCP servers" onclick="openMcp()">⚙</div>
+   <div class="iconbtn" id="sess_del" title="delete this session" style="display:none" onclick="delSess(selSess)">✕</div>
+   <div class="tabs" id="sess_tabs"></div>
+  </div>
  <div id="transcript"><div class="notice">select a branch, then a session — the chat loads here</div></div>
  <div id="composer">
   <div class="cont" id="c_cont">new session — pick a worktree, or click a session tab to continue it</div>
@@ -222,6 +238,7 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
     border-radius:8px;padding:0 10px;font:11.5px ui-monospace,Menlo,monospace">
    <datalist id="model_dl"></datalist>
    <select id="c_agent" style="height:46px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);border-radius:8px;padding:0 8px"></select>
+   <button class="send stop" id="c_stop" style="display:none" onclick="stopTurn()">STOP</button>
    <button class="send" id="c_send" onclick="sendComposer()">SEND</button>
   </div>
  </div>
@@ -229,7 +246,7 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 <div id="modal"><div class="box"><div class="hd"><b>MCP SERVERS — merged inventory</b>
 <span onclick="closeMcp()">CLOSE ✕</span></div><div class="bd" id="modal_bd"></div></div></div>
 <script>
-let S=null, selRepo=null, selWt=null, selSess=null, msgs=[], composing=false;
+let S=null, selRepo=null, selWt=null, selSess=null, msgs=[], composing=false, TURN=null;
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const mb=r=>r==null||r===undefined?'—':(r/1048576).toFixed(0)+' MB';
 const ago=ts=>{if(!ts)return'';const d=(Date.now()-ts)/1000;
@@ -313,7 +330,7 @@ function renderNav(){
 function switchApp(key){selRepo=key;selWt=null;selSess=null;msgs=[];
  $('wt_label').textContent='select a worktree';$('wt_badge').innerHTML='';
  $('c_cont').innerHTML='new session — pick a worktree, or click a session tab to continue it';
- renderNav();renderTranscript();syncHash();}
+ renderNav();renderTranscript();syncHash();syncSessBtn();}
 function pickWt(path,branch){
  selWt=path;selSess=null;msgs=[];
  if(path){
@@ -325,7 +342,7 @@ function pickWt(path,branch){
   $('wt_label').innerHTML=esc(branch||'?')+' <span class="dim">· no worktree</span>';
   $('wt_badge').innerHTML='';
  }
- renderNav();renderSessionsBar();renderTranscript();
+ renderNav();renderSessionsBar();renderTranscript();syncSessBtn();
  $('c_cont').innerHTML='new session — pick a worktree, or click a session tab to continue it';
  const sess=sessionsFor(path);
  if(sess.length)openSess(sess[0].id);
@@ -340,16 +357,17 @@ function renderSessionsBar(){
  const sess=sessionsFor(selWt).slice(0,8);
  $('sess_tabs').innerHTML=
   sess.map(s=>`<div class="tab ${selSess===s.id?'on':''}" onclick="openSess('${s.id}')"
-   title="${esc(s.title||s.id)}">${esc(s.agent||'?')}: ${esc((s.title||s.id).slice(0,26))}</div>`).join('')+
-  `<div class="tab newtab ${selSess===null?'on':''}" onclick="newSess()" title="start a fresh session">＋ new</div>`;
+   title="${esc(s.title||s.id)}"><span class="tl">${esc(s.agent||'?')}: ${esc((s.title||s.id).slice(0,26))}</span>`+
+   `<span class="tx" title="delete session" onclick="event.stopPropagation();delSess('${s.id}')">✕</span></div>`).join('')+
+   `<div class="tab newtab ${selSess===null?'on':''}" onclick="newSess()" title="start a fresh session">＋ new</div>`;
 }
 function newSess(){selSess=null;msgs=[];
  $('c_cont').innerHTML='new session in <b>'+esc(selWt?selWt.replace('/Users/scrummage/Python/',''):'?')+'</b> <span class="dim">— agent replies as a fresh session</span>';
- renderSessionsBar();renderTranscript();syncHash();}
+ renderSessionsBar();renderTranscript();syncHash();syncSessBtn();}
 async function openSess(id){
  selSess=id;msgs=[];
  $('c_cont').innerHTML=`continuing <b>${esc(id.slice(0,24))}…</b> <span class="x" onclick="newSess()">start new instead</span>`;
- renderSessionsBar();renderTranscript();syncHash();
+ renderSessionsBar();renderTranscript();syncHash();syncSessBtn();
  $('transcript').innerHTML='<div class="notice">loading…</div>';
  try{msgs=await (await fetch('/api/session?id='+id)).json();}catch(e){msgs=[];}
  renderTranscript();
@@ -369,14 +387,31 @@ function renderTranscript(){
  }).join('')||'<div class="empty-note">no text messages in this session yet</div>';
  t.scrollTop=t.scrollHeight;
 }
-function chatAppend(cls,text,md){
+function viewingTurn(){
+ const T=TURN;if(!T)return false;
+ if(selWt!==T.wt)return false;
+ if(T.sess)return selSess===T.sess;
+ return selSess===null||selSess===T.sid;
+}
+function renderLive(){
+ const T=TURN;if(!T)return;
  const t=$('transcript');
- if(t.querySelector('.empty-note'))t.innerHTML='';
- const fold=cls==='thinking'&&text.length>700?' folded':'';
- const content=md?mdRender(text):esc(text);
- t.insertAdjacentHTML('beforeend',
-  `<div class="msg ${cls}${md?' md':''}${fold}"><div class="who">${cls==='thinking'?'reasoning':cls}</div>${content}</div>`);
- t.scrollTop=t.scrollHeight;
+ const near=t.scrollHeight-t.scrollTop-t.clientHeight<90;
+ let h='';
+ for(const b of T.blocks){
+  if(b.cls==='spin'){
+   const s=((Date.now()-T.t0)/1000)|0;
+   h+='<div class="msg notice">'+(T.blocks.length<=1?'dispatching…':'working…')+
+    ' <span class="dots"><i></i><i></i><i></i></span> '+s+'s</div>';continue;}
+  if(!b.text)continue;
+  const md=b.cls==='assistant'||b.cls==='thinking';
+  const fold=b.cls==='thinking'&&b.text.length>700?' folded':'';
+  h+='<div class="msg '+b.cls+(md?' md':'')+fold+
+   '"><div class="who">'+(b.cls==='thinking'?'reasoning':b.cls)+'</div>'+
+   (md?mdRender(b.text):esc(b.text))+'</div>';
+ }
+ t.innerHTML=h;
+ if(near)t.scrollTop=t.scrollHeight;
 }
 function mdInline(s){
  s=s.replace(/`([^`\n]+)`/g,(m,c)=>'<code class="ic">'+c+'</code>');
@@ -447,62 +482,127 @@ function mdRender(src){
 $('transcript').addEventListener('click',e=>{
  const m=e.target.closest('.msg.thinking');
  if(m&&!e.target.closest('.codebox'))m.classList.toggle('folded');});
-async function sendComposer(){
- if(composing)return;
+function sendComposer(){
+ if(composing){
+  const ta=$('c_prompt');
+  const txt=ta.value.trim();
+  if(txt&&TURN&&TURN.job&&!TURN.queue){
+   TURN.queue={wt:TURN.wt,agent:$('c_agent').value,
+    model:$('c_model').value.trim(),prompt:txt};
+   ta.value='';
+   TURN.blocks.push({cls:'notice',
+    text:'queued next: '+txt.slice(0,80)+(txt.length>80?'…':'')});
+   if(viewingTurn())renderLive();
+  }
+  return;}
  const ta=$('c_prompt');
  const prompt=ta.value.trim();
  if(!prompt||!selWt)return;
- ta.value='';composing=true;$('c_send').disabled=true;
- const wasCont=!!selSess;
- chatAppend('user',prompt);
- chatAppend('notice','dispatching…');
- let job;
+ ta.value='';
+ dispatch(selWt,selSess,$('c_agent').value,$('c_model').value.trim(),prompt);
+}
+async function dispatch(wt,sess,agent,model,prompt){
+ composing=true;
+ $('c_send').textContent='QUEUE';$('c_stop').style.display='';
+ $('live_chip').style.display='';
+ TURN={wt,sess,sid:null,job:null,evs:0,ran:false,done:false,t0:Date.now(),
+  blocks:[{cls:'user',text:prompt},{cls:'spin'}],queue:null,
+  stopping:false,stopped:false};
+ if(viewingTurn())renderLive();
  try{
   const r=await fetch('/api/send',{method:'POST',body:JSON.stringify({
-   dir:selWt, agent:$('c_agent').value, prompt, session_id:selSess||null,
-   model:$('c_model').value.trim()})});
-  if(!r.ok){chatAppend('error','refused: '+await r.text());composing=false;$('c_send').disabled=false;return;}
-  job=(await r.json()).job;
- }catch(e){chatAppend('error','dispatch failed: '+e);composing=false;$('c_send').disabled=false;return;}
- const nEl=[...document.querySelectorAll('#transcript .notice')].pop();
- const t0=Date.now();
- let seen=0, err=null, hardErr=null, sid=null, st=null;
+   dir:wt,agent,prompt,session_id:sess||null,model})});
+  if(!r.ok){
+   TURN.blocks.push({cls:'error',text:'refused: '+await r.text()});
+   await finishTurn(null,null);return;}
+  TURN.job=(await r.json()).job;TURN.ran=true;
+ }catch(e){
+  TURN.blocks.push({cls:'error',text:'dispatch failed: '+e});
+  await finishTurn(null,null);return;}
+ let err=null,lastSt=null;
  try{
   while(true){
-   try{st=await (await fetch('/api/send/'+job)).json();}
+   try{lastSt=await (await fetch('/api/send/'+TURN.job)).json();}
    catch(e){err=e;break;}
-   if(st.error){hardErr=st.error;break;}
-   const evs=(st.events||[]).slice(seen);seen=(st.events||[]).length;
-   if(seen&&nEl&&nEl.isConnected)nEl.remove();
+   if(lastSt.error){
+    TURN.blocks.push({cls:'error',text:lastSt.error});lastSt=null;break;}
+   const evs=(lastSt.events||[]).slice(TURN.evs);
+   TURN.evs=(lastSt.events||[]).length;
    for(const e of evs){
-    if(e.type==='text'&&e.text)chatAppend('assistant',e.text,true);
-    else if(e.type==='reasoning'&&e.text)chatAppend('thinking',e.text,true);
-    else if(e.type==='status')chatAppend('notice',e.text);
-    else if(e.type==='step')chatAppend('notice',e.text);
-    else if(e.type==='step_finish')chatAppend('notice',e.text||'step done');
-    else if(e.type==='tool')chatAppend('tool',`tool · ${e.tool} ${e.brief||''}`);
-    else if(e.type==='error')chatAppend('error',e.text||'unknown error');
+    if(e.type==='text'&&e.text)TURN.blocks.push({cls:'assistant',text:e.text});
+    else if(e.type==='reasoning'&&e.text)TURN.blocks.push({cls:'thinking',text:e.text});
+    else if(e.type==='status')TURN.blocks.push({cls:'notice',text:e.text});
+    else if(e.type==='step')TURN.blocks.push({cls:'notice',text:e.text});
+    else if(e.type==='step_finish')TURN.blocks.push({cls:'notice',text:e.text||'step done'});
+    else if(e.type==='tool')TURN.blocks.push({cls:'tool',
+     text:'tool · '+e.tool+' '+(e.brief||'')});
+    else if(e.type==='error')TURN.blocks.push({cls:'error',text:e.text||'unknown error'});
    }
-   if(st.sid)sid=st.sid;
-   if(!st.done&&seen===0&&nEl&&nEl.isConnected)
-    nEl.textContent=`dispatching… ${((Date.now()-t0)/1000)|0}s`;
-   if(st.done)break;
+   if(lastSt.sid)TURN.sid=lastSt.sid;
+   if(viewingTurn())renderLive();
+   if(lastSt.done)break;
    await new Promise(res=>setTimeout(res,700));
   }
- }catch(loopErr){hardErr=hardErr||('console error: '+loopErr);}
- const exit=st&&typeof st.exit==='number'?st.exit:null;
- if(err)chatAppend('error','stream failed: '+err);
- else if(hardErr)chatAppend('error',hardErr);
- else if(exit)chatAppend('error',`turn process exited with code ${exit} — see notices above`);
- else chatAppend('notice',`turn complete · ${((Date.now()-t0)/1000)|0}s`);
- if(sid&&!wasCont){
-  selSess=sid;
-  $('c_cont').innerHTML=`continuing <b>${esc(sid.slice(0,24))}…</b> <span class="x" onclick="newSess()">start new instead</span>`;
-  renderSessionsBar();
+ }catch(loopErr){
+  TURN.blocks.push({cls:'error',text:'console error: '+loopErr});lastSt=null;}
+ await finishTurn(err,lastSt);
+}
+async function finishTurn(err,lastSt){
+ const T=TURN;
+ const wasViewing=viewingTurn();
+ const exit=lastSt&&typeof lastSt.exit==='number'?lastSt.exit:null;
+ if(err)T.blocks.push({cls:'error',text:'stream failed: '+err});
+ else if(T.stopped)T.blocks.push({cls:'notice',text:'stopped by user'});
+ else if(exit&&exit!==0)T.blocks.push({cls:'error',
+  text:'turn process exited with code '+exit+' — see notices above'});
+ if(wasViewing)renderLive();
+ TURN=null;
+ $('c_send').textContent='SEND';$('c_stop').style.display='none';
+ $('live_chip').style.display='none';
+ const q=(T.ran&&T.queue)?T.queue:null;
+ if(wasViewing&&T.ran&&(T.sid||T.sess)){
+  await openSess(T.sid||T.sess);
+  const t=$('transcript');
+  const secs=((Date.now()-T.t0)/1000)|0;
+  const msg=err?'stream failed · '+secs+'s'
+   :(exit&&exit!==0&&!T.stopped)?'turn failed (exit '+exit+') · '+secs+'s'
+   :(T.stopped?'stopped':'turn complete')+' · '+secs+'s';
+  t.insertAdjacentHTML('beforeend','<div class="msg notice">'+esc(msg)+'</div>');
+  t.scrollTop=t.scrollHeight;
  }
- syncHash();
- composing=false;$('c_send').disabled=false;
+ if(q){await dispatch(q.wt,T.sid||T.sess,q.agent,q.model,q.prompt);return;}
+ composing=false;
  poll();
+}
+async function stopTurn(){
+ const T=TURN;
+ if(!T||!T.job||T.stopping)return;
+ T.stopping=true;
+ T.blocks.push({cls:'notice',text:'stop requested…'});
+ if(viewingTurn())renderLive();
+ try{await fetch('/api/stop',{method:'POST',body:JSON.stringify({job:T.job})});
+  T.stopped=true;}catch(e){}
+}
+async function delSess(id){
+ if(!id)return;
+ const s=(S.sessions||[]).find(x=>x.id===id);
+ const label=s&&s.title?s.title.slice(0,40):id;
+ if(!confirm('Delete session "'+label+'"? This permanently removes its messages from kilo.db.'))return;
+ try{
+  const r=await fetch('/api/session/delete',{method:'POST',
+   body:JSON.stringify({id})});
+  if(!r.ok){alert('refused: '+(await r.text()));return;}
+ }catch(e){alert('delete failed: '+e);return;}
+ if(selSess===id){
+  selSess=null;msgs=[];
+  const next=sessionsFor(selWt).find(x=>x.id!==id);
+  if(next)await openSess(next.id);else newSess();
+ }
+ poll();
+}
+function syncSessBtn(){
+ const el=$('sess_del');
+ if(el)el.style.display=selSess?'':'none';
 }
 document.getElementById('c_prompt').addEventListener('keydown',e=>{
  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendComposer();}});
@@ -967,6 +1067,7 @@ def _known_dirs():
 
 def _start_run(job, directory, agent, prompt, session_id, model=""):
     mode = f"continue {session_id[:18]}..." if session_id else "new session"
+    job["sess"] = session_id
     job["events"].append({"type": "status", "text": (
         f"spawning agent - {agent} - {mode} - "
         f"{directory.replace('/Users/scrummage/Python/', '')}")})
@@ -988,6 +1089,7 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
         job["events"].append({"type": "error", "text": str(exc)})
         job["done"] = True
         return
+    job["proc"] = proc
 
     def _reader():
         connected = False
@@ -1124,8 +1226,68 @@ class Handler(BaseHTTPRequestHandler):
             self._mcp_toggle()
         elif self.path == "/api/send":
             self._send()
+        elif self.path == "/api/stop":
+            self._stop()
+        elif self.path == "/api/session/delete":
+            self._session_delete()
         else:
             self.send_error(404)
+
+    def _stop(self):
+        try:
+            jobid = self._read_body().get("job")
+        except Exception:
+            self._json({"error": "bad request"}, 400)
+            return
+        job = _JOBS.get(str(jobid))
+        if not job:
+            self._json({"error": "unknown job"}, 404)
+            return
+        if job.get("done"):
+            self._json({"error": "turn already finished"}, 409)
+            return
+        proc = job.get("proc")
+        if not proc:
+            self._json({"error": "process gone"}, 409)
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        time.sleep(0.7)
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        self._json({"ok": True, "stopped": str(jobid)})
+
+    def _session_delete(self):
+        try:
+            sid = self._read_body().get("id")
+        except Exception:
+            self._json({"error": "bad request"}, 400)
+            return
+        if not isinstance(sid, str) or not re.fullmatch(r"[\w-]+", sid):
+            self._json({"error": "bad session id"}, 400)
+            return
+        for j in _JOBS.values():
+            if not j.get("done") and sid in (j.get("sess"), j.get("sid")):
+                self._json(
+                    {"error": "a turn is running in this session; stop it first"},
+                    409)
+                return
+        try:
+            r = subprocess.run([KILO_BIN, "session", "delete", sid],
+                               capture_output=True, text=True, timeout=120)
+        except Exception as exc:
+            self._json({"error": f"delete failed: {exc}"}, 500)
+            return
+        if r.returncode != 0:
+            self._json(
+                {"error": (r.stderr or r.stdout or "delete failed").strip()[:300]},
+                500)
+            return
+        self._json({"ok": True, "deleted": sid})
 
     def _send(self):
         try:

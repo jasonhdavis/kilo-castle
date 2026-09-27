@@ -262,3 +262,47 @@ live by Steward separately):
 - Live e2e: thinking turn (reasoning 1017 chars + fenced code + md table in
   text, exit 0) and model-override continue turn both green; /api/session
   shows reasoning rows. No orphaned kilo children after turns (killpg reaps).
+
+## 2026-09-28 — Stream containment, stop/steer, session delete, working animation, persistent server
+
+- OUTAGE ROOT CAUSE (M'Lord's "can't tell if working"): the console server was
+  started with session-scoped lifetime and DIED between Steward turns; M'Lord's
+  in-flight turn was killed with its process tree (transient assistant row
+  removed). Console server now runs as a PERSISTENT background process
+  (survives Steward session end). Lesson: `court ui` must never be
+  session-scoped again.
+- STREAM CONTAINMENT (fixes "responses streaming into different session
+  containers"): streaming events no longer append to whatever transcript is
+  open. Each turn is a TURN buffer (blocks); renderLive() renders the buffer
+  ONLY while viewingTurn() matches (same worktree + session, or the new-session
+  view until sid adoption). Switching away mid-turn buffers silently; switching
+  back re-renders the full buffer; on completion the view reloads from kilo.db
+  (guarded: only if the turn actually ran). Adoption of the new session's sid
+  only happens when the user is still viewing the turn's context.
+- STOP: /api/stop {job} — job now stores its Popen handle; killpg SIGTERM then
+  SIGKILL after 0.7s grace. Client STOP button (red) appears while a turn runs;
+  exit -15/-9 with the stopped flag renders "stopped by user", not an error.
+  VERIFIED LIVE: long counting turn stopped at 8s → done, exit -15, no orphans.
+- STEER (queue): headless per-turn transport cannot inject a prompt mid-turn
+  (concurrent `kilo run --session` writers would race) — steering is
+  implemented as QUEUEING: while a turn runs, SEND becomes QUEUE; the typed
+  message is buffered on the turn and auto-dispatched on completion, continuing
+  the turn's ACTUAL session (resolved at finish time via T.sid||T.sess — not at
+  queue time, so early queues still attach to the adopted sid; unit-tested).
+  Enter-key queues too. Unit harness (node, stubbed fetch/DOM): 15/15 asserts —
+  viewingTurn matrix, queue-continues-adopted-sid, stop flow.
+- SESSION DELETE: `kilo session delete <id>` CLI discovered — /api/session/
+  delete delegates to it (never hand-write SQL against the live 104GB DB).
+  Guards: id regex; 409 if any unfinished job targets the session (by sess or
+  sid). UI: hover-✕ on each session tab + chatbar ✕ when a session is open;
+  confirm() dialog; after delete, selection moves to next session in the
+  worktree or new-session state. VERIFIED LIVE: throwaway session created and
+  deleted via endpoint; 0 rows remain in kilo.db.
+- WORKING ANIMATION: pulsing three-dot indicator in the live "working… Ns"
+  notice + a green pulsing "agent working" chip in the chatbar for the duration
+  of a turn (also visible when viewing another session, since the chip is
+  global). renderLive autoscrolls only when already near the bottom (no more
+  scroll yanking during streams).
+- Composer refactor: sendComposer → dispatch(wt,sess,agent,model,prompt) +
+  finishTurn; send button no longer disabled during turns (it is QUEUE);
+  c_cont/tab state updated via openSess on finalize.

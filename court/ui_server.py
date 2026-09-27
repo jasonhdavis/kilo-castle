@@ -48,16 +48,13 @@ body{background:var(--bg);color:var(--ink);
 ::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-thumb{background:var(--edge);border-radius:4px}
 ::-webkit-scrollbar-track{background:transparent}
-
-header{display:flex;align-items:center;gap:14px;padding:0 20px;height:56px;
+header{display:flex;align-items:center;gap:14px;padding:0 20px;height:52px;
  background:var(--surface);border-bottom:1px solid var(--edge);box-shadow:var(--sh-1);z-index:2}
-.brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:14px;
+.brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:13px;
  letter-spacing:.12em;text-transform:uppercase}
-.brand .glyph{width:28px;height:28px;border-radius:var(--r-md);display:grid;place-items:center;
- background:linear-gradient(135deg,#ffb300,#d29922);color:#1a1205;font-size:14px;
- box-shadow:var(--sh-1)}
+.brand .glyph{width:26px;height:26px;border-radius:var(--r-md);display:grid;place-items:center;
+ background:linear-gradient(135deg,#ffb300,#d29922);color:#1a1205;font-size:13px}
 .brand em{color:var(--primary);font-style:normal}
-.vdiv{width:1px;height:24px;background:var(--edge)}
 .chip{display:inline-flex;align-items:center;gap:5px;padding:2px 10px;border-radius:999px;
  font-size:11px;font-weight:500;background:var(--surface-2);border:1px solid var(--edge);
  color:var(--dim);white-space:nowrap}
@@ -65,310 +62,307 @@ header{display:flex;align-items:center;gap:14px;padding:0 20px;height:56px;
 .chip.rss{border-color:rgba(88,166,255,.35)} .chip.rss b{color:var(--blue)}
 header .spacer{flex:1}
 #clock{color:var(--faint);font-size:11px;font-variant-numeric:tabular-nums}
+.vdiv{width:1px;height:22px;background:var(--edge)}
 
 main{display:grid;grid-template-columns:300px 1fr;overflow:hidden}
-nav{overflow-y:auto;background:var(--surface);border-right:1px solid var(--edge);padding:14px 12px}
+nav{overflow-y:auto;background:var(--surface);border-right:1px solid var(--edge);padding:12px 12px 20px}
+.appswitch{display:flex;gap:6px;margin-bottom:12px}
+.appswitch .app{flex:1;text-align:center;padding:7px 4px;border-radius:var(--r-md);cursor:pointer;
+ background:var(--surface-2);border:1px solid var(--edge);font-size:11px;font-weight:600;
+ letter-spacing:.08em;text-transform:uppercase;color:var(--dim);transition:all .12s ease}
+.appswitch .app:hover{border-color:var(--blue);color:var(--ink)}
+.appswitch .app.on{background:rgba(255,179,0,.12);border-color:var(--primary);color:var(--primary)}
+.repohead{font-size:10px;font-weight:700;letter-spacing:.16em;color:var(--primary);
+ margin:14px 6px 6px;display:flex;align-items:center;gap:8px}
+.repohead::after{content:"";flex:1;height:1px;background:rgba(255,179,0,.25)}
 .castle{position:relative;background:linear-gradient(160deg,#1f242c,#181d24);
- border:1px solid rgba(255,179,0,.25);border-radius:var(--r-lg);padding:12px 14px;
- margin-bottom:14px;cursor:pointer;transition:all .15s ease;box-shadow:var(--sh-1)}
-.castle:hover{border-color:rgba(255,179,0,.55);transform:translateY(-1px);box-shadow:var(--sh-2)}
+ border:1px solid rgba(255,179,0,.25);border-radius:var(--r-lg);padding:10px 14px;
+ margin-bottom:12px;cursor:pointer;transition:all .15s ease;box-shadow:var(--sh-1)}
+.castle:hover{border-color:rgba(255,179,0,.55)}
 .castle.sel{border-color:var(--primary);box-shadow:0 0 0 1px var(--primary),var(--sh-1)}
 .castle .name{font-weight:600;letter-spacing:.04em;display:flex;align-items:center;gap:8px}
 .castle .name .dot{width:8px;height:8px;border-radius:50%;background:var(--green);
  box-shadow:0 0 6px var(--green)}
 .castle .sub{color:var(--dim);font-size:11px;margin-top:2px}
 nav h2{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.14em;
- color:var(--faint);margin:16px 8px 6px;display:flex;align-items:center;gap:8px}
+ color:var(--faint);margin:14px 8px 5px;display:flex;align-items:center;gap:8px}
 nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
-.q{position:relative;padding:7px 10px 7px 14px;border-radius:var(--r-md);cursor:pointer;
+.q{position:relative;padding:6px 10px 6px 14px;border-radius:var(--r-md);cursor:pointer;
  margin-bottom:2px;transition:background .12s ease}
 .q:hover{background:var(--surface-2)}
+.q.sel{background:var(--surface-2);box-shadow:inset 2px 0 0 var(--primary)}
 .q .row1{display:flex;align-items:center;gap:7px;font-weight:500;font-size:12.5px}
 .q .row2{color:var(--dim);font-size:11px;margin-top:1px;white-space:nowrap;overflow:hidden;
  text-overflow:ellipsis}
-.st{display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;font-size:9.5px;
- font-weight:600;letter-spacing:.08em;text-transform:uppercase}
-.st.WORKING{background:rgba(210,153,34,.15);color:var(--amber)}
-.st.TRIBUTE_READY{background:rgba(63,185,80,.15);color:var(--green)}
-.st.GATE{background:rgba(88,166,255,.15);color:var(--blue)}
-.st.READY_TO_RAZE{background:rgba(248,81,73,.15);color:var(--red)}
-.st.PLANNED,.st.OPEN{background:var(--surface-2);color:var(--dim)}
-.st.PUNISHED{background:rgba(248,81,73,.25);color:var(--red)}
 .badge{font-size:9.5px;padding:1px 7px;border-radius:999px;background:rgba(248,81,73,.12);
  color:var(--red);font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+.st{display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;font-size:9.5px;
+ font-weight:600;letter-spacing:.08em;text-transform:uppercase;background:var(--surface-2);color:var(--dim)}
 
-#content{overflow-y:auto;padding:20px 24px;display:flex;flex-direction:column;gap:18px}
-.card{background:var(--surface);border:1px solid var(--edge);border-radius:var(--r-lg);
- box-shadow:var(--sh-1);overflow:hidden}
-.card .hd{display:flex;align-items:center;gap:10px;padding:14px 18px 10px}
-.card .hd h3{font-size:13.5px;font-weight:600;letter-spacing:.02em}
-.card .hd .branch{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--dim);
- background:var(--surface-2);border:1px solid var(--edge);border-radius:var(--r-sm);
- padding:2px 8px}
-.card .meta{padding:0 18px 12px;color:var(--faint);font-size:11px}
-.card .bd{padding:0 18px 16px}
-.card.empty{padding:26px;text-align:center;color:var(--faint);border-style:dashed;
- background:transparent;box-shadow:none}
-
-.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
-.tab{padding:4px 14px;border:1px solid var(--edge);border-radius:999px;cursor:pointer;
- font-size:11.5px;color:var(--dim);background:var(--surface-2);max-width:260px;
+#chat{display:flex;flex-direction:column;overflow:hidden}
+#chatbar{display:flex;align-items:center;gap:10px;padding:10px 20px;
+ background:var(--surface);border-bottom:1px solid var(--edge);min-height:52px}
+#chatbar .wt{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--ink)}
+#chatbar .wt .dim{color:var(--dim)}
+.iconbtn{width:30px;height:30px;border-radius:var(--r-md);display:grid;place-items:center;
+ cursor:pointer;background:var(--surface-2);border:1px solid var(--edge);color:var(--dim);
+ transition:all .12s ease;font-size:14px}
+.iconbtn:hover{border-color:var(--primary);color:var(--primary)}
+.tabs{display:flex;gap:5px;flex-wrap:wrap;margin-left:auto;max-width:55%}
+.tab{padding:3px 12px;border:1px solid var(--edge);border-radius:999px;cursor:pointer;
+ font-size:11px;color:var(--dim);background:var(--surface-2);max-width:200px;
  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:all .12s ease}
 .tab:hover{border-color:var(--blue);color:var(--ink)}
 .tab.on{background:var(--blue);border-color:var(--blue);color:#0d1117;font-weight:600}
+.tab.newtab{border-style:dashed}
 
+#transcript{flex:1;overflow-y:auto;padding:18px 26px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:80%;padding:10px 14px;border-radius:var(--r-lg);background:var(--surface);
+ border:1px solid var(--edge-soft);white-space:pre-wrap;word-break:break-word;font-size:13px}
+.msg.user{align-self:flex-end;background:rgba(255,179,0,.08);border:1px solid rgba(255,179,0,.25)}
+.msg.assistant{align-self:flex-start;border-left:3px solid var(--blue)}
+.msg.tool{align-self:center;font-size:11px;color:var(--dim);background:var(--surface-2);
+ border:1px dashed var(--edge);padding:4px 12px;max-width:90%}
+.msg.error{align-self:center;border-left:3px solid var(--red);color:var(--red);font-size:12px}
+.msg .who{color:var(--faint);font-size:9.5px;text-transform:uppercase;letter-spacing:.1em;
+ margin-bottom:3px;font-weight:600;display:none}
+#transcript .notice{align-self:center;color:var(--faint);font-size:11.5px;padding:6px 0}
+
+#composer{border-top:1px solid var(--edge);background:var(--surface);padding:12px 20px 14px}
+#composer .cont{font-size:11px;color:var(--dim);margin-bottom:6px;display:flex;gap:8px;align-items:center}
+#composer .cont b{color:var(--blue);font-weight:600;font-family:ui-monospace,Menlo,monospace}
+#composer .cont .x{cursor:pointer;color:var(--red);font-weight:700}
+#composer .row{display:flex;gap:10px;align-items:flex-end}
+#composer textarea{flex:1;background:var(--bg);border:1px solid var(--edge);color:var(--ink);
+ border-radius:var(--r-md);font:13px/1.45 "Inter",sans-serif;padding:10px 12px;resize:none;
+ height:46px;max-height:140px}
+#composer textarea:focus{outline:none;border-color:var(--blue)}
+#composer .send{background:var(--primary);border:none;color:var(--primary-ink);
+ font-weight:700;padding:0 24px;border-radius:var(--r-md);cursor:pointer;font-size:12.5px;
+ letter-spacing:.04em;height:46px}
+#composer .send:disabled{opacity:.45;cursor:default}
+
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;z-index:20;
+ align-items:center;justify-content:center}
+#modal.on{display:flex}
+#modal .box{width:720px;max-width:92vw;max-height:80vh;overflow-y:auto;background:var(--surface);
+ border:1px solid var(--edge);border-radius:var(--r-lg);box-shadow:var(--sh-2)}
+#modal .hd{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;
+ border-bottom:1px solid var(--edge)}
+#modal .hd b{color:var(--primary);font-size:13px}
+#modal .hd span{cursor:pointer;color:var(--dim);padding:4px 10px;border-radius:var(--r-sm)}
+#modal .hd span:hover{background:var(--surface-2)}
+#modal .bd{padding:14px 18px}
+.dupwarn{display:flex;align-items:center;gap:8px;background:rgba(248,81,73,.1);color:var(--red);
+ border:1px solid rgba(248,81,73,.35);border-radius:var(--r-sm);padding:6px 12px;
+ margin-bottom:10px;font-size:11.5px;font-weight:500}
 table{width:100%;border-collapse:collapse;font-size:12px}
 th{text-align:left;padding:6px 10px;color:var(--faint);font-size:10px;font-weight:600;
  text-transform:uppercase;letter-spacing:.1em;border-bottom:1px solid var(--edge)}
-td{padding:8px 10px;border-bottom:1px solid var(--edge-soft)}
-tbody tr{cursor:pointer;transition:background .1s ease}
-tbody tr:hover{background:var(--surface-2)}
+td{padding:7px 10px;border-bottom:1px solid var(--edge-soft)}
 tbody tr:last-child td{border-bottom:none}
 .mono{font-family:ui-monospace,Menlo,monospace;font-size:11px}
 .dim{color:var(--dim)} .blue{color:var(--blue)} .num{font-variant-numeric:tabular-nums}
-
 button{background:var(--surface-2);border:1px solid var(--edge);color:var(--dim);
  border-radius:var(--r-sm);padding:3px 12px;cursor:pointer;font-size:10.5px;font-weight:600;
  letter-spacing:.06em;text-transform:uppercase;transition:all .12s ease}
 button:hover{border-color:var(--red);color:var(--red);background:rgba(248,81,73,.08)}
-
-#drawer{position:fixed;right:0;top:0;bottom:0;width:48%;max-width:720px;background:var(--surface);
- border-left:1px solid var(--edge);display:none;flex-direction:column;z-index:10;
- box-shadow:var(--sh-2)}
-
-.dupwarn{display:flex;align-items:center;gap:8px;background:rgba(248,81,73,.1);color:var(--red);
- border:1px solid rgba(248,81,73,.35);border-radius:var(--r-sm);padding:6px 12px;
- margin-bottom:10px;font-size:11.5px;font-weight:500}
-#drawer.on{display:flex}
-#drawer .hd{padding:16px 20px;border-bottom:1px solid var(--edge);display:flex;
- justify-content:space-between;align-items:center}
-#drawer .hd b{color:var(--primary);font-size:13px;letter-spacing:.02em}
-#drawer .hd span{cursor:pointer;color:var(--dim);font-size:12px;padding:4px 10px;
- border-radius:var(--r-sm)}
-#drawer .hd span:hover{background:var(--surface-2);color:var(--ink)}
-#drawer .body{overflow-y:auto;padding:14px 20px}
-.msg{margin-bottom:10px;padding:10px 14px;border-radius:var(--r-md);background:var(--bg);
- border:1px solid var(--edge-soft);white-space:pre-wrap;word-break:break-word;font-size:12.5px}
-.msg.user{border-left:3px solid var(--primary)}
-.msg.assistant{border-left:3px solid var(--blue)}
-.msg .who{color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:.1em;
- margin-bottom:4px;font-weight:600}
-.repohead{font-size:10px;font-weight:700;letter-spacing:.16em;color:var(--primary);
- margin:14px 6px 6px;display:flex;align-items:center;gap:8px}
-.repohead:first-child{margin-top:0}
-.repohead::after{content:"";flex:1;height:1px;background:rgba(255,179,0,.25)}
-
-.empty-note{color:var(--faint);text-align:center;padding:30px;font-size:12px}
-
-#composer{position:fixed;left:0;right:0;bottom:0;z-index:8;background:var(--surface);
- border-top:1px solid var(--edge);box-shadow:0 -4px 16px rgba(0,0,0,.35);
- padding:10px 20px;display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:flex-end}
-#composer .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-#composer select,#composer textarea{background:var(--bg);border:1px solid var(--edge);
- color:var(--ink);border-radius:var(--r-sm);font:12px/1.4 "Inter",sans-serif;padding:6px 8px}
-#composer select{cursor:pointer}
-#composer textarea{width:100%;resize:none;height:44px;max-height:120px}
-#composer textarea:focus,#composer select:focus{outline:none;border-color:var(--blue)}
-#composer .send{background:var(--primary);border:none;color:var(--primary-ink);
- font-weight:700;padding:9px 22px;border-radius:var(--r-sm);cursor:pointer;
- font-size:12px;letter-spacing:.04em}
-#composer .send:disabled{opacity:.45;cursor:default}
-#composer .cont{font-size:10.5px;color:var(--dim)}
-#composer .cont b{color:var(--blue);font-weight:600}
-#content{overflow-y:auto;padding:20px 24px 110px;display:flex;flex-direction:column;gap:18px}
+.empty-note{color:var(--faint);text-align:center;padding:40px;font-size:12.5px}
 </style></head><body>
-<header><div class="brand"><span class="glyph">♜</span>CASTLE <em>CONSOLE</em></div>
+<header><div class="brand"><span class="glyph">♜</span>COURT <em>CONSOLE</em></div>
 <div class="vdiv"></div><div id="totals" style="display:flex;gap:8px"></div>
-<div class="spacer"></div><div id="clock"></div></header>
-<main><nav id="nav"></nav><div id="content"></div></main>
-<div id="composer">
- <div class="row">
-  <select id="c_agent"></select>
-  <select id="c_dir"></select>
-  <span class="cont" id="c_cont">new session</span>
+<div class="spacer"></div><div class="chip rss">kilo RSS <b id="t_rss">—</b></div>
+<div id="clock"></div></header>
+<main><nav id="nav"></nav>
+<section id="chat">
+ <div id="chatbar">
+  <span class="wt" id="wt_label">select a worktree</span>
+  <span id="wt_badge"></span>
+  <div class="iconbtn" title="MCP servers" onclick="openMcp()">⚙</div>
+  <div class="tabs" id="sess_tabs"></div>
  </div>
- <textarea id="c_prompt" placeholder="message the agent… (Enter to send, Shift+Enter for newline)"></textarea>
- <button class="send" id="c_send" onclick="sendComposer()">SEND</button>
-</div>
-<div id="drawer"><div class="hd"><b id="dtitle"></b><span onclick="closeDrawer()">CLOSE ✕</span></div>
-<div class="body" id="dbody"></div></div>
+ <div id="transcript"><div class="notice">select a branch, then a session — the chat loads here</div></div>
+ <div id="composer">
+  <div class="cont" id="c_cont">new session — pick a worktree, or click a session tab to continue it</div>
+  <div class="row">
+   <textarea id="c_prompt" placeholder="message the agent… (Enter to send, Shift+Enter for newline)"></textarea>
+   <select id="c_agent" style="height:46px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);border-radius:8px;padding:0 8px"></select>
+   <button class="send" id="c_send" onclick="sendComposer()">SEND</button>
+  </div>
+ </div>
+</section></main>
+<div id="modal"><div class="box"><div class="hd"><b>MCP SERVERS — merged inventory</b>
+<span onclick="closeMcp()">CLOSE ✕</span></div><div class="bd" id="modal_bd"></div></div></div>
 <script>
-let S=null, selWt=null, selSess=null;
+let S=null, selRepo=null, selWt=null, selSess=null, msgs=[], composing=false;
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const mb=r=>r==null?'—':(r/1048576).toFixed(0)+' MB';
-async function poll(){try{S=await (await fetch('/api/state')).json();render()}catch(e){}}
-function render(){
- const flagged=(S.processes||[]).length;
- document.getElementById('totals').innerHTML=
-  `<span class="chip">sessions <b>${S.sessions.length}</b></span>
-   <span class="chip">worktrees <b>${S.worktrees.length}</b></span>
-   <span class="chip rss">kilo RSS <b>${mb(S.proc_total_rss)}</b></span>`+
-  (flagged?`<span class="chip" style="border-color:rgba(248,81,73,.4)"><b style="color:var(--red)">${flagged} flagged</b></span>`:'');
- document.getElementById('clock').textContent=new Date().toLocaleTimeString();
- const TRUNKS=['main','castle','master','trunk'];
- const nav=document.getElementById('nav');
- let h='';
- for(const repo of S.repos){
-  const wts=repo.worktrees;
-  const trunk=wts.find(w=>w.branch&&TRUNKS.some(t=>w.branch.endsWith('/'+t)||w.branch===t));
-  const rname=repo.name.toUpperCase();
-  h+=`<div class="repohead">${rname}</div>`;
-  if(trunk){
-   h+=`<div class="castle ${selWt===trunk.path?'sel':''}" onclick="pick('${esc(trunk.path)}')">
-   <div class="name"><span class="dot"></span>${rname}</div>
-   <div class="sub">${esc(trunk.branch||'trunk')} · ${wts.length} worktree${wts.length===1?'':'s'}</div></div>`;
-  }
-  const wtreeByBranch={}; for(const w of wts){if(w.branch)wtreeByBranch[w.branch]=w}
-  const secs={};
-  for(const b of repo.branches){
-   const ns=b.includes('/')?b.split('/')[0]:'(root)';
-   if(TRUNKS.includes(b)||TRUNKS.some(t=>t===ns))continue;
-   (secs[ns]??=[]).push(b);
-  }
-  for(const ns of Object.keys(secs).sort((a,b)=>secs[b].length-secs[a].length)){
-   h+=`<h2>${esc(ns)} · ${secs[ns].length}</h2>`;
-   for(const b of secs[ns].slice(0,40)){
-    const w=wtreeByBranch[b];
-    const cls=w?(w.dirty?'<span class="badge">dirty</span>':''):'<span class="st PLANNED">no wt</span>';
-    h+=`<div class="q" onclick="pick(${JSON.stringify(w?w.path:b).replace(/"/g,'&quot;')})">
-    <div class="row1">${esc(b.includes('/')?b.slice(b.indexOf('/')+1):b)}${cls}</div>
-    <div class="row2">${esc(b)}</div></div>`;
-   }
-   if(secs[ns].length>40)h+=`<div class="q dim" style="cursor:default">… ${secs[ns].length-40} more</div>`;
-  }
- }
- nav.innerHTML=h;
- const c=document.getElementById('content');
- const active=S.repos.filter(r=>selWt===null||r.root===selWt||r.worktrees.some(w=>w.path===selWt));
- let cards='';
- for(const repo of (selWt?active:S.repos)){
-  const wts=selWt?repo.worktrees.filter(w=>w.path===selWt):repo.worktrees;
-  if(!wts.length)continue;
-  if(selWt&&selWt.startsWith(repo.root)){cards+=wts.map(w=>{
-   const sess=S.sessions.filter(s=>s.directory&&s.directory.startsWith(w.path));
-   return cardWt(w,sess);}).join('');}
-  else if(!selWt){const trunk=wts.find(w=>w.branch&&TRUNKS.some(t=>w.branch.endsWith('/'+t)||w.branch===t));
-   if(trunk){const sess=S.sessions.filter(s=>s.directory&&s.directory.startsWith(trunk.path));
-    cards+=cardWt(trunk,sess);}}
- }
- c.innerHTML=(cards||'<div class="card empty">select a branch on the left</div>')+cardMcp();
+const mb=r=>r==null||r===undefined?'—':(r/1048576).toFixed(0)+' MB';
+const ago=ts=>{if(!ts)return'';const d=(Date.now()-ts)/1000;
+ return d<60?`${d|0}s`:(d<3600?`${d/60|0}m`:(d<86400?`${d/3600|0}h`:`${d/86400|0}d`))};
+const $=id=>document.getElementById(id);
+const TRUNKS=['main','castle','master','trunk'];
+function repo(){return S.repos.find(r=>r.key===selRepo)||S.repos[0]}
+
+async function poll(){
+ try{S=await (await fetch('/api/state')).json();}catch(e){return;}
+ if(!selRepo&&S.repos.length)selRepo=S.repos.find(r=>r.key==='app')? 'app':S.repos[0].key;
+ $('totals').innerHTML=`<span class="chip">sessions <b>${S.sessions.length}</b></span>
+  <span class="chip">worktrees <b>${S.worktrees.length}</b></span>`+
+  ((S.processes||[]).length?`<span class="chip" style="border-color:rgba(248,81,73,.4)"><b style="color:var(--red)">${S.processes.length} flagged</b></span>`:'');
+ $('t_rss').textContent=mb(S.proc_total_rss);
+ $('clock').textContent=new Date().toLocaleTimeString();
+ renderNav();
+ if(selWt)renderSessionsBar();
 }
-function cardMcp(){
- const list=S.mcp||[];
- let h='<div class="card"><div class="hd"><h3>MCP SERVERS</h3>'
-  +'<span class="branch">merged from global + project configs</span></div><div class="bd">';
- for(const d of list.filter(m=>m.type==='local'&&m.enabled&&m.count>=2)){
-  h+=`<div class="dupwarn">duplicate MCP spawns detected: ${esc(d.name)} x${d.count} (~${mb(d.rss)} each)</div>`;
+function renderNav(){
+ const r=repo(); if(!r){$('nav').innerHTML='';return;}
+ let h=`<div class="appswitch">`+S.repos.map(x=>
+  `<div class="app ${x.key===selRepo?'on':''}" onclick="switchApp('${x.key}')">${x.key}</div>`).join('')+`</div>`;
+ h+=`<div class="repohead">${esc(r.name)} · ${r.worktrees.length} worktrees</div>`;
+ const trunk=r.worktrees.find(w=>w.branch&&(w.branch===TRUNKS.find(t=>t===w.branch)||TRUNKS.includes(w.branch.split('/').pop())));
+ if(trunk)h+=`<div class="castle ${selWt===trunk.path?'sel':''}" onclick="pickWt('${esc(trunk.path)}')">
+  <div class="name"><span class="dot"></span>${esc(r.name)} trunk</div>
+  <div class="sub">${esc(trunk.branch||'?')}${trunk.dirty?' · dirty':''}</div></div>`;
+ const byBranch={}; for(const w of r.worktrees){if(w.branch)byBranch[w.branch]=w}
+ const secs={};
+ for(const b of r.branches){
+  const ns=b.includes('/')?b.split('/')[0]:'(root)';
+  if(TRUNKS.includes(b))continue;
+  (secs[ns]??=[]).push(b);
  }
- h+='<table><tr><th>name</th><th>scope</th><th>type</th><th>enabled</th><th>running</th><th></th></tr>'+
+ for(const ns of Object.keys(secs).sort((a,b)=>secs[b].length-secs[a].length)){
+  h+=`<h2>${esc(ns)} · ${secs[ns].length}</h2>`;
+  for(const b of secs[ns].slice(0,30)){
+   const w=byBranch[b];
+   const mark=w?(w.dirty?'<span class="badge">dirty</span>':''):'<span class="st">no wt</span>';
+   h+=`<div class="q ${selWt&&w&&selWt===w.path?'sel':''}" onclick="pickWt(${w?`'${esc(w.path)}'`:'null'},'${esc(b)}')">
+   <div class="row1">${esc(b.includes('/')?b.slice(b.indexOf('/')+1):b)}${mark}</div>
+   <div class="row2">${esc(b)}</div></div>`;
+  }
+  if(secs[ns].length>30)h+=`<div class="q dim" style="cursor:default">… ${secs[ns].length-30} more</div>`;
+ }
+ $('nav').innerHTML=h;
+}
+function switchApp(key){selRepo=key;selWt=null;selSess=null;msgs=[];
+ $('wt_label').textContent='select a worktree';$('wt_badge').innerHTML='';
+ renderNav();}
+function pickWt(path,branch){
+ selWt=path;selSess=null;msgs=[];
+ const w=(repo().worktrees||[]).find(x=>x.path===path);
+ $('wt_label').innerHTML=esc(branch||w&&w.branch||path.split('/').pop())+
+  ` <span class="dim">· ${esc(path.replace('/Users/scrummage/Python/',''))}</span>`;
+ $('wt_badge').innerHTML=w&&w.dirty?'<span class="badge">dirty</span>':'';
+ renderNav();renderSessionsBar();
+ const sess=sessionsFor(path);
+ if(sess.length)openSess(sess[0].id);
+ else{selSess=null;renderTranscript();
+  $('c_cont').innerHTML='new session — no sessions in this worktree yet';}
+}
+function sessionsFor(path){
+ return S.sessions.filter(s=>s.directory&&(s.directory===path||s.directory.startsWith(path+'/')));
+}
+function renderSessionsBar(){
+ const sess=sessionsFor(selWt).slice(0,8);
+ $('sess_tabs').innerHTML=
+  sess.map(s=>`<div class="tab ${selSess===s.id?'on':''}" onclick="openSess('${s.id}')"
+   title="${esc(s.title||s.id)}">${esc(s.agent||'?')}: ${esc((s.title||s.id).slice(0,26))}</div>`).join('')+
+  `<div class="tab newtab ${selSess===null?'on':''}" onclick="newSess()" title="start a fresh session">＋ new</div>`;
+}
+function newSess(){selSess=null;msgs=[];
+ $('c_cont').innerHTML='new session in <b>'+esc(selWt?selWt.replace('/Users/scrummage/Python/',''):'?')+'</b> <span class="dim">— agent replies as a fresh session</span>';
+ renderSessionsBar();renderTranscript();}
+async function openSess(id){
+ selSess=id;msgs=[];
+ $('c_cont').innerHTML=`continuing <b>${esc(id.slice(0,24))}…</b> <span class="x" onclick="newSess()">start new instead</span>`;
+ renderSessionsBar();renderTranscript();
+ $('transcript').innerHTML='<div class="notice">loading…</div>';
+ try{msgs=await (await fetch('/api/session?id='+id)).json();}catch(e){msgs=[];}
+ renderTranscript();
+}
+function renderTranscript(){
+ const t=$('transcript');
+ if(!msgs.length){t.innerHTML='<div class="empty-note">no messages yet — say something below</div>';return;}
+ t.innerHTML=msgs.map(m=>{
+  if(!m.text)return '';
+  const cls=m.role==='user'?'user':(m.role==='assistant'?'assistant':'tool');
+  return `<div class="msg ${cls}"><div class="who">${esc(m.role)}</div>${esc(m.text)}</div>`;
+ }).join('')||'<div class="empty-note">no text messages in this session yet</div>';
+ t.scrollTop=t.scrollHeight;
+}
+function chatAppend(cls,text){
+ const t=$('transcript');
+ if(t.querySelector('.empty-note'))t.innerHTML='';
+ t.insertAdjacentHTML('beforeend',`<div class="msg ${cls}">${esc(text)}</div>`);
+ t.scrollTop=t.scrollHeight;
+}
+async function sendComposer(){
+ if(composing)return;
+ const ta=$('c_prompt');
+ const prompt=ta.value.trim();
+ if(!prompt||!selWt)return;
+ ta.value='';composing=true;$('c_send').disabled=true;
+ chatAppend('user',prompt);
+ chatAppend('notice','dispatching…');
+ let job;
+ try{
+  const r=await fetch('/api/send',{method:'POST',body:JSON.stringify({
+   dir:selWt, agent:$('c_agent').value, prompt, session_id:selSess||null})});
+  if(!r.ok){chatAppend('error','refused: '+await r.text());composing=false;$('c_send').disabled=false;return;}
+  job=(await r.json()).job;
+ }catch(e){chatAppend('error','dispatch failed: '+e);composing=false;$('c_send').disabled=false;return;}
+ const nEl=[...document.querySelectorAll('#transcript .notice')].pop();
+ let seen=0, err=null;
+ while(true){
+  let st;
+  try{st=await (await fetch('/api/send/'+job)).json();}
+  catch(e){err=e;break;}
+  const evs=st.events.slice(seen);seen=st.events.length;
+  for(const e of evs){
+   if(nEl)nEl.remove();
+   if(e.type==='text'&&e.text)chatAppend('assistant',e.text);
+   else if(e.type==='tool')chatAppend('tool',`tool · ${e.tool} ${e.brief||''}`);
+   else if(e.type==='error')chatAppend('error',e.text||'unknown error');
+  }
+  if(st.done)break;
+  await new Promise(res=>setTimeout(res,700));
+ }
+ if(err)chatAppend('error','stream failed: '+err);
+ else chatAppend('notice','turn complete');
+ composing=false;$('c_send').disabled=false;
+ poll();
+}
+document.getElementById('c_prompt').addEventListener('keydown',e=>{
+ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendComposer();}});
+function openMcp(){
+ const list=S.mcp||[];
+ let h='';
+ for(const d of list.filter(m=>m.type==='local'&&m.enabled&&m.count>=2)){
+  h+=`<div class="dupwarn">duplicate MCP spawns detected: ${esc(d.name)} x${d.count} (~${mb(d.rss)} each)</div>`;}
+ h+='<table><thead><tr><th>name</th><th>scope</th><th>type</th><th>enabled</th><th>running</th><th></th></tr></thead><tbody>'+
   list.map(m=>{
    const run=m.running?`<span class="num" style="color:var(--green)">yes</span> <span class="num blue">${mb(m.rss)}</span>`
     :'<span class="dim">no</span>';
-   const btn=`<button title="takes effect for sessions started after the change" onclick="mcpToggle(${
-    JSON.stringify(m.file).replace(/"/g,'&quot;')},${JSON.stringify(m.name)})">${m.enabled?'disable':'enable'}</button>`;
+   const btn=m.file.endsWith('.jsonc')?'<span class="dim">manual</span>'
+    :`<button title="takes effect for sessions started after the change" onclick="mcpToggle('${esc(m.file)}','${esc(m.name)}')">${m.enabled?'disable':'enable'}</button>`;
    return `<tr><td class="mono">${esc(m.name)}</td><td class="dim">${esc(m.scope)}</td><td class="dim">${esc(m.type)}</td>`+
-    `<td>${m.enabled?'<span style="color:var(--green)">yes</span>':'no'}</td><td>${run}</td><td>${btn}</td></tr>`;
-  }).join('')+'</table>'+
-  `<div class="meta" style="padding-top:10px">toggles edit the config file (a .bak copy is kept) and take effect for sessions started after the change</div></div></div>`;
- return h;
+    `<td>${m.enabled?'<span class="num" style="color:var(--green)">yes</span>':'<span class="dim">no</span>'}</td><td>${run}</td><td>${btn}</td></tr>`;
+  }).join('')+'</tbody></table>'+
+  '<div class="dim" style="padding-top:10px;font-size:11px">toggles edit the config file (a .bak copy is kept) and take effect for sessions started after the change</div>';
+ $('modal_bd').innerHTML=h;
+ $('modal').classList.add('on');
 }
+function closeMcp(){$('modal').classList.remove('on');}
 async function mcpToggle(file,name){
  const m=(S.mcp||[]).find(x=>x.file===file&&x.name===name);
  if(!m)return;
  const r=await fetch('/api/mcp',{method:'POST',body:JSON.stringify({file,name,enabled:!m.enabled})});
  if(!r.ok)alert('refused: '+(await r.text()));else poll();
 }
-function cardWt(w,sess){
- let h=`<div class="card"><div class="hd"><h3>${esc(w.branch||'trunk')}</h3>
- <span class="branch">${esc(w.path)}</span>${w.dirty?'<span class="badge">dirty</span>':''}</div>`;
- if(!sess.length)return h+'<div class="bd empty-note">no sessions</div></div>';
- h+='<div class="bd"><div class="tabs">'+sess.map((s,i)=>
-  `<div class="tab ${selSess===s.id?'on':''}" onclick="openSess('${s.id}')">${esc(s.agent||'?')} · ${esc(s.title||s.id)}</div>`).join('')+'</div>';
- h+='<table><thead><tr><th>session</th><th>agent</th><th>model</th><th>tokens in / out</th><th>updated</th></tr></thead><tbody>'+
-  sess.map(s=>`<tr onclick="openSess('${s.id}')"><td>${esc((s.title||s.id).slice(0,42))}</td><td>${esc(s.agent||'')}</td><td class="dim mono">${esc((s.model||'').replace('openrouter/',''))}</td><td class="num">${s.tokens_input??'—'} / ${s.tokens_output??'—'}</td><td class="dim num">${ago(s.time_updated)}</td></tr>`).join('')+'</tbody></table></div></div>';
- return h;
-}
-function ago(ts){if(!ts)return'';const d=(Date.now()-ts)/1000;
- return d<60?`${d|0}s`:(d<3600?`${d/60|0}m`:(d<86400?`${d/3600|0}h`:`${d/86400|0}d`));}
-function pick(wt){selWt=wt===''?null:wt;selSess=null;render()}
-async function openSess(id){selSess=id;setCompose(id);render();
- document.getElementById('drawer').classList.add('on');
- document.getElementById('dtitle').textContent='session '+id;
- document.getElementById('dbody').textContent='loading…';
- const msgs=await (await fetch('/api/session?id='+id)).json();
- document.getElementById('dbody').innerHTML=msgs.map(m=>
-  `<div class="msg ${esc(m.role)}"><div class="who">${esc(m.role)} · ${ago(m.time_created)} ago</div>${esc(m.text).slice(0,2000)}</div>`).join('')
-  ||'<div class="meta">no messages</div>';}
-function closeDrawer(){document.getElementById('drawer').classList.remove('on')}
-async function reap(pid){
- if(!confirm(`terminate pid ${pid}?`))return;
- const r=await fetch('/api/reap',{method:'POST',body:JSON.stringify({pid})});
- if(!r.ok)alert('refused: '+(await r.text())); else poll();}
-let META=null, composing=false, COMPOSE_SID=null;
-async function loadMeta(){
- if(META)return;
- try{META=await (await fetch('/api/compose-meta')).json();}catch(e){return;}
- const a=document.getElementById('c_agent'), d=document.getElementById('c_dir');
- a.innerHTML=META.agents.map(x=>`<option>${x}</option>`).join('');
- d.innerHTML=META.dirs.map(x=>`<option value="${esc(x)}">${esc(x.replace('/Users/scrummage/Python/',''))}</option>`).join('');
-}
-function setCompose(sess){
- loadMeta();
- if(!sess){COMPOSE_SID=null;
-  document.getElementById('c_cont').textContent='new session';return;}
- const s=(S.sessions||[]).find(x=>x.id===sess);
- COMPOSE_SID=sess;
- document.getElementById('c_cont').innerHTML=`continuing <b>${esc(sess.slice(0,22))}…</b>`;
- if(s&&s.directory)document.getElementById('c_dir').value=s.directory;
-}
-async function sendComposer(){
- if(composing)return;
- const ta=document.getElementById('c_prompt');
- const prompt=ta.value.trim();
- if(!prompt)return;
- ta.value='';composing=true;
- document.getElementById('c_send').disabled=true;
- document.getElementById('dtitle').textContent='composer — '+(COMPOSE_SID?'continue':'new session');
- document.getElementById('dbody').innerHTML='<div class="empty-note">dispatching…</div>';
- document.getElementById('drawer').classList.add('on');
- const r=await fetch('/api/send',{method:'POST',body:JSON.stringify({
-  dir:document.getElementById('c_dir').value,
-  agent:document.getElementById('c_agent').value,
-  prompt, session_id:COMPOSE_SID||null})});
- if(!r.ok){alert('refused: '+(await r.text()));composing=false;
-  document.getElementById('c_send').disabled=false;return;}
- const {job}=await r.json();
- let seen=0;
- while(true){
-  const st=await (await fetch('/api/send/'+job)).json();
-  const evs=st.events.slice(seen);seen=st.events.length;
-  const body=document.getElementById('dbody');
-  if(evs.length){
-   if(body.querySelector('.empty-note'))body.innerHTML='';
-   for(const e of evs){
-    if(e.type==='text')body.insertAdjacentHTML('beforeend',
-     `<div class="msg assistant"><div class="who">assistant</div>${esc(e.text)}</div>`);
-    else if(e.type==='tool')body.insertAdjacentHTML('beforeend',
-     `<div class="msg"><div class="who">tool · ${esc(e.tool)}</div><span class="mono dim">${esc(e.brief)}</span></div>`);
-    else if(e.type==='error')body.insertAdjacentHTML('beforeend',
-     `<div class="msg" style="border-left:3px solid var(--red)"><div class="who">error</div>${esc(e.text)}</div>`);
-   }
-   body.scrollTop=body.scrollHeight;
-  }
-  if(st.done){
-   composing=false;document.getElementById('c_send').disabled=false;
-   COMPOSE_SID=null;document.getElementById('c_cont').textContent='new session';
-   body.insertAdjacentHTML('beforeend',
-    `<div class="empty-note">turn complete (exit ${st.exit??'?'} )</div>`);
-   poll();
-   break;}
-  await new Promise(res=>setTimeout(res,700));
- }
-}
-document.getElementById('c_prompt').addEventListener('keydown',e=>{
- if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendComposer();}});
-poll();setInterval(poll,5000);loadMeta();
-</script></body></html>"""
+(async()=>{try{META=await (await fetch('/api/compose-meta')).json();
+ $('c_agent').innerHTML=META.agents.map(x=>`<option>${x}</option>`).join('');}catch(e){}})();
+poll();setInterval(poll,5000);
+</script></body></html>
+"""
 PAGE = PAGE.replace("${json.dumps(STATUS_ORDER)}", json.dumps(STATUS_ORDER))
 
 
@@ -420,25 +414,57 @@ def _quests():
 
 
 def _repos():
-    repos = [COURT_DIR]
-    pb = os.path.join(os.path.dirname(COURT_DIR), "pb-app")
-    if os.path.isdir(pb):
-        repos.append(pb)
-    return repos
+    base = os.path.dirname(COURT_DIR)
+    out = []
+    for key, name, path in (
+        ("app", "pb-app", os.path.join(base, "pb-app")),
+        ("balloon", "pb-balloon", os.path.join(base, "pb-balloon")),
+        ("custom", "pb-custom", os.path.join(base, "pb-custom")),
+        ("castle", "kilo-castle", COURT_DIR),
+    ):
+        if os.path.isdir(os.path.join(path, ".git")) or os.path.isdir(path):
+            out.append({"key": key, "name": name, "root": path})
+    return out
 
 
-def _branches(repo):
+_WT_CACHE = {}
+_WT_LOCKS = {}
+_BR_CACHE = {}
+
+
+def _branches(repo, ttl=30):
+    now = time.time()
+    hit = _BR_CACHE.get(repo)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
     try:
         r = subprocess.run(
             ["git", "-C", repo, "branch", "--format=%(refname:short)"],
             capture_output=True, text=True, timeout=5)
-        return sorted(b for b in r.stdout.splitlines() if b.strip())
+        out = sorted(b for b in r.stdout.splitlines() if b.strip())
     except Exception:
-        return []
+        out = []
+    _BR_CACHE[repo] = (now, out)
+    return out
 
 
-def _worktrees(repo=None):
+def _worktrees(repo=None, ttl=60):
     repo = repo or COURT_DIR
+    now = time.time()
+    hit = _WT_CACHE.get(repo)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    lock = _WT_LOCKS.setdefault(repo, threading.Lock())
+    if not lock.acquire(blocking=False):
+        return hit[1] if hit else []
+    try:
+        return _compute_worktrees(repo)
+    finally:
+        lock.release()
+
+
+def _compute_worktrees(repo):
+    from concurrent.futures import ThreadPoolExecutor
     try:
         r = subprocess.run(
             ["git", "-C", repo, "worktree", "list", "--porcelain"],
@@ -460,14 +486,20 @@ def _worktrees(repo=None):
             cur = {}
     if cur:
         out.append(cur)
-    for w in out:
+
+    def _dirty(w):
         try:
             r2 = subprocess.run(
                 ["git", "-C", w["path"], "status", "--porcelain"],
-                capture_output=True, text=True, timeout=5)
+                capture_output=True, text=True, timeout=10)
             w["dirty"] = bool(r2.stdout.strip())
         except Exception:
             w["dirty"] = False
+        return w
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        out = list(ex.map(_dirty, out))
+    _WT_CACHE[repo] = (time.time(), out)
     return out
 
 
@@ -725,9 +757,9 @@ _JOB_SEQ = [0]
 
 
 def _known_dirs():
-    dirs = set(_repos())
-    for repo in _repos():
-        for w in _worktrees(repo):
+    dirs = {r["root"] for r in _repos()}
+    for r in _repos():
+        for w in _worktrees(r["root"]):
             dirs.add(w["path"])
     for s in _sessions(limit=200):
         if s["directory"] and os.path.isdir(s["directory"]):
@@ -745,38 +777,47 @@ def _start_run(job, directory, agent, prompt, session_id):
     cmd.append(prompt[:20000])
     try:
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            start_new_session=True)
     except Exception as exc:
         job["events"].append({"type": "error", "text": str(exc)})
         job["done"] = True
         return
-    job["pid"] = proc.pid
-    for line in proc.stdout:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except Exception:
-            continue
-        kind = ev.get("type")
-        if kind == "text":
-            job["events"].append({"type": "text", "text": ev["part"].get("text", "")})
-        elif kind == "tool":
-            part = ev.get("part", {})
-            state = part.get("state") or {}
-            inp = state.get("input") if isinstance(state, dict) else {}
-            brief = json.dumps(inp)[:160] if inp else ""
-            job["events"].append({"type": "tool", "tool": part.get("tool", "?"),
-                                  "brief": brief})
-        elif kind == "step_finish":
-            job["events"].append({"type": "step_finish"})
-        elif kind == "error":
-            job["events"].append({"type": "error",
-                                  "text": str(ev.get("part", ev))[:300]})
+
+    def _reader():
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            kind = ev.get("type")
+            if kind == "text":
+                job["events"].append({"type": "text", "text": ev["part"].get("text", "")})
+            elif kind == "tool":
+                part = ev.get("part", {})
+                state = part.get("state") or {}
+                inp = state.get("input") if isinstance(state, dict) else {}
+                brief = json.dumps(inp)[:160] if inp else ""
+                job["events"].append({"type": "tool", "tool": part.get("tool", "?"),
+                                      "brief": brief})
+            elif kind == "step_finish":
+                job["events"].append({"type": "step_finish"})
+            elif kind == "error":
+                job["events"].append({"type": "error",
+                                      "text": str(ev.get("part", ev))[:300]})
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
     rc = proc.wait()
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    reader.join(timeout=3)
     job["exit"] = rc
-    job["session_id"] = session_id or job.get("events") and None
     job["done"] = True
 
 
@@ -821,15 +862,14 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/state":
             procs = _ps_procs()
             flagged, total = _processes(procs)
+            repos = [
+                {"key": r["key"], "name": r["name"], "root": r["root"],
+                 "branches": _branches(r["root"]),
+                 "worktrees": _worktrees(r["root"])}
+                for r in _repos()]
             self._json({
-                "repo_name": os.path.basename(COURT_DIR),
-                "repo_root": COURT_DIR,
-                "repos": [
-                    {"name": os.path.basename(p), "root": p,
-                     "branches": _branches(p), "worktrees": _worktrees(p)}
-                    for p in _repos()],
-                "quests": _quests(),
-                "worktrees": [w for p in _repos() for w in _worktrees(p)],
+                "repos": repos,
+                "worktrees": [w for r in repos for w in r["worktrees"]],
                 "sessions": _sessions(),
                 "mcp": _mcp_inventory(procs),
                 "processes": [

@@ -431,6 +431,78 @@ bgp_0e0ec160e001RIL1w68UmCEWt6).
   ses_f1ef1d07effeXDx7UaRhGxAVtO (frontend/UX), ses_f1ef3b9d3ffeFurNGbhvbuI3No
   (backend) — results to be triaged into next console round.
 
+## 2026-09-27 (04:4x) — Console hardening: all review P0s + cheap P1/P2s adopted
+
+Both remaining review agents completed (after one connection-reset resume
+each). All three P0s from the backend review and both P0s from frontend/UX
+review fixed this round, direct on trunk (committed with the batch below).
+
+### Backend (from backend review)
+- P0 job-id race: `_send` read `_JOB_SEQ[0]` twice — concurrent sends
+  overwrote `_JOBS["N"]` and orphaned the loser's running process (unstopable,
+  unpollable). Fixed: id computed once into a local.
+- P0 unbounded meta scan: `/api/session/meta` ran `json_extract` over every
+  part of the session every 5s poll on the 100GB DB. Fixed: bounded two-step
+  query (newest 30 messages' parts). Verified ~10ms live.
+- P0 `_reap`: unguarded SIGTERM + uncoerced pid → fixed (int coercion, both
+  kills guarded).
+- kilo binary path was hardcoded to extension 7.8.1 (breaks on VS Code
+  auto-update) → `_kilo_bin()` resolver (latest by mtime across
+  kilocode.kilo-code-*, PATH fallback); `_models` now single-flight background
+  refresh with stale-serve (was a blocking 60s subprocess on cache miss).
+- `_worktrees` non-blocking lock miss returned `[]` (nav/board flash empty) →
+  blocking acquire with double-check.
+- `_quests` cold-cache serial git-status fan → ThreadPoolExecutor(8); quest
+  `worktree:` frontmatter now joined against repo root when relative;
+  `_all_quests` returns dict copies (no cache mutation).
+- `_mcp_toggle_write`: atomic tmp+os.replace write, per-path lock, `disabled`
+  key normalization (enabled/disabled no longer conflict).
+- `_expand_command`: unclosed frontmatter no longer leaks frontmatter keys
+  into the prompt; expansion now runs AFTER directory validation.
+- Event polling: `/api/send/<id>?since=N` cursor + `total` (kills O(n²)
+  full-list reserialization per 700ms poll; client updated in lockstep);
+  done jobs pruned from `_JOBS` after 10 min (`ended` timestamp added).
+- `_read_body` 1MB cap; `_ps_procs` per-line ValueError guard; single-arg
+  `os.path.join` cleanup.
+
+### Frontend (from frontend/UX review)
+- P0 board clipping: `.bcol` columns were wrapped in an indefinite-height
+  flex div → `max-height:100%` collapsed, bottom cards unreachable. Wrapper
+  removed; columns scroll independently again.
+- P0 injection: dynamic values were interpolated into `'…'` JS string
+  literals inside inline onclick attrs (quest frontmatter is AGENT-AUTHORED →
+  prompt-injected Serf could break out and spawn agent runs / delete
+  sessions from the console origin). All dynamic handlers converted to
+  `data-*` attributes + one delegated listener per container (nav, sess tabs,
+  board bar/cols, cmdlist, mcp modal); remaining inline handlers audited
+  static. `esc()` now also escapes `'` and strips NUL (mdRender placeholder
+  regex guarded against crafted NUL lines too).
+- P1: `turnForView` now scans most-recent-first (second parallel turn was
+  invisible/unstoppable); `openSess`/`loadCmds` stale-response seq guards
+  (fast tab B no longer overwritten by slow tab A); `.app` styles unscoped so
+  CHAT/BOARD toggle is visibly stateful; composer textarea autosizes
+  (46–140px); Enter with no worktree now shows a red hint instead of
+  silently dying; cmdlist arrow-key NaN guards; deleted session removed from
+  `S.sessions` immediately (tab no longer lingers); STOP latch resets on
+  failed stop request and hides until job exists; malformed hash no longer
+  kills the poll loop; chatbar ✕ delete button actually toggles; Escape
+  closes cmdlist (and MCP modal).
+
+### Verification
+node --check clean; import clean; live: page 200, state (87 quests, 14
+ps-derived active agents, 200 sessions), commands 34, meta 68ms wall
+(incl. curl). Server restarted persistent (pid 3885, bgp_0e0ec160e001
+RIL1w68UmCEWt6).
+
+### Deferred (noted, not adopted this round)
+- since-cursor alternative: last-good snapshot for transient DB errors; stop
+  race pre-spawn window; hung-turn watchdog; route parsing via urlparse;
+  delegated listener for modal backdrop/Escape focus management; a11y pass
+  (roles/aria/reduced-motion); board fed by `court status --json` attention
+  signals; /api/court action buttons (goad/coin/advance); persistent turn
+  journal JSONL; process/reap panel UI; turn-complete notifications; session
+  search; today-cost rollups. Ranked adoption next rounds.
+
 ## 2026-09-27 — kilo.db cleanup: 104G file → ~11G live (royal assent given)
 
 - M'Lord requested a review: "kilo db is like 11gb". Actual: `kilo.db` was

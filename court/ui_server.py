@@ -6,14 +6,17 @@ whose parent is a verified kilo process) and /api/mcp (flips the enabled flag of
 an inventoried MCP server in its own config file, with a .bak backup).
 """
 
+import glob
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 COURT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -67,11 +70,12 @@ header .spacer{flex:1}
 main{display:grid;grid-template-columns:300px 1fr;overflow:hidden}
 nav{overflow-y:auto;background:var(--surface);border-right:1px solid var(--edge);padding:12px 12px 20px}
 .appswitch{display:flex;gap:6px;margin-bottom:12px}
-.appswitch .app{flex:1;text-align:center;padding:7px 4px;border-radius:var(--r-md);cursor:pointer;
+.app{cursor:pointer;transition:all .12s ease}
+.appswitch .app,.vtabs .app{flex:1;text-align:center;padding:7px 4px;border-radius:var(--r-md);
  background:var(--surface-2);border:1px solid var(--edge);font-size:11px;font-weight:600;
- letter-spacing:.08em;text-transform:uppercase;color:var(--dim);transition:all .12s ease}
-.appswitch .app:hover{border-color:var(--blue);color:var(--ink)}
-.appswitch .app.on{background:rgba(255,179,0,.12);border-color:var(--primary);color:var(--primary)}
+ letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
+.app:hover{border-color:var(--blue);color:var(--ink)}
+.app.on{background:rgba(255,179,0,.12);border-color:var(--primary);color:var(--primary)}
 .repohead{font-size:10px;font-weight:700;letter-spacing:.16em;color:var(--primary);
  margin:14px 6px 6px;display:flex;align-items:center;gap:8px}
 .repohead::after{content:"";flex:1;height:1px;background:rgba(255,179,0,.25)}
@@ -302,7 +306,7 @@ const CTXLIM=[[/(gemini|1m)/i,1e6],[/(gpt-5|gpt-4\.1|o[34]|grok)/i,4e5],
  [/(qwen|kimi|llama)/i,256e3],[/(claude|glm|deepseek|mistral|mini)/i,2e5]];
 function ctxLim(m){if(!m)return 2e5;for(const[r,l]of CTXLIM)if(r.test(m))return l;return 2e5;}
 const ktop=t=>((t||0)/1024).toFixed(t>=1048576?0:1)+'k';
-const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const esc=s=>String(s??'').replace(/[&<>"'\0]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','\0':''}[c]));
 const mb=r=>r==null||r===undefined?'—':(r/1048576).toFixed(0)+' MB';
 const ago=ts=>{if(!ts)return'';const d=(Date.now()-ts)/1000;
  return d<60?`${d|0}s`:(d<3600?`${d/60|0}m`:(d<86400?`${d/3600|0}h`:`${d/86400|0}d`))};
@@ -311,10 +315,11 @@ const TRUNKS=['main','castle','master','trunk'];
 const STATUS_ORDER=__STATUS_ORDER__;
 function repo(){return S.repos.find(r=>r.key===selRepo)||S.repos[0]}
 function hashState(){
- const h=location.hash.replace(/^#/,'');const p={};
- for(const kv of h.split('&')){const i=kv.indexOf('=');
-  if(i>0)p[kv.slice(0,i)]=decodeURIComponent(kv.slice(i+1));}
- return p;
+  const h=location.hash.replace(/^#/,'');const p={};
+  for(const kv of h.split('&')){const i=kv.indexOf('=');
+   if(i>0){try{p[kv.slice(0,i)]=decodeURIComponent(kv.slice(i+1));}catch(e){}}
+  }
+  return p;
 }
 function syncHash(){
  const p=[];
@@ -343,11 +348,11 @@ function applyHash(){
   return hit;
 }
 
-async function poll(){
+ async function poll(){
  try{S=await (await fetch('/api/state')).json();}catch(e){return;}
  if(!selRepo&&S.repos.length){
   selRepo=(S.repos.find(r=>r.key==='app')||S.repos[0]).key;
-  if(!applyHash())renderNav();
+  applyHash();renderNav();
  }else{renderNav();if(selWt)renderSessionsBar();}
  $('totals').innerHTML=`<span class="chip">sessions <b>${S.sessions.length}</b></span>
   <span class="chip">worktrees <b>${S.worktrees.length}</b></span>`+
@@ -364,10 +369,10 @@ function renderNav(){
   const r=repo(); if(!r){$('nav').innerHTML='';return;}
   const act=activeDirs();
   let h=`<div class="appswitch">`+S.repos.map(x=>
-   `<div class="app ${x.key===selRepo?'on':''}" onclick="switchApp('${x.key}')">${x.key}</div>`).join('')+`</div>`;
+   `<div class="app ${x.key===selRepo?'on':''}" data-app="${esc(x.key)}">${x.key}</div>`).join('')+`</div>`;
   h+=`<div class="repohead">${esc(r.name)} · ${r.worktrees.length} worktrees</div>`;
   const trunk=r.worktrees.find(w=>w.branch&&(w.branch===TRUNKS.find(t=>t===w.branch)||TRUNKS.includes(w.branch.split('/').pop())));
-  if(trunk)h+=`<div class="castle ${selWt===trunk.path?'sel':''}" onclick="pickWt('${esc(trunk.path)}')">
+  if(trunk)h+=`<div class="castle ${selWt===trunk.path?'sel':''}" data-wt="${esc(trunk.path)}">
    <div class="name"><span class="dot"></span>${esc(r.name)} trunk${act.has(trunk.path)?' <span class="livedot" title="agent working"></span>':''}</div>
    <div class="sub">${esc(trunk.branch||'?')}${trunk.dirty?' · dirty':''}</div></div>`;
   const byBranch={}; for(const w of r.worktrees){if(w.branch)byBranch[w.branch]=w}
@@ -384,7 +389,7 @@ function renderNav(){
     const working=w&&act.has(w.path);
     const mark=(working?'<span class="livedot" title="agent working"></span>':'')+
      (w?(w.dirty?'<span class="badge">dirty</span>':''):'<span class="st">no wt</span>');
-    h+=`<div class="q ${selWt&&w&&selWt===w.path?'sel':''}" onclick="pickWt(${w?`'${esc(w.path)}'`:'null'},'${esc(b)}')">
+    h+=`<div class="q ${selWt&&w&&selWt===w.path?'sel':''}"${w?` data-wt="${esc(w.path)}"`:''} data-branch="${esc(b)}">
     <div class="row1">${esc(b.includes('/')?b.slice(b.indexOf('/')+1):b)}${mark}</div>
     <div class="row2">${esc(b)}</div></div>`;
    }
@@ -392,16 +397,26 @@ function renderNav(){
   }
   $('nav').innerHTML=h;
 }
+$('nav').addEventListener('click',e=>{
+  const app=e.target.closest('[data-app]');
+  if(app){switchApp(app.dataset.app);return;}
+  const wt=e.target.closest('[data-wt]');
+  if(wt){pickWt(wt.dataset.wt||null,wt.dataset.branch||null);}
+});
 function switchApp(key){selRepo=key;selWt=null;selSess=null;msgs=[];
  $('wt_label').textContent='select a worktree';$('wt_badge').innerHTML='';
  $('c_cont').innerHTML='new session — pick a worktree, or click a session tab to continue it';
  CMDS=[];renderCmdList();
  renderNav();renderTranscript();syncHash();syncComposer();}
+let cmdSeq=0;
 async function loadCmds(){
+ const seq=++cmdSeq;
  if(!selWt){CMDS=[];renderCmdList();return;}
- try{CMDS=await (await fetch('/api/commands?dir='+encodeURIComponent(selWt))).json();}
- catch(e){CMDS=[];}
- renderCmdList();}
+ let c=[];
+ try{c=await (await fetch('/api/commands?dir='+encodeURIComponent(selWt))).json();}
+ catch(e){}
+ if(seq===cmdSeq){CMDS=c;renderCmdList();}
+}
 function pickWt(path,branch){
  selWt=path;selSess=null;msgs=[];
  if(path){
@@ -426,32 +441,44 @@ function sessionsFor(path){
  return S.sessions.filter(s=>s.directory&&(s.directory===path||s.directory.startsWith(path+'/')));
 }
 function sessMeta(s){
- return `tok <b>${ktop((s.tokens_input||0)+(s.tokens_output||0))}</b> · $${(s.cost||0).toFixed(2)}`;
+ return `tok ${ktop((s.tokens_input||0)+(s.tokens_output||0))} · $${(s.cost||0).toFixed(2)}`;
 }
 function renderSessionsBar(){
   const sess=sessionsFor(selWt).slice(0,8);
   $('sess_tabs').innerHTML=
-   sess.map(s=>`<div class="tab ${selSess===s.id?'on':''}" onclick="openSess('${s.id}')"
+   sess.map(s=>`<div class="tab ${selSess===s.id?'on':''}" data-sid="${esc(s.id)}"
     title="${esc(s.title||s.id)} · ${sessMeta(s)}"><span class="tl">${esc(s.agent||'?')}: ${esc((s.title||s.id).slice(0,26))}</span>`+
-    `<span class="tx" title="delete session" onclick="event.stopPropagation();delSess('${s.id}')">✕</span></div>`).join('')+
+    `<span class="tx" title="delete session" data-act="del" data-sid="${esc(s.id)}">✕</span></div>`).join('')+
     `<div class="tab newtab ${selSess===null?'on':''}" onclick="newSess()" title="start a fresh session">＋ new</div>`;
 }
+$('sess_tabs').addEventListener('click',e=>{
+  const del=e.target.closest('[data-act="del"]');
+  if(del){delSess(del.dataset.sid);return;}
+  const tab=e.target.closest('[data-sid]');
+  if(tab)openSess(tab.dataset.sid);
+});
 function newSess(){selSess=null;msgs=[];
  $('c_cont').innerHTML='new session in <b>'+esc(selWt?selWt.replace('/Users/scrummage/Python/',''):'?')+'</b> <span class="dim">— agent replies as a fresh session</span>';
  renderSessionsBar();renderTranscript();syncHash();syncComposer();syncSessMeta();}
+let sessOpenSeq=0;
 async function openSess(id){
+ const seq=++sessOpenSeq;
  selSess=id;msgs=[];
  $('c_cont').innerHTML=`continuing <b>${esc(id.slice(0,24))}…</b> <span class="x" onclick="newSess()">start new instead</span>`;
  renderSessionsBar();renderTranscript();syncHash();syncComposer();syncSessMeta();
  $('transcript').innerHTML='<div class="notice">loading…</div>';
- try{msgs=await (await fetch('/api/session?id='+id)).json();}catch(e){msgs=[];}
+ let m=[];
+ try{m=await (await fetch('/api/session?id='+id)).json();}catch(e){}
+ if(seq!==sessOpenSeq||selSess!==id)return;
+ msgs=m;
  renderTranscript();
  syncSessMeta();
 }
 let sessMetaSeq=0;
 async function syncSessMeta(){
  const sid=selSess;const seq=++sessMetaSeq;
- if(!sid){$('sess_meta').innerHTML='';return;}
+ if(!sid){$('sess_meta').innerHTML='';$('sess_del').style.display='none';return;}
+ $('sess_del').style.display='';
  let m={};
  try{m=await (await fetch('/api/session/meta?id='+sid)).json();}catch(e){}
  if(seq!==sessMetaSeq||selSess!==sid)return;
@@ -479,11 +506,13 @@ function renderTranscript(){
   t.scrollTop=t.scrollHeight;
 }
 function turnForView(){
-  return turns.find(T=>{
-    if(T.wt!==selWt)return false;
-    if(T.sess)return selSess===T.sess;
-    return selSess===null||selSess===T.sid;
-  })||null;
+  for(let i=turns.length-1;i>=0;i--){
+    const T=turns[i];
+    if(T.wt!==selWt)continue;
+    if(T.sess){if(selSess===T.sess)return T;continue;}
+    if(selSess===null||selSess===T.sid)return T;
+  }
+  return null;
 }
 function blockHTML(b){
   const md=b.cls==='assistant'||b.cls==='thinking';
@@ -558,8 +587,8 @@ function mdRender(src){
   if(rows){out.push(mdTable(rows));rows=null;}};
  for(let i=0;i<lines.length;i++){
   const ln=lines[i];
-  const bm=ln.match(/^\x00B(\d+)\x00\s*$/);
-  if(bm){flush();out.push(codeHTML(blocks[+bm[1]]));continue;}
+   const bm=ln.match(/^\x00B(\d+)\x00\s*$/);
+   if(bm&&blocks[+bm[1]]){flush();out.push(codeHTML(blocks[+bm[1]]));continue;}
   if(/^\s*$/.test(ln)){flush();continue;}
   if(quote!==null||/^(&gt;|>)\s?/.test(ln)){
    if(quote===null)quote=[];
@@ -594,24 +623,35 @@ function syncComposer(){
   const t=turnForView();
   const running=!!t;
   $('c_send').textContent=running?'QUEUE':'SEND';
-  $('c_stop').style.display=running?'':'none';
+  $('c_stop').style.display=running&&t&&t.job?'':'none';
   $('live_chip').style.display=running?'':'none';
 }
 function sendComposer(){
   const ta=$('c_prompt');
   const txt=ta.value.trim();
-  if(!txt||!selWt)return;
+  if(!txt)return;
   const t=turnForView();
   if(t){
-   if(t.queue)return;
+   if(t.queue){
+    t.blocks.push({cls:'notice',text:'already queued — one queued message per turn'});
+    if(turnForView()===t)renderLive();
+    return;}
    t.queue={wt:t.wt,agent:$('c_agent').value,model:$('c_model').value.trim(),prompt:txt};
-   ta.value='';
+   ta.value='';autosizeTa();
    t.blocks.push({cls:'notice',
     text:'queued next: '+txt.slice(0,80)+(txt.length>80?'…':'')});
    if(turnForView()===t)renderLive();
    return;}
-  ta.value='';
+  if(!selWt){
+   $('c_cont').innerHTML='<span style="color:var(--red)">select a worktree with sessions (left) before sending — cannot dispatch without a directory</span>';
+   return;}
+  ta.value='';autosizeTa();
   dispatch(selWt,selSess,$('c_agent').value,$('c_model').value.trim(),txt);
+}
+function autosizeTa(){
+ const ta=$('c_prompt');
+ ta.style.height='auto';
+ ta.style.height=Math.min(140,Math.max(46,ta.scrollHeight))+'px';
 }
 async function dispatch(wt,sess,agent,model,prompt){
   const T={id:++TURNSEQ[0],wt,sess,sid:null,job:null,evs:0,ran:false,done:false,
@@ -691,7 +731,8 @@ async function stopTurn(){
   T.blocks.push({cls:'notice',text:'stop requested…'});
   if(turnForView()===T)renderLive();
   try{await fetch('/api/stop',{method:'POST',body:JSON.stringify({job:T.job})});
-   T.stopped=true;}catch(e){}
+   T.stopped=true;}
+  catch(e){T.stopping=false;}
 }
 async function delSess(id){
  if(!id)return;
@@ -703,6 +744,7 @@ async function delSess(id){
    body:JSON.stringify({id})});
   if(!r.ok){alert('refused: '+(await r.text()));return;}
  }catch(e){alert('delete failed: '+e);return;}
+ if(S)S.sessions=(S.sessions||[]).filter(x=>x.id!==id);
  if(selSess===id){
   selSess=null;msgs=[];
   const next=sessionsFor(selWt).find(x=>x.id!==id);
@@ -722,9 +764,9 @@ function renderCmdList(){
  if(view!=='chat'){el.style.display='none';return;}
  const m=cmdMatches();
  if(!m.length){el.style.display='none';return;}
- if(cmdIdx>=m.length)cmdIdx=0;
+ if(cmdIdx>=m.length||cmdIdx<0)cmdIdx=0;
  el.innerHTML=m.map((c,i)=>`<div class="cmdrow ${i===cmdIdx?'on':''}"
-  onclick="completeCmd('${esc(c.name)}')"><span class="cmdname">/${esc(c.name)}</span>`+
+  data-name="${esc(c.name)}"><span class="cmdname">/${esc(c.name)}</span>`+
   `<span class="cmddesc">${esc(c.desc||'')}${c.agent?' · '+esc(c.agent):''}</span></div>`).join('');
  el.style.display='';
 }
@@ -757,16 +799,16 @@ function renderBoard(){
  const apps={};for(const q of qs){const a=q.app||q.repo||'other';apps[a]=(apps[a]||0)+1;}
  if(boardApp!=='all'&&!(boardApp in apps))boardApp='all';
  const act=activeDirs();
- let h='<div class="bfil"><span class="chipx '+(boardApp==='all'?'on':'')+'" onclick="boardFilter(\'all\')">all · '+qs.length+'</span>'+
-  Object.keys(apps).sort().map(a=>`<span class="chipx ${a===boardApp?'on':''}" onclick="boardFilter('${esc(a)}')">${esc(a)} · ${apps[a]}</span>`).join('')+'</div>';
+ let h='<div class="bfil"><span class="chipx '+(boardApp==='all'?'on':'')+'" data-app="all">all · '+qs.length+'</span>'+
+  Object.keys(apps).sort().map(a=>`<span class="chipx ${a===boardApp?'on':''}" data-app="${esc(a)}">${esc(a)} · ${apps[a]}</span>`).join('')+'</div>';
  $('boardbar').innerHTML=h;
- let cols='<div style="display:flex;gap:10px;align-items:flex-start">';
+ let cols='';
  for(const st of STATUS_ORDER){
   const items=qs.filter(q=>q.status===st&&(boardApp==='all'||(q.app||q.repo)===boardApp));
   cols+=`<div class="bcol"><h3>${esc(st.toLowerCase())} · ${items.length}</h3>`;
   for(const q of items){
    const on=!!(q.worktree&&act.has(q.worktree));
-   cols+=`<div class="bcard ${q.worktree?'click':''}" ${q.worktree?`onclick="openQuestWt('${esc(q.worktree)}')"`:''}>
+   cols+=`<div class="bcard ${q.worktree?'click':''}" ${q.worktree?`data-wt="${esc(q.worktree)}"`:''}>
     <div class="bid">${esc(q.id)}${q.dirty?' <span class="badge">dirty</span>':''}${on?' <span class="livedot" title="agent working"></span>':''}</div>
     <div class="bt">${esc(q.title||'')}</div>
     <div class="brow"><span class="chip">${esc(q.app||q.repo||'—')}</span>`+
@@ -775,25 +817,31 @@ function renderBoard(){
   cols+=items.length?'':'<div class="bempty">—</div>';
   cols+='</div>';
  }
- cols+='</div>';
  $('boardcols').innerHTML=cols;
 }
-document.getElementById('c_prompt').addEventListener('input',()=>{cmdIdx=0;renderCmdList();});
+$('boardbar').addEventListener('click',e=>{
+ const c=e.target.closest('[data-app]');if(c)boardFilter(c.dataset.app);});
+$('boardcols').addEventListener('click',e=>{
+ const c=e.target.closest('[data-wt]');if(c)openQuestWt(c.dataset.wt);});
+document.getElementById('c_prompt').addEventListener('input',()=>{cmdIdx=0;autosizeTa();renderCmdList();});
 document.getElementById('c_prompt').addEventListener('keydown',e=>{
  const list=$('cmdlist');
  const listOpen=list.style.display!=='none';
  if(e.key==='Tab'&&listOpen){e.preventDefault();
   const m=cmdMatches();if(m.length)completeCmd(m[cmdIdx].name);return;}
  if(e.key==='ArrowDown'&&listOpen){e.preventDefault();
-  cmdIdx=(cmdIdx+1)%cmdMatches().length;renderCmdList();return;}
+  const m=cmdMatches();if(!m.length)return;
+  cmdIdx=(cmdIdx+1)%m.length;renderCmdList();return;}
  if(e.key==='ArrowUp'&&listOpen){e.preventDefault();
-  const n=cmdMatches().length;cmdIdx=(cmdIdx+n-1)%n;renderCmdList();return;}
- if(e.key==='Enter'&&!e.shiftKey){
+  const m=cmdMatches();if(!m.length)return;
+  cmdIdx=(cmdIdx+m.length-1)%m.length;renderCmdList();return;}
+ if(e.key==='Escape'&&listOpen){e.preventDefault();list.style.display='none';return;}
+ if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){
   if(listOpen&&!$('c_prompt').value.includes(' ')){e.preventDefault();
    const m=cmdMatches();if(m.length)completeCmd(m[cmdIdx].name);return;}
   e.preventDefault();renderCmdList();sendComposer();}});
 function openMcp(){
- const list=S.mcp||[];
+  const list=S.mcp||[];
  let h='';
  for(const d of list.filter(m=>m.type==='local'&&m.enabled&&m.count>=2)){
   h+=`<div class="dupwarn">duplicate MCP spawns detected: ${esc(d.name)} x${d.count} (~${mb(d.rss)} each)</div>`;}
@@ -801,8 +849,8 @@ function openMcp(){
   list.map(m=>{
    const run=m.running?`<span class="num" style="color:var(--green)">yes</span> <span class="num blue">${mb(m.rss)}</span>`
     :'<span class="dim">no</span>';
-   const btn=m.file.endsWith('.jsonc')?'<span class="dim">manual</span>'
-    :`<button title="takes effect for sessions started after the change" onclick="mcpToggle('${esc(m.file)}','${esc(m.name)}')">${m.enabled?'disable':'enable'}</button>`;
+    const btn=m.file.endsWith('.jsonc')?'<span class="dim">manual</span>'
+     :`<button title="takes effect for sessions started after the change" data-file="${esc(m.file)}" data-name="${esc(m.name)}">${m.enabled?'disable':'enable'}</button>`;
    return `<tr><td class="mono">${esc(m.name)}</td><td class="dim">${esc(m.scope)}</td><td class="dim">${esc(m.type)}</td>`+
     `<td>${m.enabled?'<span class="num" style="color:var(--green)">yes</span>':'<span class="dim">no</span>'}</td><td>${run}</td><td>${btn}</td></tr>`;
   }).join('')+'</tbody></table>'+
@@ -811,6 +859,9 @@ function openMcp(){
  $('modal').classList.add('on');
 }
 function closeMcp(){$('modal').classList.remove('on');}
+$('modal_bd').addEventListener('click',e=>{
+ const b=e.target.closest('[data-file]');
+ if(b)mcpToggle(b.dataset.file,b.dataset.name);});
 async function mcpToggle(file,name){
  const m=(S.mcp||[]).find(x=>x.file===file&&x.name===name);
  if(!m)return;
@@ -885,6 +936,8 @@ def _quests(root, ttl=20):
             qid = fm.get("id", fn[:-3])
             app = fm.get("app", "") or (qid.split("-")[1] if "-" in qid else "")
             wt = fm.get("worktree", "")
+            if wt and not os.path.isabs(wt):
+                wt = os.path.join(root, wt)
             quests.append({
                 "id": qid, "title": fm.get("title", ""),
                 "status": fm.get("status", "OPEN"), "app": app,
@@ -895,6 +948,10 @@ def _quests(root, ttl=20):
     quests.sort(key=lambda q: (
         STATUS_ORDER.index(q["status"]) if q["status"] in STATUS_ORDER else 99,
         q["id"]))
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for q, d in zip(quests, ex.map(_wt_dirty, [q["worktree"]
+                                                   for q in quests])):
+            q["dirty"] = d
     _QUESTS_CACHE[root] = (now, quests)
     return quests
 
@@ -903,8 +960,7 @@ def _all_quests():
     out = []
     for r in _repos():
         for q in _quests(r["root"]):
-            q["repo"] = r["key"]
-            out.append(q)
+            out.append(dict(q, repo=r["key"]))
     return out
 
 
@@ -950,16 +1006,14 @@ def _worktrees(repo=None, ttl=60):
     if hit and now - hit[0] < ttl:
         return hit[1]
     lock = _WT_LOCKS.setdefault(repo, threading.Lock())
-    if not lock.acquire(blocking=False):
-        return hit[1] if hit else []
-    try:
+    with lock:
+        hit = _WT_CACHE.get(repo)
+        if hit and time.time() - hit[0] < ttl:
+            return hit[1]
         return _compute_worktrees(repo)
-    finally:
-        lock.release()
 
 
 def _compute_worktrees(repo):
-    from concurrent.futures import ThreadPoolExecutor
     try:
         r = subprocess.run(
             ["git", "-C", repo, "worktree", "list", "--porcelain"],
@@ -1064,9 +1118,12 @@ def _ps_procs():
         parts = ln.strip().split(None, 4)
         if len(parts) < 5:
             continue
-        procs.append({"pid": int(parts[0]), "ppid": int(parts[1]),
-                      "rss": int(parts[2]) * 1024, "etime": parts[3],
-                      "args": parts[4]})
+        try:
+            procs.append({"pid": int(parts[0]), "ppid": int(parts[1]),
+                          "rss": int(parts[2]) * 1024, "etime": parts[3],
+                          "args": parts[4]})
+        except ValueError:
+            continue
     return procs
 
 
@@ -1207,6 +1264,9 @@ def _mcp_inventory(procs=None):
     return out
 
 
+_MCP_LOCK = threading.Lock()
+
+
 def _mcp_toggle_write(file, name, enabled):
     """Flip one MCP server's enabled flag; returns (http_code, payload)."""
     if file.endswith(".jsonc"):
@@ -1215,22 +1275,34 @@ def _mcp_toggle_write(file, name, enabled):
                   if e["file"] == file and e["name"] == name), None)
     if entry is None:
         return 403, {"error": "unknown mcp config file or server; refused"}
-    try:
-        with open(file) as f:
-            raw = f.read()
-        data = json.loads(_strip_jsonc(raw) if file.endswith(".jsonc") else raw)
-        servers = data.get(entry["key"])
-        if not isinstance(servers, dict) or name not in servers \
-                or not isinstance(servers[name], dict):
-            return 403, {"error": "server not found in config; refused"}
-        indent = _json_indent(raw)
-        with open(file + ".bak", "w") as f:
-            f.write(raw)
-        servers[name]["enabled"] = enabled
-        with open(file, "w") as f:
-            f.write(json.dumps(data, indent=indent) + "\n")
-    except Exception as exc:
-        return 500, {"error": f"mcp config write failed: {exc}"}
+    with _MCP_LOCK:
+        try:
+            with open(file) as f:
+                raw = f.read()
+            data = json.loads(_strip_jsonc(raw) if file.endswith(".jsonc") else raw)
+            servers = data.get(entry["key"])
+            if not isinstance(servers, dict) or name not in servers \
+                    or not isinstance(servers[name], dict):
+                return 403, {"error": "server not found in config; refused"}
+            indent = _json_indent(raw)
+            with open(file + ".bak", "w") as f:
+                f.write(raw)
+            srv = servers[name]
+            if "disabled" in srv:
+                if enabled:
+                    srv.pop("disabled", None)
+                    srv["enabled"] = True
+                else:
+                    srv["disabled"] = True
+                    srv.pop("enabled", None)
+            else:
+                srv["enabled"] = enabled
+            tmp = file + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(json.dumps(data, indent=indent) + "\n")
+            os.replace(tmp, file)
+        except Exception as exc:
+            return 500, {"error": f"mcp config write failed: {exc}"}
     return 200, {"ok": True}
 
 
@@ -1282,10 +1354,6 @@ def _session_meta(sid):
         srow = db.execute(
             "select tokens_input, tokens_output, cost, model from session"
             " where id=?", (sid,)).fetchone()
-        prow = db.execute(
-            "select p.data from part p join message m on p.message_id=m.id"
-            " where m.session_id=? and json_extract(p.data,'$.type')='step-finish'"
-            " order by p.time_created desc limit 1", (sid,)).fetchone()
         db.close()
     except Exception:
         return {}
@@ -1297,18 +1365,44 @@ def _session_meta(sid):
             out["model"] = (json.loads(model) or {}).get("id", "") or str(model)
         except Exception:
             out["model"] = str(model or "")
-    if prow:
-        try:
-            d = json.loads(prow[0])
-            out["ctx"] = (d.get("tokens") or {}).get("total") or 0
-        except Exception:
-            pass
+    # bounded scan: newest 30 messages' parts only — never a full-session
+    # json_extract pass over the 100GB DB
+    try:
+        db = sqlite3.connect(f"file:{KILO_DB}?mode=ro", uri=True, timeout=3)
+        db.execute("pragma query_only=1")
+        mids = [r[0] for r in db.execute(
+            "select id from message where session_id=?"
+            " order by time_created desc limit 30", (sid,))]
+        if mids:
+            q = ",".join("?" * len(mids))
+            for (pdata,) in db.execute(
+                    f"select data from part where message_id in ({q})"
+                    " order by time_created desc", mids):
+                try:
+                    d = json.loads(pdata)
+                except Exception:
+                    continue
+                if d.get("type") == "step-finish":
+                    out["ctx"] = (d.get("tokens") or {}).get("total") or 0
+                    break
+        db.close()
+    except Exception:
+        pass
     return out
 
 
+def _kilo_bin():
+    """Latest kilo binary across installed extension versions (auto-update
+    proof), falling back to PATH."""
+    cands = glob.glob(os.path.expanduser(
+        "~/.vscode/extensions/kilocode.kilo-code-*/bin/kilo"))
+    if cands:
+        return max(cands, key=lambda p: os.path.getmtime(os.path.dirname(
+            os.path.dirname(p))))
+    return shutil.which("kilo") or "kilo"
+
+
 _ALLOWED_AGENTS = ("steward", "code", "serf", "scout", "artist")
-KILO_BIN = os.path.expanduser(
-    "~/.vscode/extensions/kilocode.kilo-code-7.8.1-darwin-arm64/bin/kilo")
 _JOBS = {}
 _JOB_SEQ = [0]
 
@@ -1320,16 +1414,25 @@ def _models(ttl=600):
     hit = _MODEL_CACHE
     if hit["list"] and time.time() - hit["t"] < ttl:
         return hit["list"]
-    try:
-        r = subprocess.run(
-            [KILO_BIN, "models"], capture_output=True, text=True, timeout=60)
-        out = sorted({ln.strip() for ln in r.stdout.splitlines() if ln.strip()})
-    except Exception:
-        out = hit["list"]
-    if out:
-        hit["t"] = time.time()
-        hit["list"] = out
-    return out
+    if not hit.get("refreshing"):
+        hit["refreshing"] = True
+
+        def _bg():
+            try:
+                r = subprocess.run(
+                    [_kilo_bin(), "models"], capture_output=True, text=True,
+                    timeout=15)
+                out = sorted({ln.strip()
+                              for ln in r.stdout.splitlines() if ln.strip()})
+                if out:
+                    hit["t"] = time.time()
+                    hit["list"] = out
+            except Exception:
+                pass
+            finally:
+                hit["refreshing"] = False
+        threading.Thread(target=_bg, daemon=True).start()
+    return hit["list"]
 
 
 def _known_dirs():
@@ -1349,7 +1452,7 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
     job["events"].append({"type": "status", "text": (
         f"spawning agent - {agent} - {mode} - "
         f"{directory.replace('/Users/scrummage/Python/', '')}")})
-    cmd = [KILO_BIN, "run", "--dir", directory, "--agent", agent,
+    cmd = [_kilo_bin(), "run", "--dir", directory, "--agent", agent,
            "--format", "json", "--thinking", "--auto",
            "--title", prompt.strip()[:60] or "console turn"]
     if session_id:
@@ -1437,6 +1540,7 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
     job["events"].append({"type": "status",
                           "text": f"turn process exited ({rc})"})
     job["exit"] = rc
+    job["ended"] = time.time()
     job["done"] = True
 
 
@@ -1457,7 +1561,7 @@ def _command_files(directory):
     roots = []
     if directory and os.path.isdir(directory):
         roots.append(os.path.join(directory, ".kilo"))
-    roots.append(os.path.join(os.path.expanduser("~/.config/kilo")))
+    roots.append(os.path.expanduser("~/.config/kilo"))
     for r in roots:
         for name in _CMD_DIRS:
             d = os.path.join(r, name)
@@ -1512,14 +1616,14 @@ def _expand_command(prompt, directory):
     lines = text.splitlines()
     agent = ""
     if lines and lines[0].strip() == "---":
-        end = 0
+        end = -1
         for i, ln in enumerate(lines[1:], 1):
             if ln.strip() == "---":
                 end = i
                 break
             if ln.startswith("agent:"):
                 agent = ln.split(":", 1)[1].strip()
-        body = "\n".join(lines[end + 1:]).strip()
+        body = "\n".join(lines[end + 1:]).strip() if end >= 0 else text.strip()
     else:
         body = text.strip()
     if "$ARGUMENTS" in body:
@@ -1551,11 +1655,20 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path.startswith("/api/send/"):
-            job = _JOBS.get(self.path.rsplit("/", 1)[1])
+            from urllib.parse import parse_qs
+            path, _, qstr = self.path.partition("?")
+            job = _JOBS.get(path.rsplit("/", 1)[1])
             if not job:
                 self._json({"error": "unknown job"}, 404)
             else:
-                self._json({"events": job["events"], "done": job["done"],
+                since = 0
+                try:
+                    since = int(parse_qs(qstr).get("since", ["0"])[0])
+                except Exception:
+                    since = 0
+                evs = job["events"][since:] if since else job["events"]
+                self._json({"events": evs, "total": len(job["events"]),
+                            "done": job["done"],
                             "exit": job.get("exit"), "sid": job.get("sid")})
         elif self.path == "/api/compose-meta":
             self._json({"agents": list(_ALLOWED_AGENTS),
@@ -1576,6 +1689,11 @@ class Handler(BaseHTTPRequestHandler):
                     active[d] = {"dir": d, "agent": j.get("agent", "?"),
                                  "job": k, "source": "console",
                                  "started": j.get("started", 0)}
+            # prune finished jobs after 10 minutes so _JOBS cannot grow unbounded
+            cutoff = time.time() - 600
+            for k in [k for k, j in _JOBS.items()
+                      if j.get("done") and j.get("ended", 0) < cutoff]:
+                _JOBS.pop(k, None)
             self._json({
                 "repos": repos,
                 "worktrees": [w for r in repos for w in r["worktrees"]],
@@ -1666,7 +1784,7 @@ class Handler(BaseHTTPRequestHandler):
                     409)
                 return
         try:
-            r = subprocess.run([KILO_BIN, "session", "delete", sid],
+            r = subprocess.run([_kilo_bin(), "session", "delete", sid],
                                capture_output=True, text=True, timeout=120)
         except Exception as exc:
             self._json({"error": f"delete failed: {exc}"}, 500)
@@ -1695,6 +1813,10 @@ class Handler(BaseHTTPRequestHandler):
         if not prompt:
             self._json({"error": "empty prompt"}, 400)
             return
+        err = _validate_send(directory, agent)
+        if err:
+            self._json({"error": err}, 403)
+            return
         if prompt.startswith("/"):
             expanded, cerr = _expand_command(prompt, directory)
             if cerr:
@@ -1703,25 +1825,24 @@ class Handler(BaseHTTPRequestHandler):
             prompt = expanded["prompt"]
             if expanded["agent"]:
                 agent = expanded["agent"]
-        err = _validate_send(directory, agent)
-        if err:
-            self._json({"error": err}, 403)
-            return
         if session_id and not re.fullmatch(r"[\w-]+", session_id):
             self._json({"error": "bad session id"}, 400)
             return
         _JOB_SEQ[0] += 1
+        jid = _JOB_SEQ[0]
         job = {"events": [], "done": False, "started": time.time(),
                "dir": directory, "agent": agent}
-        _JOBS[str(_JOB_SEQ[0])] = job
+        _JOBS[str(jid)] = job
         threading.Thread(
             target=_start_run,
             args=(job, directory, agent, prompt, session_id, model),
             daemon=True).start()
-        self._json({"ok": True, "job": str(_JOB_SEQ[0])})
+        self._json({"ok": True, "job": str(jid)})
 
     def _read_body(self):
         n = int(self.headers.get("Content-Length", 0))
+        if n > 1_000_000:
+            raise ValueError("body too large")
         return json.loads(self.rfile.read(n) or b"{}")
 
     def _mcp_toggle(self):
@@ -1744,6 +1865,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "bad request"}, 400)
             return
         try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            self._json({"error": "bad pid"}, 400)
+            return
+        try:
             r = subprocess.run(
                 ["ps", "-o", "ppid=,args=", "-p", str(pid)],
                 capture_output=True, text=True, timeout=5)
@@ -1761,11 +1887,14 @@ class Handler(BaseHTTPRequestHandler):
         if "kilo" not in parent:
             self._json({"error": f"parent {ppid_s.strip()} is not a kilo process; refused"}, 403)
             return
-        os.kill(pid, signal.SIGTERM)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
         time.sleep(1.0)
         try:
             os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         self._json({"ok": True, "reaped": pid})
 

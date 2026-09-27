@@ -140,3 +140,20 @@ sessions painful via Steward relay, memory a primary concern.
   - kilo serve API probe (read-only research): auth token discovery, endpoint
     inventory, headless run shape, transport recommendation for the composer
     (subagent ses_f20311e99ffeA6fI8RPXwaJ027).
+
+## 2026-09-26 (late) — MCP panel merged; composer shipped; transport decision made
+
+- Merged dev-console/mcp-panel (4a204e9 → merge 9bfbdca): MCP inventory card
+  (13 entries across global/pb-app/pb-app-legacy), toggle w/ .bak backup,
+  duplicate-spawn warning; subagent also fixed the STATUS_ORDER template leak
+  that had broken page rendering; JSONC toggles guarded (comment loss).
+- Material Tailwind dark theme shipped (a5531ef): MT palette/pill chips/elevated
+  cards, per M'Lord standard (docs in pb-custom).
+- COMPOSER (primary action) shipped on HEADLESS TRANSPORT — decision made WITHOUT
+  waiting for serve probe: `kilo run` natively supports --session <id> (continue
+  existing sessions), --format json (streaming events), --dir, --agent. Composer:
+  POST /api/send (whitelisted agents steward/code/serf/scout/artist; dirs limited
+  to known worktrees+repo), event stream polled into drawer. Verified live.
+  Serve-API probe still useful for attach-mode (kilo run --attach) later.
+- Console live at http://127.0.0.1:8300: sidebar, session tabs, message drawer,
+  process panel w/ reap, MCP panel, composer.

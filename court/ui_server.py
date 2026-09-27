@@ -12,6 +12,7 @@ import re
 import signal
 import sqlite3
 import subprocess
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -153,11 +154,37 @@ button:hover{border-color:var(--red);color:var(--red);background:rgba(248,81,73,
 .msg .who{color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:.1em;
  margin-bottom:4px;font-weight:600}
 .empty-note{color:var(--faint);text-align:center;padding:30px;font-size:12px}
+
+#composer{position:fixed;left:0;right:0;bottom:0;z-index:8;background:var(--surface);
+ border-top:1px solid var(--edge);box-shadow:0 -4px 16px rgba(0,0,0,.35);
+ padding:10px 20px;display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:flex-end}
+#composer .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#composer select,#composer textarea{background:var(--bg);border:1px solid var(--edge);
+ color:var(--ink);border-radius:var(--r-sm);font:12px/1.4 "Inter",sans-serif;padding:6px 8px}
+#composer select{cursor:pointer}
+#composer textarea{width:100%;resize:none;height:44px;max-height:120px}
+#composer textarea:focus,#composer select:focus{outline:none;border-color:var(--blue)}
+#composer .send{background:var(--primary);border:none;color:var(--primary-ink);
+ font-weight:700;padding:9px 22px;border-radius:var(--r-sm);cursor:pointer;
+ font-size:12px;letter-spacing:.04em}
+#composer .send:disabled{opacity:.45;cursor:default}
+#composer .cont{font-size:10.5px;color:var(--dim)}
+#composer .cont b{color:var(--blue);font-weight:600}
+#content{overflow-y:auto;padding:20px 24px 110px;display:flex;flex-direction:column;gap:18px}
 </style></head><body>
 <header><div class="brand"><span class="glyph">♜</span>CASTLE <em>CONSOLE</em></div>
 <div class="vdiv"></div><div id="totals" style="display:flex;gap:8px"></div>
 <div class="spacer"></div><div id="clock"></div></header>
 <main><nav id="nav"></nav><div id="content"></div></main>
+<div id="composer">
+ <div class="row">
+  <select id="c_agent"></select>
+  <select id="c_dir"></select>
+  <span class="cont" id="c_cont">new session</span>
+ </div>
+ <textarea id="c_prompt" placeholder="message the agent… (Enter to send, Shift+Enter for newline)"></textarea>
+ <button class="send" id="c_send" onclick="sendComposer()">SEND</button>
+</div>
 <div id="drawer"><div class="hd"><b id="dtitle"></b><span onclick="closeDrawer()">CLOSE ✕</span></div>
 <div class="body" id="dbody"></div></div>
 <script>
@@ -236,7 +263,7 @@ function cardWt(w,sess){
 function ago(ts){if(!ts)return'';const d=(Date.now()-ts)/1000;
  return d<60?`${d|0}s`:(d<3600?`${d/60|0}m`:(d<86400?`${d/3600|0}h`:`${d/86400|0}d`));}
 function pick(wt){selWt=wt===''?null:wt;selSess=null;render()}
-async function openSess(id){selSess=id;render();
+async function openSess(id){selSess=id;setCompose(id);render();
  document.getElementById('drawer').classList.add('on');
  document.getElementById('dtitle').textContent='session '+id;
  document.getElementById('dbody').textContent='loading…';
@@ -249,7 +276,70 @@ async function reap(pid){
  if(!confirm(`terminate pid ${pid}?`))return;
  const r=await fetch('/api/reap',{method:'POST',body:JSON.stringify({pid})});
  if(!r.ok)alert('refused: '+(await r.text())); else poll();}
- poll();setInterval(poll,5000);
+let META=null, composing=false, COMPOSE_SID=null;
+async function loadMeta(){
+ if(META)return;
+ try{META=await (await fetch('/api/compose-meta')).json();}catch(e){return;}
+ const a=document.getElementById('c_agent'), d=document.getElementById('c_dir');
+ a.innerHTML=META.agents.map(x=>`<option>${x}</option>`).join('');
+ d.innerHTML=META.dirs.map(x=>`<option value="${esc(x)}">${esc(x.replace('/Users/scrummage/Python/',''))}</option>`).join('');
+}
+function setCompose(sess){
+ loadMeta();
+ if(!sess){COMPOSE_SID=null;
+  document.getElementById('c_cont').textContent='new session';return;}
+ const s=(S.sessions||[]).find(x=>x.id===sess);
+ COMPOSE_SID=sess;
+ document.getElementById('c_cont').innerHTML=`continuing <b>${esc(sess.slice(0,22))}…</b>`;
+ if(s&&s.directory)document.getElementById('c_dir').value=s.directory;
+}
+async function sendComposer(){
+ if(composing)return;
+ const ta=document.getElementById('c_prompt');
+ const prompt=ta.value.trim();
+ if(!prompt)return;
+ ta.value='';composing=true;
+ document.getElementById('c_send').disabled=true;
+ document.getElementById('dtitle').textContent='composer — '+(COMPOSE_SID?'continue':'new session');
+ document.getElementById('dbody').innerHTML='<div class="empty-note">dispatching…</div>';
+ document.getElementById('drawer').classList.add('on');
+ const r=await fetch('/api/send',{method:'POST',body:JSON.stringify({
+  dir:document.getElementById('c_dir').value,
+  agent:document.getElementById('c_agent').value,
+  prompt, session_id:COMPOSE_SID||null})});
+ if(!r.ok){alert('refused: '+(await r.text()));composing=false;
+  document.getElementById('c_send').disabled=false;return;}
+ const {job}=await r.json();
+ let seen=0;
+ while(true){
+  const st=await (await fetch('/api/send/'+job)).json();
+  const evs=st.events.slice(seen);seen=st.events.length;
+  const body=document.getElementById('dbody');
+  if(evs.length){
+   if(body.querySelector('.empty-note'))body.innerHTML='';
+   for(const e of evs){
+    if(e.type==='text')body.insertAdjacentHTML('beforeend',
+     `<div class="msg assistant"><div class="who">assistant</div>${esc(e.text)}</div>`);
+    else if(e.type==='tool')body.insertAdjacentHTML('beforeend',
+     `<div class="msg"><div class="who">tool · ${esc(e.tool)}</div><span class="mono dim">${esc(e.brief)}</span></div>`);
+    else if(e.type==='error')body.insertAdjacentHTML('beforeend',
+     `<div class="msg" style="border-left:3px solid var(--red)"><div class="who">error</div>${esc(e.text)}</div>`);
+   }
+   body.scrollTop=body.scrollHeight;
+  }
+  if(st.done){
+   composing=false;document.getElementById('c_send').disabled=false;
+   COMPOSE_SID=null;document.getElementById('c_cont').textContent='new session';
+   body.insertAdjacentHTML('beforeend',
+    `<div class="empty-note">turn complete (exit ${st.exit??'?'} )</div>`);
+   poll();
+   break;}
+  await new Promise(res=>setTimeout(res,700));
+ }
+}
+document.getElementById('c_prompt').addEventListener('keydown',e=>{
+ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendComposer();}});
+poll();setInterval(poll,5000);loadMeta();
 </script></body></html>"""
 PAGE = PAGE.replace("${json.dumps(STATUS_ORDER)}", json.dumps(STATUS_ORDER))
 
@@ -580,6 +670,76 @@ def _session_messages(sid, limit=60):
     return out
 
 
+_ALLOWED_AGENTS = ("steward", "code", "serf", "scout", "artist")
+KILO_BIN = os.path.expanduser(
+    "~/.vscode/extensions/kilocode.kilo-code-7.8.1-darwin-arm64/bin/kilo")
+_JOBS = {}
+_JOB_SEQ = [0]
+
+
+def _known_dirs():
+    dirs = {COURT_DIR}
+    for w in _worktrees():
+        dirs.add(w["path"])
+    for s in _sessions(limit=60):
+        if s["directory"] and os.path.isdir(s["directory"]):
+            dirs.add(s["directory"])
+    return sorted(dirs)
+
+
+def _start_run(job, directory, agent, prompt, session_id):
+    cmd = [KILO_BIN, "run", "--dir", directory, "--agent", agent,
+           "--format", "json", "--title", prompt.strip()[:60] or "console turn"]
+    if session_id:
+        cmd += ["--session", session_id]
+    else:
+        cmd += ["--model", "openrouter/z-ai/glm-5.3-flash"]
+    cmd.append(prompt[:20000])
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except Exception as exc:
+        job["events"].append({"type": "error", "text": str(exc)})
+        job["done"] = True
+        return
+    job["pid"] = proc.pid
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        kind = ev.get("type")
+        if kind == "text":
+            job["events"].append({"type": "text", "text": ev["part"].get("text", "")})
+        elif kind == "tool":
+            part = ev.get("part", {})
+            state = part.get("state") or {}
+            inp = state.get("input") if isinstance(state, dict) else {}
+            brief = json.dumps(inp)[:160] if inp else ""
+            job["events"].append({"type": "tool", "tool": part.get("tool", "?"),
+                                  "brief": brief})
+        elif kind == "step_finish":
+            job["events"].append({"type": "step_finish"})
+        elif kind == "error":
+            job["events"].append({"type": "error",
+                                  "text": str(ev.get("part", ev))[:300]})
+    rc = proc.wait()
+    job["exit"] = rc
+    job["session_id"] = session_id or job.get("events") and None
+    job["done"] = True
+
+
+def _validate_send(directory, agent):
+    if agent not in _ALLOWED_AGENTS:
+        return "agent not allowed"
+    if directory not in _known_dirs():
+        return "directory not a known worktree or repo; refused"
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -600,6 +760,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path.startswith("/api/send/"):
+            job = _JOBS.get(self.path.rsplit("/", 1)[1])
+            if not job:
+                self._json({"error": "unknown job"}, 404)
+            else:
+                self._json({"events": job["events"][-80:], "done": job["done"],
+                            "exit": job.get("exit")})
+        elif self.path == "/api/compose-meta":
+            self._json({"agents": list(_ALLOWED_AGENTS),
+                        "dirs": _known_dirs()})
         elif self.path == "/api/state":
             procs = _ps_procs()
             flagged, total = _processes(procs)
@@ -627,8 +797,38 @@ class Handler(BaseHTTPRequestHandler):
             self._reap()
         elif self.path == "/api/mcp":
             self._mcp_toggle()
+        elif self.path == "/api/send":
+            self._send()
         else:
             self.send_error(404)
+
+    def _send(self):
+        try:
+            body = self._read_body()
+        except Exception:
+            self._json({"error": "bad request"}, 400)
+            return
+        directory = body.get("dir", "")
+        agent = body.get("agent", "")
+        prompt = str(body.get("prompt", "")).strip()
+        session_id = body.get("session_id") or None
+        if not prompt:
+            self._json({"error": "empty prompt"}, 400)
+            return
+        err = _validate_send(directory, agent)
+        if err:
+            self._json({"error": err}, 403)
+            return
+        if session_id and not re.fullmatch(r"[\w-]+", session_id):
+            self._json({"error": "bad session id"}, 400)
+            return
+        _JOB_SEQ[0] += 1
+        job = {"events": [], "done": False, "started": time.time()}
+        _JOBS[str(_JOB_SEQ[0])] = job
+        threading.Thread(
+            target=_start_run,
+            args=(job, directory, agent, prompt, session_id), daemon=True).start()
+        self._json({"ok": True, "job": str(_JOB_SEQ[0])})
 
     def _read_body(self):
         n = int(self.headers.get("Content-Length", 0))

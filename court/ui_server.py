@@ -153,6 +153,11 @@ button:hover{border-color:var(--red);color:var(--red);background:rgba(248,81,73,
 .msg.assistant{border-left:3px solid var(--blue)}
 .msg .who{color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:.1em;
  margin-bottom:4px;font-weight:600}
+.repohead{font-size:10px;font-weight:700;letter-spacing:.16em;color:var(--primary);
+ margin:14px 6px 6px;display:flex;align-items:center;gap:8px}
+.repohead:first-child{margin-top:0}
+.repohead::after{content:"";flex:1;height:1px;background:rgba(255,179,0,.25)}
+
 .empty-note{color:var(--faint);text-align:center;padding:30px;font-size:12px}
 
 #composer{position:fixed;left:0;right:0;bottom:0;z-index:8;background:var(--surface);
@@ -195,35 +200,58 @@ async function poll(){try{S=await (await fetch('/api/state')).json();render()}ca
 function render(){
  const flagged=(S.processes||[]).length;
  document.getElementById('totals').innerHTML=
-  `<span class="chip">quests <b>${S.quests.length}</b></span>
-   <span class="chip">sessions <b>${S.sessions.length}</b></span>
+  `<span class="chip">sessions <b>${S.sessions.length}</b></span>
+   <span class="chip">worktrees <b>${S.worktrees.length}</b></span>
    <span class="chip rss">kilo RSS <b>${mb(S.proc_total_rss)}</b></span>`+
   (flagged?`<span class="chip" style="border-color:rgba(248,81,73,.4)"><b style="color:var(--red)">${flagged} flagged</b></span>`:'');
  document.getElementById('clock').textContent=new Date().toLocaleTimeString();
+ const TRUNKS=['main','castle','master','trunk'];
  const nav=document.getElementById('nav');
- const groups={};
- for(const q of S.quests){(groups[q.status||'OPEN']??=[]).push(q)}
- let h=`<div class="castle ${selWt===null?'sel':''}" onclick="pick(null)">
- <div class="name"><span class="dot"></span>CASTLE</div>
- <div class="sub">${esc(S.repo_name)} · trunk</div></div>`;
- for(const st of ${json.dumps(STATUS_ORDER)}){
-  if(!groups[st])continue;
-  h+=`<h2>${st} · ${groups[st].length}</h2>`;
-  for(const q of groups[st]){
-   const dirty=q.dirty?'<span class="badge">dirty</span>':'';
-   h+=`<div class="q" onclick="pick(${JSON.stringify(q.worktree||'').replace(/"/g,'&quot;')})">
-   <div class="row1"><span class="st ${esc(st)}">${st.slice(0,4)}</span>${esc(q.id)}${dirty}</div>
-   <div class="row2">${esc(q.title)}</div></div>`;
+ let h='';
+ for(const repo of S.repos){
+  const wts=repo.worktrees;
+  const trunk=wts.find(w=>w.branch&&TRUNKS.some(t=>w.branch.endsWith('/'+t)||w.branch===t));
+  const rname=repo.name.toUpperCase();
+  h+=`<div class="repohead">${rname}</div>`;
+  if(trunk){
+   h+=`<div class="castle ${selWt===trunk.path?'sel':''}" onclick="pick('${esc(trunk.path)}')">
+   <div class="name"><span class="dot"></span>${rname}</div>
+   <div class="sub">${esc(trunk.branch||'trunk')} · ${wts.length} worktree${wts.length===1?'':'s'}</div></div>`;
+  }
+  const wtreeByBranch={}; for(const w of wts){if(w.branch)wtreeByBranch[w.branch]=w}
+  const secs={};
+  for(const b of repo.branches){
+   const ns=b.includes('/')?b.split('/')[0]:'(root)';
+   if(TRUNKS.includes(b)||TRUNKS.some(t=>t===ns))continue;
+   (secs[ns]??=[]).push(b);
+  }
+  for(const ns of Object.keys(secs).sort((a,b)=>secs[b].length-secs[a].length)){
+   h+=`<h2>${esc(ns)} · ${secs[ns].length}</h2>`;
+   for(const b of secs[ns].slice(0,40)){
+    const w=wtreeByBranch[b];
+    const cls=w?(w.dirty?'<span class="badge">dirty</span>':''):'<span class="st PLANNED">no wt</span>';
+    h+=`<div class="q" onclick="pick(${JSON.stringify(w?w.path:b).replace(/"/g,'&quot;')})">
+    <div class="row1">${esc(b.includes('/')?b.slice(b.indexOf('/')+1):b)}${cls}</div>
+    <div class="row2">${esc(b)}</div></div>`;
+   }
+   if(secs[ns].length>40)h+=`<div class="q dim" style="cursor:default">… ${secs[ns].length-40} more</div>`;
   }
  }
  nav.innerHTML=h;
  const c=document.getElementById('content');
- if(selWt==='CASTLE'){selWt=S.repo_root}
- const wts=S.worktrees.filter(w=>selWt===null||w.path===selWt);
- c.innerHTML=(wts.map(w=>{
-  const sess=S.sessions.filter(s=>s.directory&&s.directory.startsWith(w.path));
-  return cardWt(w,sess);
- }).join('')||'<div class="card empty">select a section on the left</div>')+cardMcp();
+ const active=S.repos.filter(r=>selWt===null||r.root===selWt||r.worktrees.some(w=>w.path===selWt));
+ let cards='';
+ for(const repo of (selWt?active:S.repos)){
+  const wts=selWt?repo.worktrees.filter(w=>w.path===selWt):repo.worktrees;
+  if(!wts.length)continue;
+  if(selWt&&selWt.startsWith(repo.root)){cards+=wts.map(w=>{
+   const sess=S.sessions.filter(s=>s.directory&&s.directory.startsWith(w.path));
+   return cardWt(w,sess);}).join('');}
+  else if(!selWt){const trunk=wts.find(w=>w.branch&&TRUNKS.some(t=>w.branch.endsWith('/'+t)||w.branch===t));
+   if(trunk){const sess=S.sessions.filter(s=>s.directory&&s.directory.startsWith(trunk.path));
+    cards+=cardWt(trunk,sess);}}
+ }
+ c.innerHTML=(cards||'<div class="card empty">select a branch on the left</div>')+cardMcp();
 }
 function cardMcp(){
  const list=S.mcp||[];
@@ -391,10 +419,29 @@ def _quests():
     return quests
 
 
-def _worktrees():
+def _repos():
+    repos = [COURT_DIR]
+    pb = os.path.join(os.path.dirname(COURT_DIR), "pb-app")
+    if os.path.isdir(pb):
+        repos.append(pb)
+    return repos
+
+
+def _branches(repo):
     try:
         r = subprocess.run(
-            ["git", "-C", COURT_DIR, "worktree", "list", "--porcelain"],
+            ["git", "-C", repo, "branch", "--format=%(refname:short)"],
+            capture_output=True, text=True, timeout=5)
+        return sorted(b for b in r.stdout.splitlines() if b.strip())
+    except Exception:
+        return []
+
+
+def _worktrees(repo=None):
+    repo = repo or COURT_DIR
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo, "worktree", "list", "--porcelain"],
             capture_output=True, text=True, timeout=5)
     except Exception:
         return []
@@ -405,7 +452,7 @@ def _worktrees():
         elif ln.startswith("HEAD "):
             pass
         elif ln.startswith("branch "):
-            cur["branch"] = ln[7:]
+            cur["branch"] = ln[7:].replace("refs/heads/", "")
         elif ln.startswith("bare") or ln.startswith("detached"):
             cur.setdefault("branch", "(detached)")
         elif not ln and cur:
@@ -424,7 +471,7 @@ def _worktrees():
     return out
 
 
-def _sessions(limit=60):
+def _sessions(limit=200):
     if not os.path.exists(KILO_DB):
         return []
     try:
@@ -678,10 +725,11 @@ _JOB_SEQ = [0]
 
 
 def _known_dirs():
-    dirs = {COURT_DIR}
-    for w in _worktrees():
-        dirs.add(w["path"])
-    for s in _sessions(limit=60):
+    dirs = set(_repos())
+    for repo in _repos():
+        for w in _worktrees(repo):
+            dirs.add(w["path"])
+    for s in _sessions(limit=200):
         if s["directory"] and os.path.isdir(s["directory"]):
             dirs.add(s["directory"])
     return sorted(dirs)
@@ -776,8 +824,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json({
                 "repo_name": os.path.basename(COURT_DIR),
                 "repo_root": COURT_DIR,
+                "repos": [
+                    {"name": os.path.basename(p), "root": p,
+                     "branches": _branches(p), "worktrees": _worktrees(p)}
+                    for p in _repos()],
                 "quests": _quests(),
-                "worktrees": _worktrees(),
+                "worktrees": [w for p in _repos() for w in _worktrees(p)],
                 "sessions": _sessions(),
                 "mcp": _mcp_inventory(procs),
                 "processes": [

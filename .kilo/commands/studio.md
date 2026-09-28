@@ -26,16 +26,16 @@ Follow the Combined Studio Protocol (Q-2 — the deterministic formalization of 
    - Renders the artist brief to `.kilo/TASK_ARTIST.md` in the studio (easel table with charters + routes, merge disclosures, Volt Pro design-system rules, authority boundaries, per-quest sign-off flow, sync-back steps).
    - Records the studio routing in every merged Quest's Castle Ledger and sets `artist_model` (no Cog Ship stamp, no status change — the studio sits beside the pipeline).
 
-3. **Spawn the Court Artist Session (both paths stay documented)**:
-   - **Branch A — Agent Manager first**: `agent_manager` start (`mode: "worktree"`, `branchName: "artist/<ids>-ui-studio"`, `model`/`provider` from the command's `--json` task payload, `name: "<ids> Studio"`, prompt = rendered brief). Record the session on every studio Quest:
-     ```bash
-     python3 -m court.cli set-field <QID> artist_session_id <session_id>
-     ```
-   - **Branch B — CLI fallback** (AM extension unresponsive; argv-list per the double-eval rule):
+3. **Spawn the Court Artist Session (single unified path — prompting)**:
+   - Agent Manager prompting is RETIRED (2026-09-28): it defaults sessions to `steward` mode, lacks agent parameterization, and its launcher times out. Spawn via Kilo CLI instead:
      ```bash
      kilo run --agent artist --model "$(python3 -m court.cli model artist)" --dir .kilo/worktrees/artist-studio-<ids> "$(cat .kilo/worktrees/artist-studio-<ids>/.kilo/TASK_ARTIST.md)"
      ```
      or pass `--standup` to the studio command to spawn + record in one shot, or `cd .kilo/worktrees/artist-studio-<ids> && kilo` (default_agent already `artist`).
+   - Record the session on every studio Quest:
+     ```bash
+     python3 -m court.cli set-field <QID> artist_session_id <session_id>
+     ```
    - Present M'Lord the preview URLs and the per-quest route list. **Single-writer**: no Gatekeeper or second session in the studio worktree until royal sign-off.
 
 4. **During the Review (Royal Addendum + merge sanity-check)**:

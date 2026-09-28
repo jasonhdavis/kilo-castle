@@ -413,10 +413,14 @@ class TestStudioCommand(unittest.TestCase):
         data = json.loads(buf.getvalue())
         self.assertEqual(data["studio"], "q721")
         self.assertEqual(data["branch"], "artist/q721-ui-studio")
-        self.assertEqual(data["task"]["branchName"], "artist/q721-ui-studio")
+        # 2026-09-28: Agent Manager task payload replaced by the unified
+        # Kilo CLI spawn brief (argv list + interactive fallback).
+        self.assertEqual(data["spawn"]["argv"][:2], ["kilo", "run"])
+        self.assertIn("--agent", data["spawn"]["argv"])
+        self.assertIn("artist", data["spawn"]["argv"])
         from court import config as _cfg
         self.assertEqual(data["model"], _cfg.get_model("artist"))
-        self.assertIn("prompt", data["task"])
+        self.assertIn("prompt", data)
         self.assertEqual(data["freshness"]["age_hours"], 0.36)
         self.assertIn("conflict_policy", data)
 
@@ -590,12 +594,16 @@ class TestStudioSyncBack(unittest.TestCase):
 
 
 class TestStudioDocsAndSpawnPaths(unittest.TestCase):
-    def test_command_docs_present_in_both_layouts_and_document_both_spawn_paths(self):
+    def test_command_docs_present_in_both_layouts_and_document_unified_spawn_path(self):
         for p in (Path("court/commands/studio.md"), Path(".kilo/commands/studio.md")):
             self.assertTrue(p.exists(), p)
             text = p.read_text()
-            self.assertIn("agent_manager", text)  # Branch A (AM-first)
-            self.assertIn("kilo run --agent artist", text)  # Branch B (CLI fallback)
+            # 2026-09-28: spawn unified through prompting — Kilo CLI is the
+            # single documented path; Agent Manager prompting is retired.
+            self.assertIn("kilo run --agent artist", text)
+            self.assertIn("--standup", text)
+            self.assertIn("Agent Manager prompting is RETIRED", text)
+            self.assertNotIn("agent_manager", text)
             self.assertIn("--sync-back", text)
             self.assertIn("branch-wins", text)
             self.assertIn("union", text)

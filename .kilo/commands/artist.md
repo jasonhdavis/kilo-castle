@@ -22,25 +22,18 @@ Follow the Court Artist Protocol:
      - Renders `.court/templates/court_artist_prompt.md` with live URLs, design system instructions, and authority boundaries.
      - Logs the summons in the Quest's Castle Ledger and records `artist_model`.
 
-3. **Check or Spawn Dedicated Court Artist Session**:
-   - Query `agent_manager` (`action: "list"`).
-   - If `artist_session_id` is already recorded on the Quest and is active in `agent_manager`:
-     - Prompt that existing session with M'Lord's directive via `agent_manager` `action: "prompt"`, `sessionID: "<artist_session_id>"`.
-   - If no active session exists:
-     - Spawn a **brand-new, dedicated** Agent Manager session bound to the Quest's existing branch:
-       - Call `agent_manager` with:
-         - `mode: "worktree"`
-         - `tasks`:
-           - `name`: `"<short_id> Court Artist"`
-           - `branchName`: `"<branch>"`
-           - `model`: `"<model>"`
-           - `provider`: `"<provider>"`
-           - `prompt`: `"<rendered_prompt>"`
-     - Record the new session ID on the Quest:
-       ```bash
-       python3 -m court.cli set-field <quest_id> artist_session_id <session_id>
-       python3 -m court.cli set-field <quest_id> artist_model "<model>"
-       ```
+3. **Check or Spawn Dedicated Court Artist Session (single unified path — prompting)**:
+   - Agent Manager prompting is RETIRED (2026-09-28): it defaults sessions to `steward` mode, lacks agent parameterization, and its launcher times out (the Q602 studio confusion). Spawn via Kilo CLI:
+     ```bash
+     kilo run --agent artist --model "<model>" --dir <worktree> "$(cat <worktree>/.kilo/TASK_ARTIST.md)"
+     ```
+     (the `court artist` command writes the rendered brief to `<worktree>/.kilo/TASK_ARTIST.md` and its `--json` output carries the same argv list under `spawn`), or interactive: `cd <worktree> && kilo` (default_agent already `artist`).
+   - Reuse first: if `artist_session_id` is already recorded on the Quest, resume that session (e.g. `kilo run --agent artist --session <artist_session_id> --dir <worktree> "<directive>"` if supported, or work interactively in the same worktree session) instead of spawning a duplicate.
+   - Record the session ID on the Quest:
+     ```bash
+     python3 -m court.cli set-field <quest_id> artist_session_id <session_id>
+     python3 -m court.cli set-field <quest_id> artist_model "<model>"
+     ```
 
 4. **Present the Royal Studio Easel to M'Lord**:
    - Report the active Court Artist session name and ID.
@@ -54,5 +47,5 @@ Follow the Court Artist Protocol:
    - If several UI-review-pending Quests are stacked up, do NOT spawn one artist session per Quest — merge them into ONE reviewed state with ONE artist:
      - `/studio <QID1>,<QID2>,...` (`court studio`) — the **deterministic Combined Studio** (Q-2): cuts an `artist-studio-<ids>` worktree from the castle tip, merges the N quest branches with the established conflict policy (charter paperwork → branch-wins; genuine code overlap → disclosed union), boots the freshness-gated runserver, and records the studio + session in the ledger. Per-quest sync-back after sign-off; collection stays with the Steward.
      - `/atelier <QID1>,<QID2>,...` (`court atelier`) — the **pre-collect Cog Ship convoy** variant: stamps the convoy and advances the quests to GATE; the Gatekeeper promotes the convoy branch into castle after the unified suite.
-   - The spawn protocol above (Branch A: Agent Manager; Branch B: CLI fallback) applies unchanged to the studio/atelier artist session — record its session id on every studio/atelier quest.
+   - The spawn protocol above (single unified path: Kilo CLI prompting) applies unchanged to the studio/atelier artist session — record its session id on every studio/atelier quest.
    - The per-Quest `/artist` flow above remains the right tool for a single Quest.

@@ -191,6 +191,12 @@ def test_standard_collect_auto_audits_hotfix(tmp_path, monkeypatch, capsys):
     quest.set_section("Tribute Rendered", "### 1. Ballad\nFixed signature check.\n\n### 2. Tribute\n- webhook.py\n\n### 3. Tally\n- test ok\n\n### 4. Penance\nNone\n\n### 5. Audience\nNone\n\n### 6. Humble Opinion\nShip\n")
     store.save(quest, court_root=tmp_path / ".court", auto_commit=False)
 
+    # Deferred rebase doctrine: TRIBUTE_READY entry requires zero drift
+    # (the tribute save above autocommitted on castle; branches diverged via
+    # the webhook.py commit, so this is a true merge).
+    subprocess.run(["git", "-C", str(wt), "merge", "castle", "-m", "merge castle (deferred rebase)"],
+                   check=True, capture_output=True)
+
     # Advance to TRIBUTE_READY without manual Master of Coin audit
     main(["advance", quest_id, "TRIBUTE_READY", "--note", "Tribute rendered"])
     capsys.readouterr()

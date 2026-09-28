@@ -21,8 +21,12 @@ Follow the Royal UI Atelier Protocol:
    - Configures the worktree for the `artist` agent (single-writer) and starts its runserver.
    - Renders `.court/templates/court_artist_convoy_prompt.md` (Royal Addendum protocol, single-writer rule, per-quest routes) and records `artist_model` on every packed quest.
 
-3. **Spawn the Court Artist Session in the Convoy Worktree**:
-   - Spawn a dedicated session bound to the convoy branch `the-gatehouse/<cogship_id>` (Agent Manager `mode: "worktree"`, `branchName: "the-gatehouse/<cogship_id>"`, using the `--json` task payload — or `cd .kilo/worktrees/the-gatehouse-<cogship_id> && kilo`, where `default_agent` is already `artist`).
+3. **Spawn the Court Artist Session in the Convoy Worktree (single unified path — prompting)**:
+   - Agent Manager prompting is RETIRED (2026-09-28). Spawn via Kilo CLI bound to the convoy branch `the-gatehouse/<cogship_id>` (the command writes the rendered brief to `.kilo/worktrees/the-gatehouse-<cogship_id>/.kilo/TASK_ARTIST.md`; its `--json` output carries the same argv list under `spawn`):
+     ```bash
+     kilo run --agent artist --model "$(python3 -m court.cli model artist)" --dir .kilo/worktrees/the-gatehouse-<cogship_id> "$(cat .kilo/worktrees/the-gatehouse-<cogship_id>/.kilo/TASK_ARTIST.md)"
+     ```
+     or `cd .kilo/worktrees/the-gatehouse-<cogship_id> && kilo`, where `default_agent` is already `artist`.
    - Record the session on each packed quest:
      ```bash
      python3 -m court.cli set-field <QID> artist_session_id <session_id>

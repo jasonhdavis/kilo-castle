@@ -195,6 +195,150 @@ def ensure_worktree_browser_mcp(worktree_path: Path, port: int) -> bool:
 canonical_model_id = config.canonical_model_id
 
 
+SESSION_FRESH_MS = 30 * 60 * 1000  # 30 min: a session updated within this window is presumed live
+
+
+def latest_session_activity_ms(worktree_path: Path) -> Optional[int]:
+    """Return the max session time_updated (epoch ms) recorded in kilo.db for a
+    worktree, or None when the db is missing/unreadable or the worktree has no
+    sessions."""
+    db_path = Path.home() / ".local" / "share" / "kilo" / "kilo.db"
+    wt_str = str(worktree_path.resolve())
+    if not db_path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=1.0)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT MAX(time_updated) FROM session WHERE directory = ?",
+            (wt_str,),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            return int(row[0])
+    except Exception:
+        pass
+    return None
+
+
+def session_is_fresh(worktree_path: Path, max_age_ms: int = SESSION_FRESH_MS) -> bool:
+    """True when the worktree has a kilo session updated within max_age_ms."""
+    act = latest_session_activity_ms(worktree_path)
+    if act is None:
+        return False
+    return (time.time() * 1000 - act) <= max_age_ms
+
+
+def gatehouse_convoy_is_live(cogship_id: str, repo_root: Optional[Path] = None) -> tuple[bool, str]:
+    """Mechanical version of the 'grep cogship_id before standing up a
+    Gatekeeper' ritual (2026-09-09 lesson): a convoy is live when its ephemeral
+    gatehouse worktree exists AND has a freshly-updated kilo session (an active
+    Gatekeeper), or when the convoy branch exists ahead of castle."""
+    norm = store.normalize_cogship_id(cogship_id)
+    if not norm:
+        return False, "unnormalized cogship id"
+    root = repo_root or git_ops.get_repo_root()
+    wt = root / ".kilo" / "worktrees" / f"the-gatehouse-{norm}"
+    if wt.is_dir():
+        if session_is_fresh(wt):
+            return True, f"gatehouse worktree {wt} has a session updated in the last 30 min"
+        return False, f"gatehouse worktree {wt} exists but has no fresh session (stale convoy)"
+    res = git_ops._run(
+        ["git", "rev-parse", "--verify", "--quiet", f"the-gatehouse/{norm}^{{commit}}"], root
+    )
+    if res.get("ok") and (res.get("stdout") or "").strip():
+        return False, f"branch the-gatehouse/{norm} exists but no gatehouse worktree"
+    return False, "no gatehouse worktree or branch found"
+
+
+_OP_LOCK_DIR = Path("/tmp") / "kilo-castle-op-locks"
+
+
+def _op_lock_path(name: str) -> Path:
+    """Repo-scoped lock path: two different checkouts' courts must not share
+    one lock, two windows on the same repo must."""
+    import hashlib
+    try:
+        repo = str(git_ops.get_repo_root())
+    except Exception:
+        repo = os.environ.get("COURT_DIR") or os.getcwd()
+    tag = hashlib.sha1(repo.encode("utf-8")).hexdigest()[:10]
+    return _OP_LOCK_DIR / f"{name}-{tag}.lock"
+
+
+def acquire_op_lock(name: str, stale_seconds: int = 900) -> bool:
+    """Advisory cross-window single-writer lock (Class 3: two Steward windows
+    double-running collect/ship within seconds). Held via O_EXCL lockfile for
+    the remainder of the process lifetime — the OS releases it on exit, so no
+    cleanup path is needed. Re-acquiring within the same process is idempotent
+    (sequential runs in one process are legitimate); stale locks (holder
+    crashed) are stolen after stale_seconds."""
+    _OP_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = _op_lock_path(name)
+    for _attempt in range(2):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            # Lock present: same process (idempotent), live holder, or stale?
+            try:
+                holder = lock_path.read_text().strip()
+                holder_pid = int(holder or "0")
+            except (OSError, ValueError):
+                holder, holder_pid = "", 0
+            if holder_pid == os.getpid():
+                # Re-entrant within this process: touch and succeed.
+                try:
+                    os.utime(lock_path, None)
+                except OSError:
+                    pass
+                return True
+            if holder_pid > 0:
+                try:
+                    os.kill(holder_pid, 0)
+                    return False  # holder alive; genuinely concurrent
+                except ProcessLookupError:
+                    pass  # holder died: steal, regardless of age
+                except PermissionError:
+                    return False  # alive under another user
+                except OSError:
+                    return False
+            else:
+                # Unparseable pid: fall back to the age grace before stealing.
+                try:
+                    age = time.time() - lock_path.stat().st_mtime
+                except OSError:
+                    continue  # vanished between attempts; retry create
+                if age < stale_seconds:
+                    return False
+            try:
+                lock_path.unlink()
+            except OSError:
+                return False
+            continue  # retry the exclusive create
+        except OSError:
+            return False
+        with os.fdopen(fd, "w") as f:
+            f.write(str(os.getpid()))
+        return True
+    return False
+
+
+def require_op_lock(name: str) -> None:
+    if not acquire_op_lock(name):
+        try:
+            holder = _op_lock_path(name).read_text().strip()
+        except OSError:
+            holder = "?"
+        print(
+            f"ERROR: another `{name}` run is already in progress (holder pid {holder}). "
+            f"Concurrent operators double-run convoys (cogship-040/041, cogship-247/248, "
+            f"the v1332 double-ship). Wait for it to finish instead of racing it.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def query_kilo_session_ids(worktree_path: Path) -> set[str]:
     """Inspect local kilo.db and return all session IDs recorded for a worktree."""
     db_path = Path.home() / ".local" / "share" / "kilo" / "kilo.db"
@@ -341,6 +485,7 @@ def standup_kilo_session(
                     "--model", qual_model,
                     "--dir", str(worktree_path),
                     "--title", title,
+                    "--auto",
                     prompt,
                 ]
                 proc = subprocess.Popen(
@@ -354,7 +499,39 @@ def standup_kilo_session(
             finally:
                 log_out.close()
 
-            session_id = query_latest_kilo_session_id(worktree_path, timeout_seconds=2.5, exclude_ids=pre_existing) or f"kilo-{agent}-{proc.pid}"
+            session_id = query_latest_kilo_session_id(worktree_path, timeout_seconds=2.5, exclude_ids=pre_existing)
+            if session_id:
+                return {
+                    "ok": True,
+                    "mode": "cli",
+                    "session_id": session_id,
+                    "pid": proc.pid,
+                    "message": f"Stood up session {session_id} (pid {proc.pid}) via Kilo CLI",
+                    "log": str(log_file),
+                }
+            # kilo-coin-36177 class (Q699): the detached process died instantly
+            # and the PID-fallback id recorded a session that never existed.
+            # poll() -> int is a real exit code; anything else (None/MagicMock
+            # in tests) is treated as alive.
+            poll_res = proc.poll()
+            if isinstance(poll_res, int):
+                tail = ""
+                try:
+                    tail = "\n".join(log_file.read_text(encoding="utf-8").splitlines()[-8:])
+                except Exception:
+                    pass
+                return {
+                    "ok": False,
+                    "mode": "dead-spawn",
+                    "session_id": "",
+                    "pid": proc.pid,
+                    "message": (
+                        f"{agent} process exited immediately (exit {poll_res}); no session was created. "
+                        f"Log tail ({log_file}):\n{tail}"
+                    ),
+                    "log": str(log_file),
+                }
+            session_id = f"kilo-{agent}-{proc.pid}"
             return {
                 "ok": True,
                 "mode": "cli",
@@ -682,7 +859,7 @@ def cmd_sync(args):
         b_md = _git_out(repo, "show", f"{branch}:{rel}")
         b_events = _git_out(repo, "show", f"{branch}:{rel_events}")
         c_md = qpath.read_text(encoding="utf-8")
-        c_events_p = qpath.parent / rel_events
+        c_events_p = qpath.with_suffix(".events.jsonl")
         c_events = c_events_p.read_text(encoding="utf-8") if c_events_p.exists() else ""
 
         if b_md == c_md and b_events == c_events:
@@ -711,8 +888,8 @@ def cmd_sync(args):
         qpath.write_text(b_md, encoding="utf-8")
         staged.append(qpath)
         if b_events:
-            (qpath.parent / rel_events).write_text(b_events, encoding="utf-8")
-            staged.append(qpath.parent / rel_events)
+            qpath.with_suffix(".events.jsonl").write_text(b_events, encoding="utf-8")
+            staged.append(qpath.with_suffix(".events.jsonl"))
         elif c_events:
             print(f"      note: branch carries no events file; kept the main checkout's events")
         synced.append(qpath.stem)
@@ -1421,6 +1598,90 @@ def cmd_advance(args):
             else:
                 quest.set_status(new_status, args.note or "")
 
+        elif new_status == "TRIBUTE_READY":
+            # Hardened TRIBUTE_READY guard (Q277/Q696 class): the most-used
+            # transition ran on a bare else — no tribute-completeness, no
+            # unchecked-checklist, no base-drift check — so quests like Q277
+            # self-advanced with an empty Tribute Rendered, unchecked Expected
+            # Tribute boxes, and 187 commits of drift. GATE and READY_TO_RAZE
+            # already carry hardened, --force-marked guards; TRIBUTE_READY now
+            # matches them. ward.audit_quest only flags tribute gaps once the
+            # quest is *already* TRIBUTE_READY+, so completeness is checked
+            # here explicitly with ward.check_tribute_sections (status-free).
+            tribute_present, _present_secs, missing_secs, _extracted = ward.check_tribute_sections(quest)
+            blockers: list[str] = []
+            if not tribute_present:
+                blockers.append(
+                    "Tribute Rendered is empty or a placeholder — render the required "
+                    "sections (Ballad, Tribute, Tally, Penance, Audience, Opinion; scouts: "
+                    "Survey, Map, Dangers, Tribute, Plot) before advancing."
+                )
+            elif missing_secs:
+                blockers.append(
+                    f"Incomplete tribute: missing required subsection(s): {', '.join(missing_secs)}."
+                )
+
+            checklist = ward.parse_markdown_checklist(quest.body_sections.get("Expected Tribute", ""))
+            # Hotfix fast-track exemption: patchwork quests carry an advisory
+            # checklist and promote via inline verification (the hotfix collect
+            # auto-advance never checked it either); the hard checklist gate
+            # would block the exact flow the hotfix doctrine prescribes.
+            is_hotfix = bool(getattr(quest, "is_hotfix", False)) or "hotfix" in (quest.tags or "").lower()
+            if (
+                not is_hotfix
+                and checklist.get("total", 0) > 0
+                and checklist.get("unchecked", 0) > 0
+            ):
+                blockers.append(
+                    f"Expected Tribute has {checklist['unchecked']} unchecked item(s) of "
+                    f"{checklist['total']} — complete the checklist or mark cancelled [~] before advancing."
+                )
+
+            wt_for_guard = quest.worktree if (quest.worktree and Path(quest.worktree).is_dir()) else None
+            base_branch = getattr(args, "base", None) or "castle"
+            if wt_for_guard:
+                git_stat = git_ops.get_worktree_git_status(Path(wt_for_guard), base=base_branch)
+                if git_stat.get("dirty"):
+                    blockers.append(
+                        "Worktree has uncommitted files — stage and commit deliverables "
+                        "(Gate 2) before advancing."
+                    )
+                behind = git_stat.get("behind")
+                if behind is not None and behind > 0:
+                    blockers.append(
+                        f"{behind} commit(s) behind {base_branch} — run the deferred rebase "
+                        f"`git merge {base_branch}` (zero drift) before advancing."
+                    )
+                actual_branch = (git_stat.get("branch") or "").replace("refs/heads/", "")
+                quest_branch = (quest.branch or "").replace("refs/heads/", "")
+                if actual_branch and quest_branch and actual_branch != quest_branch:
+                    blockers.append(
+                        f"Worktree is on branch '{actual_branch}' but frontmatter says "
+                        f"'{quest_branch}' — reconcile before advancing."
+                    )
+            elif not wt_for_guard and quest.kind not in ("epic", "scout"):
+                blockers.append(
+                    "Quest has no resolvable worktree — a code-bearing quest cannot render "
+                    "tribute without one."
+                )
+
+            if blockers and not force:
+                blocker_lines = "\n".join(f"  🔴 {b}" for b in blockers)
+                print(
+                    f"ERROR: Cannot advance {quest.id} to TRIBUTE_READY: {len(blockers)} blocker(s).\n"
+                    f"{blocker_lines}\n\n"
+                    f"To bypass this check, use: python3 -m court.cli advance {quest.id} TRIBUTE_READY --force --note \"<reason>\"",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            elif blockers:
+                forced_note = (
+                    f"(FORCED - {len(blockers)} TRIBUTE-READINESS BLOCKER(S): {'; '.join(blockers)}) {args.note}"
+                ).strip()
+                quest.set_status(new_status, forced_note)
+            else:
+                quest.set_status(new_status, args.note or "")
+
         elif new_status == "READY_TO_RAZE" and quest.kind == "epic":
             # Epic Closing Pathway (Q135): an Epic owns no code of its own —
             # all real changes live in its child Quests. Once every child is
@@ -2009,7 +2270,11 @@ def cmd_dispatch(args):
     quest.updated_at = now_iso()
 
     entered_working = False
-    if quest.status in ("OPEN", "PLANNED"):
+    if quest.status in ("OPEN", "PLANNED", "CHARTERED"):
+        # Q695 (2026-09-28): CHARTERED quests were skipped here ("already
+        # [CHARTERED] — transitions skipped"), leaving a freshly dispatched
+        # serf toiling under a stale status. CHARTERED is dispatchable like
+        # PLANNED — route it through the same DISPATCHED -> WORKING path.
         quest.set_status("DISPATCHED", f"{role_label} dispatched (`court dispatch`)")
         quest.set_status("WORKING", f"{role_label} toiling in worktree (`court dispatch`)")
         entered_working = True
@@ -2161,7 +2426,7 @@ def cmd_patchwork(args):
             print(f"🪙 Inline Master of Coin audit recorded for {quest.id}.")
 
         if quest.status != "GATE":
-            cogship_id = store.stamp_cogship([quest], cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit)
+            cogship_id = store.stamp_cogship([quest], cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit, force=getattr(args, "force_stamp", False))
             quest.set_status("GATE", f"Hotfix packed in {cogship_id} for solo gatehouse promotion")
             store.save(quest, auto_commit=auto_commit, commit_msg=f"court: advance {quest.id} to GATE in {cogship_id}")
             print(f"🛡️  Advanced {quest.id} to GATE in {cogship_id}.")
@@ -2206,7 +2471,7 @@ def cmd_patchwork(args):
                 sys.exit(1)
 
         if not quest.cogship_id:
-            cogship_id = store.stamp_cogship([quest], cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit)
+            cogship_id = store.stamp_cogship([quest], cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit, force=getattr(args, "force_stamp", False))
         if not quest.body_sections.get("Master of Coin's Audit", "").strip():
             quest.set_section("Master of Coin's Audit", "### Master of Coin Audit (Hotfix Fast-Track)\n- **Verdict**: PASS (Hotfix inline verified)\n- **Commutation**: None required\n- **UI Review**: None required\n")
         quest.set_status("READY_TO_RAZE", f"Hotfix promoted directly into {base_branch}")
@@ -2294,6 +2559,7 @@ def cmd_coin(args):
         "--model", qual_model,
         "--dir", str(wt),
         "--title", title,
+        "--auto",
         rendered_prompt,
     ]
 
@@ -2309,6 +2575,19 @@ def cmd_coin(args):
             quest.master_of_coin_session_id = session_id
             quest.master_of_coin_model = model
             store.save(quest, auto_commit=auto_commit, commit_msg=f"court: record MoC session {session_id} for {quest.id}")
+        # Q699 class: kilo-coin-36177 died with an empty audit on both copies
+        # while the dispatch printed success. A completed run that produced no
+        # verdict is a failed audit, not a success.
+        fresh = store.load(quest.id)
+        audit_body = fresh.body_sections.get("Master of Coin's Audit", "").strip()
+        if res.returncode == 0 and (not audit_body or ward.is_placeholder(audit_body)):
+            print(
+                f"ERROR: Master of Coin run exited 0 but produced no verdict — "
+                f"'Master of Coin's Audit' is empty on {quest.id}. Re-dispatch "
+                f"(`court coin {quest.id}`) and check the log: tail -40 {log_file}",
+                file=sys.stderr,
+            )
+            return 1
         return res.returncode
     else:
         pre_existing = query_kilo_session_ids(wt)
@@ -2326,7 +2605,21 @@ def cmd_coin(args):
             )
         finally:
             log_out.close()
-        session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5, exclude_ids=pre_existing) or f"kilo-coin-{proc.pid}"
+        session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5, exclude_ids=pre_existing)
+        # kilo-coin-36177 class (Q699): verify the detached process actually
+        # survived spawn before recording a session id. A PID-fallback id for
+        # an instantly-dead process is a session that never existed — the
+        # empty '## Master of Coin's Audit' both copies showed. A MagicMock
+        # poll() (tests) is treated as alive.
+        poll_res = proc.poll() if hasattr(proc, "poll") else None
+        if session_id is None and isinstance(poll_res, int):
+            print(
+                f"ERROR: Master of Coin process exited immediately (exit {poll_res}); no session was created. "
+                f"Log tail: tail -20 {log_file}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        session_id = session_id or f"kilo-coin-{proc.pid}"
         quest.master_of_coin_session_id = session_id
         quest.master_of_coin_model = model
         store.save(quest, auto_commit=auto_commit, commit_msg=f"court: dispatch MoC {session_id} for {quest.id}")
@@ -2397,6 +2690,7 @@ def cmd_goad(args):
         "--model", qual_model,
         "--dir", str(wt),
         "--title", title,
+        "--auto",
         rendered_prompt,
     ]
 
@@ -2416,7 +2710,18 @@ def cmd_goad(args):
         )
     finally:
         log_out.close()
-    session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5, exclude_ids=pre_existing) or f"kilo-{agent_role}-{proc.pid}"
+    session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5, exclude_ids=pre_existing)
+    # Same instant-death verification as cmd_coin (Q699 class): refuse to
+    # record a session id for a process that died on spawn.
+    poll_res = proc.poll() if hasattr(proc, "poll") else None
+    if session_id is None and isinstance(poll_res, int):
+        print(
+            f"ERROR: Goaded {role_label} process exited immediately (exit {poll_res}); no session was created. "
+            f"Log tail: tail -20 {log_file}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    session_id = session_id or f"kilo-{agent_role}-{proc.pid}"
     quest.serf_session_id = session_id
     store.save(quest, auto_commit=auto_commit, commit_msg=f"court: goad {role_label} session {session_id} for {quest.id}")
     print(f"⚡ Goaded {role_label} for {quest.id}:")
@@ -2626,12 +2931,27 @@ def cmd_artist(args):
     store.save(quest, auto_commit=auto_commit, commit_msg=f"court: summon artist for {quest.id}")
 
     short_id = quest.id.split("-")[0]
-    task_desc = {
-        "name": f"{short_id} Court Artist",
-        "branchName": quest.branch,
+    # Single unified spawn path (2026-09-28): Agent Manager prompting is
+    # retired — headless Kilo CLI sessions are the one documented way to
+    # launch the Court Artist. The brief is written to the worktree so the
+    # printed `kilo run` line and the JSON spawn payload carry it verbatim.
+    brief_file = wt / ".kilo" / "TASK_ARTIST.md"
+    try:
+        brief_file.parent.mkdir(parents=True, exist_ok=True)
+        brief_file.write_text(prompt, encoding="utf-8")
+    except Exception:
+        brief_file = None
+    spawn_desc = {
+        "argv": [
+            "kilo", "run",
+            "--agent", "artist",
+            "--model", model,
+            "--dir", str(wt),
+            *([f"$(cat {brief_file})"] if brief_file else [prompt]),
+        ],
+        "interactive": f"cd {wt} && kilo   # default_agent already set to artist",
         "model": model,
         "provider": provider,
-        "prompt": prompt,
     }
 
     if getattr(args, "prompt_only", False):
@@ -2650,7 +2970,7 @@ def cmd_artist(args):
             "provider": provider,
             "routes": routes,
             "prompt": prompt,
-            "task": task_desc,
+            "spawn": spawn_desc,
         }
         print(json.dumps(out, indent=2))
         return
@@ -2671,9 +2991,15 @@ def cmd_artist(args):
         print(f"  • {url_line}")
     print()
     print("Next Steps for M'Lord & Steward:")
-    print(f"  1. Launch the Court Artist session in Agent Manager:")
-    print(f"     agent_manager start (mode: 'worktree', branchName: '{quest.branch}', model: '{model}', name: '{short_id} Court Artist')")
-    print(f"     (Slash command: `/artist {quest.id}` spawns this automatically).")
+    print("  1. Launch the Court Artist session via Kilo CLI (the single unified path —")
+    print("     Agent Manager prompting is retired; it defaults to steward mode and lacks")
+    print("     agent parameterization):")
+    if brief_file:
+        print(f"     kilo run --agent artist --model \"{model}\" --dir {wt} \"$(cat {brief_file})\"")
+    else:
+        print(f"     kilo run --agent artist --model \"{model}\" --dir {wt} \"<the brief>\"")
+    print(f"     (or interactive: cd {wt} && kilo — default_agent already set to artist).")
+    print(f"     (Slash command: `/artist {quest.id}` drives this flow.)")
     print(f"  2. Open the live preview in your browser: {runserver_url}")
     print("  3. Direct the Court Artist on layout, typography, colors, and design system compliance.")
     print("  4. The Court Artist will edit templates live and prompt you to refresh.")
@@ -3238,7 +3564,47 @@ def cmd_collect(args):
         print("(no Master-of-Coin-approved Quests ready to pack into a Cog Ship)")
         return
 
-    cogship_id = store.stamp_cogship(accepted, cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit)
+    # Single-writer serialization for the convoy-minting tail: stamp + standup
+    # is where double-running operators minted duplicate convoys and duplicate
+    # Gatekeepers. The lock is advisory and auto-releases on process exit.
+    require_op_lock("collect")
+
+    # cogship-040/041 + cogship-247/248 guard: quests already stamped on a
+    # prior convoy are re-packed only when that convoy is provably dead. A
+    # live prior convoy (fresh Gatekeeper session in its gatehouse worktree)
+    # means another operator's integration is in flight — skip, don't race it.
+    requested_cogship = getattr(args, "cogship", None)
+    live_skipped: list[tuple[str, str]] = []
+    repackable: list = []
+    for q in accepted:
+        prior = store.normalize_cogship_id(q.cogship_id or "")
+        if not prior or prior == store.normalize_cogship_id(requested_cogship or ""):
+            repackable.append(q)
+            continue
+        is_live, why = gatehouse_convoy_is_live(prior, repo_root=git_ops.get_repo_root())
+        if is_live:
+            live_skipped.append((q.id, why))
+        else:
+            repackable.append(q)
+    for qid, why in live_skipped:
+        print(f"⏭️  Skipping {qid}: prior convoy still live — {why}")
+    if live_skipped and not repackable:
+        print("(all candidates belong to live prior convoys — nothing packed)")
+        return
+    # force=True is required whenever any candidate carries a prior stamp from
+    # a dead convoy (deliberate re-pack); fresh quests take the guarded path.
+    repack_force = any(q.cogship_id for q in repackable)
+    try:
+        cogship_id = store.stamp_cogship(
+            repackable,
+            cogship_id=requested_cogship,
+            auto_commit=auto_commit,
+            force=repack_force,
+        )
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    accepted = repackable
     print(f"🚢 Stamped {len(accepted)} Quest(s) onto {cogship_id}.")
 
     for quest in accepted:
@@ -3305,7 +3671,12 @@ def cmd_collect(args):
         if kilo_bin:
             if len(accepted) == 1:
                 solo = accepted[0]
-                if solo.worktree and Path(solo.worktree).is_dir():
+                if solo.gatekeeper_session_id:
+                    # cogship-247/248: a re-run collect --standup spawned a
+                    # duplicate Gatekeeper beside the live one. One convoy,
+                    # one Gatekeeper — resume the recorded session instead.
+                    print(f"⏭️  Skipping Gatekeeper standup: {solo.id} already records Gatekeeper session {solo.gatekeeper_session_id}. Resume it instead of spawning a duplicate.")
+                elif solo.worktree and Path(solo.worktree).is_dir():
                     wt = Path(solo.worktree)
                     setup_worktree_agent_config(wt, "gatekeeper")
                     prompt = f"Act as Gatekeeper for {solo.id} on {cogship_id}: merge castle in, run test suite, and on clean pass merge into castle."
@@ -3330,6 +3701,28 @@ def cmd_collect(args):
                 wt_name = f"the-gatehouse-{cogship_id}"
                 branch_name = f"the-gatehouse/{cogship_id}"
                 wt_path = root / ".kilo" / "worktrees" / wt_name
+                if wt_path.is_dir():
+                    # The convoy worktree already exists: never blind-create or
+                    # re-stand over it. A fresh session in it means a Gatekeeper
+                    # is already integrating this convoy (cogship-247/248
+                    # duplicate-Gatekeeper incident); a stale one means an
+                    # earlier convoy died mid-integration and must be resumed
+                    # or torn down by hand, not silently re-created.
+                    if session_is_fresh(wt_path):
+                        print(
+                            f"ERROR: Gatehouse worktree {wt_path} already has a session updated in the "
+                            f"last 30 min — a Gatekeeper is already integrating {cogship_id}. "
+                            f"Do not stand up a duplicate; resume that session instead.",
+                            file=sys.stderr,
+                        )
+                        sys.exit(1)
+                    print(
+                        f"ERROR: Gatehouse worktree {wt_path} already exists (no fresh session — a prior "
+                        f"convoy likely died mid-integration). Refusing to re-create it: resume the "
+                        f"existing worktree by hand or tear it down first: git -C {wt_path} status",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
                 try:
                     # Timeouts are mandatory here: `kilo worktree create` used to
                     # be the only unbounded subprocess in court, so a prompt/hang
@@ -3845,7 +4238,10 @@ def cmd_atelier(args):
               f"per-Quest review is `/artist {accepted[0].id}` (no convoy worktree needed). "
               "Proceeding with the atelier anyway for the Royal Addendum protocol.")
 
-    cogship_id = store.stamp_cogship(accepted, cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit)
+    # Atelier is a deliberate single-operator batch flow (M'Lord drives it
+    # interactively); re-rolls of already-stamped UI quests are intentional,
+    # so the duplicate-convoy backstop is overridden here.
+    cogship_id = store.stamp_cogship(accepted, cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit, force=True)
     print(f"🎨 Stamped {len(accepted)} UI Quest(s) onto {cogship_id} for the Royal Atelier (pre-integration review).")
 
     for quest in accepted:
@@ -3954,6 +4350,16 @@ def cmd_atelier(args):
         quest.log_ledger("GATE", "GATE", note)
     store.save_many(accepted, f"court: record atelier routing for {cogship_id}", auto_commit=auto_commit)
 
+    # Write the artist brief into the convoy worktree so the single unified
+    # spawn path (`kilo run ... "$(cat ...)"`) carries it verbatim.
+    atelier_brief_path = wt_path / ".kilo" / "TASK_ARTIST.md"
+    try:
+        atelier_brief_path.parent.mkdir(parents=True, exist_ok=True)
+        atelier_brief_path.write_text(prompt, encoding="utf-8")
+    except Exception as e:
+        atelier_brief_path = None
+        print(f"⚠️  could not write {atelier_brief_path} ({e}); use --prompt-only for the brief")
+
     if getattr(args, "prompt_only", False):
         print(prompt)
         return
@@ -3973,12 +4379,17 @@ def cmd_atelier(args):
             "model": model,
             "provider": provider,
             "prompt": prompt,
-            "task": {
-                "name": f"{cogship_id} Atelier",
-                "branchName": branch_name,
+            "spawn": {
+                "argv": [
+                    "kilo", "run",
+                    "--agent", "artist",
+                    "--model", model,
+                    "--dir", str(wt_path),
+                    *([f"$(cat {atelier_brief_path})"] if atelier_brief_path else [prompt]),
+                ],
+                "interactive": f"cd {wt_path} && kilo   # default_agent already set to artist",
                 "model": model,
                 "provider": provider,
-                "prompt": prompt,
             },
         }
         print(json.dumps(out, indent=2))
@@ -4002,10 +4413,14 @@ def cmd_atelier(args):
         print(f"  • {url_line}")
     print()
     print("Next Steps for M'Lord & Steward:")
-    print("  1. Spawn the Court Artist session in the convoy worktree (it is pre-configured")
-    print(f"     as the sole writer there): `cd {wt_path} && kilo` (default_agent: artist),")
-    print(f"     or via Agent Manager: agent_manager start (mode: 'worktree', branchName: '{branch_name}',")
-    print(f"     model: '{model}', name: '{short_id} Atelier').")
+    print("  1. Launch the Court Artist session in the convoy worktree (it is pre-configured")
+    print("     as the sole writer there) via Kilo CLI — the single unified path; Agent")
+    print("     Manager prompting is retired:")
+    if atelier_brief_path:
+        print(f"     kilo run --agent artist --model \"{model}\" --dir {wt_path} \"$(cat {atelier_brief_path})\"")
+    else:
+        print(f"     kilo run --agent artist --model \"{model}\" --dir {wt_path} \"<the brief>\"")
+    print(f"     (or interactive: cd {wt_path} && kilo — default_agent already set to artist).")
     print(f"     (Slash command: `/atelier {merged_ids}` drives this whole flow.)")
     print(f"  2. Record the session on each packed Quest: python3 -m court.cli set-field <id> artist_session_id <session_id>")
     print(f"  3. Open the live preview: {runserver_url} — review every Quest's UI in one session.")
@@ -4082,10 +4497,12 @@ def cmd_studio(args):
     copies the gitignored .env into the fresh worktree, starts the runserver
     behind the WARN-ONLY freshness gate, renders the artist brief to
     `.kilo/TASK_ARTIST.md`, and records the studio + session in each Quest's
-    Castle Ledger (`artist_session_id` / `artist_model`) — while both
-    documented spawn paths stay intact: Agent Manager first (Branch A, the
-    `--json` task payload), Kilo CLI fallback (Branch B, `--standup` or the
-    printed `kilo run` line).
+    Castle Ledger (`artist_session_id` / `artist_model`) — with a single
+    unified spawn path: Kilo CLI prompting (`--standup` lets this command
+    spawn and record the session; the printed `kilo run` line is the manual
+    equivalent). Agent Manager prompting is retired (2026-09-28): it defaults
+    sessions to steward mode, lacks agent parameterization, and its launcher
+    is flaky (see LEDGER).
 
     Unlike /atelier, the studio does NOT stamp a Cog Ship or advance statuses:
     Quests keep their pipeline place and sync-back happens per Quest
@@ -4414,12 +4831,17 @@ def cmd_studio(args):
             "provider": provider,
             "brief_path": str(brief_path),
             "prompt": prompt,
-            "task": {
-                "name": f"{slug} Combined Studio",
-                "branchName": branch_name,
+            "spawn": {
+                "argv": [
+                    "kilo", "run",
+                    "--agent", "artist",
+                    "--model", model,
+                    "--dir", str(wt_path),
+                    f"$(cat {brief_path})",
+                ],
+                "interactive": f"cd {wt_path} && kilo   # default_agent already set to artist",
                 "model": model,
                 "provider": provider,
-                "prompt": prompt,
             },
         }
         print(json.dumps(out, indent=2))
@@ -4471,15 +4893,13 @@ def cmd_studio(args):
         url_line = f"{runserver_url}{r}" if not r.startswith("http") else r
         print(f"  • {url_line}")
     print()
-    print("Next Steps for M'Lord & Steward (both spawn paths stay documented):")
-    print("  BRANCH A (Agent Manager first): agent_manager start (mode: 'worktree',")
-    print(f"    branchName: '{branch_name}', model: '{model}', name: '{slug} Studio',")
-    print("    prompt: the rendered brief) — the --json task payload carries it verbatim;")
-    print("    then record the session: python3 -m court.cli set-field <id> artist_session_id <session_id>")
-    print("  BRANCH B (CLI fallback, argv-list per the double-eval rule):")
+    print("Next Steps for M'Lord & Steward (single unified spawn path — prompting):")
+    print("  Spawn the Court Artist session via Kilo CLI (Agent Manager prompting is")
+    print("  retired: it defaults sessions to steward mode and lacks agent parameterization):")
     print(f"    kilo run --agent artist --model \"$(python3 -m court.cli model artist)\" --dir {wt_path} \"$(cat {brief_path})\"")
     print("    (or `--standup` next time to let this command spawn and record it), or interactive:")
     print(f"    cd {wt_path} && kilo   # default_agent already set to artist")
+    print("    then record the session: python3 -m court.cli set-field <id> artist_session_id <session_id>")
     print(f"  Brief:    {brief_path} (also rendered above with --prompt-only)")
     print()
     print("🛡️ AFTER THE ROYAL SIGN-OFF (single-writer — no Gatekeeper in this worktree):")
@@ -4512,7 +4932,7 @@ def cmd_stamp(args):
     cogship_id = None if (not cogship_arg or cogship_arg.lower() == "new") else cogship_arg
     auto_commit = not getattr(args, "no_commit", False)
     try:
-        stamped = store.stamp_cogship(quests, cogship_id=cogship_id, auto_commit=auto_commit)
+        stamped = store.stamp_cogship(quests, cogship_id=cogship_id, auto_commit=auto_commit, force=getattr(args, "force", False))
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
@@ -4952,6 +5372,9 @@ def cmd_edict(args):
 
 
 def cmd_ship(args):
+    # v1332 double-ship guard: two operators (or two agents) packing the
+    # manifest concurrently produce two Cog Ship manifests for one convoy.
+    require_op_lock("ship")
     base_branch = getattr(args, "base", "main")
     head_branch = getattr(args, "head", "castle")
 
@@ -5810,6 +6233,7 @@ def build_parser():
     p_patchwork.add_argument("--native", action="store_true", help="Force native git worktree without Kilo CLI")
     p_patchwork.add_argument("--create-worktree", action="store_true", help="Create native git worktree automatically")
     p_patchwork.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
+    p_patchwork.add_argument("--force-stamp", action="store_true", help="Allow re-stamping a quest already stamped on another cogship (duplicate-convoy guard override)")
     p_patchwork.set_defaults(func=cmd_patchwork)
 
     p_charter = sub.add_parser(
@@ -5916,7 +6340,7 @@ def build_parser():
     p_artist.add_argument("--no-server", action="store_true", help="Skip starting the worktree dev server")
     p_artist.add_argument("--no-commit", action="store_true", help="Do not autocommit quest updates")
     p_artist.add_argument("--prompt-only", action="store_true", help="Print only the rendered Court Artist prompt")
-    p_artist.add_argument("--json", action="store_true", help="Output JSON format for agent_manager or scripts")
+    p_artist.add_argument("--json", action="store_true", help="Output JSON format for scripts (spawn payload uses the unified Kilo CLI path)")
     p_artist.set_defaults(func=cmd_artist)
 
     p_show = sub.add_parser("show", help="Print a Quest/Epic's full markdown or extracted section")
@@ -6096,7 +6520,7 @@ def build_parser():
     p_atelier.add_argument("--port", type=int, help="Override worktree runserver port")
     p_atelier.add_argument("--no-server", action="store_true", help="Skip starting the convoy dev server")
     p_atelier.add_argument("--prompt-only", action="store_true", help="Print only the rendered convoy Court Artist prompt")
-    p_atelier.add_argument("--json", action="store_true", help="Output JSON format for agent_manager or scripts")
+    p_atelier.add_argument("--json", action="store_true", help="Output JSON format for scripts (spawn payload uses the unified Kilo CLI path)")
     p_atelier.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_atelier.set_defaults(func=cmd_atelier)
 
@@ -6124,7 +6548,7 @@ def build_parser():
     p_studio.add_argument("--skip-teardown", action="store_true", help="--close: stop after the manifest; leave the studio worktree/server/session alive")
     p_studio.add_argument("--artist-session", action="store_true", help="--close: stand up a dedicated artist session in the live studio worktree for union-pending quests")
     p_studio.add_argument("--prompt-only", action="store_true", help="Print only the rendered studio Court Artist prompt")
-    p_studio.add_argument("--json", action="store_true", help="Output JSON format for agent_manager or scripts")
+    p_studio.add_argument("--json", action="store_true", help="Output JSON format for scripts (spawn payload uses the unified Kilo CLI path)")
     p_studio.add_argument("--no-commit", action="store_true", help="Do not autocommit ledger changes")
     p_studio.add_argument(
         "--no-browser",
@@ -6183,6 +6607,7 @@ def build_parser():
     p_stamp.add_argument("quest_ids", help="Comma-separated Quest IDs (e.g. Q101,Q102,Q105)")
     p_stamp.add_argument("--cogship", default=None, help="Existing Cog Ship ID to stamp (e.g. cogship-002); omit or pass 'new' to allocate the next id")
     p_stamp.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
+    p_stamp.add_argument("--force", action="store_true", help="Allow re-stamping quests already stamped on another cogship (duplicate-convoy guard override)")
     p_stamp.set_defaults(func=cmd_stamp)
 
     p_edict = sub.add_parser("edict", help="View or add royal edicts and strategic priorities")

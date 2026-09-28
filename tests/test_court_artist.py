@@ -169,8 +169,12 @@ class TestCourtArtist(unittest.TestCase):
             self.assertEqual(data["port"], 8088)
             self.assertEqual(data["runserver_url"], "http://localhost:8088")
             self.assertEqual(data["model"], "google/gemini-2.5-pro")
-            self.assertEqual(data["task"]["model"], "google/gemini-2.5-pro")
-            self.assertEqual(data["task"]["name"], "Q906 Court Artist")
+            # 2026-09-28: Agent Manager task payload replaced by the unified
+            # Kilo CLI spawn brief (argv list + interactive fallback).
+            self.assertEqual(data["spawn"]["argv"][:2], ["kilo", "run"])
+            self.assertEqual(data["spawn"]["model"], "google/gemini-2.5-pro")
+            self.assertIn("--agent", data["spawn"]["argv"])
+            self.assertIn("artist", data["spawn"]["argv"])
             self.assertIn("/shops/catalog/", data["routes"])
             self.assertIn("Court Artist", data["prompt"])
             self.assertIn("http://localhost:8088", data["prompt"])
@@ -224,9 +228,9 @@ class TestCourtArtist(unittest.TestCase):
 
             from court import config as _cfg
             self.assertEqual(data["model"], _cfg.get_model("artist"))
-            self.assertEqual(data["task"]["model"], _cfg.get_model("artist"))
+            self.assertEqual(data["spawn"]["model"], _cfg.get_model("artist"))
             self.assertEqual(data["provider"], "openrouter")
-            self.assertEqual(data["task"]["provider"], "openrouter")
+            self.assertEqual(data["spawn"]["provider"], "openrouter")
             self.assertEqual(q.artist_model, _cfg.get_model("artist"))
             mock_save.assert_called_once()
 

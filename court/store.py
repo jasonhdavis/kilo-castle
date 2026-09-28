@@ -148,6 +148,7 @@ def stamp_cogship(
     court_root: Optional[Path] = None,
     auto_commit: bool = True,
     commit_msg: Optional[str] = None,
+    force: bool = False,
 ) -> str:
     """Stamp a cogship_id onto a batch of Quest objects and persist them."""
     root = court_root or get_court_root()
@@ -160,6 +161,21 @@ def stamp_cogship(
             cogship_id = norm
 
     archive_d = get_archive_dir(root)
+    # cogship-040/041 + cogship-247/248 class guard: a quest already stamped on
+    # a *different* cogship used to be silently "reassigned", minting duplicate
+    # convoys from a double-run collect. Refuse unless the caller passes
+    # force=True (deliberate re-pack after the prior convoy is confirmed dead).
+    cross_stamped = [
+        q.id for q in quests
+        if q.cogship_id and normalize_cogship_id(q.cogship_id) != normalize_cogship_id(cogship_id)
+    ]
+    if cross_stamped and not force:
+        raise ValueError(
+            f"Refusing to stamp {', '.join(cross_stamped)} onto {cogship_id}: already stamped on "
+            f"other cogship(s). A second collect of the same quests mints duplicate convoys "
+            f"(cogship-040/041, cogship-247/248). Re-run with force=True only after confirming "
+            f"the prior convoy is dead (no live Gatekeeper session, no active gatehouse worktree)."
+        )
     for q in quests:
         src = find_path(q.id, root)
         if src is None or src.parent == archive_d:

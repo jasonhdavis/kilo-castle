@@ -101,6 +101,7 @@ of current state), reconstruct reality from disk + live tool state:
 - Never run Gatekeeper as a background task or subagent on `castle`.
 - Use `court dispatch <id> --standup` (or `kilo worktree create` + `kilo run --agent serf`) to stand up Serf sessions with pure task instructions.
 - Do not poll on a timer. State is pulled on-demand.
+- Artist studio/atelier/summon spawn is UNIFIED through prompting: `court studio <ids> --standup` (or the printed `kilo run --agent artist ... "$(cat .kilo/TASK_ARTIST.md)"` line). Agent Manager prompting is retired — never spawn role sessions via `agent_manager` (steward-mode default, no agent parameterization, launcher timeouts). Agent Manager remains for human viewing/terminal/diff inspection only.
 
 ## The Quest Lifecycle
 

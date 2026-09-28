@@ -1,6 +1,7 @@
 import os
 import subprocess
 from pathlib import Path
+import pytest
 from court.cli import main
 from court import store
 
@@ -40,7 +41,11 @@ def test_cli_new_show_advance_status(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Q001-Core-Jwt-Rotation: WORKING" in out
 
-    main(["advance", "Q001-Core-Jwt-Rotation,Q001-Core-Jwt-Rotation", "TRIBUTE_READY", "--note", "Batch advance test"])
+    # TRIBUTE_READY is now guarded (Q277 class): an empty Tribute Rendered with
+    # an unchecked Expected Tribute checklist is blocked without --force.
+    with pytest.raises(SystemExit):
+        main(["advance", "Q001-Core-Jwt-Rotation", "TRIBUTE_READY", "--note", "Should be blocked"])
+    main(["advance", "Q001-Core-Jwt-Rotation", "TRIBUTE_READY", "--note", "Batch advance test", "--force"])
     out = capsys.readouterr().out
     assert "Q001-Core-Jwt-Rotation: TRIBUTE_READY" in out
 

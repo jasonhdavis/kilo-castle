@@ -808,6 +808,44 @@ every subsequent navigation/new document hits the deferred path → dead.
   `--sync-back`. Atelier close support = follow-up. Next: dispatch serf.
 - **03:35Z ROYAL PIVOT — NO QUEST, NO CASTLE-ON-CASTLE, DIRECT BUILD ON MAIN.**
   The Q001 serf died instantly anyway (headless permission auto-reject, zero
-  commits — the known exit-1 class). Quest file deleted (a6b45dd), worktree +
+  commits — the known exit-1 class).   Quest file deleted (a6b45dd), worktree +
   branch torn down. The Steward implements `court studio --close` DIRECTLY on
   main per M'Lord's directive; this ledger entry stands as the pivot record.
+- **03:5xZ DIRECT BUILD SHIPPED — `court studio <ids> --close`** (commits on
+  main, no quest ceremony):
+  - New engine module `court/studio_close.py` + `--close` wiring in `cli.py`
+    (`cmd_studio` hook + parser flags) + `.kilo/commands/studio-close.md` thin
+    wrapper. Five guards: (1) dated `studio sign-off` ledger-marker proof or
+    `--signoff "note"` written at invocation; (2) merge-base base-drift vs
+    `--drift-threshold`/`studio.close_max_base_drift` (default 100, a
+    configured 0 is honored — falsy-or-default bug avoided), re-cut
+    recommended, `--force-union` overrides; (3) convoy-race refusal (stamped
+    cogship with live `the-gatehouse/<id>` branch, or quest tip contained in
+    any `the-gatehouse/*` branch); (4) cherry-pick extraction of labeled
+    artist commits (`style(...): <QID> ... royal review ...` subject +
+    `Addendum-Quests:` trailer) with `-x` provenance, conflict-abort (never
+    auto-union), `git cherry` patch-id already-present verification; (5)
+    conflict → machine union brief at
+    `.court/studio-close/<slug>/<qid>-union-brief.md` (conflict regions +
+    branch-vs-studio feature diffs both directions) + `Studio Close:
+    UNION-PENDING` ledger mark + optional `--artist-session`.
+  - Close-out manifest `.court/studio-close/<slug>/manifest.md` committed with
+    paperwork: per-quest synced (hashes) / union-pending / already-present /
+    race-blocked + approved-UI-present YES/NO (patch-id applied or labeled
+    files byte-identical between studio tip and branch tip). Teardown gated on
+    ALL-GREEN or `--override-manifest`: runserver kill (manage_servers.sh /
+    port-file lsof fallback) → AM move-to-Ashes-then-stop sequence (emitted
+    for the Steward's agent_manager tool; headless CLI artist processes are
+    killed directly) → branch ref kept, deletion manual.
+  - `--sync-back` retains as the guarded low-level primitive: same base-drift
+    + convoy-race guards now arm it.
+  - Tests: new `tests/test_studio_close.py` (22 tests, REAL temp git repos —
+    guards, extraction, conflict abort, brief, manifest, teardown, sync-back
+    guard refusals); full suite 233 passed. Also repaired 5 PRE-EXISTING
+    stale-model test failures (tests/test_studio.py ×2, test_atelier.py,
+    test_court_artist.py ×2 hardcoded `glm-5.3` expectations vs config's
+    flash) to assert against `config.get_model("artist")` — config is the
+    Q455 source of truth.
+  - Live smoke: `--help` renders all flags; unknown-id error path clean. No
+    real studio touched (pb-app studios live at 8250/8251 under active royal
+    review).

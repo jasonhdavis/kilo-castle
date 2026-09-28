@@ -1357,10 +1357,46 @@ function renderBoard(){
  const qs=S.quests||[];
  const bc=$('boardcols');
  const keep={left:bc?bc.scrollLeft:0,tops:bc?[...bc.querySelectorAll('.bcol')].map(c=>c.scrollTop):[]};
- const act=activeDirs();
- let cols='';
- for(const st of STATUS_ORDER){
-  const items=qs.filter(q=>q.status===st&&(boardApp==='all'||(q.app||q.repo)===boardApp));
+  const act=activeDirs();
+  // Virtual 🚢 cogships column — built here, injected right after the GATE
+  // column below. Live convoys: any member integrating at GATE or promoted-
+  // but-undeployed (ship_ready). Click a card → ship manifest document;
+  // confirm button → court ship --confirm for the convoy's ready members.
+  // Fully-deployed/archived convoys drop off.
+  const rel=qs.filter(q=>boardApp==='all'||(q.app||q.repo)===boardApp);
+  const trunkAhead=rel.length?Math.max(0,...rel.map(q=>q.trunk_ahead||0)):0;
+  const byCs={};
+  for(const q of rel)if(q.cogship_id)(byCs[q.cogship_id]=byCs[q.cogship_id]||[]).push(q);
+  const csKeys=Object.keys(byCs).filter(cs=>byCs[cs].some(q=>
+   q.ship_ready||q.status==='GATE')).sort((a,b)=>{
+    const na=parseInt(a.replace(/\D/g,''),10),nb=parseInt(b.replace(/\D/g,''),10);
+    return nb-na;});
+  let csCol=`<div class="bcol bcol-ship"><h3 class="shiphead"><span>🚢 cogships · ${csKeys.length}</span>`+
+   (trunkAhead>0?`<span class="bchip ship" title="commits on the castle trunk not yet deployed to main — archived convoys ride in the next promote">trunk ↑${trunkAhead}</span>`:'')+
+   '</h3>';
+  for(const cs of csKeys){
+   const members=byCs[cs];
+   const readyIds=members.filter(q=>q.ship_ready).map(q=>q.id);
+   const anyGate=members.some(q=>q.status==='GATE');
+   const chips=members.map(q=>{
+    const qn=(String(q.id).match(/^[A-Za-z]+\d+/)||[q.id])[0].toUpperCase();
+    const cls=q.ship_ready?'ok':(q.status==='GATE'?'warn':'');
+    return `<span class="bchip ${cls}" title="${esc(q.id)} — ${esc(String(q.status).toLowerCase())}">${esc(qn)}</span>`;}).join('');
+   csCol+=`<div class="bcard click" data-cs="${esc(cs)}" title="click to open the ship manifest document">`+
+    `<div class="btop"><span class="qnum" style="color:var(--blue)">🚢 ${esc(cs)}</span>`+
+    `<span class="qgrow"></span>`+
+    (anyGate?'<span class="bchip warn">integrating</span>':'')+
+    (readyIds.length?`<button class="bgo" data-csconfirm="${esc(cs)}" data-ids="${esc(readyIds.join(','))}" title="court ship --confirm ${esc(readyIds.join(','))} — promote castle to main and deploy to production">confirm</button>`:'')+
+    `</div>`+
+    `<div class="bchips">${chips}</div>`+
+    '</div>';
+  }
+  csCol+=csKeys.length?'':'<div class="bempty">—</div>';
+  csCol+='</div>';
+  let cols='';
+  for(const st of STATUS_ORDER){
+   if(st==='ASHES')continue;
+   const items=qs.filter(q=>q.status===st&&(boardApp==='all'||(q.app||q.repo)===boardApp));
   const allSel=items.length&&items.every(q=>BOARD_SEL.has(q.id));
   cols+=`<div class="bcol"><h3><label class="bselall" title="select all in this column">`+
    `<input type="checkbox" class="bselall" data-bselall="${esc(st)}"${allSel?' checked':''}>`+
@@ -1402,42 +1438,9 @@ function renderBoard(){
   }
   cols+=items.length?'':'<div class="bempty">—</div>';
   cols+='</div>';
+  if(st==='GATE')cols+=csCol;
   }
- // Virtual 🚢 cogships column — live convoys: any member integrating at
- // GATE or promoted-but-undeployed (ship_ready). Click a card → ship
- // manifest document; confirm button → court ship --confirm for the
- // convoy's ready members. Fully-deployed/archived convoys drop off.
- const rel=qs.filter(q=>boardApp==='all'||(q.app||q.repo)===boardApp);
- const trunkAhead=rel.length?Math.max(0,...rel.map(q=>q.trunk_ahead||0)):0;
- const byCs={};
- for(const q of rel)if(q.cogship_id)(byCs[q.cogship_id]=byCs[q.cogship_id]||[]).push(q);
- const csKeys=Object.keys(byCs).filter(cs=>byCs[cs].some(q=>
-  q.ship_ready||q.status==='GATE')).sort((a,b)=>{
-   const na=parseInt(a.replace(/\D/g,''),10),nb=parseInt(b.replace(/\D/g,''),10);
-   return nb-na;});
- cols+=`<div class="bcol bcol-ship"><h3 class="shiphead"><span>🚢 cogships · ${csKeys.length}</span>`+
-  (trunkAhead>0?`<span class="bchip ship" title="commits on the castle trunk not yet deployed to main — archived convoys ride in the next promote">trunk ↑${trunkAhead}</span>`:'')+
-  '</h3>';
- for(const cs of csKeys){
-  const members=byCs[cs];
-  const readyIds=members.filter(q=>q.ship_ready).map(q=>q.id);
-  const anyGate=members.some(q=>q.status==='GATE');
-  const chips=members.map(q=>{
-   const qn=(String(q.id).match(/^[A-Za-z]+\d+/)||[q.id])[0].toUpperCase();
-   const cls=q.ship_ready?'ok':(q.status==='GATE'?'warn':'');
-   return `<span class="bchip ${cls}" title="${esc(q.id)} — ${esc(String(q.status).toLowerCase())}">${esc(qn)}</span>`;}).join('');
-  cols+=`<div class="bcard click" data-cs="${esc(cs)}" title="click to open the ship manifest document">`+
-   `<div class="btop"><span class="qnum" style="color:var(--blue)">🚢 ${esc(cs)}</span>`+
-   `<span class="qgrow"></span>`+
-   (anyGate?'<span class="bchip warn">integrating</span>':'')+
-   (readyIds.length?`<button class="bgo" data-csconfirm="${esc(cs)}" data-ids="${esc(readyIds.join(','))}" title="court ship --confirm ${esc(readyIds.join(','))} — promote castle to main and deploy to production">confirm</button>`:'')+
-   `</div>`+
-   `<div class="bchips">${chips}</div>`+
-   '</div>';
- }
- cols+=csKeys.length?'':'<div class="bempty">—</div>';
- cols+='</div>';
- $('boardcols').innerHTML=cols;
+  $('boardcols').innerHTML=cols;
  if(bc){bc.scrollLeft=keep.left;
   [...bc.querySelectorAll('.bcol')].forEach((c,i)=>{c.scrollTop=keep.tops[i]||0;});}
 }

@@ -194,7 +194,8 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
  .idledot{width:7px;height:7px;border-radius:50%;border:1.5px solid var(--dim);display:inline-block;opacity:.7}
  .bread{font-size:9px;padding:1px 7px;border-radius:4px;background:var(--surface-2);
   border:1px solid var(--edge);color:var(--green);cursor:pointer;font-weight:600;flex:none}
- .bread:hover{border-color:rgba(63,185,80,.5)}
+  .bread:hover{border-color:rgba(63,185,80,.5)}
+  .bread.lg{font-size:10.5px;padding:4px 12px;border-radius:999px;letter-spacing:.02em}
 
 #transcript{flex:1;overflow-y:auto;padding:18px 26px;display:flex;flex-direction:column;gap:12px}
 .msg{max-width:80%;padding:10px 14px;border-radius:var(--r-lg);background:var(--surface);
@@ -224,14 +225,19 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
 #composer .cont{font-size:11px;color:var(--dim);margin-bottom:6px;display:flex;gap:8px;align-items:center}
 #composer .cont b{color:var(--blue);font-weight:600;font-family:ui-monospace,Menlo,monospace}
 #composer .cont .x{cursor:pointer;color:var(--red);font-weight:700}
-#composer .row{display:flex;gap:10px;align-items:flex-end}
-#composer textarea{flex:1;background:var(--bg);border:1px solid var(--edge);color:var(--ink);
+#composer .cont .newbtn{font-size:10.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+ padding:4px 14px;border-radius:999px;background:var(--surface-2);border:1px solid var(--edge);
+ color:var(--dim);cursor:pointer;flex:none;transition:all .12s ease}
+#composer .cont .newbtn:hover{border-color:var(--red);color:var(--red)}
+#composer .row{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap}
+#composer .rgrow{flex:1}
+#composer textarea{display:block;width:100%;background:var(--bg);border:1px solid var(--edge);color:var(--ink);
  border-radius:var(--r-md);font:13px/1.45 "Inter",sans-serif;padding:10px 12px;resize:none;
  height:46px;max-height:140px}
 #composer textarea:focus{outline:none;border-color:var(--blue)}
 #composer .send{background:var(--primary);border:none;color:var(--primary-ink);
- font-weight:700;padding:0 24px;border-radius:var(--r-md);cursor:pointer;font-size:12.5px;
- letter-spacing:.04em;height:46px}
+ font-weight:700;padding:0 22px;border-radius:var(--r-md);cursor:pointer;font-size:12px;
+ letter-spacing:.04em;height:34px;flex:none}
 #composer .send:disabled{opacity:.45;cursor:default}
 
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;z-index:20;
@@ -527,7 +533,8 @@ html[data-theme="light"] .iconbtn .bcount{color:#fff}
    <span id="live_chip" class="chip" style="display:none"><span class="livedot"></span>&nbsp;agent working</span>
    <span id="sess_meta" class="sessmeta"></span>
    <div class="hgrp">
-    <div class="iconbtn" title="open quest charter in drawer" onclick="toggleDoc(event)">▤</div>
+     <button class="bread lg" id="markread_btn" style="display:none" title="clear the turn marker" onclick="markReadCur()">mark read</button>
+     <div class="iconbtn" title="open quest charter in drawer" onclick="toggleDoc(event)">▤</div>
     <div class="iconbtn" id="browser_btn" title="launch studio chromium" style="display:none" onclick="launchBrowser(event)">▶</div>
     <div class="iconbtn" title="settings — models, presets, suite, MCP" onclick="setView('settings')">⚙</div>
     <div class="iconbtn" id="sess_del" title="delete this session" style="display:none" onclick="delSess(selSess)">✕</div>
@@ -539,23 +546,24 @@ html[data-theme="light"] .iconbtn .bcount{color:#fff}
   <div class="wc-hi" id="boot_hi"></div>
   <div class="wc-sub">the court is waking — worktrees and ledger loading…</div></div></div>
  <div id="composer">
-  <div id="cmdlist"></div>
-  <div class="cont" id="c_cont">new session — pick a worktree, or open the ☰ sessions menu to continue one</div>
-  <div class="row">
+   <div id="cmdlist"></div>
+   <div class="cont" id="c_cont">new session — pick a worktree, or open the ☰ sessions menu to continue one</div>
    <textarea id="c_prompt" placeholder="message the agent… (Enter to send, Shift+Enter for newline)"></textarea>
-   <select id="c_model" title="model preset — any preset pairs with any agent class; edit the list in settings"
-    style="width:250px;height:46px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);
-    border-radius:8px;padding:0 8px;font:11.5px ui-monospace,Menlo,monospace"></select>
-   <input id="c_model_custom" list="model_dl" spellcheck="false" autocomplete="off" placeholder="provider/model id"
-    title="custom model id — type to filter (kilo/provider/model or provider/model)" style="display:none;
-    width:250px;height:46px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);
-    border-radius:8px;padding:0 10px;font:11.5px ui-monospace,Menlo,monospace">
-   <datalist id="model_dl"></datalist>
-   <select id="c_agent" style="height:46px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);border-radius:8px;padding:0 8px"></select>
-   <button class="send stop" id="c_stop" style="display:none" onclick="stopTurn()">STOP</button>
-   <button class="send" id="c_send" onclick="sendComposer()">SEND</button>
+   <div class="row">
+    <select id="c_model" title="model preset — any preset pairs with any agent class; edit the list in settings"
+     style="width:250px;min-width:0;height:34px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);
+     border-radius:8px;padding:0 8px;font:11.5px ui-monospace,Menlo,monospace"></select>
+    <input id="c_model_custom" list="model_dl" spellcheck="false" autocomplete="off" placeholder="provider/model id"
+     title="custom model id — type to filter (kilo/provider/model or provider/model)" style="display:none;
+     width:250px;min-width:0;height:34px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);
+     border-radius:8px;padding:0 10px;font:11.5px ui-monospace,Menlo,monospace">
+    <datalist id="model_dl"></datalist>
+    <select id="c_agent" style="height:34px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);border-radius:8px;padding:0 8px"></select>
+    <span class="rgrow"></span>
+    <button class="send stop" id="c_stop" style="display:none" onclick="stopTurn()">STOP</button>
+    <button class="send" id="c_send" onclick="sendComposer()">SEND</button>
+   </div>
   </div>
- </div>
 </section>
 <section id="board">
  <div id="boardbar" style="padding:10px 20px;border-bottom:1px solid var(--edge);background:var(--surface)"></div>
@@ -709,7 +717,7 @@ function applyHash(){
   $('t_rss').textContent=mb(S.proc_total_rss);
   const ty=S.today||{};
   $('t_today').innerHTML=`$ <b>${(ty.cost||0).toFixed(2)}</b> today`;
-  syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();
+   syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();syncMarkRead();
   if(view==='board'){
     const key=boardApp+'|'+(S.quests||[]).map(q=>q.id+q.status+(q.dirty?'d':'')+(q.app||'')+(q.cogship_id||'')+(q.moc_live?'m':'')+(q.cogship_live?'g':'')).join(',');
    if(key!==boardKey){boardKey=key;renderBoard();}}
@@ -736,11 +744,20 @@ function applyHash(){
  const INTERACTIVE_AGENTS=new Set(['artist','steward','code']);
  let DS_CACHE=null;
  function readMap(){try{return JSON.parse(localStorage.getItem('bdread')||'{}')}catch(e){return{}}}
- function markRead(key){const m=readMap();m[key]=1;
-  const cutoff=Date.now()-2*3600*1000;
-  for(const k of Object.keys(m)){const t=parseInt((k.split('|')[1]||'0'),10);if(!t||t<cutoff)delete m[k];}
-  try{localStorage.setItem('bdread',JSON.stringify(m))}catch(e){}
-  DS_CACHE=null;renderNav();renderBoard();}
+  function markRead(key){const m=readMap();m[key]=1;
+   const cutoff=Date.now()-2*3600*1000;
+   for(const k of Object.keys(m)){const t=parseInt((k.split('|')[1]||'0'),10);if(!t||t<cutoff)delete m[k];}
+   try{localStorage.setItem('bdread',JSON.stringify(m))}catch(e){}
+   DS_CACHE=null;renderNav();renderBoard();syncMarkRead();}
+  function syncMarkRead(){
+   const el=$('markread_btn');if(!el)return;
+   const st=selWt&&stateFor(selWt);
+   const show=!!st&&(st.state==='done'||st.state==='stalled');
+   el.style.display=show?'':'none';
+   if(show){el.dataset.bread=st.key;
+    el.title=st.state==='done'?'turn completed — clear the ✓ marker':'stalled — clear the ! marker';}}
+  function markReadCur(){const el=$('markread_btn');
+   if(el&&el.dataset.bread)markRead(el.dataset.bread);}
  function dirStates(){if(DS_CACHE)return DS_CACHE;const now=Date.now(),out=new Map();
   const byDir={};for(const a of (S.active||[]))if(a.dir)byDir[a.dir]=a;
   const touch={};for(const x of (S.sessions||[]))if(x.directory){const t=x.time_updated||0;if(t>(touch[x.directory]||0))touch[x.directory]=t;}
@@ -859,7 +876,7 @@ function switchApp(key){selRepo=key;selWt=null;selSess=null;msgs=[];curLane=null
  $('wt_label').textContent='select a worktree';$('wt_badge').innerHTML='';
  $('c_cont').innerHTML='new session — pick a worktree, or open the ☰ sessions menu to continue one';
  CMDS=[];renderCmdList();
- renderNav();renderTranscript();syncHash();syncComposer();}
+  renderNav();renderTranscript();syncHash();syncComposer();syncMarkRead();}
 let cmdSeq=0;
 const CMD_CACHE={};
 async function loadCmds(){
@@ -885,7 +902,7 @@ function pickWt(path,branch){
   $('wt_label').innerHTML=esc(branch||'?')+' <span class="dim">· no worktree</span>';
   $('wt_badge').innerHTML='';
  }
-  renderNav();renderSessionsBar();renderTranscript();syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();
+   renderNav();renderSessionsBar();renderTranscript();syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();syncMarkRead();
   $('c_cont').innerHTML='new session — pick a worktree, or click a session tab to continue it';
  const sess=sessionsFor(path);
  if(sess.length)openSess(sess[0].id);
@@ -977,13 +994,13 @@ document.addEventListener('click',e=>{
  if(!e.target.closest('#sessmenu')&&!e.target.closest('#sess_burger'))closeSessMenu();});
 function newSess(){selSess=null;msgs=[];curLane='L'+(++LANESEQ);
  $('c_cont').innerHTML='new session in <b>'+esc(selWt?selWt.replace('/Users/scrummage/Python/',''):'?')+'</b> <span class="dim">— agent replies as a fresh session</span>';
- renderSessionsBar();renderTranscript();syncHash();syncComposer();syncSessMeta();}
+ renderSessionsBar();renderTranscript();syncHash();syncComposer();syncSessMeta();syncMarkRead();}
 let sessOpenSeq=0;
 async function openSess(id){
  const seq=++sessOpenSeq;
  selSess=id;msgs=[];curLane=id;
- $('c_cont').innerHTML=`continuing <b>${esc(id.slice(0,24))}…</b> <span class="x" onclick="newSess()">start new instead</span>`;
- renderSessionsBar();renderTranscript();syncHash();syncComposer();syncSessMeta();
+ $('c_cont').innerHTML=`continuing <b>${esc(id.slice(0,24))}…</b> <button class="newbtn" onclick="newSess()">start new instead</button>`;
+ renderSessionsBar();renderTranscript();syncHash();syncComposer();syncSessMeta();syncMarkRead();
  loadCmds();
  $('transcript').innerHTML='<div class="notice">loading…</div>';
  let m=[];

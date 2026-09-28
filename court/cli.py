@@ -2875,8 +2875,11 @@ def cmd_raze(args):
         # If worktree does not exist anywhere and was already deleted
         if not wt_exists and not found_wt_id:
             if quest.status == "READY_TO_RAZE" and args.archive_pruned:
-                dst = store.archive(quest.id)
-                print(f"🪦 {quest.id}: Worktree already pruned from disk/AM -> Archived to {dst}")
+                try:
+                    dst = store.archive(quest.id)
+                    print(f"🪦 {quest.id}: Worktree already pruned from disk/AM -> Archived to {dst}")
+                except FileNotFoundError:
+                    print(f"🪦 {quest.id}: Worktree pruned and quest already in archive.")
                 return
             elif quest.status == "READY_TO_RAZE":
                 print(f"ℹ️ {quest.id}: Worktree already pruned from disk/AM (ready to archive: python3 -m court.cli archive {quest.id})")

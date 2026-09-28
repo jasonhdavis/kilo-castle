@@ -212,7 +212,6 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
 .msg.error{align-self:center;border-left:3px solid var(--red);color:var(--red);font-size:12px}
 .msg .who{color:var(--faint);font-size:9.5px;text-transform:uppercase;letter-spacing:.1em;
  margin-bottom:3px;font-weight:600;display:none}
-.msg .who .mts{text-transform:none;letter-spacing:0;font-weight:400;opacity:.85}
 .msg .mts.foot{display:block;font-size:9px;color:var(--faint);text-align:right;
  margin-top:3px;letter-spacing:.03em;text-transform:none;font-weight:400}
 .msg.user .mts.foot,.msg.assistant .mts.foot,.msg.thinking .mts.foot{display:block}
@@ -1019,7 +1018,7 @@ function msgHTML(m){
   const who=cls==='user'?'you':cls;
   const showTs=cls==='user'||cls==='assistant'||cls==='thinking';
   const ts=showTs&&m.time_created?msgTS(m.time_created):null;
-  return `<div class="msg ${cls}${md?' md':''}${fold}"${k?` data-fk="${esc(k)}"`:''}><div class="who">${esc(who)}${ts?` <span class="mts">${esc(ts.time)}</span>`:''}</div>${content}${ts?`<div class="mts foot" title="${esc(ts.day)}">${esc(ts.day)} · ${esc(ts.time)}</div>`:''}</div>`;
+  return `<div class="msg ${cls}${md?' md':''}${fold}"${k?` data-fk="${esc(k)}"`:''}><div class="who">${esc(who)}</div>${content}${ts?`<div class="mts foot" title="${esc(ts.day)}">${esc(ts.day)} · ${esc(ts.time)}</div>`:''}</div>`;
 }
 function msgTS(v){
   const d=new Date(typeof v==='number'?v:Number(v));
@@ -1126,7 +1125,7 @@ function blockHTML(b){
   const showTs=b.cls==='user'||b.cls==='assistant'||b.cls==='thinking';
   const ts=showTs?msgTS(b.ts||(b.ts=Date.now())):null;
   return `<div class="msg ${b.cls}${md?' md':''}${fold}"${k?` data-fk="${esc(k)}"`:''}>`+
-   `<div class="who">${b.cls==='thinking'?'reasoning':b.cls==='user'?'you':b.cls}${ts?` <span class="mts">${esc(ts.time)}</span>`:''}</div>`+
+   `<div class="who">${b.cls==='thinking'?'reasoning':b.cls==='user'?'you':b.cls}</div>`+
    (md?mdRender(b.text):esc(b.text))+
    (ts?`<div class="mts foot" title="${esc(ts.day)}">${esc(ts.day)} · ${esc(ts.time)}</div>`:'')+'</div>';
 }

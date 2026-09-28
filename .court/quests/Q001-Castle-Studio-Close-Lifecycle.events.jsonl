@@ -13,3 +13,5 @@
 {"target": "field:status", "ts": "2026-09-28T03:00:20Z", "value": "PLANNED"}
 {"target": "field:updated_at", "ts": "2026-09-28T03:00:20Z", "value": "2026-09-28T03:00:20Z"}
 {"target": "section:Castle Ledger", "ts": "2026-09-28T03:00:20Z", "value": "- **2026-09-28T03:00:12Z** — - → OPEN: Quest created\n- **2026-09-28T03:00:20Z** — OPEN → PLANNED: Chartered via composite `court charter`"}
+{"target": "field:section", "ts": "2026-09-28T03:00:25Z", "value": "Feature"}
+{"target": "field:updated_at", "ts": "2026-09-28T03:00:25Z", "value": "2026-09-28T03:00:25Z"}

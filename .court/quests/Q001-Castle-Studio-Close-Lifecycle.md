@@ -5,7 +5,7 @@ kind: quest
 app: castle
 concern: studio-close-lifecycle
 parent_epic: 
-section: 
+section: Feature
 tags: 
 status: PLANNED
 cogship_id: 
@@ -27,7 +27,7 @@ artist_session_id:
 artist_model: 
 vassal_session_id: 
 created_at: 2026-09-28T03:00:12Z
-updated_at: 2026-09-28T03:00:20Z
+updated_at: 2026-09-28T03:00:25Z
 ---
 
 # Q001-Castle-Studio-Close-Lifecycle — Studio close-out lifecycle: gated close command with sign-off proof, drift/race guards, cherry-pick extraction, union briefs, close-out manifest, teardown

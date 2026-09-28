@@ -3,10 +3,12 @@
 Reads: .court quest files, git worktrees, the local kilo session DB (read-only),
 and the live process table. Mutating endpoints: /api/reap (terminates a process
 whose parent is a verified kilo process), /api/mcp (flips the enabled flag of
-an inventoried MCP server in its own config file, with a .bak backup), and
-/api/annotation (appends one studio-annotation JSON line to the target
-worktree's .kilo/studio-annotations.jsonl; served CORS-open for the managed
-studio browser).
+an inventoried MCP server in its own config file, with a .bak backup),
+/api/settings (validated merge into .court/config.json — role models, model
+presets/aliases, suite/harness/freshness commands, no_kilo_mode — atomic with
+a .bak), and /api/annotation (appends one studio-annotation JSON line to the
+target worktree's .kilo/studio-annotations.jsonl; served CORS-open for the
+managed studio browser).
 """
 
 import glob
@@ -19,8 +21,11 @@ import sqlite3
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 COURT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KILO_DB = os.path.expanduser("~/.local/share/kilo/kilo.db")
@@ -34,9 +39,12 @@ STATUS_ORDER = [
     "WORKING", "TRIBUTE_READY", "GATE", "READY_TO_RAZE", "PLANNED", "OPEN",
     "PUNISHED", "ASHES",
 ]
+# Roles carried by the manifest's models map (mirrors court.config).
+KNOWN_ROLE_MODELS = ("serf", "master_of_coin", "gatekeeper", "steward",
+                     "artist", "scout")
 
 PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Castle</title>
+<html lang="en" data-theme="light"><head><meta charset="utf-8"><title>Castle</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 448 512'%3E%3Cpath fill='%23000' d='M32 192L32 48c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 40c0 4.4 3.6 8 8 8l32 0c4.4 0 8-3.6 8-8l0-40c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 40c0 4.4 3.6 8 8 8l32 0c4.4 0 8-3.6 8-8l0-40c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 144c0 10.1-4.7 19.6-12.8 25.6L352 256l16 144L80 400 96 256 44.8 217.6C36.7 211.6 32 202.1 32 192zm176 96l32 0c8.8 0 16-7.2 16-16l0-48c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 48c0 8.8 7.2 16 16 16zM22.6 473.4L64 432l320 0 41.4 41.4c4.2 4.2 6.6 10 6.6 16c0 12.5-10.1 22.6-22.6 22.6L38.6 512C26.1 512 16 501.9 16 489.4c0-6 2.4-11.8 6.6-16z'/%3E%3C/svg%3E">
 <style>
 :root{
@@ -68,7 +76,6 @@ header{display:flex;align-items:center;gap:14px;padding:0 20px;height:52px;
 .chip b{color:var(--ink);font-weight:600}
 .chip.rss{border-color:rgba(88,166,255,.35)} .chip.rss b{color:var(--blue)}
 header .spacer{flex:1}
-#clock{color:var(--faint);font-size:11px;font-variant-numeric:tabular-nums}
 .vdiv{width:1px;height:22px;background:var(--edge)}
 
 main{display:grid;grid-template-columns:300px 1fr;overflow:hidden}
@@ -95,12 +102,16 @@ nav{overflow-y:auto;background:var(--surface);border-right:1px solid var(--edge)
 nav h2{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.14em;
  color:var(--faint);margin:14px 8px 5px;display:flex;align-items:center;gap:8px}
 nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
-.q{position:relative;padding:6px 10px 6px 14px;border-radius:var(--r-md);cursor:pointer;
- margin-bottom:2px;transition:background .12s ease}
+.q{position:relative;padding:8px 10px 9px 14px;border-radius:var(--r-md);cursor:pointer;
+ margin-bottom:8px;transition:background .12s ease}
 .q:hover{background:var(--surface-2)}
 .q.sel{background:var(--surface-2);box-shadow:inset 2px 0 0 var(--primary)}
-.q .row1{display:flex;align-items:center;gap:7px;font-weight:500;font-size:12.5px}
-.q .row2{color:var(--dim);font-size:11px;margin-top:1px;white-space:nowrap;overflow:hidden;
+.qtop{display:flex;align-items:center;gap:6px;min-height:16px}
+.qtop .qgrow{flex:1}
+.qtitle2{font-size:13px;font-weight:600;line-height:1.4;margin-top:4px;color:var(--ink);
+ display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+ overflow-wrap:break-word}
+.qsub{color:var(--dim);font-size:11px;margin-top:2px;white-space:nowrap;overflow:hidden;
  text-overflow:ellipsis}
 .qnum{font-family:ui-monospace,Menlo,monospace;font-size:14.5px;font-weight:700;
  color:var(--primary);flex:none;letter-spacing:.02em}
@@ -117,6 +128,7 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
 .qmeta{display:flex;gap:4px;flex-wrap:wrap;margin:4px 2px 1px}
 .qslug{color:var(--dim);font-size:11.5px;flex:1;min-width:0;overflow:hidden;
  text-overflow:ellipsis;white-space:nowrap}
+.navmore{color:var(--blue);font-size:10.5px;text-align:center;cursor:pointer;font-weight:600}
 .badge{font-size:9.5px;padding:1px 7px;border-radius:999px;background:rgba(248,81,73,.12);
  color:var(--red);font-weight:600;letter-spacing:.06em;text-transform:uppercase}
 .st{display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;font-size:9.5px;
@@ -178,7 +190,9 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
 #transcript{flex:1;overflow-y:auto;padding:18px 26px;display:flex;flex-direction:column;gap:12px}
 .msg{max-width:80%;padding:10px 14px;border-radius:var(--r-lg);background:var(--surface);
  border:1px solid var(--edge-soft);white-space:pre-wrap;word-break:break-word;font-size:13px}
-.msg.user{align-self:flex-end;background:rgba(255,179,0,.08);border:1px solid rgba(255,179,0,.25)}
+.msg.user{align-self:flex-end;margin-left:auto;background:rgba(255,179,0,.14);
+ border:1px solid rgba(255,179,0,.42)}
+.msg.user .who{display:block;text-align:right;color:var(--amber)}
 .msg.assistant{align-self:flex-start;border-left:3px solid var(--blue)}
 .msg.notice{align-self:center;font-size:11px;color:var(--faint);
  background:transparent;border:none;padding:2px}
@@ -291,7 +305,8 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
  flex-direction:column}
 .bcard.attn{border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.05)}
 .bcard.attn .bid{color:var(--red)}
-.bops{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap;margin-top:auto;padding-top:6px}
+.bops{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap;margin-top:auto;padding-top:6px;
+ justify-content:flex-end}
 .bops button{padding:2px 8px;font-size:9px}
 .bops button.go{border-color:rgba(63,185,80,.4);color:var(--green)}
 .bops button.go:hover{border-color:var(--green);color:var(--green);background:rgba(63,185,80,.08)}
@@ -302,13 +317,49 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 .bchip.ok{color:var(--green);border-color:rgba(63,185,80,.3)}
 .bchip.bad{color:var(--red);border-color:rgba(248,81,73,.35)}
 .bchip.warn{color:var(--amber);border-color:rgba(210,153,34,.35)}
-.btop{display:flex;flex-wrap:wrap;align-items:center;gap:4px;min-width:0}
-.bapp{flex:none;display:inline-block;font-size:9px;padding:1px 6px;border-radius:4px;font-weight:600;
- background:rgba(255,179,0,.1);border:1px solid rgba(255,179,0,.35);color:var(--primary);
- margin-right:6px;text-transform:uppercase;letter-spacing:.06em;vertical-align:1px}
+.bchip.ship{color:var(--blue);border-color:rgba(88,166,255,.4);font-weight:700}
+.bselall{display:flex;align-items:center;gap:6px;cursor:pointer}
+.bselall input{accent-color:var(--primary);cursor:pointer}
+.btop{display:flex;align-items:center;gap:6px;min-width:0}
+.btop .qgrow{flex:1}
+.btitle2{font-size:13px;font-weight:600;line-height:1.45;margin-top:4px;color:var(--ink);
+ display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;
+ overflow-wrap:break-word}
+.bdesc{color:var(--dim);font-size:10.5px;margin-top:3px;white-space:nowrap;overflow:hidden;
+ text-overflow:ellipsis;font-family:ui-monospace,Menlo,monospace}
 #jobout{font-family:ui-monospace,Menlo,monospace;font-size:11px;white-space:pre-wrap;
  word-break:break-word;background:var(--bg);border:1px solid var(--edge);
  border-radius:var(--r-md);padding:10px 12px;max-height:52vh;overflow-y:auto;margin-top:10px}
+#settings{display:none;overflow-y:auto;padding:18px 26px 40px}
+.setwrap{max-width:880px;margin:0 auto}
+.sethd{display:flex;align-items:center;gap:12px;margin:4px 2px 14px}
+.sethd b{color:var(--primary);font-size:13px;letter-spacing:.04em}
+.sethd .path{color:var(--faint);font-size:10.5px;font-family:ui-monospace,Menlo,monospace;
+ overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.sethd .setsave{background:var(--primary);border:none;color:var(--primary-ink);
+ font-weight:700;padding:7px 18px;border-radius:var(--r-md);cursor:pointer;font-size:11.5px;
+ letter-spacing:.05em;text-transform:uppercase}
+.sethd .setsave:hover{filter:brightness(1.08);border:none;color:var(--primary-ink)}
+.setgrp{background:var(--surface);border:1px solid var(--edge);border-radius:var(--r-lg);
+ padding:12px 16px 14px;margin-bottom:14px}
+.setgrp h3{font-size:10.5px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+ color:var(--primary);margin:2px 2px 8px;display:flex;align-items:center;gap:8px}
+.setgrp h3::after{content:"";flex:1;height:1px;background:rgba(255,179,0,.25)}
+.setgrp h3 .hdnote{color:var(--faint);font-weight:400;letter-spacing:0;text-transform:none;
+ font-size:10px}
+.setrow{display:flex;gap:10px;align-items:center;padding:7px 2px;border-bottom:1px solid var(--edge-soft)}
+.setrow:last-child{border-bottom:none}
+.setrow label{flex:none;width:150px;font-size:11.5px;font-weight:600;color:var(--ink);
+ overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.setrow label small{display:block;color:var(--faint);font-weight:400;font-size:9.5px}
+.setrow input[type=text],.setrow input[type=number]{flex:1;min-width:0;background:var(--bg);
+ border:1px solid var(--edge);color:var(--ink);border-radius:var(--r-sm);padding:6px 10px;
+ font:11.5px ui-monospace,Menlo,monospace}
+.setrow input[type=text]:focus,.setrow input[type=number]:focus{outline:none;border-color:var(--blue)}
+.setrow .prov{flex:none;width:120px}
+.setrow .mini{flex:none;color:var(--red);cursor:pointer;font-weight:700;padding:2px 6px}
+.setrow .mini:hover{color:var(--ink)}
+.setnote{color:var(--faint);font-size:10.5px;padding:8px 2px 0}
 #jobout .err{color:var(--red)}
 .turnrow{display:flex;gap:8px;align-items:baseline;padding:5px 4px;border-bottom:1px solid var(--edge-soft);
  font-size:11px;cursor:pointer}
@@ -332,9 +383,20 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 @media (prefers-reduced-motion:reduce){.livedot,.dots i{animation:none}}
 .bcard.click{cursor:pointer}
 .bcard:hover{border-color:var(--blue)}
-.bid{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--blue);
- display:flex;align-items:center;gap:6px}
-.bt{font-size:12px;margin:5px 0 0;color:var(--ink)}
+.bcard.sel{border-color:rgba(88,166,255,.55);background:rgba(88,166,255,.05)}
+.bcard.bulkbusy{opacity:.55}
+.bsel{accent-color:var(--blue);cursor:pointer;flex:none;width:12px;height:12px}
+button.busy,.bgo{font-family:inherit}
+button.busy{opacity:.65;pointer-events:none}
+.spin{display:inline-block;animation:rot .9s linear infinite}
+@keyframes rot{to{transform:rotate(360deg)}}
+.bbulk{display:flex;align-items:center;gap:8px;margin-left:auto;flex-wrap:wrap}
+.bbulk b{color:var(--primary);font-size:11px;letter-spacing:.04em}
+.bgo{font-size:10.5px;padding:2px 12px;border-radius:999px;border:1px solid var(--edge);
+ background:var(--surface);color:var(--ink);cursor:pointer;transition:all .12s ease}
+.bgo:hover{border-color:var(--primary);color:var(--primary)}
+.bgo.warn{border-color:rgba(248,81,73,.4);color:var(--red)}
+.bgo.warn:hover{border-color:var(--red);color:var(--red)}
 .bempty{color:var(--faint);font-size:11px;text-align:center;padding:6px 0}
 .q .livedot{flex:none}
 #composer{position:relative}
@@ -364,16 +426,79 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
  margin-bottom:6px;cursor:pointer;font-size:12px;transition:border-color .12s ease}
 .dother:hover{border-color:var(--blue)}
 .dother b{color:var(--blue);font-family:ui-monospace,Menlo,monospace;font-size:11px;margin-right:6px}
+
+/* ---- Light mode: cream paper, editorial serif, extra breathing room ---- */
+html[data-theme="light"]{
+ --bg:#f7f4ec; --surface:#fdfcf8; --surface-2:#efe9da; --edge:#ddd5c2;
+ --edge-soft:rgba(80,70,45,.12); --ink:#272219; --dim:#6e6857; --faint:#99927d;
+ --primary:#95650e; --primary-ink:#fffcf3; --blue:#31619f; --green:#3d7a44;
+ --red:#b5432f; --amber:#8f6410;
+ --sh-1:0 1px 2px rgba(74,64,44,.08); --sh-2:0 10px 28px rgba(74,64,44,.14);
+}
+html[data-theme="light"] body{font:400 13.5px/1.55
+ "Iowan Old Style","Palatino Linotype",Palatino,Georgia,Cambria,"Times New Roman",serif}
+html[data-theme="light"] ::selection{background:rgba(149,101,14,.16)}
+html[data-theme="light"] .chip,html[data-theme="light"] .st,html[data-theme="light"] .badge,
+html[data-theme="light"] .qbadge,html[data-theme="light"] .appswitch .app,
+html[data-theme="light"] .vtabs .app,html[data-theme="light"] nav h2,
+html[data-theme="light"] .smenuhd,html[data-theme="light"] th,html[data-theme="light"] button,
+html[data-theme="light"] .codebar,html[data-theme="light"] .bapp,html[data-theme="light"] .bchip,
+html[data-theme="light"] .msg .who,html[data-theme="light"] .chipx,
+html[data-theme="light"] .bops button,html[data-theme="light"] .bgo,
+html[data-theme="light"] #drawer .dh span,html[data-theme="light"] .repohead,
+html[data-theme="light"] .wc-hint,html[data-theme="light"] .sessmeta,
+html[data-theme="light"] .cmddesc,html[data-theme="light"] .bbulk b,
+html[data-theme="light"] .iconbtn{font-family:"Inter","Roboto",-apple-system,"Segoe UI",sans-serif}
+html[data-theme="light"] .wc-hi{font-size:19px;font-weight:700;letter-spacing:.01em}
+html[data-theme="light"] #chatbar .qslug{font-family:"Iowan Old Style","Palatino Linotype",
+ Palatino,Georgia,Cambria,"Times New Roman",serif}
+html[data-theme="light"] #composer textarea{font:13.5px/1.55 "Iowan Old Style",
+ "Palatino Linotype",Palatino,Georgia,Cambria,"Times New Roman",serif}
+html[data-theme="light"] header{height:56px;padding:0 24px}
+html[data-theme="light"] main{grid-template-columns:320px 1fr}
+html[data-theme="light"] nav{padding:16px 14px 28px}
+html[data-theme="light"] nav h2{margin:18px 8px 7px}
+html[data-theme="light"] .appswitch{margin-bottom:14px}
+html[data-theme="light"] .castle{padding:12px 16px;margin-bottom:14px;
+ background:linear-gradient(160deg,#fbf8f0,#f3edda);border-color:rgba(149,101,14,.28)}
+html[data-theme="light"] .castle:hover{border-color:rgba(149,101,14,.55)}
+html[data-theme="light"] .repohead{margin:16px 6px 7px}
+html[data-theme="light"] .repohead::after{background:rgba(149,101,14,.3)}
+html[data-theme="light"] .q{padding:9px 12px 10px 16px;margin-bottom:9px}
+html[data-theme="light"] .qtitle2{font-size:13.5px}
+html[data-theme="light"] .qslug{font-size:12px}
+html[data-theme="light"] #chatbar{padding:12px 26px;min-height:56px}
+html[data-theme="light"] #transcript{padding:26px 36px;gap:15px}
+html[data-theme="light"] .msg{padding:13px 17px;font-size:13.5px;line-height:1.62;
+ box-shadow:var(--sh-1)}
+html[data-theme="light"] .msg.md{line-height:1.66}
+html[data-theme="light"] .msg.user{background:rgba(149,101,14,.13);
+ border-color:rgba(149,101,14,.4)}
+html[data-theme="light"] .msg.user .who{color:var(--amber)}
+html[data-theme="light"] .app.on,html[data-theme="light"] .chipx.on{background:rgba(149,101,14,.1)}
+html[data-theme="light"] #composer{padding:14px 26px 18px}
+html[data-theme="light"] .wcard{padding:12px 16px}
+html[data-theme="light"] .scard{padding:10px 13px}
+html[data-theme="light"] .bcard{padding:10px 12px;margin-bottom:8px}
+html[data-theme="light"] #boardcols{gap:14px;padding:18px}
+html[data-theme="light"] td{padding:8px 10px}
+html[data-theme="light"] #modal{background:rgba(46,38,24,.38)}
+html[data-theme="light"] #modal .box{box-shadow:var(--sh-2)}
+html[data-theme="light"] .qbadge.app-common,html[data-theme="light"] .qbadge.app-intelligence{
+ background:rgba(123,83,194,.08);border-color:rgba(123,83,194,.4);color:#7b53c2}
+html[data-theme="light"] .iconbtn .bcount{color:#fff}
 </style></head><body>
 <header><div class="brand"><span class="glyph"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><path fill="currentColor" d="M32 192L32 48c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 40c0 4.4 3.6 8 8 8l32 0c4.4 0 8-3.6 8-8l0-40c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 40c0 4.4 3.6 8 8 8l32 0c4.4 0 8-3.6 8-8l0-40c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 144c0 10.1-4.7 19.6-12.8 25.6L352 256l16 144L80 400 96 256 44.8 217.6C36.7 211.6 32 202.1 32 192zm176 96l32 0c8.8 0 16-7.2 16-16l0-48c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 48c0 8.8 7.2 16 16 16zM22.6 473.4L64 432l320 0 41.4 41.4c4.2 4.2 6.6 10 6.6 16c0 12.5-10.1 22.6-22.6 22.6L38.6 512C26.1 512 16 501.9 16 489.4c0-6 2.4-11.8 6.6-16z"/></svg></span><em>CASTLE</em></div>
 <div class="vtabs"><div class="app on" id="v_chat" onclick="setView('chat')">chat</div>
-<div class="app" id="v_board" onclick="setView('board')">board</div></div>
+<div class="app" id="v_board" onclick="setView('board')">board</div>
+<div class="app" id="v_settings" onclick="setView('settings')">settings</div></div>
 <div class="vdiv"></div><div id="totals" style="display:flex;gap:8px"></div>
-<div class="spacer"></div><span class="chip" id="t_today" title="sessions active since local midnight — cost / tokens"></span>
+<div class="spacer"></div>
+<span class="chip" id="t_today" title="sessions active since local midnight — cost / tokens"></span>
 <div class="chip rss">kilo RSS <b id="t_rss">—</b></div>
+<div class="iconbtn" id="theme_btn" title="toggle light / dark" onclick="toggleTheme()">☾</div>
 <div class="iconbtn" title="recent turns" onclick="openTurns()">≡</div>
-<div class="iconbtn" title="search sessions" onclick="openSearch()">⌕</div>
-<div id="clock"></div></header>
+<div class="iconbtn" title="search sessions" onclick="openSearch()">⌕</div></header>
 <main><nav id="nav"></nav>
 <section id="chat">
   <div id="chatbar">
@@ -384,7 +509,8 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
    <span id="sess_meta" class="sessmeta"></span>
    <div class="hgrp">
     <div class="iconbtn" title="open quest charter in drawer" onclick="toggleDoc(event)">▤</div>
-    <div class="iconbtn" title="MCP servers" onclick="openMcp()">⚙</div>
+    <div class="iconbtn" id="browser_btn" title="launch studio chromium" style="display:none" onclick="launchBrowser(event)">▶</div>
+    <div class="iconbtn" title="settings — models, presets, suite, MCP" onclick="setView('settings')">⚙</div>
     <div class="iconbtn" id="sess_del" title="delete this session" style="display:none" onclick="delSess(selSess)">✕</div>
     <div class="iconbtn" id="sess_burger" title="sessions in this worktree" onclick="toggleSessMenu(event)">☰</div>
    </div>
@@ -398,9 +524,12 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
   <div class="cont" id="c_cont">new session — pick a worktree, or open the ☰ sessions menu to continue one</div>
   <div class="row">
    <textarea id="c_prompt" placeholder="message the agent… (Enter to send, Shift+Enter for newline)"></textarea>
-   <input id="c_model" list="model_dl" value="openrouter/z-ai/glm-5.3-flash" spellcheck="false"
-    autocomplete="off" placeholder="model" title="model id — type to filter (kilo/provider/model or provider/model)"
-    style="width:240px;height:46px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);
+   <select id="c_model" title="model preset — any preset pairs with any agent class; edit the list in settings"
+    style="width:250px;height:46px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);
+    border-radius:8px;padding:0 8px;font:11.5px ui-monospace,Menlo,monospace"></select>
+   <input id="c_model_custom" list="model_dl" spellcheck="false" autocomplete="off" placeholder="provider/model id"
+    title="custom model id — type to filter (kilo/provider/model or provider/model)" style="display:none;
+    width:250px;height:46px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);
     border-radius:8px;padding:0 10px;font:11.5px ui-monospace,Menlo,monospace">
    <datalist id="model_dl"></datalist>
    <select id="c_agent" style="height:46px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);border-radius:8px;padding:0 8px"></select>
@@ -412,16 +541,38 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 <section id="board">
  <div id="boardbar" style="padding:10px 20px;border-bottom:1px solid var(--edge);background:var(--surface)"></div>
  <div id="boardcols"></div>
-</section></main>
+</section>
+<section id="settings"><div class="setwrap" id="settings_bd"></div></section></main>
 <div id="drawer"><div class="dh"><b id="drawer_title">quest charter</b>
  <span onclick="toggleDoc(event)">CLOSE ✕</span></div>
  <div class="db" id="drawer_bd"></div></div>
-<div id="modal"><div class="box"><div class="hd"><b>MCP SERVERS — merged inventory</b>
-<span onclick="closeMcp()">CLOSE ✕</span></div><div class="bd" id="modal_bd"></div></div></div>
+<div id="modal"><div class="box"><div class="hd"><b>DETAILS</b>
+<span onclick="closeModal()">CLOSE ✕</span></div><div class="bd" id="modal_bd"></div></div></div>
 <script>
 let S=null, selRepo=null, selWt=null, selSess=null, msgs=[], TURN=null, turns=[];
 let LANESEQ=0, curLane=null;
+const NAV_EXP={};
+const SECTION_ORDER=[
+ {id:'artist',label:'Artist studio'},
+ {id:'gatehouse',label:'Gatehouse'},
+ {id:'treasury',label:'Treasury'},
+ {id:'frontier',label:'Frontier'},
+ {id:'field',label:'The Field'},
+ {id:'other',label:'Other'},
+];
+function sectionOfBranch(b){
+ if(b.startsWith('artist/'))return 'artist';
+ if(b.startsWith('the-gatehouse/'))return 'gatehouse';
+ if(b.startsWith('scout/'))return 'frontier';
+ if(b.startsWith('quest/')||b.startsWith('epic/'))return 'field';
+ return 'other';
+}
+function addUnit(sec,path,b,w){
+ if(sec.seen.has(path))return;
+ sec.seen.add(path);sec.units.push({b,w});
+}
 let view='chat', boardApp='all', boardKey='', CMDS=[], cmdIdx=0;
+let BOARD_SEL=new Set();
 const TURNSEQ=[0];
 const foldMemo={};
 const foldKey=t=>'F'+t.length+':'+t.slice(0,80);
@@ -434,6 +585,15 @@ const mb=r=>r==null||r===undefined?'—':(r/1048576).toFixed(0)+' MB';
 const ago=ts=>{if(!ts)return'';const d=(Date.now()-ts)/1000;
  return d<60?`${d|0}s`:(d<3600?`${d/60|0}m`:(d<86400?`${d/3600|0}h`:`${d/86400|0}d`))};
 const $=id=>document.getElementById(id);
+function applyTheme(t){
+ document.documentElement.dataset.theme=t;
+ const b=$('theme_btn');if(b)b.textContent=t==='light'?'☾':'☀';
+ try{localStorage.setItem('castle-theme',t)}catch(e){}
+}
+function toggleTheme(){
+ applyTheme(document.documentElement.dataset.theme==='light'?'dark':'light');
+}
+applyTheme((()=>{try{return localStorage.getItem('castle-theme')||'light'}catch(e){return 'light'}})());
 const TRUNKS=['main','castle','master','trunk'];
 const KIND_NAMES={quest:'quest',epic:'epic',scout:'scout',artist:'artist','the-gatehouse':'gate'};
 function qparse(b){
@@ -494,13 +654,13 @@ function syncHash(){
  if(selRepo)p.push('app='+encodeURIComponent(selRepo));
  if(selWt)p.push('wt='+encodeURIComponent(selWt));
  if(selSess)p.push('sess='+encodeURIComponent(selSess));
- if(view==='board')p.push('view=board');
- history.replaceState(null,'','#'+p.join('&'));
+  if(view!=='chat')p.push('view='+view);
+  history.replaceState(null,'','#'+p.join('&'));
 }
 function applyHash(){
  const p=hashState();let hit=false;
  if(p.app&&S.repos.some(r=>r.key===p.app)){selRepo=p.app;hit=true;}
- if(p.view==='board')setView('board');
+  if(p.view==='board'||p.view==='settings')setView(p.view);
  if(p.wt){
   const r=repo();
   const w=(r.worktrees||[]).find(x=>x.path===p.wt)||(r.worktrees||[]).find(x=>x.branch===p.wt);
@@ -530,10 +690,9 @@ function applyHash(){
   $('t_rss').textContent=mb(S.proc_total_rss);
   const ty=S.today||{};
   $('t_today').innerHTML=`$ <b>${(ty.cost||0).toFixed(2)}</b> today`;
-  $('clock').textContent=new Date().toLocaleTimeString();
-  syncComposer();syncSessMeta();syncEaselChip();
+  syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();
   if(view==='board'){
-   const key=boardApp+'|'+(S.quests||[]).map(q=>q.id+q.status+(q.dirty?'d':'')+(q.app||'')).join(',');
+   const key=boardApp+'|'+(S.quests||[]).map(q=>q.id+q.status+(q.dirty?'d':'')+(q.app||'')+(q.cogship_id||'')).join(',');
    if(key!==boardKey){boardKey=key;renderBoard();}}
 }
 function activeDirs(){const s=new Set();for(const a of (S.active||[]))if(a.dir)s.add(a.dir);return s;}
@@ -548,49 +707,69 @@ function renderNav(){
    <div class="name"><span class="dot"></span>${esc(r.name)} trunk${act.has(trunk.path)?' <span class="livedot" title="agent working"></span>':''}</div>
    <div class="sub">${esc(trunk.branch||'?')}${trunk.dirty?' · dirty':''}</div></div>`;
   const byBranch={}; for(const w of r.worktrees){if(w.branch)byBranch[w.branch]=w}
-  const secs={};
+  const secs={};for(const s of SECTION_ORDER)secs[s.id]={seen:new Set(),units:[]};
   for(const b of r.branches){
-   const ns=b.includes('/')?b.split('/')[0]:'(root)';
    if(TRUNKS.includes(b))continue;
-   if(!byBranch[b])continue;
-   (secs[ns]??=[]).push(b);
+   const w=byBranch[b];
+   if(!w)continue;
+   addUnit(secs[sectionOfBranch(b)],w.path,b,w);
   }
-  for(const ns of Object.keys(secs).sort((a,b)=>secs[b].length-secs[a].length)){
-   if(!secs[ns].length)continue;
-   h+=`<h2>${esc(ns)} · ${secs[ns].length}</h2>`;
-   for(const b of secs[ns].slice(0,30)){
-    const w=byBranch[b];
-    const working=act.has(w.path);
-    const mark=(working?'<span class="livedot" title="agent working"></span>':'')+
+  for(const w of r.worktrees){
+   if(!w.branch)continue;
+   const agents=new Set(sessionsFor(w.path).map(s=>s.agent));
+   for(const a of (S.active||[]))if(a.dir===w.path)agents.add(a.agent);
+   if(agents.has('master_of_coin'))addUnit(secs.treasury,w.path,w.branch,w);
+   if(agents.has('gatekeeper'))addUnit(secs.gatehouse,w.path,w.branch,w);
+   if(agents.has('artist'))addUnit(secs.artist,w.path,w.branch,w);
+  }
+  for(const sec of SECTION_ORDER){
+   const s=secs[sec.id];
+   if(!s.units.length)continue;
+   h+=`<h2>${esc(sec.label)} · ${s.units.length}</h2>`;
+   const items=NAV_EXP[sec.id]?s.units:s.units.slice(0,30);
+    for(const u of items){
+     const b=u.b,w=u.w;
+     const working=act.has(w.path);
+     const q=questFor(r.key,w.path,b);
+     const p=qparse(b);
+     const marks=(working?'<span class="livedot" title="agent working"></span>':'')+
      (w.dirty?'<span class="badge">dirty</span>':'');
-    const q=questFor(r.key,w.path,b);
-    const p=qparse(b);
     let inner;
     if(q){
-     inner=`<div class="row1">${questTitleHTML(q)}${mark}</div>`;
-     const nsess=sessionsFor(w.path).length;
-     const a=q.audit;
-     let chips='';
-     if(a&&a.tasks_total)chips+=`<span class="bchip ${a.tasks_pct>=100?'ok':''}">${a.tasks_done}/${a.tasks_total} tasks</span>`;
-     if(a&&a.tribute_present)chips+='<span class="bchip ok">tribute</span>';
+     const badge=appBadge(q.app)?
+      `<span class="qbadge app-${esc(String(q.app||'').toLowerCase())}">${esc(appBadge(q.app))}</span>`:'';
+     inner=`<div class="qtop"><span class="qnum">${esc(qnumOf(q.id)||q.id)}</span>${badge}`+
+      `<span class="qgrow"></span>${marks}</div>`+
+      `<div class="qtitle2">${esc(q.title||'')}</div>`;
+      const nsess=sessionsFor(w.path).length;
+      const a=q.audit;
+      let chips='';
+      if(q.cogship_id)chips+=`<span class="bchip ship" title="stamped onto this cog ship convoy">🚢 ${esc(q.cogship_id)}</span>`;
+      if(a&&a.tasks_total)chips+=`<span class="bchip ${a.tasks_pct>=100?'ok':''}">${a.tasks_done}/${a.tasks_total} tasks</span>`;
+     if(q.tribute_total)chips+=`<span class="bchip ${q.tribute_done>=q.tribute_total?'ok':''}">${q.tribute_done}/${q.tribute_total} tribute</span>`;
+     else if(a&&a.tribute_present)chips+='<span class="bchip ok">tribute</span>';
+     if(q.wt_status&&q.wt_status!==q.status)chips+=`<span class="bchip warn" title="worktree charter status — ahead of the master charter until sync-back">wt: ${esc(q.wt_status.toLowerCase())}</span>`;
      chips+=`<span class="bchip${nsess?'':' dim'}">${nsess} session${nsess===1?'':'s'}</span>`;
      inner+=`<div class="qmeta">${chips}</div>`;
     }else if(p){
-     inner=`<div class="row1"><span class="qnum">${esc(p.big)}</span>`+
-      `<span class="qslug">${esc(p.rest||'')}</span>${mark}</div>`;
+     inner=`<div class="qtop"><span class="qnum">${esc(p.big)}</span><span class="qgrow"></span>${marks}</div>`+
+      `<div class="qtitle2">${esc(p.rest||b)}</div>`;
     }else{
-     inner=`<div class="row1">${esc(b.includes('/')?b.slice(b.indexOf('/')+1):b)}${mark}</div>`+
-      `<div class="row2">${esc(b)}</div>`;
+     inner=`<div class="qtop"><span class="qgrow"></span>${marks}</div>`+
+      `<div class="qtitle2">${esc(b.includes('/')?b.slice(b.indexOf('/')+1):b)}</div>`+
+      `<div class="qsub">${esc(b)}</div>`;
     }
     h+=`<div class="q ${selWt===w.path?'sel':''}" title="${esc(b)}" data-wt="${esc(w.path)}" data-branch="${esc(b)}">${inner}</div>`;
    }
-   if(secs[ns].length>30)h+=`<div class="q dim" style="cursor:default">… ${secs[ns].length-30} more</div>`;
+   if(s.units.length>30)h+=`<div class="q navmore" data-navmore="${esc(sec.id)}">${NAV_EXP[sec.id]?'▴ show less':'… '+(s.units.length-30)+' more'}</div>`;
   }
   $('nav').innerHTML=h;
 }
 $('nav').addEventListener('click',e=>{
   const app=e.target.closest('[data-app]');
   if(app){switchApp(app.dataset.app);return;}
+  const more=e.target.closest('[data-navmore]');
+  if(more){NAV_EXP[more.dataset.navmore]=!NAV_EXP[more.dataset.navmore];renderNav();return;}
   const wt=e.target.closest('[data-wt]');
   if(wt){pickWt(wt.dataset.wt||null,wt.dataset.branch||null);}
 });
@@ -600,16 +779,22 @@ function switchApp(key){selRepo=key;selWt=null;selSess=null;msgs=[];curLane=null
  CMDS=[];renderCmdList();
  renderNav();renderTranscript();syncHash();syncComposer();}
 let cmdSeq=0;
+const CMD_CACHE={};
 async function loadCmds(){
+ const dir=selWt;
+ if(!dir){CMDS=[];renderCmdList();return;}
+ const hit=CMD_CACHE[dir];
+ if(hit&&Date.now()-hit.ts<60000){if(CMDS!==hit.list){CMDS=hit.list;renderCmdList();}return;}
  const seq=++cmdSeq;
- if(!selWt){CMDS=[];renderCmdList();return;}
  let c=[];
- try{c=await (await fetch('/api/commands?dir='+encodeURIComponent(selWt))).json();}
+ try{c=await (await fetch('/api/commands?dir='+encodeURIComponent(dir))).json();}
  catch(e){}
+ if(Array.isArray(c))CMD_CACHE[dir]={ts:Date.now(),list:c};
  if(seq===cmdSeq){CMDS=c;renderCmdList();}
 }
 function pickWt(path,branch){
  selWt=path;selSess=null;msgs=[];
+ if(view==='board')setView('chat');
  if(path){
   const w=(repo().worktrees||[]).find(x=>x.path===path);
   setWtLabel(branch||w&&w.branch||path.split('/').pop(),path);
@@ -618,19 +803,41 @@ function pickWt(path,branch){
   $('wt_label').innerHTML=esc(branch||'?')+' <span class="dim">· no worktree</span>';
   $('wt_badge').innerHTML='';
  }
-  renderNav();renderSessionsBar();renderTranscript();syncComposer();syncSessMeta();syncEaselChip();
+  renderNav();renderSessionsBar();renderTranscript();syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();
   $('c_cont').innerHTML='new session — pick a worktree, or click a session tab to continue it';
  const sess=sessionsFor(path);
  if(sess.length)openSess(sess[0].id);
- else{selSess=null;msgs=[];curLane='L'+(++LANESEQ);renderTranscript();
-  $('c_cont').innerHTML='new session — no sessions in this worktree yet';}
+ else{
+  selSess=null;msgs=[];curLane='L'+(++LANESEQ);renderTranscript();
+  $('c_cont').innerHTML='new session — checking for earlier sessions…';
+  wtSessions(path).then(list=>{
+   if(selWt!==path)return;
+   if(list.length)openSess(list[0].id);
+   else $('c_cont').innerHTML='new session — no sessions in this worktree yet';
+  });
+ }
  loadCmds();
  syncHash();
 }
 function sessionsFor(path){
  // exact-directory match only: a repo-root (trunk) card must show ONLY its own
  // root sessions, never the sessions of nested quest/artist worktrees.
- return S.sessions.filter(s=>s.directory&&s.directory===path);
+ const base=S.sessions.filter(s=>s.directory&&s.directory===path);
+ const extra=(WT_SESS[path]||{}).list||[];
+ if(!extra.length)return base;
+ const seen=new Set(base.map(s=>s.id));
+ return base.concat(extra.filter(s=>!seen.has(s.id)));
+}
+const WT_SESS={};
+async function wtSessions(path){
+ if(!path)return[];
+ if(WT_SESS[path]&&Date.now()-WT_SESS[path].ts<60000)return WT_SESS[path].list;
+ try{
+  const list=await (await fetch('/api/sessions?wt='+encodeURIComponent(path))).json();
+  WT_SESS[path]={ts:Date.now(),list:list||[]};
+  renderSessionsBar();
+ }catch(e){return[];}
+ return WT_SESS[path].list;
 }
 function sessMeta(s){
  return `tok ${ktop((s.tokens_input||0)+(s.tokens_output||0))} · $${(s.cost||0).toFixed(2)}`;
@@ -695,6 +902,7 @@ async function openSess(id){
  selSess=id;msgs=[];curLane=id;
  $('c_cont').innerHTML=`continuing <b>${esc(id.slice(0,24))}…</b> <span class="x" onclick="newSess()">start new instead</span>`;
  renderSessionsBar();renderTranscript();syncHash();syncComposer();syncSessMeta();
+ loadCmds();
  $('transcript').innerHTML='<div class="notice">loading…</div>';
  let m=[];
  try{m=await (await fetch('/api/session?id='+id)).json();}catch(e){}
@@ -725,7 +933,8 @@ function msgHTML(m){
   const md=cls==='assistant'||cls==='thinking';
   const k=cls==='thinking'?foldKey(m.text):null;
   const fold=k&&foldMemo[k]===true?' folded':'';
-  return `<div class="msg ${cls}${md?' md':''}${fold}"${k?` data-fk="${esc(k)}"`:''}><div class="who">${esc(m.role)}</div>${content}</div>`;
+  const who=cls==='user'?'you':cls;
+  return `<div class="msg ${cls}${md?' md':''}${fold}"${k?` data-fk="${esc(k)}"`:''}><div class="who">${esc(who)}</div>${content}</div>`;
 }
 function renderTranscript(){
   const t=$('transcript');
@@ -767,19 +976,25 @@ function welcomeHTML(){
   LAUNCHES.map((l,i)=>`<div class="wcard" data-launch="${i}">
    <div class="wl-t">${esc(l.t)}</div><div class="wl-d">${esc(l.d)}</div></div>`).join('')+
   `</div>
-  <div class="wc-hint">suggestions launch a steward session in the castle trunk — or pick any worktree on the left</div>
+  <div class="wc-hint">suggestions launch a fresh steward session in your selected worktree — pick a worktree on the left to change the target</div>
  </div>`;
 }
 function launchSuggestion(i){
- const L=LAUNCHES[i];if(!L)return;
- const cr=S?S.repos.find(r=>r.key==='castle'):null;
- const wt=cr&&cr.root?cr.root:selWt;
+ const L=LAUNCHES[i];if(!L||!S)return;
+ let wt=selWt||null;
+ if(!wt){
+  const r=repo();
+  if(r)wt=r.root;
+ }
+ if(!wt){
+  const cr=S.repos.find(r=>r.key==='castle');
+  if(cr){wt=cr.root;selRepo='castle';}
+ }
  if(!wt)return;
- if(cr)selRepo=cr.key;
- pickWt(wt,cr&&cr.branch||null);
+ if(selWt!==wt)pickWt(wt);
  newSess();
- $('c_agent').value='steward';
- dispatch(wt,null,'steward',$('c_model').value.trim(),L.p);
+ $('c_agent').value='steward';syncRoleModel();
+ dispatch(wt,null,'steward',composerModel(),L.p);
 }
 $('transcript').addEventListener('click',e=>{
  const c=e.target.closest('[data-launch]');
@@ -799,7 +1014,7 @@ function blockHTML(b){
   const k=b.cls==='thinking'?foldKey(b.text):null;
   const fold=k&&foldMemo[k]===true?' folded':'';
   return `<div class="msg ${b.cls}${md?' md':''}${fold}"${k?` data-fk="${esc(k)}"`:''}>`+
-   `<div class="who">${b.cls==='thinking'?'reasoning':b.cls}</div>`+
+   `<div class="who">${b.cls==='thinking'?'reasoning':b.cls==='user'?'you':b.cls}</div>`+
    (md?mdRender(b.text):esc(b.text))+'</div>';
 }
 function renderLive(T0){
@@ -916,17 +1131,21 @@ function sendComposer(){
     t.blocks.push({cls:'notice',text:'already queued — one queued message per turn'});
     if(turnForView()===t)renderLive();
     return;}
-   t.queue={wt:t.wt,agent:$('c_agent').value,model:$('c_model').value.trim(),prompt:txt};
+   t.queue={wt:t.wt,agent:$('c_agent').value,model:composerModel(),prompt:txt};
    ta.value='';autosizeTa();
    t.blocks.push({cls:'notice',
     text:'queued next: '+txt.slice(0,80)+(txt.length>80?'…':'')});
    if(turnForView()===t)renderLive();
    return;}
   if(!selWt){
-   $('c_cont').innerHTML='<span style="color:var(--red)">select a worktree with sessions (left) before sending — cannot dispatch without a directory</span>';
-   return;}
+   const r=repo();
+   if(r&&r.root){pickWt(r.root);}
+   else{
+    $('c_cont').innerHTML='<span style="color:var(--red)">select a worktree with sessions (left) before sending — cannot dispatch without a directory</span>';
+    return;}
+  }
   ta.value='';autosizeTa();
-  dispatch(selWt,selSess,$('c_agent').value,$('c_model').value.trim(),txt);
+  dispatch(selWt,selSess,$('c_agent').value,composerModel(),txt);
 }
 function autosizeTa(){
  const ta=$('c_prompt');
@@ -1043,6 +1262,7 @@ async function delSess(id){
   if(!r.ok){alert('refused: '+(await r.text()));return;}
  }catch(e){alert('delete failed: '+e);return;}
  if(S)S.sessions=(S.sessions||[]).filter(x=>x.id!==id);
+ if(selWt)delete WT_SESS[selWt];
  if(selSess===id){
   selSess=null;msgs=[];
   const next=sessionsFor(selWt).find(x=>x.id!==id);
@@ -1066,23 +1286,28 @@ function renderCmdList(){
  el.innerHTML=m.map((c,i)=>`<div class="cmdrow ${i===cmdIdx?'on':''}"
   data-name="${esc(c.name)}"><span class="cmdname">/${esc(c.name)}</span>`+
   `<span class="cmddesc">${esc(c.desc||'')}${c.agent?' · '+esc(c.agent):''}</span></div>`).join('');
- el.style.display='';
+ el.style.display='block';
 }
 function completeCmd(name){
  const ta=$('c_prompt');
  ta.value='/'+name+' ';ta.focus();
  renderCmdList();
 }
+$('cmdlist').addEventListener('mousedown',e=>{
+ const r=e.target.closest('.cmdrow');
+ if(r){e.preventDefault();completeCmd(r.dataset.name);}});
 function setView(v){
- view=v;
+ view=v;syncHash();
  $('chat').style.display=v==='chat'?'':'none';
  $('board').style.display=v==='board'?'flex':'none';
+ $('settings').style.display=v==='settings'?'block':'none';
  $('v_chat').classList.toggle('on',v==='chat');
  $('v_board').classList.toggle('on',v==='board');
+ $('v_settings').classList.toggle('on',v==='settings');
  renderCmdList();
  renderNav();
  if(v==='board'){boardKey='';renderBoard();}
- syncHash();
+ if(v==='settings')renderSettings();
 }
 function boardFilter(a){boardApp=a;renderBoard();}
 function openQuestWt(p){
@@ -1093,43 +1318,75 @@ function openQuestWt(p){
  else poll();
 }
 const BOARD_OPS={WORKING:[["goad","goad","go"]],
- TRIBUTE_READY:[["coin","coin","go"],["advance","advance","GATE",""]],
- GATE:[["collect","collect","go"]],
+ TRIBUTE_READY:[["coin","coin","go"],["studio","🎨 studio","go"],["advance","advance","GATE",""]],
+ GATE:[["collect","🚢 collect","go"],["studio","🎨 studio","go"]],
  READY_TO_RAZE:[["raze","raze","warn"]],
  PLANNED:[["dispatch","dispatch","go"]]};
-function renderBoard(){
+function boardAttn(q){
+ const a=q.audit;
+ return !!(a&&(a.violations>0||a.pending_audience||a.forced_transition));
+}
+function renderBoardBar(){
  if(view!=='board')return;
  const qs=S.quests||[];
  const apps={};for(const q of qs){const a=q.app||q.repo||'other';apps[a]=(apps[a]||0)+1;}
- if(boardApp!=='all'&&!(boardApp in apps))boardApp='all';
- const act=activeDirs();
- const attn=q=>{const a=q.audit;return a&&(a.violations>0||a.pending_audience||a.forced_transition);};
- const nAttn=qs.filter(attn).length;
+ const nAttn=qs.filter(boardAttn).length;
  let h='<div class="bfil"><span class="chipx '+(boardApp==='all'?'on':'')+'" data-app="all">all · '+qs.length+'</span>'+
   Object.keys(apps).sort().map(a=>`<span class="chipx ${a===boardApp?'on':''}" data-app="${esc(a)}">${esc(a)} · ${apps[a]}</span>`).join('')+
-  (nAttn?`<span class="chipx" style="border-color:rgba(248,81,73,.5);color:var(--red)">${nAttn} need attention</span>`:'')+'</div>';
+  (nAttn?`<span class="chipx" style="border-color:rgba(248,81,73,.5);color:var(--red)">${nAttn} need attention</span>`:'')+
+  (BOARD_SEL.size?`<div class="bbulk"><b>${BOARD_SEL.size} selected</b>`+
+   '<button class="bgo" data-bulk="collect">🚢 pack</button>'+
+   '<button class="bgo" data-bulk="studio">🎨 studio</button>'+
+   '<button class="bgo" data-bulk="coin">coin</button>'+
+   '<button class="bgo" data-bulk="goad">goad</button>'+
+   '<button class="bgo" data-bulk="advance">→ tribute</button>'+
+   '<button class="bgo warn" data-bulk="raze">raze</button>'+
+   '<button class="bgo" data-bulk="clear">clear</button></div>':'')+'</div>';
  $('boardbar').innerHTML=h;
+}
+function renderBoard(){
+ if(view!=='board')return;
+ renderBoardBar();
+ const qs=S.quests||[];
+ const bc=$('boardcols');
+ const keep={left:bc?bc.scrollLeft:0,tops:bc?[...bc.querySelectorAll('.bcol')].map(c=>c.scrollTop):[]};
+ const act=activeDirs();
  let cols='';
  for(const st of STATUS_ORDER){
   const items=qs.filter(q=>q.status===st&&(boardApp==='all'||(q.app||q.repo)===boardApp));
-  cols+=`<div class="bcol"><h3>${esc(st.toLowerCase())} · ${items.length}</h3>`;
+  const allSel=items.length&&items.every(q=>BOARD_SEL.has(q.id));
+  cols+=`<div class="bcol"><h3><label class="bselall" title="select all in this column">`+
+   `<input type="checkbox" class="bselall" data-bselall="${esc(st)}"${allSel?' checked':''}>`+
+   `${esc(st.toLowerCase())} · ${items.length}</label></h3>`;
   for(const q of items){
    const on=!!(q.worktree&&act.has(q.worktree));
    const a=q.audit;
-   const ops=BOARD_OPS[q.status]||[];
-   let chips='';
-   if(a){
+    const ops=BOARD_OPS[q.status]||[];
+    let chips='';
+    if(q.cogship_id)chips+=`<span class="bchip ship" title="stamped onto this cog ship convoy">🚢 ${esc(q.cogship_id)}</span>`;
+    if(a){
     if(a.tasks_total)chips+=`<span class="bchip ${a.tasks_pct>=100?'ok':''}">${a.tasks_done}/${a.tasks_total} tasks</span>`;
-    chips+=a.tribute_present?'<span class="bchip ok">tribute</span>':'';
+    if(q.tribute_total)chips+=`<span class="bchip ${q.tribute_done>=q.tribute_total?'ok':''}">${q.tribute_done}/${q.tribute_total} tribute</span>`;
+    else chips+=a.tribute_present?'<span class="bchip ok">tribute</span>':'';
+    if(q.wt_status&&q.wt_status!==q.status)chips+=`<span class="bchip warn" title="worktree charter status — ahead of the master charter until sync-back">wt: ${esc(q.wt_status.toLowerCase())}</span>`;
     if(a.violations)chips+=`<span class="bchip bad">${a.violations} viol</span>`;
     if(a.pending_audience)chips+='<span class="bchip warn">audience</span>';
     if(a.forced_transition)chips+='<span class="bchip warn">forced</span>';
     if(a.commutation_done)chips+='<span class="bchip ok">commuted</span>';
    }
-   cols+=`<div class="bcard ${q.worktree?'click':''} ${attn(q)?'attn':''}" ${q.worktree?`data-wt="${esc(q.worktree)}"`:''}>
-    <div class="btop"><span class="bid">${esc(q.id)}</span>${q.dirty?'<span class="badge">dirty</span>':''}${on?'<span class="livedot" title="agent working"></span>':''}`+
-    (chips?`<span class="bchips">${chips}</span>`:'')+'</div>'+
-    `<div class="bt"><span class="bapp">${esc(q.app||q.repo||'—')}</span>${esc(q.title||'')}</div>`+
+   const qnum=(String(q.id).match(/^[A-Za-z]+\d+/)||[q.id])[0].toUpperCase();
+   const appLabel=appBadge(q.app);
+   const desc=[q.section,q.branch].filter(Boolean).join(' · ');
+   cols+=`<div class="bcard click ${boardAttn(q)?'attn':''} ${BOARD_SEL.has(q.id)?'sel':''}" data-qid="${esc(q.id)}" ${q.worktree?`data-wt="${esc(q.worktree)}"`:''}>
+    <div class="btop"><input type="checkbox" class="bsel" data-bsel="${esc(q.id)}" title="select for bulk action"${BOARD_SEL.has(q.id)?' checked':''}>`+
+    `<span class="qnum">${esc(qnum)}</span>`+
+    (appLabel?`<span class="qbadge app-${esc(String(q.app||'').toLowerCase())}">${esc(appLabel)}</span>`:'')+
+    `<span class="qgrow"></span>`+
+    (q.dirty?'<span class="badge">dirty</span>':'')+
+    (on?'<span class="livedot" title="agent working"></span>':'')+`</div>`+
+    `<div class="btitle2">${esc(q.title||'')}</div>`+
+    (desc?`<div class="bdesc" title="${esc(desc)}">${esc(desc)}</div>`:'')+
+    (chips?`<div class="bchips">${chips}</div>`:'')+
     (ops.length?`<div class="bops">${ops.map(o=>
      `<button class="${o[2]==='warn'?'warn':'go'}" data-op="${o[0]}" data-id="${esc(q.id)}"${o[0]==='advance'?` data-status="${o[3]}"`:''}>${esc(o[1])}</button>`).join('')}</div>`:'')+
     '</div>';
@@ -1138,59 +1395,108 @@ function renderBoard(){
   cols+='</div>';
  }
  $('boardcols').innerHTML=cols;
+ if(bc){bc.scrollLeft=keep.left;
+  [...bc.querySelectorAll('.bcol')].forEach((c,i)=>{c.scrollTop=keep.tops[i]||0;});}
 }
 $('boardbar').addEventListener('click',e=>{
+ const bulk=e.target.closest('[data-bulk]');
+ if(bulk){bulkRun(bulk.dataset.bulk);return;}
  const c=e.target.closest('[data-app]');if(c)boardFilter(c.dataset.app);});
 $('boardcols').addEventListener('click',e=>{
+ const sa=e.target.closest('[data-bselall]');
+ if(sa){const st=sa.dataset.bselall;
+  const qs=S.quests||[];
+  const ids=qs.filter(q=>q.status===st&&(boardApp==='all'||(q.app||q.repo)===boardApp)).map(q=>q.id);
+  const all=ids.length&&ids.every(id=>BOARD_SEL.has(id));
+  if(all)ids.forEach(id=>BOARD_SEL.delete(id));else ids.forEach(id=>BOARD_SEL.add(id));
+  renderBoard();return;}
+ const cb=e.target.closest('[data-bsel]');
+ if(cb){const id=cb.dataset.bsel;
+  if(cb.checked)BOARD_SEL.add(id);else BOARD_SEL.delete(id);
+  const card=cb.closest('.bcard');if(card)card.classList.toggle('sel',cb.checked);
+  renderBoardBar();return;}
  const op=e.target.closest('[data-op]');
- if(op){courtOp(op.dataset.op,op.dataset.id,op.dataset.status||'');return;}
+ if(op){courtOp(op.dataset.op,op.dataset.id,op.dataset.status||'',op);return;}
+ const card=e.target.closest('.bcard');
+ if(card&&card.dataset.qid&&!card.dataset.wt){openDocFor(card.dataset.qid);return;}
  const c=e.target.closest('[data-wt]');if(c)openQuestWt(c.dataset.wt);});
-function courtOp(op,id,status){
- const verb={goad:'GOAD (spawns a serf turn in its worktree)',
-  coin:'COIN (runs a Master-of-Coin audit session)',
-  collect:'COLLECT (packs the GATE convoy)',
-  raze:'RAZE (verify merge + queue for teardown)',
-  dispatch:'DISPATCH --standup (creates worktree + starts serf)',
-  advance:'ADVANCE to '+status}[op];
- if(!confirm(verb+'\n\n'+id+' — proceed?'))return;
- fetch('/api/court',{method:'POST',body:JSON.stringify({op,id,status})})
-  .then(r=>r.json()).then(d=>{
-   if(d.error){alert('refused: '+d.error);return;}
-   watchJob(d.job,op.toUpperCase()+' '+id);}).catch(e=>alert('failed: '+e));
+function courtOp(op,id,status,btn){
+ if(op==='raze'&&!confirm('RAZE (verify merge + queue for teardown)\n\n'+id+' — proceed?'))return;
+ runCourtOp(op,id,status,btn,btn&&btn.closest('.bcard')).then(r=>{
+  if(r&&r.error)alert(op.toUpperCase()+' '+id+' — '+r.error);});
 }
-let JOBW=null;
-function watchJob(job,title){
- openModal(esc(title||'court op'),'<div id="jobout">starting…</div>'+
-  '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">'+
-  '<button id="jobstop">STOP</button><button id="jobclose">CLOSE</button></div>');
- $('jobclose').onclick=()=>{closeModal();};
- $('jobstop').onclick=()=>{fetch('/api/stop',{method:'POST',body:JSON.stringify({job})});};
- if(JOBW)clearInterval(JOBW.iv);
- JOBW={job,shown:0,iv:setInterval(pollJob,700)};
- pollJob();
+async function runCourtOp(op,id,status,btn,card,ids){
+ let d;
+ try{d=await (await fetch('/api/court',{method:'POST',body:JSON.stringify(ids?{op,id:id||'',status,ids}:{op,id:id||'',status})})).json();}
+ catch(e){return {error:'failed: '+e};}
+ if(d.error)return {error:d.error};
+ const job=d.job;
+ const sibs=card?[...card.querySelectorAll('button')]:[];
+ const orig=btn?btn.textContent:'';
+ if(btn){btn.classList.add('busy');btn.innerHTML='<span class="spin">⟳</span>';btn.disabled=true;}
+ if(card){card.classList.toggle('bulkbusy',!btn);
+  sibs.forEach(b=>{b.disabled=true;});}
+ let shown=0,res={ok:true};
+ while(true){
+  let st;
+  try{st=await (await fetch('/api/send/'+job+'?since='+shown)).json();}
+  catch(e){await new Promise(r=>setTimeout(r,900));continue;}
+  shown=(st.events||[]).length;
+  if(st.done){
+   if(st.exit===0)res={ok:true};
+   else{const errs=(st.events||[]).filter(e=>e.type==='error');
+    res={ok:false,error:(errs.length?errs[errs.length-1].text:'court op failed (exit '+st.exit+')')};}
+   break;}
+  await new Promise(r=>setTimeout(r,800));
+ }
+ if(btn&&btn.isConnected){btn.classList.remove('busy');btn.textContent=orig;btn.disabled=false;}
+ sibs.forEach(b=>{if(b.isConnected)b.disabled=false;});
+ if(card&&card.isConnected)card.classList.remove('bulkbusy');
+ poll();
+ return res;
 }
-async function pollJob(){
- if(!JOBW)return;
- let st;
- try{st=await (await fetch('/api/send/'+JOBW.job+'?since='+JOBW.shown)).json();}
- catch(e){return;}
- const out=$('jobout');if(!out){clearInterval(JOBW.iv);JOBW=null;return;}
- const evs=st.events||[];
- JOBW.shown=st.total!=null?st.total:(JOBW.shown+evs.length);
- for(const ev of evs){
-  if(!ev.text)continue;
-  const d=document.createElement('div');
-  if(ev.type==='error'){d.className='err';}
-  d.textContent=ev.text;
-  out.appendChild(d);
+async function bulkRun(op){
+ const ids=[...BOARD_SEL];
+ if(!ids.length)return;
+ if(op==='clear'){BOARD_SEL=new Set();renderBoard();return;}
+ if(op==='collect'){
+  if(!confirm('PACK × '+ids.length+' quest'+(ids.length>1?'s':'')+' onto ONE cog ship convoy?\n\ncollect '+ids.join(',')+
+   '\n\nStamps the selection as one convoy and advances it to GATE. Quests that fail the pack audit are skipped with reasons.'))
+   return;
+  const bar0=$('boardbar').querySelector('.bbulk');
+  if(bar0)bar0.innerHTML='<b>collecting '+ids.length+' quest'+(ids.length===1?'':'s')+' onto one convoy…</b>';
+  const r=await runCourtOp('collect',null,'',null,null,ids);
+  BOARD_SEL=new Set();
+  renderBoard();
+  if(r&&!r.ok)alert('collect failed — '+r.error);
+  return;}
+ if(op==='studio'){
+  if(!confirm('STUDIO × '+ids.length+' quest'+(ids.length>1?'s':'')+' — one combined artist studio?\n\ncourt studio '+ids.join(',')+
+   '\n\nCuts an artist-studio worktree from the trunk tip, merges the selection with the established conflict policy, boots the freshness-gated runserver, and stands up the Court Artist.'))
+   return;
+  const barS=$('boardbar').querySelector('.bbulk');
+  if(barS)barS.innerHTML='<b>standing up combined studio for '+ids.length+' quest'+(ids.length===1?'':'s')+'…</b>';
+  const r=await runCourtOp('studio',null,'',null,null,ids);
+  BOARD_SEL=new Set();
+  renderBoard();
+  if(r&&!r.ok)alert('studio failed — '+r.error);
+  return;}
+ if(!confirm(op.toUpperCase()+' × '+ids.length+' quest'+(ids.length>1?'s':'')+' — run sequentially now?'))return;
+ const bar=$('boardbar').querySelector('.bbulk');
+ const setProg=txt=>{if(bar)bar.innerHTML='<b>'+esc(txt)+'</b>';};
+ const results=[];
+ for(let i=0;i<ids.length;i++){
+  const qid=ids[i];
+  setProg(op+' '+qid+' ('+(i+1)+'/'+ids.length+')…');
+  const card=document.querySelector('#boardcols .bcard[data-qid="'+qid+'"]');
+  const r=await runCourtOp(op,qid,op==='advance'?'TRIBUTE_READY':'',null,card);
+  results.push(Object.assign({id:qid},r));
  }
- out.scrollTop=out.scrollHeight;
- if(st.done){
-  clearInterval(JOBW.iv);JOBW=null;
-  out.insertAdjacentHTML('beforeend',
-   `<div class="${st.exit?'err':''}">— finished (exit ${st.exit==null?'?':st.exit}) —</div>`);
-  poll();
- }
+ BOARD_SEL=new Set();
+ renderBoard();
+ const bad=results.filter(r=>!r.ok);
+ if(bad.length)alert(op+' finished — '+results.filter(r=>r.ok).length+' ok, '+bad.length+' failed\n\n'+
+  bad.map(r=>r.id+': '+r.error).join('\n'));
 }
 document.getElementById('c_prompt').addEventListener('input',()=>{cmdIdx=0;autosizeTa();renderCmdList();});
 document.getElementById('c_prompt').addEventListener('keydown',e=>{
@@ -1215,14 +1521,13 @@ function openModal(title, body){
   $('modal').classList.add('on');
 }
 function closeModal(){$('modal').classList.remove('on');}
-function closeMcp(){closeModal();}
 function toggleDoc(ev){
  if(ev)ev.stopPropagation();
  const d=$('drawer');
  if(d.classList.contains('on')){d.classList.remove('on');return;}
- d.classList.add('on');
- loadQuestDoc('');
+ openDocFor('');
 }
+function openDocFor(qid){$('drawer').classList.add('on');loadQuestDoc(qid);}
 async function loadQuestDoc(qid){
  const bd=$('drawer_bd');
  bd.innerHTML='<div class="dim">loading…</div>';
@@ -1239,29 +1544,158 @@ async function loadQuestDoc(qid){
   $('drawer_title').textContent=(j.quest.id?j.quest.id.toUpperCase()+' · ':'')+
    (j.quest.title||'quest charter')+' — '+String(j.quest.status||'').toLowerCase();
   const md=String(j.md||'').replace(/^---\n[\s\S]*?\n---\s*\n?/,'');
-  bd.innerHTML='<div class="msg md qdoc">'+mdRender(md||'(empty charter)')+'</div>';
+  const fm=j.fm||{};
+  const chips=[['status',j.quest.status],['app',j.quest.app],['section',fm.section],
+   ['concern',fm.concern],['branch',fm.branch],['convoy',fm.cogship_id],
+   ['epic',fm.parent_epic],['worktree',fm.worktree]].filter(x=>x[1]).
+   map(x=>`<span class="bchip"><b>${esc(x[0])}</b> ${esc(String(x[1]))}</span>`).join('');
+  const det=chips?'<div class="bchips" style="margin-bottom:10px">'+chips+'</div>':'';
+  const thin=!md||!md.trim();
+  bd.innerHTML=det+'<div class="msg md qdoc">'+
+   (thin?'<div class="dim">No charter content yet — this quest is '+
+    esc(String(j.quest.status||'').toLowerCase())+
+    '. Its Goal & Scope and Expected Tribute are written when the quest is chartered.</div>'
+    :mdRender(md))+'</div>';
   bd.scrollTop=0;
  }catch(e){bd.innerHTML='<div class="dim">failed to load: '+esc(e)+'</div>';}
 }
 $('drawer_bd').addEventListener('click',e=>{
  const o=e.target.closest('[data-qid]');
  if(o)loadQuestDoc(o.dataset.qid);});
-function openMcp(){
-  const list=S.mcp||[];
- let h='';
- for(const d of list.filter(m=>m.type==='local'&&m.enabled&&m.count>=2)){
-  h+=`<div class="dupwarn">duplicate MCP spawns detected: ${esc(d.name)} x${d.count} (~${mb(d.rss)} each)</div>`;}
- h+='<table><thead><tr><th>name</th><th>scope</th><th>type</th><th>enabled</th><th>running</th><th></th></tr></thead><tbody>'+
-  list.map(m=>{
-   const run=m.running?`<span class="num" style="color:var(--green)">yes</span> <span class="num blue">${mb(m.rss)}</span>`
-    :'<span class="dim">no</span>';
+function openMcp(){setView('settings');}
+const _SET_ED={};
+function setRow(label,inner,note){
+ return `<div class="setrow"><label title="${esc(label)}">${esc(label)}${note?`<small>${esc(note)}</small>`:''}</label>${inner}</div>`;}
+function renderSettings(){
+ if(view!=='settings')return;
+ if(!SETTINGS){$('settings_bd').innerHTML='<div class="empty-note">loading settings…</div>';
+  loadSettings().then(renderSettings);return;}
+ const ed=_SET_ED;
+ if(!ed.ready){
+  ed.roles=SETTINGS.roles.slice();
+  ed.models=Object.assign({},SETTINGS.models);
+  ed.providers=Object.assign({},SETTINGS.providers);
+  ed.aliases=Object.assign({},SETTINGS.aliases);
+  ed.presets=SETTINGS.presets.slice();
+  ed.suite=SETTINGS.suite;ed.harness=SETTINGS.harness;
+  ed.freshness=Object.assign({},SETTINGS.freshness);
+  ed.no_kilo_mode=SETTINGS.no_kilo_mode;
+  ed.ready=true;}
+ let h=`<div class="sethd"><b>SETTINGS — court manifest</b>`+
+  `<span class="path">${esc(SETTINGS.manifest_path||'')}</span>`+
+  `<span class="sessmeta" id="set_state"></span>`+
+  `<button class="setsave" onclick="saveSettings()">save</button></div>`;
+ // role models
+ h+=`<div class="setgrp"><h3>models per class<span class="hdnote">applies to the composer defaults, court dispatch, and every CLI that resolves a role model</span></h3>`+
+  ed.roles.map(r=>setRow(r,
+   `<input type="text" id="set_m_${esc(r)}" value="${esc(ed.models[r]||'')}" list="model_dl" spellcheck="false">`+
+   `<input type="text" id="set_p_${esc(r)}" class="prov" value="${esc(ed.providers[r]||'')}" placeholder="provider" spellcheck="false" title="optional Kilo CLI provider (models.${esc(r)}_provider)">`,
+   'model · provider')).join('')+
+  `<div class="setnote">any model preset may be paired with any class inside a session from the composer; bare names resolve through the aliases below.</div></div>`;
+ // presets
+ h+=`<div class="setgrp"><h3>model presets<span class="hdnote">the basic pick list in the composer model select</span></h3>`+
+  ed.presets.map((p,i)=>setRow('preset '+(i+1),
+   `<input type="text" value="${esc(p)}" data-preset="${i}" spellcheck="false" onchange="edPreset(${i},this.value)">`+
+   `<span class="mini" title="remove preset" onclick="edPreset(${i},'')">✕</span>`)).join('')+
+  setRow('add preset','<input type="text" id="set_preset_add" list="model_dl" placeholder="provider/model or alias" spellcheck="false">'+
+   '<button class="bgo" onclick="edPresetAdd()">add</button>')+
+  '</div>';
+ // aliases
+ h+=`<div class="setgrp"><h3>model aliases<span class="hdnote">display name → qualified id</span></h3>`+
+  Object.entries(ed.aliases).map(([n,v],i)=>setRow(n,
+   `<input type="text" value="${esc(v)}" data-alias="${esc(n)}" spellcheck="false" onchange="edAlias('${esc(n)}',this.value)">`+
+   `<span class="mini" title="remove alias" onclick="edAlias('${esc(n)}','')">✕</span>`)).join('')+
+  setRow('add alias','<input type="text" id="set_alias_name" placeholder="display name">'+
+   '<input type="text" id="set_alias_val" placeholder="provider/model">'+
+   '<button class="bgo" onclick="edAliasAdd()">add</button>')+
+  '</div>';
+ // pipeline
+ h+=`<div class="setgrp"><h3>pipeline commands</h3>`+
+  setRow('integration suite','<input type="text" id="set_suite" value="'+esc(ed.suite)+'" spellcheck="false">','suite.command')+
+  setRow('verification harness','<input type="text" id="set_harness" value="'+esc(ed.harness)+'" spellcheck="false">','harness.command')+
+  setRow('studio freshness gate','<input type="text" id="set_fresh" value="'+esc(ed.freshness.command||'')+'" spellcheck="false">','studio.freshness_command')+
+  setRow('freshness max age (h)','<input type="number" id="set_fresh_age" value="'+esc(ed.freshness.max_age_hours!=null?ed.freshness.max_age_hours:24)+'" min="0.5" step="0.5">')+
+  setRow('no-kilo mode','<input type="checkbox" id="set_nokilo"'+(ed.no_kilo_mode?' checked':'')+'>')+
+  '</div>';
+ // MCP
+ const list=S&&S.mcp?S.mcp:[];
+ h+=`<div class="setgrp"><h3>mcp servers<span class="hdnote">merged inventory — toggles edit the owning config file (a .bak copy is kept)</span></h3>`;
+ if(!list.length)h+='<div class="setnote">no MCP servers inventoried yet</div>';
+ else{
+  h+='<table><thead><tr><th>name</th><th>scope</th><th>type</th><th>enabled</th><th>running</th><th></th></tr></thead><tbody>'+
+   list.map(m=>{
+    const run=m.running?`<span class="num" style="color:var(--green)">yes</span> <span class="num blue">${mb(m.rss)}</span>`
+     :'<span class="dim">no</span>';
     const btn=m.file.endsWith('.jsonc')?'<span class="dim">manual</span>'
      :`<button title="takes effect for sessions started after the change" data-file="${esc(m.file)}" data-name="${esc(m.name)}">${m.enabled?'disable':'enable'}</button>`;
-   return `<tr><td class="mono">${esc(m.name)}</td><td class="dim">${esc(m.scope)}</td><td class="dim">${esc(m.type)}</td>`+
-    `<td>${m.enabled?'<span class="num" style="color:var(--green)">yes</span>':'<span class="dim">no</span>'}</td><td>${run}</td><td>${btn}</td></tr>`;
-  }).join('')+'</tbody></table>'+
-  '<div class="dim" style="padding-top:10px;font-size:11px">toggles edit the config file (a .bak copy is kept) and take effect for sessions started after the change</div>';
-  openModal('MCP SERVERS — merged inventory', h);
+    return `<tr><td class="mono">${esc(m.name)}</td><td class="dim">${esc(m.scope)}</td><td class="dim">${esc(m.type)}</td>`+
+     `<td>${m.enabled?'<span class="num" style="color:var(--green)">yes</span>':'<span class="dim">no</span>'}</td><td>${run}</td><td>${btn}</td></tr>`;
+   }).join('')+'</tbody></table>';
+ }
+ h+='</div>';
+ $('settings_bd').innerHTML=h;
+}
+function edPreset(i,val){
+ val=String(val||'').trim();
+ if(val)_SET_ED.presets[i]=val;else _SET_ED.presets.splice(i,1);
+ renderSettings();}
+function edPresetAdd(){
+ const v=($('set_preset_add').value||'').trim();if(!v)return;
+ _SET_ED.presets.push(v);renderSettings();}
+function edAlias(name,val){
+ val=String(val||'').trim();
+ if(val)_SET_ED.aliases[name]=val;else delete _SET_ED.aliases[name];
+ renderSettings();}
+function edAliasAdd(){
+ const n=($('set_alias_name').value||'').trim(),v=($('set_alias_val').value||'').trim();
+ if(!n||!v)return;
+ _SET_ED.aliases[n]=v;renderSettings();}
+async function loadSettings(){
+ try{SETTINGS=await (await fetch('/api/settings')).json();
+  if(_SET_ED.ready){_SET_ED.ready=false;}
+ }catch(e){}}
+$('settings_bd').addEventListener('click',e=>{
+ const b=e.target.closest('[data-file]');
+ if(b)mcpToggle(b.dataset.file,b.dataset.name);});
+$('settings_bd').addEventListener('keydown',e=>{
+ if(e.key!=='Enter')return;
+ const t=e.target;
+ if(t.id==='set_preset_add')edPresetAdd();
+ else if(t.id==='set_alias_name'||t.id==='set_alias_val')edAliasAdd();
+ else if(t.id==='set_suite'||t.id==='set_harness'||t.id==='set_fresh'||t.id==='set_fresh_age')saveSettings();});
+async function saveSettings(){
+ const ed=_SET_ED;
+ if(!ed.ready){renderSettings();return;}
+ for(const r of ed.roles){
+  ed.models[r]=($('set_m_'+r).value||'').trim();
+  ed.providers[r]=($('set_p_'+r).value||'').trim();}
+ ed.suite=($('set_suite').value||'').trim();
+ ed.harness=($('set_harness').value||'').trim();
+ ed.freshness={command:($('set_fresh').value||'').trim(),
+  max_age_hours:parseFloat($('set_fresh_age').value)||24};
+ ed.no_kilo_mode=$('set_nokilo').checked;
+ const body={models:{},aliases:ed.aliases,presets:ed.presets,
+  suite:ed.suite,harness:ed.harness,freshness:ed.freshness,no_kilo_mode:ed.no_kilo_mode};
+ for(const r of ed.roles)body.models[r]={model:ed.models[r],provider:ed.providers[r]};
+ const st=$('set_state');if(st)st.textContent='saving…';
+ let out=null;
+ try{
+  const r=await fetch('/api/settings',{method:'POST',body:JSON.stringify(body)});
+  out=await r.json();
+  if(!r.ok){if(st)st.textContent='refused: '+(out.error||r.status);return;}
+ }catch(e){if(st)st.textContent='save failed: '+e;return;}
+ _SET_ED.ready=false;
+ await loadSettings();
+ _SET_ED.ready=false;
+ renderSettings();
+ if($('set_state'))$('set_state').textContent='saved ✓';
+ try{META=await (await fetch('/api/compose-meta')).json();
+  $('model_dl').innerHTML=(META.models||[]).map(m=>`<option value="${esc(m)}"></option>`).join('');
+  $('c_model').innerHTML=(META.presets||[]).map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join('')+
+   '<option value="__custom__">custom…</option>';
+  syncRoleModel();
+ }catch(e){}
+ setTimeout(()=>{const s=$('set_state');if(s)s.textContent='';},2500);
 }
 $('modal_bd').addEventListener('click',e=>{
   const c=e.target.closest('[data-copy]');
@@ -1279,6 +1713,40 @@ $('modal').addEventListener('click',e=>{
  if(e.target.id==='modal')closeModal();});
 document.addEventListener('keydown',e=>{
   if(e.key==='Escape'){closeModal();closeSessMenu();$('drawer').classList.remove('on');}});
+function isArtistWt(){
+ if(!selWt||!S)return false;
+ const w=(repo().worktrees||[]).find(x=>x.path===selWt);
+ return !!(w&&w.branch&&w.branch.startsWith('artist/'));
+}
+function syncBrowserBtn(){
+ const b=$('browser_btn');if(!b)return;
+ const st=(S||{}).browser||{};
+ b.style.display=isArtistWt()?'':'none';
+ const running=!!st.running;
+ b.classList.toggle('on',running);
+ const port=st.recorded?st.recorded.port:null;
+ b.title=running?
+  'studio chromium is up'+(port?' (CDP :'+port+')':'')+' — click to pin the annotation overlay to this worktree'
+  :'launch shared studio chromium (headed, persistent login profile, CDP + annotation overlay for this worktree)';
+}
+async function launchBrowser(ev){
+ if(ev)ev.stopPropagation();
+ if(!selWt)return;
+ $('c_cont').innerHTML='starting studio chromium + runserver…';
+ let j;
+ try{
+  const r=await fetch('/api/browser',{method:'POST',body:JSON.stringify({wt:selWt})});
+  j=await r.json();
+  if(!r.ok){alert('browser launch refused: '+(j.error||r.status));poll();return;}
+ }catch(e){alert('browser launch failed: '+e);poll();return;}
+ poll();
+ const sv=j.server||{};
+ $('c_cont').innerHTML='studio chromium up — app <b>'+esc(sv.url||'?')+'</b> '+
+  (sv.up?(sv.spawned?'<span class="dim">(runserver just started)</span>':'<span class="dim">(runserver already up)</span>')
+       :'<span style="color:var(--red)">runserver did not come up — see .kilo/runserver.log</span>')+
+  ' <span class="dim">'+(j.annotator_alive?'— annotation overlay pinned to this worktree':'— annotator not attached')+'</span>';
+ if(!sv.up&&sv.log_tail)alert('runserver log tail:\n'+sv.log_tail);
+}
 function syncEaselChip(){
  const el=$('easel_chip');if(!el)return;
  const w=selWt&&S?(S.worktrees||[]).find(x=>x.path===selWt):null;
@@ -1395,20 +1863,51 @@ function jumpToSession(sid){
  syncHash();
  poll();
 }
-async function mcpToggle(file,name){
- const m=(S.mcp||[]).find(x=>x.file===file&&x.name===name);
- if(!m){openMcp();return;}
- let r;
- try{r=await fetch('/api/mcp',{method:'POST',body:JSON.stringify({file,name,enabled:!m.enabled})});}
- catch(e){alert('toggle failed: '+e);return;}
- if(!r.ok){alert('refused: '+(await r.text()));return;}
- await poll();
- openMcp();
-}
+ async function mcpToggle(file,name){
+  const m=(S.mcp||[]).find(x=>x.file===file&&x.name===name);
+  if(!m){if(view==='settings')renderSettings();return;}
+  let r;
+  try{r=await fetch('/api/mcp',{method:'POST',body:JSON.stringify({file,name,enabled:!m.enabled})});}
+  catch(e){alert('toggle failed: '+e);return;}
+  if(!r.ok){alert('refused: '+(await r.text()));return;}
+  await poll();
+  if(view==='settings')renderSettings();
+ }
+let META=null, SETTINGS=null;
+function canonModelJS(v){
+ const m=String(v||'').trim();if(!m)return'';
+ if(m.includes('/'))return m;
+ const low=m.toLowerCase().replace(/ /g,'').replace(/-/g,'').replace(/\./g,'');
+ for(const[name,q]of Object.entries((META&&META.aliases)||{})){
+  const n=String(name).toLowerCase().replace(/ /g,'').replace(/-/g,'').replace(/\./g,'');
+  if(n&&n===low&&String(q||'').trim())return String(q).trim();}
+ return'openrouter/'+m;}
+function composerModel(){
+ const sel=$('c_model');
+ if(sel.value==='__custom__')return($('c_model_custom').value||'').trim();
+ return sel.value;}
+function setComposerModel(qid){
+ qid=canonModelJS(qid);if(!qid)return;
+ const sel=$('c_model');
+ const hit=[...sel.options].find(o=>o.value===qid);
+ if(hit){sel.value=qid;$('c_model_custom').style.display='none';$('c_model_custom').value='';}
+ else{sel.value='__custom__';$('c_model_custom').style.display='';$('c_model_custom').value=qid;}}
+function syncRoleModel(){
+ if(!META)return;
+ const roleModel=(META.role_models||{})[$('c_agent').value]||'';
+ if(roleModel)setComposerModel(roleModel);}
+$('c_agent').addEventListener('change',syncRoleModel);
+$('c_model').addEventListener('change',()=>{
+ const custom=$('c_model').value==='__custom__';
+ $('c_model_custom').style.display=custom?'':'none';
+ if(custom)$('c_model_custom').focus();});
 (async()=>{try{META=await (await fetch('/api/compose-meta')).json();
  $('c_agent').innerHTML=META.agents.map(x=>`<option>${x}</option>`).join('');
- if(META.models&&META.models.length)
-  $('model_dl').innerHTML=META.models.map(m=>`<option value="${esc(m)}"></option>`).join('');
+ $('model_dl').innerHTML=(META.models||[]).map(m=>`<option value="${esc(m)}"></option>`).join('');
+ const sel=$('c_model');
+ sel.innerHTML=(META.presets||[]).map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join('')+
+  '<option value="__custom__">custom…</option>';
+ syncRoleModel();
 }catch(e){}})();
 const bootHi=$('boot_hi');if(bootHi)bootHi.textContent=greet();
 const bootGl=$('boot_glyph');if(bootGl)bootGl.innerHTML=ROOK;
@@ -1443,6 +1942,42 @@ def _wt_dirty(path, ttl=30):
 _QUESTS_CACHE = {}
 
 
+def _frontmatter_status(text):
+    """status: field from a charter's frontmatter block only ('' if absent)."""
+    head = text.split("\n---", 1)[0]
+    m = re.search(r"^status:\s*(\S+)", head, re.M)
+    return m.group(1) if m else ""
+
+
+def _tribute_counts(text):
+    """[done, total] of the charter's 'Expected Tribute' markdown checklist.
+
+    Mirrors models.Quest.from_markdown shape detection: sections may use
+    '## Expected Tribute' (current charters) or '# Expected Tribute' (legacy).
+    Checklist semantics mirror ward.parse_markdown_checklist: [x] done,
+    [ ] pending, [~]/[-] cancelled — all three count toward total."""
+    body = text
+    fm = re.match(r"\A---\n.*?\n---\n", text, re.S)
+    if fm:
+        body = text[fm.end():]
+    level = 2 if re.search(r"^##\s+Expected Tribute\s*$", body, re.M) else 1
+    pat = re.compile(r"^#{%d}\s+(.+?)\s*$" % level, re.M)
+    start = end = None
+    for m in pat.finditer(body):
+        if start is not None:
+            end = m.start()
+            break
+        if m.group(1).strip() == "Expected Tribute":
+            start = m.end()
+    if start is None:
+        return 0, 0
+    sec = body[start:end] if end is not None else body[start:]
+    done = len(re.findall(r"^\s*[-*]\s+\[[xX]\]", sec, re.M))
+    total = len(re.findall(r"^\s*[-*]\s+\[[ xX]\]", sec, re.M)) + \
+        len(re.findall(r"^\s*[-*]\s+\[[~-]\]", sec, re.M))
+    return done, total
+
+
 def _quests(root, ttl=20):
     """Read <root>/.court/{quests,epics}/*.md frontmatter into card dicts."""
     now = time.time()
@@ -1460,9 +1995,11 @@ def _quests(root, ttl=20):
                 continue
             path = os.path.join(d, fn)
             fm = {}
+            charter_text = ""
             try:
                 with open(path) as f:
-                    lines = f.read().splitlines()
+                    charter_text = f.read()
+                lines = charter_text.splitlines()
                 if lines and lines[0].strip() == "---":
                     for ln in lines[1:]:
                         if ln.strip() == "---":
@@ -1477,12 +2014,27 @@ def _quests(root, ttl=20):
             wt = fm.get("worktree", "")
             if wt and not os.path.isabs(wt):
                 wt = os.path.join(root, wt)
+            wt_status = ""
+            if wt and path:
+                wt_copy = os.path.join(
+                    wt, ".court", "quests", os.path.basename(path))
+                if os.path.isfile(wt_copy):
+                    try:
+                        with open(wt_copy) as f:
+                            wt_status = _frontmatter_status(f.read())
+                    except OSError:
+                        wt_status = ""
+            t_done, t_total = _tribute_counts(charter_text)
             quests.append({
                 "id": qid, "title": fm.get("title", ""),
                 "status": fm.get("status", "OPEN"), "app": app,
                 "branch": fm.get("branch", ""), "worktree": wt,
                 "epic": fm.get("parent_epic", ""),
+                "section": fm.get("section", ""), "concern": fm.get("concern", ""),
                 "dirty": _wt_dirty(wt), "path": path,
+                "wt_status": wt_status,
+                "cogship_id": fm.get("cogship_id", ""),
+                "tribute_done": t_done, "tribute_total": t_total,
             })
     quests.sort(key=lambda q: (
         STATUS_ORDER.index(q["status"]) if q["status"] in STATUS_ORDER else 99,
@@ -1537,10 +2089,26 @@ def _quest_doc(root, wt, qid):
             md = f.read()
     except OSError as exc:
         return {"error": f"charter unreadable: {exc}", "others": others}
+    # Split frontmatter from body so the drawer can show charter details
+    # even for quests too young to have charter content (OPEN/PLANNED).
+    fm = {}
+    body = md
+    lines = md.splitlines()
+    if lines and lines[0].strip() == "---":
+        for i, ln in enumerate(lines[1:], 1):
+            if ln.strip() == "---":
+                body = "\n".join(lines[i + 1:])
+                break
+            if ":" in ln:
+                k, v = ln.split(":", 1)
+                fm[k.strip()] = v.strip()
     return {"quest": {"id": q["id"], "title": q["title"],
                       "status": q["status"], "app": q["app"],
                       "branch": q["branch"]},
-            "md": md, "others": others}
+            "fm": {k: fm.get(k, "") for k in (
+                "kind", "section", "concern", "parent_epic", "tags",
+                "cogship_id", "worktree", "created_at", "updated_at")},
+            "md": body, "others": others}
 
 
 _AUDIT_CACHE = {}  # repo root -> {"t": ts, "data": {quest_id: audit}, "busy": bool}
@@ -1730,9 +2298,9 @@ def _sessions_for_wt(wt, limit=200):
             "select id, title, agent, model, directory, time_updated,"
             " tokens_input, tokens_output, tokens_cache_read,"
             " tokens_cache_write, cost from session"
-            " where directory=? or directory like ?"
+            " where directory=?"
             " order by time_updated desc limit ?",
-            (wt, wt + "/%", limit)).fetchall()
+            (wt, limit)).fetchall()
         db.close()
     except Exception:
         return []
@@ -1961,6 +2529,135 @@ def _mcp_inventory(procs=None):
 
 
 _MCP_LOCK = threading.Lock()
+
+
+def _browser_runtime():
+    """Lazy import keeps court.browser (and its subprocess constants) out of
+    the module graph until the studio browser feature is actually used."""
+    from court import browser as studio_browser
+    return studio_browser
+
+
+def _probe_http(url, timeout=2.0):
+    """Any HTTP answer (2xx/3xx/4xx/5xx) counts as up; connection errors don't."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+
+
+def _tail_file(path, limit=800):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - limit))
+            return f.read().decode(errors="replace")
+    except Exception:
+        return ""
+
+
+def _ensure_runserver(wt):
+    """Guarantee the worktree dev server is reachable: adopt the port recorded
+    in .worktree-port (else 8000), probe it, and spawn
+    `<venv>/bin/python manage.py runserver 127.0.0.1:PORT --noreload` detached
+    when it is down. Returns a status dict; never raises."""
+    port = None
+    port_file = os.path.join(wt, ".worktree-port")
+    if os.path.isfile(port_file):
+        try:
+            with open(port_file) as f:
+                port = int(f.read().strip())
+        except Exception:
+            port = None
+    if not port:
+        port = 8000
+    url = f"http://127.0.0.1:{port}/"
+    if _probe_http(url, timeout=2.0):
+        return {"port": port, "url": url, "up": True, "spawned": False, "log_tail": ""}
+    repo = next((r["root"] for r in _repos()
+                 if wt.startswith(r["root"] + os.sep)), None)
+    py = None
+    for cand in (os.path.join(repo, "venv", "bin", "python") if repo else "",
+                 os.path.join(repo, ".venv", "bin", "python") if repo else "",
+                 shutil.which("python3") or ""):
+        if cand and os.path.exists(cand):
+            py = cand
+            break
+    log_path = os.path.join(wt, ".kilo", "runserver.log")
+    log_tail = ""
+    if repo and os.path.exists(os.path.join(wt, "manage.py")):
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "ab") as log:
+                log.write(
+                    f"\n--- console runserver spawn {time.strftime('%F %T')} "
+                    f"port {port} ---\n".encode())
+                proc = subprocess.Popen(
+                    [py, "manage.py", "runserver", f"127.0.0.1:{port}",
+                     "--noreload"],
+                    cwd=wt, stdout=log, stderr=subprocess.STDOUT,
+                    start_new_session=True)
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                if _probe_http(url, timeout=1.5):
+                    return {"port": port, "url": url, "up": True,
+                            "spawned": True, "log_tail": ""}
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.4)
+        except Exception:
+            pass
+        log_tail = _tail_file(log_path)
+    return {"port": port, "url": url, "up": False, "spawned": False,
+            "log_tail": log_tail}
+
+
+def _cdp_open_tab(cdp_port, url):
+    """Open a new tab in the shared Chromium via the DevTools HTTP API.
+    Newer Chrome builds ignore ?url=…: the working form is PUT with the raw
+    target URL as the query string; the encoded ?url=… form stays as fallback."""
+    import urllib.parse
+    base = f"http://127.0.0.1:{int(cdp_port)}/json/new?"
+    for query in (url, "url=" + urllib.parse.quote(url, safe="")):
+        try:
+            req = urllib.request.Request(base + query, method="PUT")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return json.loads(r.read().decode() or "{}")
+        except Exception:
+            continue
+    return None
+
+
+def _cdp_close_blanks(cdp_port, keep_id=None):
+    """Close leftover about:blank page targets (from earlier launches)."""
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{int(cdp_port)}/json", timeout=3) as r:
+            targets = json.loads(r.read().decode() or "[]")
+    except Exception:
+        return 0
+    closed = 0
+    for t in targets:
+        if t.get("type") != "page" or t.get("url") not in ("", "about:blank"):
+            continue
+        if keep_id and t.get("id") == keep_id:
+            continue
+        for method in ("GET", "PUT"):
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{int(cdp_port)}/json/close/{t.get('id')}",
+                    method=method)
+                with urllib.request.urlopen(req, timeout=3) as r:
+                    r.read()
+                closed += 1
+                break
+            except Exception:
+                continue
+    return closed
 
 
 def _mcp_toggle_write(file, name, enabled):
@@ -2209,7 +2906,8 @@ def _ctx_limits_bg(ttl=86400):
     threading.Thread(target=_fetch, daemon=True).start()
 
 
-_ALLOWED_AGENTS = ("steward", "code", "serf", "scout", "artist")
+_ALLOWED_AGENTS = ("steward", "code", "serf", "scout", "artist",
+                   "gatekeeper", "master_of_coin")
 
 TURN_JOURNAL = os.path.expanduser(
     "~/.local/share/kilo-castle/console_turns.jsonl")
@@ -2254,6 +2952,7 @@ _COURT_OP_ARITY = {
     "goad": ("goad", "{id}"),
     "coin": ("coin", "{id}"),
     "collect": ("collect",),
+    "studio": ("studio", "{id}"),
     "raze": ("raze", "{id}"),
     "dispatch": ("dispatch", "{id}", "--standup"),
 }
@@ -2274,11 +2973,18 @@ def _find_quest_repo(qid):
     return None
 
 
-def _court_op(job, op, qid, status, note):
+def _court_op(job, op, qid, status, note, ids=None):
     try:
         found = _find_quest_repo(qid)
-        if not found and op == "collect":
+        if not found and op == "collect" and not qid:
+            # Bare collect (no selection): explicit pack-everything intent.
             found = {"root": COURT_DIR}
+        if not found and op == "studio" and not ids and not qid:
+            job["events"].append({"type": "error",
+                                  "text": "studio needs an explicit quest selection"})
+            job["done"] = True
+            job["ended"] = time.time()
+            return
         if not found:
             job["events"].append({"type": "error",
                                   "text": f"unknown or ambiguous quest id {qid!r}"})
@@ -2295,11 +3001,41 @@ def _court_op(job, op, qid, status, note):
                 return
             argv = ["python3", "-m", "court.cli", "advance", found["quest"]["id"],
                     status, "--note", note or "advanced via court console"]
+        elif ids and op in ("collect", "studio"):
+            # Batched call: one command for the whole selection
+            # (collect id1,id2,... packs ONE convoy; studio id1,id2,...
+            # routes ONE combined artist studio). Refuse cross-repo
+            # selections — a court root serves one convoy/studio.
+            roots = set()
+            resolved = []
+            for bid in ids:
+                f = _find_quest_repo(bid)
+                if not f or not f.get("quest"):
+                    job["events"].append({"type": "error",
+                                          "text": f"unknown or ambiguous quest id {bid!r}"})
+                    job["done"] = True
+                    job["ended"] = time.time()
+                    return
+                roots.add(f["root"])
+                resolved.append(f["quest"]["id"])
+            if len(roots) > 1:
+                job["events"].append({"type": "error",
+                                      "text": "selection spans multiple repos — run one " + op + " per repo"})
+                job["done"] = True
+                job["ended"] = time.time()
+                return
+            root = roots.pop()
+            argv = ["python3", "-m", "court.cli", op, ",".join(resolved)]
         else:
             tmpl = _COURT_OP_ARITY[op]
-            argv = ["python3", "-m", "court.cli"] + [
-                a.replace("{id}", found["quest"]["id"] if found.get("quest") else "")
-                for a in tmpl]
+            if op in ("collect", "studio") and found.get("quest"):
+                # Selection-scoped: operate only on this quest.
+                argv = ["python3", "-m", "court.cli", op,
+                        found["quest"]["id"]]
+            else:
+                argv = ["python3", "-m", "court.cli"] + [
+                    a.replace("{id}", found["quest"]["id"] if found.get("quest") else "")
+                    for a in tmpl]
         job["events"].append({"type": "status", "text": "$ " + " ".join(argv) +
                               f"   (cwd {root})"})
         proc = subprocess.Popen(
@@ -2312,8 +3048,8 @@ def _court_op(job, op, qid, status, note):
                 if len(ln) > 400:
                     ln = ln[:400] + " …"
                 job["events"].append({"type": "text", "text": ln})
-        # goad/coin/dispatch wrap a full agent turn — no timeout; stop via /api/stop
-        long_op = op in ("goad", "coin", "dispatch")
+        # goad/coin/dispatch/studio wrap a full agent turn — no timeout; stop via /api/stop
+        long_op = op in ("goad", "coin", "dispatch", "studio")
         try:
             rc = proc.wait(None if long_op else 180)
         except subprocess.TimeoutExpired:
@@ -2341,6 +3077,238 @@ _JOB_SEQ = [0]
 
 
 _MODEL_CACHE = {"t": 0.0, "list": []}
+
+
+def _manifest_path():
+    return os.path.join(COURT_DIR, ".court", "config.json")
+
+
+def _manifest():
+    """Fresh read of the court manifest (.court/config.json); {} when absent."""
+    try:
+        with open(_manifest_path()) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _canon_model(v, cfg=None):
+    """Bare/display model name -> qualified provider/model id (manifest
+    aliases first, then the default provider prefix)."""
+    m = str(v or "").strip()
+    if not m:
+        return ""
+    if "/" in m:
+        return m
+    cfg = cfg if cfg is not None else _manifest()
+    low = m.lower().replace(" ", "").replace("-", "").replace(".", "")
+    for name, q in (cfg.get("model_aliases") or {}).items():
+        norm = str(name).lower().replace(" ", "").replace("-", "").replace(".", "")
+        if norm and norm == low and str(q).strip():
+            return str(q).strip()
+    return "openrouter/" + m
+
+
+# Basic preset list: manifest model_presets win; fallback seeds the manifest
+# aliases plus every configured role model so any class has basics to pick.
+_DEFAULT_PRESETS = [
+    "openrouter/z-ai/glm-5.3-flash",
+    "openrouter/z-ai/glm-5.3",
+    "openrouter/google/gemini-3.7-flash",
+    "openrouter/google/gemma-4-31b-it",
+    "openrouter/anthropic/claude-sonnet-4.6",
+    "openrouter/openai/gpt-5.2",
+]
+
+
+def _presets():
+    cfg = _manifest()
+    out = []
+    for v in (cfg.get("model_presets") or []):
+        q = _canon_model(v, cfg)
+        if q and q not in out:
+            out.append(q)
+    if not out:
+        for q in (cfg.get("model_aliases") or {}).values():
+            q = _canon_model(q, cfg)
+            if q and q not in out:
+                out.append(q)
+    for role in KNOWN_ROLE_MODELS:
+        q = _canon_model((cfg.get("models") or {}).get(role), cfg)
+        if q and q not in out:
+            out.append(q)
+    for q in _DEFAULT_PRESETS:
+        if q not in out:
+            out.append(q)
+    return out[:40]
+
+
+def _aliases():
+    a = _manifest().get("model_aliases")
+    return dict(a) if isinstance(a, dict) else {}
+
+
+def _role_models():
+    models = _manifest().get("models")
+    if not isinstance(models, dict):
+        return {}
+    return {r: str(models.get(r) or "") for r in KNOWN_ROLE_MODELS
+            if str(models.get(r) or "").strip()}
+
+
+_SETTINGS_LOCK = threading.Lock()
+
+_ROLE_MODEL_RE = re.compile(r"^[\w.~@/-]{1,120}$")
+_ALIAS_NAME_RE = re.compile(r"^[\w .-]{1,60}$")
+
+
+def _settings_write(payload):
+    """Merge validated settings into .court/config.json (atomic, .bak kept).
+    Returns (http_code, payload_dict)."""
+    if not isinstance(payload, dict):
+        return 400, {"error": "bad request"}
+    with _SETTINGS_LOCK:
+        cfg = _manifest()
+        models = dict(cfg.get("models")) if isinstance(cfg.get("models"), dict) else {}
+
+        role_updates = payload.get("models")
+        if role_updates is not None:
+            if not isinstance(role_updates, dict):
+                return 400, {"error": "models must be an object"}
+            for role, upd in role_updates.items():
+                if role not in KNOWN_ROLE_MODELS or not isinstance(upd, dict):
+                    return 400, {"error": f"unknown role {role}"}
+                model = str(upd.get("model") or "").strip()
+                if not model or not _ROLE_MODEL_RE.match(model):
+                    return 400, {"error": f"bad model id for {role}"}
+                models[role] = model
+                provider = str(upd.get("provider") or "").strip()
+                if provider:
+                    if not re.fullmatch(r"[\w-]{1,40}", provider):
+                        return 400, {"error": f"bad provider for {role}"}
+                    models[f"{role}_provider"] = provider
+                    models.pop(f"{role}_provider_disabled", None)
+                else:
+                    models.pop(f"{role}_provider", None)
+            cfg["models"] = models
+
+        aliases = payload.get("aliases")
+        if aliases is not None:
+            if not isinstance(aliases, dict):
+                return 400, {"error": "aliases must be an object"}
+            clean = {}
+            for name, val in aliases.items():
+                name = str(name).strip()
+                val = _canon_model(str(val).strip(), cfg)
+                if not _ALIAS_NAME_RE.match(name) or not val:
+                    return 400, {"error": f"bad alias {name!r}"}
+                clean[name] = val
+                if len(clean) > 60:
+                    return 400, {"error": "too many aliases"}
+            cfg["model_aliases"] = clean
+
+        presets = payload.get("presets")
+        if presets is not None:
+            if not isinstance(presets, list):
+                return 400, {"error": "presets must be a list"}
+            clean = []
+            for v in presets:
+                q = _canon_model(str(v).strip(), cfg)
+                if not q or not _ROLE_MODEL_RE.match(q):
+                    return 400, {"error": f"bad preset {v!r}"}
+                if q not in clean:
+                    clean.append(q)
+                if len(clean) > 60:
+                    return 400, {"error": "too many presets"}
+            cfg["model_presets"] = clean
+
+        def _cmd(section, key, value):
+            if value is None:
+                return True
+            if not isinstance(value, str):
+                return False
+            value = "".join(c for c in value.strip() if c >= " " or c == "\t")
+            if len(value) > 500:
+                return False
+            blk = cfg.get(section)
+            blk = dict(blk) if isinstance(blk, dict) else {}
+            if value:
+                blk[key] = value
+            else:
+                blk.pop(key, None)
+            if blk:
+                cfg[section] = blk
+            else:
+                cfg.pop(section, None)
+            return True
+
+        if not _cmd("suite", "command", payload.get("suite")):
+            return 400, {"error": "bad suite command"}
+        if not _cmd("harness", "command", payload.get("harness")):
+            return 400, {"error": "bad harness command"}
+        fresh = payload.get("freshness")
+        if fresh is not None:
+            if not isinstance(fresh, dict):
+                return 400, {"error": "bad freshness"}
+            if not _cmd("studio", "freshness_command", fresh.get("command")):
+                return 400, {"error": "bad freshness command"}
+            if fresh.get("max_age_hours") is not None:
+                try:
+                    hours = float(fresh["max_age_hours"])
+                    if not 0 < hours <= 24 * 30:
+                        return 400, {"error": "bad freshness max age"}
+                    blk = dict(cfg.get("studio")) if isinstance(cfg.get("studio"), dict) else {}
+                    blk["freshness_max_age_hours"] = hours
+                    cfg["studio"] = blk
+                except (TypeError, ValueError):
+                    return 400, {"error": "bad freshness max age"}
+
+        if "no_kilo_mode" in payload:
+            cfg["no_kilo_mode"] = bool(payload["no_kilo_mode"])
+
+        path = _manifest_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if os.path.exists(path):
+                with open(path) as f:
+                    raw = f.read()
+                with open(path + ".bak", "w") as f:
+                    f.write(raw)
+                indent = 2
+            else:
+                indent = 2
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(json.dumps(cfg, indent=indent) + "\n")
+            os.replace(tmp, path)
+        except Exception as exc:
+            return 500, {"error": f"manifest write failed: {exc}"}
+    return 200, {"ok": True, "settings": _settings_snapshot()}
+
+
+def _settings_snapshot():
+    cfg = _manifest()
+    studio = cfg.get("studio") if isinstance(cfg.get("studio"), dict) else {}
+    suite = cfg.get("suite") if isinstance(cfg.get("suite"), dict) else {}
+    harness = cfg.get("harness") if isinstance(cfg.get("harness"), dict) else {}
+    return {
+        "roles": list(KNOWN_ROLE_MODELS),
+        "models": {r: str((cfg.get("models") or {}).get(r) or "")
+                   for r in KNOWN_ROLE_MODELS},
+        "providers": {r: str((cfg.get("models") or {}).get(f"{r}_provider") or "")
+                      for r in KNOWN_ROLE_MODELS},
+        "aliases": _aliases(),
+        "presets": _presets(),
+        "suite": str(suite.get("command") or ""),
+        "harness": str(harness.get("command") or ""),
+        "freshness": {
+            "command": str(studio.get("freshness_command") or ""),
+            "max_age_hours": studio.get("freshness_max_age_hours", 24),
+        },
+        "no_kilo_mode": bool(cfg.get("no_kilo_mode")),
+        "manifest_path": _manifest_path(),
+    }
 
 
 def _models(ttl=600):
@@ -2393,7 +3361,11 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
     if model:
         cmd += ["--model", model]
     elif not session_id:
-        cmd += ["--model", "openrouter/z-ai/glm-5.3-flash"]
+        # settings-driven default: the agent class's manifest model wins, the
+        # canonical console default is the last resort
+        role = agent if agent in KNOWN_ROLE_MODELS else ""
+        manifest_model = _canon_model((_manifest().get("models") or {}).get(role, ""))
+        cmd += ["--model", manifest_model or "openrouter/z-ai/glm-5.3-flash"]
     cmd.append(prompt[:20000])
     try:
         proc = subprocess.Popen(
@@ -2500,11 +3472,18 @@ _CMD_DIRS = ("commands", "command")
 
 
 def _command_files(directory):
-    """Map command name -> md path; project dir wins over global config."""
+    """Map command name -> md path; precedence: worktree .kilo, then the
+    owning repo root's .kilo (VS Code Kilo reads the project register even
+    inside a worktree), then the global user config."""
     seen = {}
     roots = []
     if directory and os.path.isdir(directory):
         roots.append(os.path.join(directory, ".kilo"))
+    norm_dir = os.path.normpath(directory) if directory else ""
+    for r in _repos():
+        rd = os.path.normpath(r["root"])
+        if norm_dir and norm_dir != rd and norm_dir.startswith(rd + os.sep):
+            roots.append(os.path.join(rd, ".kilo"))
     roots.append(os.path.expanduser("~/.config/kilo"))
     for r in roots:
         for name in _CMD_DIRS:
@@ -2674,6 +3653,9 @@ class Handler(BaseHTTPRequestHandler):
             body = PAGE.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            # The whole app (JS included) rides in this one document; always
+            # revalidate so a restarted server is picked up on plain reload.
+            self.send_header("Cache-Control", "no-cache")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -2696,7 +3678,12 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/compose-meta":
             self._json({"agents": list(_ALLOWED_AGENTS),
                         "dirs": _known_dirs(),
-                        "models": _models()})
+                        "models": _models(),
+                        "presets": _presets(),
+                        "aliases": _aliases(),
+                        "role_models": _role_models()})
+        elif self.path == "/api/settings":
+            self._json(_settings_snapshot())
         elif self.path == "/api/state":
             procs = _ps_procs()
             flagged, total = _processes(procs)
@@ -2755,6 +3742,7 @@ class Handler(BaseHTTPRequestHandler):
                 "active": sorted(active.values(),
                                  key=lambda a: a.get("started") or 0),
                 "mcp": _mcp_inventory(procs),
+                "browser": _browser_runtime().browser_status(),
                 "processes": [
                     {k: p[k] for k in ("pid", "ppid", "rss", "etime", "args")}
                     for p in flagged],
@@ -2825,6 +3813,16 @@ class Handler(BaseHTTPRequestHandler):
             self._reap()
         elif self.path == "/api/mcp":
             self._mcp_toggle()
+        elif self.path == "/api/settings":
+            try:
+                body = self._read_body()
+            except Exception:
+                self._json({"error": "bad request"}, 400)
+                return
+            code, payload = _settings_write(body)
+            self._json(payload, code)
+        elif self.path == "/api/browser":
+            self._browser()
         elif self.path == "/api/send":
             self._send()
         elif self.path == "/api/stop":
@@ -2890,9 +3888,20 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self._read_body()
             op = str(body.get("op", ""))
-            qid = str(body.get("id", ""))
+            raw_qid = body.get("id")
+            qid = "" if raw_qid is None else str(raw_qid).strip()
             status = str(body.get("status", ""))
             note = str(body.get("note", ""))[:200]
+            raw_ids = body.get("ids")
+            ids = None
+            ids_sent = isinstance(raw_ids, list)
+            if ids_sent:
+                clean = []
+                for b in raw_ids[:50]:
+                    bid = str(b).strip()
+                    if re.fullmatch(r"[QqEeSs]?\d[\w-]{0,60}", bid):
+                        clean.append(bid)
+                ids = clean or None
         except Exception:
             self._json({"error": "bad request"}, 400)
             return
@@ -2902,13 +3911,22 @@ class Handler(BaseHTTPRequestHandler):
         if op == "advance" and status not in STATUS_ORDER:
             self._json({"error": "status not allowed"}, 403)
             return
+        if ids_sent and op not in ("collect", "studio"):
+            self._json({"error": "ids only allowed for collect/studio"}, 400)
+            return
+        if ids_sent and not ids:
+            # A bulk request whose selection sanitized to nothing must fail
+            # loudly — never degrade to a bare pack-everything run.
+            self._json({"error": "no valid quest ids in selection"}, 400)
+            return
         _JOB_SEQ[0] += 1
         jid = _JOB_SEQ[0]
         job = {"events": [], "done": False, "started": time.time(),
-               "dir": "", "agent": "court:" + op, "op": op, "qid": qid}
+               "dir": "", "agent": "court:" + op, "op": op,
+               "qid": ",".join(ids) if ids else qid}
         _JOBS[str(jid)] = job
         threading.Thread(target=_court_op, daemon=True,
-                         args=(job, op, qid, status, note)).start()
+                         args=(job, op, qid, status, note, ids)).start()
         self._json({"ok": True, "job": str(jid)})
 
     def _stop(self):
@@ -3028,6 +4046,48 @@ class Handler(BaseHTTPRequestHandler):
             return
         code, payload = _mcp_toggle_write(file, name, enabled)
         self._json(payload, code)
+
+    def _browser(self):
+        """Idempotently launch the shared studio Chromium (headed, persistent
+        profile, CDP) and pin the annotation overlay to the given worktree."""
+        try:
+            body = self._read_body()
+            wt = str(body.get("wt", ""))
+        except Exception:
+            self._json({"error": "bad request"}, 400)
+            return
+        wt = os.path.normpath(wt) if wt else ""
+        if not wt or wt not in _known_dirs() or not os.path.isdir(wt):
+            self._json({"error": "worktree is not a known directory; refused"}, 403)
+            return
+        studio_browser = _browser_runtime()
+        try:
+            server = _ensure_runserver(wt)
+            info = studio_browser.start_browser(
+                headless=False, annotate_worktree=Path(wt))
+        except Exception as exc:
+            self._json({"error": f"browser launch failed: {exc}"}, 500)
+            return
+        status = studio_browser.browser_status()
+        tab = None
+        closed_blanks = 0
+        if server["up"] and info.get("port"):
+            try:
+                tab = _cdp_open_tab(info["port"], server["url"])
+            except Exception:
+                tab = None
+            try:
+                closed_blanks = _cdp_close_blanks(
+                    info["port"], keep_id=(tab or {}).get("id"))
+            except Exception:
+                closed_blanks = 0
+        self._json({"ok": True, "running": True,
+                    "cdp_url": info.get("cdp_url"), "port": info.get("port"),
+                    "pid": info.get("pid"),
+                    "annotator_pid": info.get("annotator_pid"),
+                    "annotator_alive": bool(status.get("annotator_alive")),
+                    "server": server, "tab": tab,
+                    "closed_blanks": closed_blanks})
 
     def _reap(self):
         try:

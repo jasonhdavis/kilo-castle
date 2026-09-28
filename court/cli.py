@@ -44,6 +44,7 @@ from . import branch_ops
 from . import config
 from . import migration_guard
 from . import migration_graph
+from . import browser as studio_browser
 
 # The Ward's durable workspace: patrol ledger + Warden Report queue.
 WARD_DIR = Path(__file__).resolve().parent.parent / "ward"
@@ -151,6 +152,41 @@ def setup_worktree_agent_config(worktree_path: Path, agent: str = "serf") -> Non
         except Exception:
             pass
     cfg_file.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+
+def ensure_worktree_browser_mcp(worktree_path: Path, port: int) -> bool:
+    """Merge the chrome-devtools MCP server into the worktree's untracked
+    ``.kilo/kilo.json`` (the same file setup_worktree_agent_config maintains),
+    preserving every existing key. Returns True on success.
+
+    Its tools attach to the shared studio browser over CDP automatically.
+    """
+    try:
+        kilo_dir = worktree_path / ".kilo"
+        kilo_dir.mkdir(parents=True, exist_ok=True)
+        cfg_file = kilo_dir / "kilo.json"
+        cfg: dict[str, Any] = {}
+        if cfg_file.is_file():
+            try:
+                existing = json.loads(cfg_file.read_text(encoding="utf-8"))
+                if isinstance(existing, dict):
+                    cfg = existing
+            except Exception:
+                cfg = {}
+        mcp = cfg.get("mcp") if isinstance(cfg.get("mcp"), dict) else {}
+        mcp["chrome-devtools"] = {
+            "type": "local",
+            "command": [
+                "npx", "-y", "chrome-devtools-mcp@latest",
+                "--browserUrl", f"http://127.0.0.1:{int(port)}",
+            ],
+            "enabled": True,
+        }
+        cfg["mcp"] = mcp
+        cfg_file.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        return True
+    except Exception:
+        return False
 
 
 # Q455: canonical_model_id moved to engine.config — alias resolution now reads
@@ -986,6 +1022,7 @@ def cmd_status(args):
                 "gatekeeper_session_id": q.gatekeeper_session_id,
                 "parent_epic": q.parent_epic,
                 "scout_of": getattr(q, "scout_of", ""),
+                "cogship_id": q.cogship_id or "",
                 "is_compliant": audit.is_compliant,
                 "git_status": audit.git_status,
                 "task_progress": audit.task_progress,
@@ -2281,6 +2318,58 @@ def cmd_goad(args):
     print(f"   Model:    {qual_model}")
     print(f"   Worktree: {wt}")
     print(f"   Log:      tail -f {log_file}")
+
+
+def cmd_artist_say(args):
+    """Deliver M'Lord's instruction to an existing Court Artist session.
+
+    Mirrors the goad path: runs one whole agent turn via the Kilo CLI against
+    the session recorded on the Quest (artist_session_id), streaming output.
+    """
+    try:
+        quest = store.load(args.quest_id)
+    except Exception as e:
+        print(f"ERROR: {args.quest_id}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    wt = git_ops.find_worktree_for_quest(quest)
+    if not wt or not wt.is_dir():
+        print(
+            f"ERROR: No active worktree found on disk for {quest.id} (branch: {quest.branch or '-'})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    session_id = (getattr(quest, "artist_session_id", "") or "").strip()
+    if not session_id:
+        print(
+            f"ERROR: {quest.id} has no recorded Court Artist session — the frontmatter field "
+            f"`artist_session_id` is empty. Summon one first (`court artist {quest.id}` or "
+            f"`court studio <ids> --standup`), then record it: "
+            f"python3 -m court.cli set-field {quest.id} artist_session_id <session_id>",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    kilo_bin = find_kilo_binary()
+    if not kilo_bin:
+        print("ERROR: Kilo binary not found. Cannot deliver the instruction via CLI.", file=sys.stderr)
+        sys.exit(1)
+
+    model = quest.artist_model or config.get_model("artist")
+    qual_model = canonical_model_id(model)
+    cmd = [
+        str(kilo_bin),
+        "run",
+        "--dir", str(wt),
+        "--agent", "artist",
+        "--session", session_id,
+        "--model", qual_model,
+        args.instruction,
+    ]
+    print(f"🎨 Delivering instruction to Court Artist session {session_id} ({quest.id}, model {qual_model})…")
+    result = subprocess.run(cmd)
+    raise SystemExit(result.returncode)
 
 
 def _extract_target_routes(quest: Quest, worktree: Optional[Path] = None) -> list[str]:
@@ -3793,6 +3882,54 @@ def cmd_atelier(args):
     print("=" * 76)
 
 
+# Shared-studio MCP wiring verdict (probe 2026-09-27, /var/folders/.../kilo/mcp-probe):
+# a `.kilo/kilo.json` containing only an mcp block IS sufficient — Kilo loads it
+# even with an empty global config: variant A (.kilo/kilo.json) reported
+# "MCP server: chrome-devtools" and listed the shared browser's tabs; the
+# no-config control reported "MCP servers: None". So studio worktrees get the
+# chrome-devtools MCP pre-configured in their untracked .kilo/kilo.json.
+STUDIO_MCP_WORKTREE_CONFIG = True
+
+
+def render_browser_note(
+    wt_path: Path,
+    browser_info: Optional[dict[str, Any]],
+    mcp_wired: bool,
+) -> str:
+    """Pure renderer for the studio brief's shared-browser note.
+
+    Independent of quests and the running browser so it stays unit-testable.
+    """
+    port = (browser_info or {}).get("port") or studio_browser.DEFAULT_PORT
+    cdp_url = (browser_info or {}).get("cdp_url") or f"http://127.0.0.1:{port}"
+    annotations_file = Path(wt_path) / ".kilo" / "studio-annotations.jsonl"
+
+    if not browser_info:
+        manual = f"npx chrome-devtools-mcp@latest --browserUrl http://127.0.0.1:{studio_browser.DEFAULT_PORT}"
+        return (
+            "- Shared studio browser: not running (start it with "
+            f"`python3 -m court.cli browser start --annotate {wt_path}`).\n"
+            f"- To give the browser tools to this session, attach the MCP manually: `{manual}`.\n"
+            f"- Annotation notes file: `{annotations_file}` (append-only JSONL)."
+        )
+
+    if mcp_wired:
+        mcp_line = (
+            f"- Shared studio browser: the chrome-devtools MCP is pre-configured in this worktree "
+            f"(`.kilo/kilo.json`); its tools connect automatically to the shared browser at `{cdp_url}`."
+        )
+    else:
+        mcp_line = (
+            f"- Shared studio browser: attach its tools manually with "
+            f"`npx chrome-devtools-mcp@latest --browserUrl {cdp_url}` (CDP port {port})."
+        )
+    return (
+        mcp_line + "\n"
+        f"- M'Lord's annotation notes land in `{annotations_file}` (append-only JSONL) — "
+        "read it before and during the review."
+    )
+
+
 def cmd_studio(args):
     """Deterministic Multi-Quest Combined Studio (Q-2): formalize the hand-run
     artist-studio recipe (Q472/Q473/Q412, Q589, Q617 cohorts) into one command.
@@ -3974,6 +4111,36 @@ def cmd_studio(args):
     model = getattr(args, "model", None) or config.get_model("artist")
     provider = getattr(args, "provider", None) or config.get_provider("artist")
 
+    # Shared studio browser + annotation overlay. Best-effort: the studio must
+    # not die because the browser failed to start.
+    browser_info: Optional[dict[str, Any]] = None
+    browser_wired_mcp = False
+    if not getattr(args, "no_browser", False):
+        try:
+            browser_info = studio_browser.start_browser(annotate_worktree=wt_path)
+            try:
+                (wt_path / ".worktree-browser").write_text(
+                    json.dumps(
+                        {
+                            "port": browser_info.get("port"),
+                            "cdp_url": browser_info.get("cdp_url"),
+                            "profile": browser_info.get("profile"),
+                            "annotator": True,
+                        },
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"⚠️  shared studio browser not started ({e}); the Artist brief carries manual attach instructions")
+            browser_info = None
+        if browser_info and STUDIO_MCP_WORKTREE_CONFIG:
+            browser_wired_mcp = ensure_worktree_browser_mcp(wt_path, int(browser_info.get("port") or 0))
+    browser_mcp_line = render_browser_note(wt_path, browser_info, browser_wired_mcp)
+
     quest_blocks: list[str] = []
     routes_by_id: dict[str, list[str]] = {}
     for quest in merged_quests:
@@ -4030,6 +4197,9 @@ def cmd_studio(args):
         .replace("{{ port }}", str(port))
         .replace("{{ model }}", model)
         .replace("{{ freshness_note }}", fresh_verdict)
+        .replace("{{ browser_mcp_line }}", browser_mcp_line)
+        .replace("{{ annotations_file }}", str(wt_path / ".kilo" / "studio-annotations.jsonl"))
+        .replace("{{ vision_model }}", config.get_model("artist_vision", default=model))
         .replace("{{ merge_disclosures }}", "\n".join(merge_disclosure_lines) or "- (clean merges — no policy resolutions needed)")
         .replace("{{ sync_back_commands }}", sync_back_commands)
         .replace("{{ target_routes }}", "\n".join(
@@ -4145,6 +4315,10 @@ def cmd_studio(args):
     print(f"Runserver:   {runserver_url} (Port {port}) [{server_status}]")
     print(f"Freshness:   {fresh_verdict}")
     print(f"Model:       {model} ({provider})")
+    _browser_lines = browser_mcp_line.splitlines() or ["not configured"]
+    print(f"Browser:     {_browser_lines[0].lstrip('- ')}")
+    for _bline in _browser_lines[1:]:
+        print(f"             {_bline.lstrip('- ')}")
     if env_note:
         print(f"Env:         {env_note}")
     print()
@@ -5369,6 +5543,80 @@ def cmd_fix_branches(args):
         sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# Shared studio browser verbs (thin wrappers over court.browser)
+# ---------------------------------------------------------------------------
+
+
+def cmd_browser_start(args):
+    annotate_wt = Path(args.annotate).expanduser().resolve() if getattr(args, "annotate", None) else None
+    if annotate_wt and not annotate_wt.is_dir():
+        print(f"ERROR: --annotate worktree does not exist: {annotate_wt}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        info = studio_browser.start_browser(
+            headless=bool(getattr(args, "headless", False)),
+            port=getattr(args, "port", None),
+            profile=None,
+            annotate_worktree=annotate_wt,
+        )
+    except Exception as e:
+        print(f"ERROR: could not start the shared studio browser: {e}", file=sys.stderr)
+        sys.exit(1)
+    print("🌐 Shared studio browser is up:")
+    print(f"  CDP:      {info.get('cdp_url')}")
+    print(f"  Port:     {info.get('port')}")
+    print(f"  PID:      {info.get('pid')}")
+    print(f"  Profile:  {info.get('profile')}")
+    print(f"  Headless: {info.get('headless')}")
+    annotator_pid = info.get("annotator_pid")
+    if annotate_wt:
+        print(f"  Injector: {'PID ' + str(annotator_pid) if annotator_pid else 'not started'} (worktree: {annotate_wt})")
+        print(f"  Notes:    {Path(annotate_wt) / '.kilo' / 'studio-annotations.jsonl'}")
+    print(f"  State:    {studio_browser.STATE_PATH}")
+    if info.get("headless"):
+        print(f"  Attach:   npx chrome-devtools-mcp@latest --browserUrl {info.get('cdp_url')}")
+
+
+def cmd_browser_status(args):
+    info = studio_browser.browser_status()
+    if getattr(args, "json", False):
+        print(json.dumps(info, indent=2))
+        return
+    recorded = info.get("recorded")
+    if not recorded:
+        print("🌐 No shared studio browser recorded (never started, or state file removed).")
+        return
+    if info.get("running"):
+        print("🌐 Shared studio browser is RUNNING:")
+        print(f"  CDP:      http://127.0.0.1:{recorded.get('port')}")
+        print(f"  PID:      {recorded.get('pid')} ({info.get('cdp', {}).get('browser') or 'chromium'})")
+        print(f"  Profile:  {recorded.get('profile')}")
+        print(f"  Injector: {'alive (PID ' + str(recorded.get('annotator_pid')) + ')' if info.get('annotator_alive') else 'not running'}")
+    else:
+        print("🌐 Shared studio browser is NOT running (stale state file):")
+        print(f"  Recorded PID: {recorded.get('pid')} — alive: {info.get('pid_alive')} — CDP: {info.get('cdp_responsive')}")
+        print("  Start it with: python3 -m court.cli browser start")
+
+
+def cmd_browser_stop(args):
+    result = studio_browser.stop_browser()
+    if not result.get("had_state"):
+        print("🌐 Nothing to stop (no state file).")
+        return
+    if not result.get("actions"):
+        print("🌐 Stopped: state file cleared (recorded processes were already gone).")
+        return
+    for action in result["actions"]:
+        outcome = action.get("outcome", "")
+        for key, value in action.items():
+            if key != "outcome":
+                print(f"  {key} {value}: {outcome}")
+    print("🌐 Shared studio browser stopped.")
+
+
+def cmd_browser_inject_worker(args):
+    studio_browser._inject_worker(args.worktree)
 
 
 def build_parser():
@@ -5721,7 +5969,58 @@ def build_parser():
     p_studio.add_argument("--prompt-only", action="store_true", help="Print only the rendered studio Court Artist prompt")
     p_studio.add_argument("--json", action="store_true", help="Output JSON format for agent_manager or scripts")
     p_studio.add_argument("--no-commit", action="store_true", help="Do not autocommit ledger changes")
+    p_studio.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Do not start/adopt the shared studio browser for this studio",
+    )
     p_studio.set_defaults(func=cmd_studio)
+
+    p_browser = sub.add_parser(
+        "browser",
+        help="Shared studio browser: one headed Chromium with a persistent profile that the "
+             "Court Artist attaches to over CDP (chrome-devtools MCP) and the annotation "
+             "overlay is pinned into",
+    )
+    browser_sub = p_browser.add_subparsers(dest="browser_command")
+    p_browser.set_defaults(func=lambda _args: p_browser.print_help() or sys.exit(2))
+
+    p_browser_start = browser_sub.add_parser(
+        "start",
+        help="Start (or adopt the already-running) shared studio browser and its annotation injector",
+    )
+    p_browser_start.add_argument("--headless", action="store_true", help="Run headless (probe/testing mode)")
+    p_browser_start.add_argument("--port", type=int, default=None, help="CDP port override (default: 9335 or first free port)")
+    p_browser_start.add_argument(
+        "--annotate",
+        default=None,
+        metavar="WORKTREE",
+        help="Worktree whose annotation notes the injector serves (pins the overlay script into every page)",
+    )
+    p_browser_start.set_defaults(func=cmd_browser_start)
+
+    p_browser_status = browser_sub.add_parser("status", help="Show shared browser state, liveness, and CDP probe result")
+    p_browser_status.add_argument("--json", action="store_true", help="Output JSON format")
+    p_browser_status.set_defaults(func=cmd_browser_status)
+
+    p_browser_stop = browser_sub.add_parser("stop", help="Stop the shared browser and injector recorded in the state file (only those)")
+    p_browser_stop.set_defaults(func=cmd_browser_stop)
+
+    p_browser_inject = browser_sub.add_parser(
+        "_inject_worker",
+        help="internal: long-running annotation injector loop (spawned by `browser start`)",
+        description="Internal: long-running annotation injector loop (spawned by `browser start`)",
+    )
+    p_browser_inject.add_argument("worktree", help="Worktree whose studio annotations the injector serves")
+    p_browser_inject.set_defaults(func=cmd_browser_inject_worker)
+
+    p_artist_say = sub.add_parser(
+        "artist-say",
+        help="Deliver M'Lord's instruction to an existing Court Artist session (kilo run --agent artist --session <artist_session_id>)",
+    )
+    p_artist_say.add_argument("quest_id", help="Quest ID with a recorded artist_session_id (e.g. Q196)")
+    p_artist_say.add_argument("instruction", help="The instruction to deliver to the artist session")
+    p_artist_say.set_defaults(func=cmd_artist_say)
 
     p_stamp = sub.add_parser("stamp", help="Stamp Quests onto a Cog Ship convoy id (allocates next cogship-NNN unless --cogship given)")
     p_stamp.add_argument("quest_ids", help="Comma-separated Quest IDs (e.g. Q101,Q102,Q105)")
@@ -5853,7 +6152,7 @@ def build_parser():
 # checkout's index / dirty tree. Read-only reporting commands never take it.
 _READ_ONLY_COMMANDS = {
     "status", "show", "list", "tally", "ward", "ship", "diff", "timber",
-    "model", "verify-merged", "verify-manifest", "runsuite",
+    "model", "verify-merged", "verify-manifest", "runsuite", "browser",
 }
 
 

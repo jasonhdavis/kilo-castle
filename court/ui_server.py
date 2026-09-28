@@ -186,9 +186,15 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
 .dots i:nth-child(2){animation-delay:.15s}
 .dots i:nth-child(3){animation-delay:.3s}
 @keyframes dotp{0%,80%,100%{transform:scale(.6);opacity:.35}40%{transform:scale(1);opacity:1}}
-.livedot{width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;
- animation:pulse 1.1s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+ .livedot{width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;
+  animation:pulse 1.1s infinite}
+ @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+ .readdot{color:var(--green);font-size:11px;font-weight:700;cursor:pointer;line-height:1;padding:0 2px}
+ .stalledot{color:var(--amber);font-size:11px;font-weight:700;cursor:pointer;line-height:1;padding:0 2px}
+ .idledot{width:7px;height:7px;border-radius:50%;border:1.5px solid var(--dim);display:inline-block;opacity:.7}
+ .bread{font-size:9px;padding:1px 7px;border-radius:4px;background:var(--surface-2);
+  border:1px solid var(--edge);color:var(--green);cursor:pointer;font-weight:600;flex:none}
+ .bread:hover{border-color:rgba(63,185,80,.5)}
 
 #transcript{flex:1;overflow-y:auto;padding:18px 26px;display:flex;flex-direction:column;gap:12px}
 .msg{max-width:80%;padding:10px 14px;border-radius:var(--r-lg);background:var(--surface);
@@ -206,6 +212,13 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
 .msg.error{align-self:center;border-left:3px solid var(--red);color:var(--red);font-size:12px}
 .msg .who{color:var(--faint);font-size:9.5px;text-transform:uppercase;letter-spacing:.1em;
  margin-bottom:3px;font-weight:600;display:none}
+.msg .who .mts{text-transform:none;letter-spacing:0;font-weight:400;opacity:.85}
+.msg .mts.foot{display:block;font-size:9px;color:var(--faint);text-align:right;
+ margin-top:3px;letter-spacing:.03em;text-transform:none;font-weight:400}
+.msg.user .mts.foot,.msg.assistant .mts.foot,.msg.thinking .mts.foot{display:block}
+.daydiv{align-self:center;font-size:10px;color:var(--faint);letter-spacing:.08em;
+ text-transform:uppercase;font-weight:600;padding:8px 0 2px;user-select:none}
+.daydiv::before,.daydiv::after{content:'—';margin:0 8px;opacity:.5}
 #transcript .notice{align-self:center;color:var(--faint);font-size:11.5px;padding:6px 0}
 
 #composer{border-top:1px solid var(--edge);background:var(--surface);padding:12px 20px 14px}
@@ -685,7 +698,7 @@ function applyHash(){
 }
 
  async function poll(){
- try{S=await (await fetch('/api/state')).json();}catch(e){return;}
+ try{S=await (await fetch('/api/state')).json();DS_CACHE=null;}catch(e){return;}
  if(!selRepo&&S.repos.length){
   selRepo=(S.repos.find(r=>r.key==='app')||S.repos[0]).key;
   applyHash();renderNav();
@@ -702,31 +715,78 @@ function applyHash(){
     const key=boardApp+'|'+(S.quests||[]).map(q=>q.id+q.status+(q.dirty?'d':'')+(q.app||'')+(q.cogship_id||'')+(q.moc_live?'m':'')+(q.cogship_live?'g':'')).join(',');
    if(key!==boardKey){boardKey=key;renderBoard();}}
 }
-// "Working" means the agent is actually emitting, not merely alive: kilo CLI
-// processes stay alive while an interactive session (artist studio, steward)
-// sits parked between turns, so a bare ps-liveness dot flashed forever.
-// A ps-sourced entry only lights when its dir's newest session was touched
-// inside the freshness window; console-spawned jobs stream while not done.
-// A session touched within the window is always inside _sessions()'s
-// most-recent-first window, so a live-but-unlisted dir is treated as parked.
-const WORKING_FRESH_MS=4*60*1000;
-function activeDirs(){const s=new Set();const now=Date.now();
- const byDir={};for(const x of (S.sessions||[]))if(x.directory){const t=x.time_updated||0;if(t>(byDir[x.directory]||0))byDir[x.directory]=t;}
- for(const a of (S.active||[])){if(!a.dir)continue;
-  if(a.source!=='ps'){s.add(a.dir);continue;}
-  const t=byDir[a.dir]||0;
-  if(t&&now-t<WORKING_FRESH_MS)s.add(a.dir);}
- return s;}
-function renderNav(){
-  const r=repo(); if(!r){$('nav').innerHTML='';return;}
-  const act=activeDirs();
-  let h=`<div class="appswitch">`+S.repos.map(x=>
-   `<div class="app ${x.key===selRepo?'on':''}" data-app="${esc(x.key)}">${x.key}</div>`).join('')+`</div>`;
-  h+=`<div class="repohead">${esc(r.name)} · ${r.worktrees.length} worktrees</div>`;
-  const trunk=r.worktrees.find(w=>w.branch&&(w.branch===TRUNKS.find(t=>t===w.branch)||TRUNKS.includes(w.branch.split('/').pop())));
-  if(trunk)h+=`<div class="castle ${selWt===trunk.path?'sel':''}" data-wt="${esc(trunk.path)}">
-   <div class="name"><span class="dot"></span>${esc(r.name)} trunk${act.has(trunk.path)?' <span class="livedot" title="agent working"></span>':''}</div>
-   <div class="sub">${esc(trunk.branch||'?')}${trunk.dirty?' · dirty':''}</div></div>`;
+ // Per-directory turn state, from three observable signals — process
+ // liveness (S.active), last emission (session time_updated), and the newest
+ // session's message tail (S.tails: assistant `finish` is the deterministic
+ // turn-completion marker; null = cut mid-write). Windows are heuristics;
+ // any new write instantly returns a card to working.
+ //   working ● pulsing — touched inside the freshness window (or a console
+ //                       job streaming); a one-shot agent mid-tool-call gets
+ //                       the benefit of the doubt between windows.
+ //   stalled ! amber   — stopped without signaling completion: a one-shot
+ //                       agent alive but silent >10min (these exit when
+ //                       done), or a dead session whose tail has finish=null
+ //                       (killed mid-write — the goad candidate).
+ //   done ✓ green      — the tail signaled an end inside the lookback window;
+ //                       cleared only by mark-as-read (per browser), leaving
+ //                       idle while the process stays open, silence after.
+ //   idle ◌ hollow     — process open, nothing emitting: parked interactive
+ //                       session ("studio open"). Interactive roles never
+ //                       stall on silence — parking is their normal state.
+ const WORKING_FRESH_MS=4*60*1000, STALLED_SILENT_MS=10*60*1000, TAIL_LOOKBACK_MS=30*60*1000;
+ const INTERACTIVE_AGENTS=new Set(['artist','steward','code']);
+ let DS_CACHE=null;
+ function readMap(){try{return JSON.parse(localStorage.getItem('bdread')||'{}')}catch(e){return{}}}
+ function markRead(key){const m=readMap();m[key]=1;
+  const cutoff=Date.now()-2*3600*1000;
+  for(const k of Object.keys(m)){const t=parseInt((k.split('|')[1]||'0'),10);if(!t||t<cutoff)delete m[k];}
+  try{localStorage.setItem('bdread',JSON.stringify(m))}catch(e){}
+  DS_CACHE=null;renderNav();renderBoard();}
+ function dirStates(){if(DS_CACHE)return DS_CACHE;const now=Date.now(),out=new Map();
+  const byDir={};for(const a of (S.active||[]))if(a.dir)byDir[a.dir]=a;
+  const touch={};for(const x of (S.sessions||[]))if(x.directory){const t=x.time_updated||0;if(t>(touch[x.directory]||0))touch[x.directory]=t;}
+  const dirs=new Set([...Object.keys(touch),...Object.keys(byDir)]);
+  for(const d of dirs){
+   const t=touch[d]||0,a=byDir[d],tail=(S.tails||{})[d];
+   const key=d+'|'+t;
+   const agent=(tail&&tail.agent)||(a&&a.agent)||'';
+   const interactive=INTERACTIVE_AGENTS.has(agent);
+   const fresh=t&&now-t<WORKING_FRESH_MS;
+   const acked=!!readMap()[key];
+   let st=null,why='';
+   if(a&&a.source!=='ps'){st='working';why='console job streaming';}
+   else if(fresh){st='working';why='emitting';}
+   else if(tail&&tail.role==='assistant'&&tail.finish!=null){
+    if(!acked&&now-t<TAIL_LOOKBACK_MS){st='done';why='turn completed';}
+    else if(a){st='idle';why='session open — idle';}
+   }
+   else if(a){
+    if(interactive){st='idle';why='session open — idle';}
+    else if(t&&now-t>=STALLED_SILENT_MS){st='stalled';why='no output for '+Math.round((now-t)/60000)+' min';}
+    else{st='working';why='long tool call';}
+   }
+   else if(tail&&tail.role==='assistant'){st='stalled';why='turn ended without completing';}
+   else if(tail&&tail.role==='user'&&a){st='idle';why='prompt queued';}
+   if(st)out.set(d,{state:st,why,touch:t,agent,key});
+  }
+  DS_CACHE=out;return out;}
+ function stateFor(path){return dirStates().get(path)||null;}
+ function stateGlyph(st){if(!st)return'';
+  const t=st.state;
+  if(t==='working')return `<span class="livedot" title="${esc(st.why||'agent working')}"></span>`;
+  if(t==='done')return `<span class="readdot" data-bread="${esc(st.key)}" title="turn completed — click, or “mark read”, to clear">✓</span>`;
+  if(t==='stalled')return `<span class="stalledot" data-bread="${esc(st.key)}" title="stalled — ${esc(st.why)} — click, or “mark read”, to clear">!</span>`;
+  return `<span class="idledot" title="${esc(st.why||'idle')}"></span>`;}
+ function renderNav(){
+   const r=repo(); if(!r){$('nav').innerHTML='';return;}
+   let h=`<div class="appswitch">`+S.repos.map(x=>
+    `<div class="app ${x.key===selRepo?'on':''}" data-app="${esc(x.key)}">${x.key}</div>`).join('')+`</div>`;
+   h+=`<div class="repohead">${esc(r.name)} · ${r.worktrees.length} worktrees</div>`;
+   const trunk=r.worktrees.find(w=>w.branch&&(w.branch===TRUNKS.find(t=>t===w.branch)||TRUNKS.includes(w.branch.split('/').pop())));
+   if(trunk){const tst=stateFor(trunk.path);
+    h+=`<div class="castle ${selWt===trunk.path?'sel':''}" data-wt="${esc(trunk.path)}">
+    <div class="name"><span class="dot"></span>${esc(r.name)} trunk${tst?' '+stateGlyph(tst):''}</div>
+    <div class="sub">${esc(trunk.branch||'?')}${trunk.dirty?' · dirty':''}</div></div>`;}
   const byBranch={}; for(const w of r.worktrees){if(w.branch)byBranch[w.branch]=w}
   const secs={};for(const s of SECTION_ORDER)secs[s.id]={seen:new Set(),units:[]};
   for(const b of r.branches){
@@ -750,10 +810,10 @@ function renderNav(){
    const items=NAV_EXP[sec.id]?s.units:s.units.slice(0,30);
     for(const u of items){
      const b=u.b,w=u.w;
-     const working=act.has(w.path);
+     const nst=stateFor(w.path);
      const q=questFor(r.key,w.path,b);
      const p=qparse(b);
-     const marks=(working?'<span class="livedot" title="agent working"></span>':'')+
+     const marks=(nst?stateGlyph(nst):'')+
      (w.dirty?'<span class="badge">dirty</span>':'');
     let inner;
     if(q){
@@ -786,8 +846,10 @@ function renderNav(){
   }
   $('nav').innerHTML=h;
 }
-$('nav').addEventListener('click',e=>{
-  const app=e.target.closest('[data-app]');
+ $('nav').addEventListener('click',e=>{
+  const bread=e.target.closest('[data-bread]');
+  if(bread){markRead(bread.dataset.bread);return;}
+   const app=e.target.closest('[data-app]');
   if(app){switchApp(app.dataset.app);return;}
   const more=e.target.closest('[data-navmore]');
   if(more){NAV_EXP[more.dataset.navmore]=!NAV_EXP[more.dataset.navmore];renderNav();return;}
@@ -955,7 +1017,34 @@ function msgHTML(m){
   const k=cls==='thinking'?foldKey(m.text):null;
   const fold=k&&foldMemo[k]===true?' folded':'';
   const who=cls==='user'?'you':cls;
-  return `<div class="msg ${cls}${md?' md':''}${fold}"${k?` data-fk="${esc(k)}"`:''}><div class="who">${esc(who)}</div>${content}</div>`;
+  const showTs=cls==='user'||cls==='assistant'||cls==='thinking';
+  const ts=showTs&&m.time_created?msgTS(m.time_created):null;
+  return `<div class="msg ${cls}${md?' md':''}${fold}"${k?` data-fk="${esc(k)}"`:''}><div class="who">${esc(who)}${ts?` <span class="mts">${esc(ts.time)}</span>`:''}</div>${content}${ts?`<div class="mts foot" title="${esc(ts.day)}">${esc(ts.day)} · ${esc(ts.time)}</div>`:''}</div>`;
+}
+function msgTS(v){
+  const d=new Date(typeof v==='number'?v:Number(v));
+  if(isNaN(d))return null;
+  return {
+    day:d.toLocaleDateString([], {weekday:'short', month:'short', day:'numeric'}),
+    time:d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
+  };
+}
+function dayKey(v){
+  const d=new Date(typeof v==='number'?v:Number(v));
+  return isNaN(d)?null:d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
+function transcriptHTML(list){
+  let prev=null,out='';
+  for(const m of list){
+    const k=m.time_created?dayKey(m.time_created):null;
+    if(k&&k!==prev){
+      const d=new Date(Number(m.time_created));
+      if(!isNaN(d))out+=`<div class="daydiv">${esc(d.toLocaleDateString([], {weekday:'long', month:'long', day:'numeric', year:'numeric'}))}</div>`;
+      prev=k;
+    }
+    out+=msgHTML(m);
+  }
+  return out;
 }
 function renderTranscript(){
   const t=$('transcript');
@@ -963,7 +1052,7 @@ function renderTranscript(){
   if(!msgs.length){
    if(!turnForView()){t.innerHTML=welcomeHTML();return;}
    t.innerHTML='<div class="empty-note">working — live output streams here</div>';return;}
-  t.innerHTML=msgs.map(msgHTML).join('')||'<div class="empty-note">no text messages in this session yet</div>';
+  t.innerHTML=transcriptHTML(msgs)||'<div class="empty-note">no text messages in this session yet</div>';
   t.scrollTop=t.scrollHeight;
 }
 const LAUNCHES=[
@@ -984,7 +1073,7 @@ function welcomeHTML(){
  if(!S)return '<div class="notice">summoning the court…</div>';
  const qs=S.quests||[];
   const working=qs.filter(q=>q.status==='WORKING').length;
-  const act=activeDirs().size;
+  const act=[...dirStates().values()].filter(s=>s.state==='working').length;
  const g=greet();
  const sub=(working||act)?
   `The court is in motion — <b>${working}</b> quest${working===1?'':'s'} underway, <b>${act}</b> agent${act===1?'':'s'} working. What does M'lord require?`
@@ -1034,9 +1123,12 @@ function blockHTML(b){
   const md=b.cls==='assistant'||b.cls==='thinking';
   const k=b.cls==='thinking'?foldKey(b.text):null;
   const fold=k&&foldMemo[k]===true?' folded':'';
+  const showTs=b.cls==='user'||b.cls==='assistant'||b.cls==='thinking';
+  const ts=showTs?msgTS(b.ts||(b.ts=Date.now())):null;
   return `<div class="msg ${b.cls}${md?' md':''}${fold}"${k?` data-fk="${esc(k)}"`:''}>`+
-   `<div class="who">${b.cls==='thinking'?'reasoning':b.cls==='user'?'you':b.cls}</div>`+
-   (md?mdRender(b.text):esc(b.text))+'</div>';
+   `<div class="who">${b.cls==='thinking'?'reasoning':b.cls==='user'?'you':b.cls}${ts?` <span class="mts">${esc(ts.time)}</span>`:''}</div>`+
+   (md?mdRender(b.text):esc(b.text))+
+   (ts?`<div class="mts foot" title="${esc(ts.day)}">${esc(ts.day)} · ${esc(ts.time)}</div>`:'')+'</div>';
 }
 function renderLive(T0){
   const T=T0||turnForView();if(!T)return;
@@ -1176,7 +1268,7 @@ function autosizeTa(){
 async function dispatch(wt,sess,agent,model,prompt){
   const T={id:++TURNSEQ[0],wt,sess,sid:null,job:null,evs:0,ran:false,done:false,
    lane:sess||curLane,t0:Date.now(),blocks:[{cls:'user',text:prompt}],queue:null,
-   histHTML:msgs.map(msgHTML).join(''),stopping:false,stopped:false,
+   histHTML:transcriptHTML(msgs),stopping:false,stopped:false,
    shown:0,spinEl:null};
   TURN=T;turns.push(T);
   syncComposer();
@@ -1370,8 +1462,7 @@ function renderBoard(){
  renderBoardBar();
  const qs=S.quests||[];
  const bc=$('boardcols');
- const keep={left:bc?bc.scrollLeft:0,tops:bc?[...bc.querySelectorAll('.bcol')].map(c=>c.scrollTop):[]};
-  const act=activeDirs();
+  const keep={left:bc?bc.scrollLeft:0,tops:bc?[...bc.querySelectorAll('.bcol')].map(c=>c.scrollTop):[]};
   // Virtual 🚢 cogships column — built here, injected right after the GATE
   // column below. Live convoys: any member integrating at GATE or promoted-
   // but-undeployed (ship_ready). Click a card → ship manifest document;
@@ -1392,17 +1483,26 @@ function renderBoard(){
     const members=byCs[cs];
     const readyIds=members.filter(q=>q.ship_ready).map(q=>q.id);
     const anyGate=members.some(q=>q.status==='GATE');
-    const liveM=members.filter(q=>(q.worktree&&act.has(q.worktree))||q.moc_live||q.cogship_live);
-    const csTitle=members.some(q=>q.cogship_live)?('integration in progress — '+cs):
-     (members.some(q=>q.moc_live)?'master of coin auditing':
-      'agent working in '+liveM.length+' member quest'+(liveM.length===1?'':'s'));
-    const chips=members.map(q=>{
-     const qn=(String(q.id).match(/^[A-Za-z]+\d+/)||[q.id])[0].toUpperCase();
-     const cls=q.ship_ready?'ok':(q.status==='GATE'?'warn':'');
-     return `<span class="bchip ${cls}" title="${esc(q.id)} — ${esc(String(q.status).toLowerCase())}">${esc(qn)}</span>`;}).join('');
-    csCol+=`<div class="bcard click" data-cs="${esc(cs)}" title="click to open the ship manifest document">`+
-     `<div class="btop">`+(liveM.length?`<span class="livedot" title="${esc(csTitle)}"></span>`:'')+
-     `<span class="qnum" style="color:var(--blue)">🚢 ${esc(cs)}</span>`+
+     const msts=members.map(q=>q.worktree?stateFor(q.worktree):null).filter(Boolean);
+     const nStall=msts.filter(s=>s.state==='stalled').length;
+     const nWork=msts.filter(s=>s.state==='working').length;
+     const hasDone=!nStall&&!nWork&&msts.some(s=>s.state==='done');
+     const anyLive=members.some(q=>q.moc_live||q.cogship_live);
+     const csTitle=nStall?('stalled — '+nStall+' member quest'+(nStall===1?'':'s')+' silent without completing'):
+      (members.some(q=>q.cogship_live)?'integration in progress — '+cs:
+       (members.some(q=>q.moc_live)?'master of coin auditing':
+        (nWork?'agent working in '+nWork+' member quest'+(nWork===1?'':'s'):
+         (hasDone?'member turns completed — clear via mark-read on the quest cards':''))));
+     const csGlyph=nStall?`<span class="stalledot" title="${esc(csTitle)}">!</span>`:
+      ((nWork||anyLive)?`<span class="livedot" title="${esc(csTitle)}"></span>`:
+       (hasDone?`<span class="readdot" title="${esc(csTitle)}">✓</span>`:''));
+     const chips=members.map(q=>{
+      const qn=(String(q.id).match(/^[A-Za-z]+\d+/)||[q.id])[0].toUpperCase();
+      const cls=q.ship_ready?'ok':(q.status==='GATE'?'warn':'');
+      return `<span class="bchip ${cls}" title="${esc(q.id)} — ${esc(String(q.status).toLowerCase())}">${esc(qn)}</span>`;}).join('');
+     csCol+=`<div class="bcard click" data-cs="${esc(cs)}" title="click to open the ship manifest document">`+
+      `<div class="btop">${csGlyph}`+
+      `<span class="qnum" style="color:var(--blue)">🚢 ${esc(cs)}</span>`+
     `<span class="qgrow"></span>`+
     (anyGate?'<span class="bchip warn">integrating</span>':'')+
     (readyIds.length?`<button class="bgo" data-csconfirm="${esc(cs)}" data-ids="${esc(readyIds.join(','))}" title="court ship --confirm ${esc(readyIds.join(','))} — promote castle to main and deploy to production">confirm</button>`:'')+
@@ -1420,10 +1520,12 @@ function renderBoard(){
   cols+=`<div class="bcol"><h3><label class="bselall" title="select all in this column">`+
    `<input type="checkbox" class="bselall" data-bselall="${esc(st)}"${allSel?' checked':''}>`+
    `${esc(st.toLowerCase())} · ${items.length}</label></h3>`;
-   for(const q of items){
-    const wtOn=!!(q.worktree&&act.has(q.worktree));
-    const on=wtOn||q.moc_live||q.cogship_live;
-    const liveTitle=wtOn?'agent working':(q.moc_live?'master of coin auditing':'integration in progress — '+(q.cogship_id||'convoy'));
+    for(const q of items){
+     const wst=q.worktree?stateFor(q.worktree):null;
+     const on=!!wst||q.moc_live||q.cogship_live;
+     const liveTitle=wst?wst.why:(q.moc_live?'master of coin auditing':'integration in progress — '+(q.cogship_id||'convoy'));
+     const liveGlyph=wst?stateGlyph(wst):(on?`<span class="livedot" title="${esc(liveTitle)}"></span>`:'');
+     const readBtn=(wst&&(wst.state==='done'||wst.state==='stalled'))?`<button class="bread" data-bread="${esc(wst.key)}" title="clear the turn marker">mark read</button>`:'';
     const a=q.audit;
     const ops=BOARD_OPS[q.status]||[];
     let chips='';
@@ -1443,10 +1545,11 @@ function renderBoard(){
    const desc=[q.section,q.branch].filter(Boolean).join(' · ');
    cols+=`<div class="bcard click ${boardAttn(q)?'attn':''} ${BOARD_SEL.has(q.id)?'sel':''}" data-qid="${esc(q.id)}" ${q.worktree?`data-wt="${esc(q.worktree)}"`:''}>
      <div class="btop"><input type="checkbox" class="bsel" data-bsel="${esc(q.id)}" title="select for bulk action"${BOARD_SEL.has(q.id)?' checked':''}>`+
-     (on?`<span class="livedot" title="${liveTitle}"></span>`:'')+
+     liveGlyph+
      `<span class="qnum">${esc(qnum)}</span>`+
      (appLabel?`<span class="qbadge app-${esc(String(q.app||'').toLowerCase())}">${esc(appLabel)}</span>`:'')+
      `<span class="qgrow"></span>`+
+     readBtn+
      (q.dirty?'<span class="badge">dirty</span>':'')+`</div>`+
     `<div class="btitle2">${esc(q.title||'')}</div>`+
     (desc?`<div class="bdesc" title="${esc(desc)}">${esc(desc)}</div>`:'')+
@@ -1467,8 +1570,10 @@ $('boardbar').addEventListener('click',e=>{
  const bulk=e.target.closest('[data-bulk]');
  if(bulk){bulkRun(bulk.dataset.bulk);return;}
  const c=e.target.closest('[data-app]');if(c)boardFilter(c.dataset.app);});
-$('boardcols').addEventListener('click',e=>{
- const sa=e.target.closest('[data-bselall]');
+ $('boardcols').addEventListener('click',e=>{
+  const bread=e.target.closest('[data-bread]');
+  if(bread){markRead(bread.dataset.bread);return;}
+  const sa=e.target.closest('[data-bselall]');
  if(sa){const st=sa.dataset.bselall;
   const qs=S.quests||[];
   const ids=qs.filter(q=>q.status===st&&(boardApp==='all'||(q.app||q.repo)===boardApp)).map(q=>q.id);
@@ -2412,6 +2517,53 @@ def _sessions(limit=200):
     except Exception:
         return []
     return _session_rows(rows)
+
+
+_TAILS_CACHE = {"ts": 0.0, "data": {}}
+
+
+def _turn_tails(lookback_ms=30 * 60 * 1000, ttl=60.0):
+    """Turn-tail state per recently-touched directory: the newest session's
+    last message role + finish. An assistant message's `finish` field is the
+    deterministic turn-completion signal — present (stop/tool-calls/…) means
+    the turn signaled an end; null means cut mid-write (working, or killed).
+    Cached 60s: tails move only when a turn ends, never mid-emission."""
+    now = time.time()
+    if _TAILS_CACHE["data"] and now - _TAILS_CACHE["ts"] < ttl:
+        return _TAILS_CACHE["data"]
+    if not os.path.exists(KILO_DB):
+        return {}
+    cutoff = (now * 1000) - lookback_ms
+    out = {}
+    try:
+        db = sqlite3.connect(f"file:{KILO_DB}?mode=ro", uri=True, timeout=3)
+        db.execute("pragma query_only=1")
+        rows = db.execute(
+            "select directory, id, agent, time_updated from session"
+            " where time_updated >= ? order by time_updated desc limit 400",
+            (cutoff,)).fetchall()
+        seen = set()
+        for directory, sid, agent, tu in rows:
+            if not directory or directory in seen:
+                continue
+            seen.add(directory)
+            tail = {}
+            m = db.execute(
+                "select data from message where session_id=?"
+                " order by time_created desc limit 1", (sid,)).fetchone()
+            if m:
+                try:
+                    d = json.loads(m[0])
+                    tail = {"role": d.get("role"), "finish": d.get("finish")}
+                except Exception:
+                    pass
+            out[directory] = {"agent": agent or "", "touch": tu, **tail}
+        db.close()
+    except Exception:
+        return _TAILS_CACHE["data"]
+    _TAILS_CACHE["ts"] = now
+    _TAILS_CACHE["data"] = out
+    return out
 
 
 def _sessions_for_wt(wt, limit=200):
@@ -3939,6 +4091,7 @@ class Handler(BaseHTTPRequestHandler):
                 "repos": repos,
                 "worktrees": all_wts,
                 "sessions": _sessions(),
+                "tails": _turn_tails(),
                 "quests": quests,
                 "today": _today_totals(),
                 "active": sorted(active.values(),

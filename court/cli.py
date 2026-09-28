@@ -6156,6 +6156,11 @@ def build_parser():
 _READ_ONLY_COMMANDS = {
     "status", "show", "list", "tally", "ward", "ship", "diff", "timber",
     "model", "verify-merged", "verify-manifest", "runsuite", "browser",
+    # `ui` is a long-lived server: it must never hold the court-wide write
+    # lock for its whole lifetime (that deadlocked every root-level mutation
+    # until the server died). Its in-process court ops shell out as
+    # short-lived subprocesses which serialize on the lock themselves.
+    "ui",
 }
 
 

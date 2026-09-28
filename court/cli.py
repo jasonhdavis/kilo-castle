@@ -625,6 +625,112 @@ def cmd_update(args):
     init_cmd.run_init(force=True)
 
 
+def _git_out(repo: Path, *argv: str) -> str:
+    res = subprocess.run(["git", *argv], cwd=repo, capture_output=True, text=True)
+    return res.stdout if res.returncode == 0 else ""
+
+
+def cmd_sync(args):
+    """Pull branch-tip quest paperwork into the main checkout.
+
+    The manual half of the ledger single-source-of-truth fix (punished Q696):
+    serf self-advances and coin audits commit paperwork on the quest branch,
+    while the board and `collect` read the main checkout's ledger — the two
+    fork silently. For each quest this reads the committed branch tip (never
+    the worktree working tree), compares it against the main checkout's
+    copies, and applies the established conflict policy:
+
+      - branch changed, main checkout unchanged since the merge-base
+            -> branch-wins: charter + events copied onto the main checkout.
+      - main checkout changed, branch unchanged
+            -> castle-ahead: nothing to do.
+      - both changed
+            -> mixed fork: reported with a diffstat, never auto-merged.
+    """
+    repo = git_ops.get_repo_root()
+    quests_dir = store.get_quests_dir()
+    base = getattr(args, "base", None) or "castle"
+
+    ids = [x for x in (args.quest_ids or []) if x]
+    if getattr(args, "all", False):
+        ids = [p.stem for p in sorted(quests_dir.glob("*.md"))]
+        ids = [i for i in ids if not i.endswith(".events")]
+    if not ids:
+        print("No quest ids given (usage: court sync <id> [<id>...] | --all)")
+        sys.exit(2)
+
+    synced, clean, ahead, mixed, missing = [], [], [], [], []
+    staged: list[Path] = []
+    for qid in ids:
+        qpath = store.find_path(qid, quests_dir.parent)
+        if not qpath or not qpath.exists():
+            missing.append(qid)
+            print(f"  ? {qid}: quest file not found in the main checkout")
+            continue
+        rel = qpath.relative_to(repo).as_posix()
+        rel_events = rel[: -len(".md")] + ".events.jsonl"
+        head_fm = qpath.read_text(encoding="utf-8")[:2000]
+        m = re.search(r"^branch:\s*(\S+)", head_fm, re.MULTILINE)
+        branch = m.group(1) if m else ""
+        if not branch:
+            print(f"  - {qpath.stem}: no branch in frontmatter — skipping")
+            continue
+        if not _git_out(repo, "rev-parse", "--verify", "--quiet", branch):
+            print(f"  - {qpath.stem}: branch {branch} not found — skipping")
+            continue
+
+        b_md = _git_out(repo, "show", f"{branch}:{rel}")
+        b_events = _git_out(repo, "show", f"{branch}:{rel_events}")
+        c_md = qpath.read_text(encoding="utf-8")
+        c_events_p = qpath.parent / rel_events
+        c_events = c_events_p.read_text(encoding="utf-8") if c_events_p.exists() else ""
+
+        if b_md == c_md and b_events == c_events:
+            clean.append(qpath.stem)
+            print(f"  = {qpath.stem}: clean (branch tip matches the main checkout)")
+            continue
+
+        mb = _git_out(repo, "merge-base", base, branch).strip()
+        paths = [rel] + ([rel_events] if c_events or b_events else [])
+        castle_changed = bool(_git_out(repo, "diff", "--name-only", f"{mb}..{base}", "--", *paths).strip()) if mb else True
+        branch_changed = bool(_git_out(repo, "diff", "--name-only", f"{mb}..{branch}", "--", *paths).strip()) if mb else True
+
+        if castle_changed and branch_changed:
+            mixed.append(qpath.stem)
+            stat = _git_out(repo, "diff", "--stat", f"{mb}..{branch}", "--", *paths)
+            print(f"  ✗ {qpath.stem}: MIXED fork — both sides changed since the merge-base; refusing (resolve manually)")
+            for line in stat.splitlines()[-4:]:
+                print(f"      {line}")
+            continue
+        if castle_changed and not branch_changed:
+            ahead.append(qpath.stem)
+            print(f"  > {qpath.stem}: castle-ahead — main checkout already newer, nothing to do")
+            continue
+
+        # branch strictly ahead: branch-wins for charter paperwork
+        qpath.write_text(b_md, encoding="utf-8")
+        staged.append(qpath)
+        if b_events:
+            (qpath.parent / rel_events).write_text(b_events, encoding="utf-8")
+            staged.append(qpath.parent / rel_events)
+        elif c_events:
+            print(f"      note: branch carries no events file; kept the main checkout's events")
+        synced.append(qpath.stem)
+        print(f"  ✓ {qpath.stem}: synced branch paperwork onto the main checkout (branch-wins)")
+
+    if staged:
+        msg = "court: sync quest ledger from branch — " + ", ".join(synced[:6]) + ("…" if len(synced) > 6 else "")
+        res = git_ops.git_commit_paths(staged, msg, cwd=repo)
+        if not res.get("ok", True):
+            print(f"  commit failed: {res}")
+            sys.exit(1)
+    print()
+    print(f"Ledger sync: {len(synced)} synced, {len(clean)} clean, {len(ahead)} castle-ahead, {len(mixed)} MIXED, {len(missing)} not found")
+    if mixed:
+        print(f"  Mixed forks need manual resolution: {', '.join(mixed)}")
+        sys.exit(1)
+
+
 def cmd_ward(args):
     last_survey = _read_last_survey_timestamp()
     pending_reports = _list_pending_warden_reports()
@@ -5857,6 +5963,12 @@ def build_parser():
     p_log.add_argument("note")
     p_log.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_log.set_defaults(func=cmd_log)
+
+    p_sync = sub.add_parser("sync", help="Pull branch-tip quest ledger (charter + events) onto the main checkout — branch-wins, mixed forks refuse")
+    p_sync.add_argument("quest_ids", nargs="*", help="Quest ID(s), or empty with --all")
+    p_sync.add_argument("--all", action="store_true", help="Sync every quest in the main checkout's ledger")
+    p_sync.add_argument("--base", default="castle", help="Base branch for merge-base classification (default: castle)")
+    p_sync.set_defaults(func=cmd_sync)
 
     p_commute = sub.add_parser("commute", help="Record a post-deployment commutation as completed (appends a dated entry to the Quest's Cogship Log)")
     p_commute.add_argument("quest_id")

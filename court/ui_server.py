@@ -1429,11 +1429,11 @@ function openQuestWt(p){
  if(p&&((repo().worktrees||[]).some(w=>w.path===p)))pickWt(p);
  else poll();
 }
-const BOARD_OPS={WORKING:[["goad","goad","go"]],
- TRIBUTE_READY:[["coin","coin","go"],["studio","🎨 studio","go"],["advance","advance","GATE",""]],
- GATE:[["collect","🚢 collect","go"],["studio","🎨 studio","go"]],
- READY_TO_RAZE:[["raze","raze","warn"]],
- PLANNED:[["dispatch","dispatch","go"]]};
+const BOARD_OPS={WORKING:[["goad","goad","go"],["sync","sync","go"]],
+ TRIBUTE_READY:[["coin","coin","go"],["studio","🎨 studio","go"],["advance","advance","GATE",""],["sync","sync","go"]],
+ GATE:[["collect","🚢 collect","go"],["studio","🎨 studio","go"],["sync","sync","go"]],
+ READY_TO_RAZE:[["raze","raze","warn"],["sync","sync","go"]],
+ PLANNED:[["dispatch","dispatch","go"],["sync","sync","go"]]};
 function boardAttn(q){
  const a=q.audit;
  return !!(a&&(a.violations>0||a.pending_audience||a.forced_transition));
@@ -3234,6 +3234,9 @@ _COURT_OP_ARITY = {
     "studio": ("studio", "{id}"),
     "raze": ("raze", "{id}"),
     "dispatch": ("dispatch", "{id}", "--standup"),
+    # sync: pull branch-tip quest ledger onto the main checkout (Q696's
+    # transitional reconcile) — branch-wins, mixed forks refuse with a report.
+    "sync": ("sync", "{id}"),
     # ship: --confirm is appended ONLY when the request carries confirm:true
     # (dialog-acknowledged board confirm) — never baked into the template.
     "ship": ("ship", "{id}"),

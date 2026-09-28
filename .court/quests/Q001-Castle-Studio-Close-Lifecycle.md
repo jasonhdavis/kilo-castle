@@ -6,8 +6,8 @@ app: castle
 concern: studio-close-lifecycle
 parent_epic: 
 section: Feature
-tags: 
-status: PLANNED
+tags: Feature
+status: WORKING
 cogship_id: 
 cogship_station: 
 cogship_promoted_commit: 
@@ -16,9 +16,9 @@ pillory_of:
 pilloried_by: 
 scout_of: 
 branch: quest/q001-castle-studio-close-lifecycle
-worktree: 
-serf_session_id: 
-serf_model: 
+worktree: /Users/scrummage/Python/kilo-castle/.kilo/worktrees/quest-q001-castle-studio-close-lifecycle
+serf_session_id: kilo-serf-23069
+serf_model: GLM-5.3-Flash
 master_of_coin_session_id: 
 master_of_coin_model: 
 gatekeeper_session_id: 
@@ -27,7 +27,7 @@ artist_session_id:
 artist_model: 
 vassal_session_id: 
 created_at: 2026-09-28T03:00:12Z
-updated_at: 2026-09-28T03:00:25Z
+updated_at: 2026-09-28T03:01:02Z
 ---
 
 # Q001-Castle-Studio-Close-Lifecycle — Studio close-out lifecycle: gated close command with sign-off proof, drift/race guards, cherry-pick extraction, union briefs, close-out manifest, teardown
@@ -36,6 +36,8 @@ updated_at: 2026-09-28T03:00:25Z
 
 - **2026-09-28T03:00:12Z** — - → OPEN: Quest created
 - **2026-09-28T03:00:20Z** — OPEN → PLANNED: Chartered via composite `court charter`
+- **2026-09-28T03:01:02Z** — PLANNED → DISPATCHED: Serf dispatched (`court dispatch`)
+- **2026-09-28T03:01:02Z** — DISPATCHED → WORKING: Serf toiling in worktree (`court dispatch`)
 
 ## The Kingdom Requires
 

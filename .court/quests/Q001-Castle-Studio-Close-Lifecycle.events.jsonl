@@ -15,3 +15,9 @@
 {"target": "section:Castle Ledger", "ts": "2026-09-28T03:00:20Z", "value": "- **2026-09-28T03:00:12Z** — - → OPEN: Quest created\n- **2026-09-28T03:00:20Z** — OPEN → PLANNED: Chartered via composite `court charter`"}
 {"target": "field:section", "ts": "2026-09-28T03:00:25Z", "value": "Feature"}
 {"target": "field:updated_at", "ts": "2026-09-28T03:00:25Z", "value": "2026-09-28T03:00:25Z"}
+{"target": "field:status", "ts": "2026-09-28T03:01:02Z", "value": "WORKING"}
+{"target": "field:worktree", "ts": "2026-09-28T03:01:02Z", "value": "/Users/scrummage/Python/kilo-castle/.kilo/worktrees/quest-q001-castle-studio-close-lifecycle"}
+{"target": "field:serf_session_id", "ts": "2026-09-28T03:01:02Z", "value": "kilo-serf-23069"}
+{"target": "field:serf_model", "ts": "2026-09-28T03:01:02Z", "value": "GLM-5.3-Flash"}
+{"target": "field:updated_at", "ts": "2026-09-28T03:01:02Z", "value": "2026-09-28T03:01:02Z"}
+{"target": "section:Castle Ledger", "ts": "2026-09-28T03:01:02Z", "value": "- **2026-09-28T03:00:12Z** — - → OPEN: Quest created\n- **2026-09-28T03:00:20Z** — OPEN → PLANNED: Chartered via composite `court charter`\n- **2026-09-28T03:01:02Z** — PLANNED → DISPATCHED: Serf dispatched (`court dispatch`)\n- **2026-09-28T03:01:02Z** — DISPATCHED → WORKING: Serf toiling in worktree (`court dispatch`)"}

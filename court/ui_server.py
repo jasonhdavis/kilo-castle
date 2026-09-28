@@ -318,8 +318,8 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 .bchip.bad{color:var(--red);border-color:rgba(248,81,73,.35)}
 .bchip.warn{color:var(--amber);border-color:rgba(210,153,34,.35)}
 .bchip.ship{color:var(--blue);border-color:rgba(88,166,255,.4);font-weight:700}
-.bselall{display:flex;align-items:center;gap:6px;cursor:pointer}
-.bselall input{accent-color:var(--primary);cursor:pointer}
+.bselall{display:flex;align-items:center;gap:7px;cursor:pointer}
+.bselall input{accent-color:var(--primary);cursor:pointer;width:16px;height:16px}
 .btop{display:flex;align-items:center;gap:6px;min-width:0}
 .btop .qgrow{flex:1}
 .btitle2{font-size:13px;font-weight:600;line-height:1.45;margin-top:4px;color:var(--ink);
@@ -385,7 +385,7 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 .bcard:hover{border-color:var(--blue)}
 .bcard.sel{border-color:rgba(88,166,255,.55);background:rgba(88,166,255,.05)}
 .bcard.bulkbusy{opacity:.55}
-.bsel{accent-color:var(--blue);cursor:pointer;flex:none;width:12px;height:12px}
+.bsel{accent-color:var(--blue);cursor:pointer;flex:none;width:18px;height:18px}
 button.busy,.bgo{font-family:inherit}
 button.busy{opacity:.65;pointer-events:none}
 .spin{display:inline-block;animation:rot .9s linear infinite}

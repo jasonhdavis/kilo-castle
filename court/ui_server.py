@@ -392,6 +392,7 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 .shiphead{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
 .shiphead .bgo{padding:2px 10px}
 .bcol-ship .bcard{border-color:rgba(88,166,255,.3)}
+.bchip.dim{color:var(--dim);border-color:var(--edge-soft)}
 button.busy,.bgo{font-family:inherit}
 button.busy{opacity:.65;pointer-events:none}
 .spin{display:inline-block;animation:rot .9s linear infinite}
@@ -1402,26 +1403,39 @@ function renderBoard(){
   cols+=items.length?'':'<div class="bempty">—</div>';
   cols+='</div>';
   }
- // Virtual 🚢 ship column — promoted to castle but not yet merged into
- // main (deploy pending). Computed server-side (q.ship_ready), not a status.
- const ship=qs.filter(q=>q.ship_ready&&(boardApp==='all'||(q.app||q.repo)===boardApp));
+ // Virtual 🚢 cogships column — live convoys: any member integrating at
+ // GATE or promoted-but-undeployed (ship_ready). Click a card → ship
+ // manifest document; confirm button → court ship --confirm for the
+ // convoy's ready members. Fully-deployed/archived convoys drop off.
  const rel=qs.filter(q=>boardApp==='all'||(q.app||q.repo)===boardApp);
  const trunkAhead=rel.length?Math.max(0,...rel.map(q=>q.trunk_ahead||0)):0;
- cols+=`<div class="bcol bcol-ship"><h3 class="shiphead"><span>🚢 ship · ${ship.length}</span>`+
-  (trunkAhead>0?`<span class="bchip ship" title="commits on the castle trunk not yet deployed to main — archived quests ride in the next promote">trunk ↑${trunkAhead}</span>`:'')+
-  (ship.length?'<button class="bgo" data-ship="1" title="court ship --confirm — promote castle to main and deploy to production">launch</button>':'')+
+ const byCs={};
+ for(const q of rel)if(q.cogship_id)(byCs[q.cogship_id]=byCs[q.cogship_id]||[]).push(q);
+ const csKeys=Object.keys(byCs).filter(cs=>byCs[cs].some(q=>
+  q.ship_ready||q.status==='GATE')).sort((a,b)=>{
+   const na=parseInt(a.replace(/\D/g,''),10),nb=parseInt(b.replace(/\D/g,''),10);
+   return nb-na;});
+ cols+=`<div class="bcol bcol-ship"><h3 class="shiphead"><span>🚢 cogships · ${csKeys.length}</span>`+
+  (trunkAhead>0?`<span class="bchip ship" title="commits on the castle trunk not yet deployed to main — archived convoys ride in the next promote">trunk ↑${trunkAhead}</span>`:'')+
   '</h3>';
- for(const q of ship){
-  const qnum=(String(q.id).match(/^[A-Za-z]+\d+/)||[q.id])[0].toUpperCase();
-  cols+=`<div class="bcard click" data-qid="${esc(q.id)}">`+
-   `<div class="btop"><span class="qnum">${esc(qnum)}</span>`+
+ for(const cs of csKeys){
+  const members=byCs[cs];
+  const readyIds=members.filter(q=>q.ship_ready).map(q=>q.id);
+  const anyGate=members.some(q=>q.status==='GATE');
+  const chips=members.map(q=>{
+   const qn=(String(q.id).match(/^[A-Za-z]+\d+/)||[q.id])[0].toUpperCase();
+   const cls=q.ship_ready?'ok':(q.status==='GATE'?'warn':'');
+   return `<span class="bchip ${cls}" title="${esc(q.id)} — ${esc(String(q.status).toLowerCase())}">${esc(qn)}</span>`;}).join('');
+  cols+=`<div class="bcard click" data-cs="${esc(cs)}" title="click to open the ship manifest document">`+
+   `<div class="btop"><span class="qnum" style="color:var(--blue)">🚢 ${esc(cs)}</span>`+
    `<span class="qgrow"></span>`+
-   (q.dirty?'<span class="badge">dirty</span>':'')+`</div>`+
-   `<div class="btitle2">${esc(q.title||'')}</div>`+
-   (q.cogship_id?`<div class="bchips"><span class="bchip ship" title="convoy that carried this quest into the castle">🚢 ${esc(q.cogship_id)}</span></div>`:'')+
+   (anyGate?'<span class="bchip warn">integrating</span>':'')+
+   (readyIds.length?`<button class="bgo" data-csconfirm="${esc(cs)}" data-ids="${esc(readyIds.join(','))}" title="court ship --confirm ${esc(readyIds.join(','))} — promote castle to main and deploy to production">confirm</button>`:'')+
+   `</div>`+
+   `<div class="bchips">${chips}</div>`+
    '</div>';
  }
- cols+=ship.length?'':'<div class="bempty">—</div>';
+ cols+=csKeys.length?'':'<div class="bempty">—</div>';
  cols+='</div>';
  $('boardcols').innerHTML=cols;
  if(bc){bc.scrollLeft=keep.left;
@@ -1445,8 +1459,10 @@ $('boardcols').addEventListener('click',e=>{
   const card=cb.closest('.bcard');if(card)card.classList.toggle('sel',cb.checked);
   renderBoardBar();return;}
   const op=e.target.closest('[data-op]');
-  const sh=e.target.closest('[data-ship]');
-  if(sh){bulkShip();return;}
+  const csc=e.target.closest('[data-csconfirm]');
+  if(csc){shipCogship(csc.dataset.csconfirm,csc.dataset.ids);return;}
+  const ccard=e.target.closest('[data-cs]');
+  if(ccard){openCogshipDoc(ccard.dataset.cs);return;}
  if(op){courtOp(op.dataset.op,op.dataset.id,op.dataset.status||'',op);return;}
  const card=e.target.closest('.bcard');
  if(card&&card.dataset.qid&&!card.dataset.wt){openDocFor(card.dataset.qid);return;}
@@ -1533,13 +1549,12 @@ async function bulkRun(op){
  if(bad.length)alert(op+' finished — '+results.filter(r=>r.ok).length+' ok, '+bad.length+' failed\n\n'+
   bad.map(r=>r.id+': '+r.error).join('\n'));
 }
- async function bulkShip(){
-  const ids=(S.quests||[]).filter(q=>q.ship_ready&&(boardApp==='all'||(q.app||q.repo)===boardApp)).map(q=>q.id);
-  if(!ids.length)return;
-  if(!confirm('🚢 SHIP × '+ids.length+' quest'+(ids.length>1?'s':'')+' — PRODUCTION DEPLOY\n\ncourt ship --confirm '+ids.join(',')+
-   '\n\nPromotes castle → main and releases the fleet. This is the production deploy step — quests leave the ship column once merged into main.'))
+ async function shipCogship(cs,ids){
+  if(!ids)return;
+  if(!confirm('🚢 SHIP '+cs.toUpperCase()+' — PRODUCTION DEPLOY\n\ncourt ship --confirm '+ids+
+   '\n\nPromotes castle → main and releases the fleet. This is the production deploy step — the convoy leaves the board once merged into main.'))
    return;
-  const r=await runCourtOp('ship',null,'',null,null,ids);
+  const r=await runCourtOp('ship',null,'',null,null,ids.split(','));
   renderBoard();
   if(r&&!r.ok)alert('ship failed — '+r.error);
  }
@@ -1573,6 +1588,21 @@ function toggleDoc(ev){
  openDocFor('');
 }
 function openDocFor(qid){$('drawer').classList.add('on');loadQuestDoc(qid);}
+function openCogshipDoc(cs){$('drawer').classList.add('on');loadCogshipDoc(cs);}
+async function loadCogshipDoc(cs){
+ const bd=$('drawer_bd');
+ bd.innerHTML='<div class="dim">packing manifest…</div>';
+ $('drawer_title').textContent='🚢 '+cs+' — ship manifest';
+ try{
+  const j=await (await fetch('/api/cogship?cogship='+encodeURIComponent(cs))).json();
+  if(j.error){bd.innerHTML='<div class="dim">'+esc(j.error)+'</div>';return;}
+  $('drawer_title').textContent=j.title;
+  const ids=(j.ids||[]).length?'<div class="bchips" style="margin-bottom:10px">'+
+   j.ids.map(id=>`<span class="bchip"><b>${esc(id.split('-')[0]+id.match(/\d+/)[0])}</b> ${esc(id)}</span>`).join('')+'</div>':'';
+  bd.innerHTML=ids+'<div class="msg md qdoc">'+mdRender(String(j.text||''))+'</div>';
+  bd.scrollTop=0;
+ }catch(e){bd.innerHTML='<div class="dim">failed to load: '+esc(e)+'</div>';}
+}
 async function loadQuestDoc(qid){
  const bd=$('drawer_bd');
  bd.innerHTML='<div class="dim">loading…</div>';
@@ -3885,6 +3915,44 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(_quest_doc(
                     root, qs.get("wt", [""])[0], qs.get("id", [""])[0]))
+        elif self.path.startswith("/api/cogship"):
+            # Ship manifest document for one convoy: locate the repo whose
+            # quests carry this cogship stamp, then render the read-only
+            # `court ship <ids>` report (bare ship never mutates — the
+            # confirm branch is the only mutating path in cmd_ship).
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            cs = qs.get("cogship", [""])[0].strip()
+            if not re.fullmatch(r"cogship-\d+", cs):
+                self._json({"error": "bad cogship id"}, 400)
+            else:
+                root, ids = None, []
+                for r in _repos():
+                    members = [q for q in _quests(r["root"])
+                               if q.get("cogship_id") == cs]
+                    if members:
+                        root = r["root"]
+                        ids = [q["id"] for q in members]
+                        break
+                if root is None:
+                    self._json({"error": f"no quests stamped {cs}"}, 404)
+                else:
+                    try:
+                        pr = subprocess.run(
+                            ["python3", "-m", "court.cli", "ship",
+                             ",".join(ids)],
+                            cwd=root, capture_output=True, text=True,
+                            timeout=90)
+                        text = pr.stdout or ""
+                        if pr.returncode != 0 and not text:
+                            text = (pr.stderr or
+                                    f"court ship exited {pr.returncode}")
+                    except subprocess.TimeoutExpired:
+                        text = "court ship timed out after 90s"
+                    except Exception as e:
+                        text = f"failed: {e}"
+                    self._json({"title": f"🚢 {cs} — ship manifest",
+                                "ids": ids, "text": text})
         elif self.path.startswith("/api/turns"):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)

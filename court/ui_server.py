@@ -676,21 +676,37 @@ function hashState(){
   }
   return p;
 }
-function syncHash(){
+// Navigation history: user-driven state changes push a history entry so the
+// browser back/forward buttons walk worktree/session/view selections. Boot and
+// popstate restorations run with NAVSUP set (replaceState only), and a push is
+// skipped when the target state already equals the current history entry — so
+// poll re-renders and restoration side-effects never flood the stack.
+let NAVSUP=false;
+function syncHash(push){
  const p=[];
  if(selRepo)p.push('app='+encodeURIComponent(selRepo));
  if(selWt)p.push('wt='+encodeURIComponent(selWt));
  if(selSess)p.push('sess='+encodeURIComponent(selSess));
   if(view!=='chat')p.push('view='+view);
-  history.replaceState(null,'','#'+p.join('&'));
+ const h='#'+p.join('&');
+ if(push&&!NAVSUP&&h!==location.hash)history.pushState(null,'',h);
+ else history.replaceState(null,'',h);
+}
+function clearWtSel(){
+ selWt=null;selSess=null;msgs=[];curLane=null;
+ $('wt_label').textContent='select a worktree';$('wt_badge').innerHTML='';
+ $('c_cont').innerHTML='new session — pick a worktree, or open the ☰ sessions menu to continue one';
 }
 function applyHash(){
  const p=hashState();let hit=false;
- if(p.app&&S.repos.some(r=>r.key===p.app)){selRepo=p.app;hit=true;}
+ NAVSUP=true;
+ try{
+  if(p.app&&S.repos.some(r=>r.key===p.app)){selRepo=p.app;hit=true;}
   if(p.view==='board'||p.view==='settings')setView(p.view);
- if(p.wt){
-  const r=repo();
-  const w=(r.worktrees||[]).find(x=>x.path===p.wt)||(r.worktrees||[]).find(x=>x.branch===p.wt);
+  else if(view!=='chat')setView('chat');
+  if(p.wt){
+   const r=repo();
+   const w=(r.worktrees||[]).find(x=>x.path===p.wt)||(r.worktrees||[]).find(x=>x.branch===p.wt);
    if(w){selWt=w.path;hit=true;
     const wi=(repo().worktrees||[]).find(x=>x.path===w.path);
     setWtLabel(wi&&wi.branch||w.branch||w.path.split('/').pop(),w.path);
@@ -699,10 +715,16 @@ function applyHash(){
     if(p.sess&&/^[\w-]+$/.test(p.sess))openSess(p.sess);
     else{const s=sessionsFor(selWt);if(s.length)openSess(s[0].id);else newSess();}
    }
-  }
+  }else if(hit&&!p.sess&&!p.wt)clearWtSel();
+ }finally{NAVSUP=false;}
   loadCmds();
   return hit;
 }
+window.addEventListener('popstate',()=>{
+ if(!S)return;
+ applyHash();
+ renderNav();renderSessionsBar();renderTranscript();syncComposer();syncSessMeta();syncMarkRead();syncEaselChip();syncBrowserBtn();
+});
 
  async function poll(){
  try{S=await (await fetch('/api/state')).json();DS_CACHE=null;}catch(e){return;}
@@ -876,7 +898,7 @@ function switchApp(key){selRepo=key;selWt=null;selSess=null;msgs=[];curLane=null
  $('wt_label').textContent='select a worktree';$('wt_badge').innerHTML='';
  $('c_cont').innerHTML='new session — pick a worktree, or open the ☰ sessions menu to continue one';
  CMDS=[];renderCmdList();
-  renderNav();renderTranscript();syncHash();syncComposer();syncMarkRead();}
+  renderNav();renderTranscript();syncHash(true);syncComposer();syncMarkRead();}
 let cmdSeq=0;
 const CMD_CACHE={};
 async function loadCmds(){
@@ -916,7 +938,7 @@ function pickWt(path,branch){
   });
  }
  loadCmds();
- syncHash();
+ syncHash(true);
 }
 function sessionsFor(path){
  // exact-directory match only: a repo-root (trunk) card must show ONLY its own
@@ -994,13 +1016,13 @@ document.addEventListener('click',e=>{
  if(!e.target.closest('#sessmenu')&&!e.target.closest('#sess_burger'))closeSessMenu();});
 function newSess(){selSess=null;msgs=[];curLane='L'+(++LANESEQ);
  $('c_cont').innerHTML='new session in <b>'+esc(selWt?selWt.replace('/Users/scrummage/Python/',''):'?')+'</b> <span class="dim">— agent replies as a fresh session</span>';
- renderSessionsBar();renderTranscript();syncHash();syncComposer();syncSessMeta();syncMarkRead();}
+ renderSessionsBar();renderTranscript();syncHash(true);syncComposer();syncSessMeta();syncMarkRead();}
 let sessOpenSeq=0;
 async function openSess(id){
  const seq=++sessOpenSeq;
  selSess=id;msgs=[];curLane=id;
  $('c_cont').innerHTML=`continuing <b>${esc(id.slice(0,24))}…</b> <button class="newbtn" onclick="newSess()">start new instead</button>`;
- renderSessionsBar();renderTranscript();syncHash();syncComposer();syncSessMeta();syncMarkRead();
+ renderSessionsBar();renderTranscript();syncHash(true);syncComposer();syncSessMeta();syncMarkRead();
  loadCmds();
  $('transcript').innerHTML='<div class="notice">loading…</div>';
  let m=[];
@@ -1426,7 +1448,7 @@ $('cmdlist').addEventListener('mousedown',e=>{
  const r=e.target.closest('.cmdrow');
  if(r){e.preventDefault();completeCmd(r.dataset.name);}});
 function setView(v){
- view=v;syncHash();
+ view=v;syncHash(true);
  $('chat').style.display=v==='chat'?'':'none';
  $('board').style.display=v==='board'?'flex':'none';
  $('settings').style.display=v==='settings'?'block':'none';
@@ -2078,7 +2100,7 @@ function jumpToSession(sid){
  setView('chat');
  openSess(sid);
  loadCmds();
- syncHash();
+ syncHash(true);
  poll();
 }
  async function mcpToggle(file,name){

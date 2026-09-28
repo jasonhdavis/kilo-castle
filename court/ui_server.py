@@ -26,6 +26,9 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+
+from court import git_ops
 
 COURT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KILO_DB = os.path.expanduser("~/.local/share/kilo/kilo.db")
@@ -386,6 +389,9 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 .bcard.sel{border-color:rgba(88,166,255,.55);background:rgba(88,166,255,.05)}
 .bcard.bulkbusy{opacity:.55}
 .bsel{accent-color:var(--blue);cursor:pointer;flex:none;width:18px;height:18px}
+.shiphead{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.shiphead .bgo{padding:2px 10px}
+.bcol-ship .bcard{border-color:rgba(88,166,255,.3)}
 button.busy,.bgo{font-family:inherit}
 button.busy{opacity:.65;pointer-events:none}
 .spin{display:inline-block;animation:rot .9s linear infinite}
@@ -1393,7 +1399,28 @@ function renderBoard(){
   }
   cols+=items.length?'':'<div class="bempty">—</div>';
   cols+='</div>';
+  }
+ // Virtual 🚢 ship column — promoted to castle but not yet merged into
+ // main (deploy pending). Computed server-side (q.ship_ready), not a status.
+ const ship=qs.filter(q=>q.ship_ready&&(boardApp==='all'||(q.app||q.repo)===boardApp));
+ const rel=qs.filter(q=>boardApp==='all'||(q.app||q.repo)===boardApp);
+ const trunkAhead=rel.length?Math.max(0,...rel.map(q=>q.trunk_ahead||0)):0;
+ cols+=`<div class="bcol bcol-ship"><h3 class="shiphead"><span>🚢 ship · ${ship.length}</span>`+
+  (trunkAhead>0?`<span class="bchip ship" title="commits on the castle trunk not yet deployed to main — archived quests ride in the next promote">trunk ↑${trunkAhead}</span>`:'')+
+  (ship.length?'<button class="bgo" data-ship="1" title="court ship --confirm — promote castle to main and deploy to production">launch</button>':'')+
+  '</h3>';
+ for(const q of ship){
+  const qnum=(String(q.id).match(/^[A-Za-z]+\d+/)||[q.id])[0].toUpperCase();
+  cols+=`<div class="bcard click" data-qid="${esc(q.id)}">`+
+   `<div class="btop"><span class="qnum">${esc(qnum)}</span>`+
+   `<span class="qgrow"></span>`+
+   (q.dirty?'<span class="badge">dirty</span>':'')+`</div>`+
+   `<div class="btitle2">${esc(q.title||'')}</div>`+
+   (q.cogship_id?`<div class="bchips"><span class="bchip ship" title="convoy that carried this quest into the castle">🚢 ${esc(q.cogship_id)}</span></div>`:'')+
+   '</div>';
  }
+ cols+=ship.length?'':'<div class="bempty">—</div>';
+ cols+='</div>';
  $('boardcols').innerHTML=cols;
  if(bc){bc.scrollLeft=keep.left;
   [...bc.querySelectorAll('.bcol')].forEach((c,i)=>{c.scrollTop=keep.tops[i]||0;});}
@@ -1415,7 +1442,9 @@ $('boardcols').addEventListener('click',e=>{
   if(cb.checked)BOARD_SEL.add(id);else BOARD_SEL.delete(id);
   const card=cb.closest('.bcard');if(card)card.classList.toggle('sel',cb.checked);
   renderBoardBar();return;}
- const op=e.target.closest('[data-op]');
+  const op=e.target.closest('[data-op]');
+  const sh=e.target.closest('[data-ship]');
+  if(sh){bulkShip();return;}
  if(op){courtOp(op.dataset.op,op.dataset.id,op.dataset.status||'',op);return;}
  const card=e.target.closest('.bcard');
  if(card&&card.dataset.qid&&!card.dataset.wt){openDocFor(card.dataset.qid);return;}
@@ -1459,10 +1488,14 @@ async function bulkRun(op){
  const ids=[...BOARD_SEL];
  if(!ids.length)return;
  if(op==='clear'){BOARD_SEL=new Set();renderBoard();return;}
- if(op==='collect'){
-  if(!confirm('PACK × '+ids.length+' quest'+(ids.length>1?'s':'')+' onto ONE cog ship convoy?\n\ncollect '+ids.join(',')+
-   '\n\nStamps the selection as one convoy and advances it to GATE. Quests that fail the pack audit are skipped with reasons.'))
-   return;
+  if(op==='collect'){
+   const atGate=ids.filter(id=>{const q=(S.quests||[]).find(x=>x.id===id);return q&&q.status==='GATE';}).length;
+   const gateNote=atGate===ids.length
+    ?'All selected are already at GATE — they are re-stamped onto the new convoy, no status change.'
+    :'Quests not yet at GATE are advanced to GATE as part of the pack.';
+   if(!confirm('PACK × '+ids.length+' quest'+(ids.length>1?'s':'')+' onto ONE cog ship convoy?\n\ncollect '+ids.join(',')+
+    '\n\nStamps the selection as one convoy and hands it to the Gatekeeper. '+gateNote+' Quests that fail the pack audit are skipped with reasons.'))
+    return;
   const bar0=$('boardbar').querySelector('.bbulk');
   if(bar0)bar0.innerHTML='<b>collecting '+ids.length+' quest'+(ids.length===1?'':'s')+' onto one convoy…</b>';
   const r=await runCourtOp('collect',null,'',null,null,ids);
@@ -1498,7 +1531,17 @@ async function bulkRun(op){
  if(bad.length)alert(op+' finished — '+results.filter(r=>r.ok).length+' ok, '+bad.length+' failed\n\n'+
   bad.map(r=>r.id+': '+r.error).join('\n'));
 }
-document.getElementById('c_prompt').addEventListener('input',()=>{cmdIdx=0;autosizeTa();renderCmdList();});
+ async function bulkShip(){
+  const ids=(S.quests||[]).filter(q=>q.ship_ready&&(boardApp==='all'||(q.app||q.repo)===boardApp)).map(q=>q.id);
+  if(!ids.length)return;
+  if(!confirm('🚢 SHIP × '+ids.length+' quest'+(ids.length>1?'s':'')+' — PRODUCTION DEPLOY\n\ncourt ship --confirm '+ids.join(',')+
+   '\n\nPromotes castle → main and releases the fleet. This is the production deploy step — quests leave the ship column once merged into main.'))
+   return;
+  const r=await runCourtOp('ship',null,'',null,null,ids);
+  renderBoard();
+  if(r&&!r.ok)alert('ship failed — '+r.error);
+ }
+ document.getElementById('c_prompt').addEventListener('input',()=>{cmdIdx=0;autosizeTa();renderCmdList();});
 document.getElementById('c_prompt').addEventListener('keydown',e=>{
  const list=$('cmdlist');
  const listOpen=list.style.display!=='none';
@@ -2031,10 +2074,13 @@ def _quests(root, ttl=20):
                 "branch": fm.get("branch", ""), "worktree": wt,
                 "epic": fm.get("parent_epic", ""),
                 "section": fm.get("section", ""), "concern": fm.get("concern", ""),
+                "kind": fm.get("kind", ""),
                 "dirty": _wt_dirty(wt), "path": path,
                 "wt_status": wt_status,
                 "cogship_id": fm.get("cogship_id", ""),
+                "cogship_promoted_commit": fm.get("cogship_promoted_commit", ""),
                 "tribute_done": t_done, "tribute_total": t_total,
+                "ship_ready": False,
             })
     quests.sort(key=lambda q: (
         STATUS_ORDER.index(q["status"]) if q["status"] in STATUS_ORDER else 99,
@@ -2043,6 +2089,34 @@ def _quests(root, ttl=20):
         for q, d in zip(quests, ex.map(_wt_dirty, [q["worktree"]
                                                    for q in quests])):
             q["dirty"] = d
+    # Ship-ready mirror of the CLI's "Cogships Ready" predicate: promoted to
+    # castle but NOT yet merged into main (deploy pending). Computed, not a
+    # status — the board renders it as its own virtual column.
+    for q in quests:
+        if q["status"] not in ("READY_TO_RAZE", "READY_FOR_TEARDOWN", "DONE"):
+            continue
+        if q["kind"] == "scout" or q["section"] == "Investigation":
+            continue
+        probe = SimpleNamespace(**{k: q.get(k, "") for k in (
+            "id", "branch", "kind", "section", "cogship_promoted_commit")})
+        if not probe.cogship_promoted_commit:
+            probe.cogship_promoted_commit = None
+        try:
+            q["ship_ready"] = not git_ops.is_quest_merged_into(
+                probe, target_ref="main", cwd=Path(root))
+        except Exception:
+            q["ship_ready"] = False
+    # Trunk deploy backlog: commits on castle not yet merged into main.
+    # One git call per repo; archived-but-undeployed quests (razed, shipped
+    # into the castle, awaiting the next castle→main promote) ride here.
+    try:
+        ra = subprocess.run(["git", "rev-list", "--count", "main..castle"],
+                            cwd=root, capture_output=True, text=True, timeout=15)
+        trunk_ahead = int(ra.stdout.strip()) if ra.returncode == 0 else 0
+    except Exception:
+        trunk_ahead = 0
+    for q in quests:
+        q["trunk_ahead"] = trunk_ahead
     _QUESTS_CACHE[root] = (now, quests)
     return quests
 
@@ -2955,6 +3029,7 @@ _COURT_OP_ARITY = {
     "studio": ("studio", "{id}"),
     "raze": ("raze", "{id}"),
     "dispatch": ("dispatch", "{id}", "--standup"),
+    "ship": ("ship", "--confirm", "{id}"),
 }
 
 
@@ -2976,8 +3051,8 @@ def _find_quest_repo(qid):
 def _court_op(job, op, qid, status, note, ids=None):
     try:
         found = _find_quest_repo(qid)
-        if not found and op == "collect" and not qid:
-            # Bare collect (no selection): explicit pack-everything intent.
+        if not found and op in ("collect", "ship") and not qid:
+            # Bare collect/ship (no selection): explicit pack/launch intent.
             found = {"root": COURT_DIR}
         if not found and op == "studio" and not ids and not qid:
             job["events"].append({"type": "error",
@@ -3001,10 +3076,11 @@ def _court_op(job, op, qid, status, note, ids=None):
                 return
             argv = ["python3", "-m", "court.cli", "advance", found["quest"]["id"],
                     status, "--note", note or "advanced via court console"]
-        elif ids and op in ("collect", "studio"):
+        elif ids and op in ("collect", "studio", "ship"):
             # Batched call: one command for the whole selection
             # (collect id1,id2,... packs ONE convoy; studio id1,id2,...
-            # routes ONE combined artist studio). Refuse cross-repo
+            # routes ONE combined artist studio; ship id1,id2,... launches
+            # exactly that deployment manifest). Refuse cross-repo
             # selections — a court root serves one convoy/studio.
             roots = set()
             resolved = []
@@ -3026,12 +3102,16 @@ def _court_op(job, op, qid, status, note, ids=None):
                 return
             root = roots.pop()
             argv = ["python3", "-m", "court.cli", op, ",".join(resolved)]
+            if op == "ship":
+                argv.append("--confirm")
         else:
             tmpl = _COURT_OP_ARITY[op]
-            if op in ("collect", "studio") and found.get("quest"):
+            if op in ("collect", "studio", "ship") and found.get("quest"):
                 # Selection-scoped: operate only on this quest.
                 argv = ["python3", "-m", "court.cli", op,
                         found["quest"]["id"]]
+                if op == "ship":
+                    argv.append("--confirm")
             else:
                 argv = ["python3", "-m", "court.cli"] + [
                     a.replace("{id}", found["quest"]["id"] if found.get("quest") else "")
@@ -3048,10 +3128,11 @@ def _court_op(job, op, qid, status, note, ids=None):
                 if len(ln) > 400:
                     ln = ln[:400] + " …"
                 job["events"].append({"type": "text", "text": ln})
-        # goad/coin/dispatch/studio wrap a full agent turn — no timeout; stop via /api/stop
+        # goad/coin/dispatch/studio wrap a full agent turn — no timeout; stop via /api/stop.
+        # ship promotes castle → main (merge + manifest rollup) — allow 10 min.
         long_op = op in ("goad", "coin", "dispatch", "studio")
         try:
-            rc = proc.wait(None if long_op else 180)
+            rc = proc.wait(None if long_op else (600 if op == "ship" else 180))
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)

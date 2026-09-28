@@ -698,7 +698,7 @@ function applyHash(){
   $('t_today').innerHTML=`$ <b>${(ty.cost||0).toFixed(2)}</b> today`;
   syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();
   if(view==='board'){
-   const key=boardApp+'|'+(S.quests||[]).map(q=>q.id+q.status+(q.dirty?'d':'')+(q.app||'')+(q.cogship_id||'')).join(',');
+    const key=boardApp+'|'+(S.quests||[]).map(q=>q.id+q.status+(q.dirty?'d':'')+(q.app||'')+(q.cogship_id||'')+(q.moc_live?'m':'')+(q.cogship_live?'g':'')).join(',');
    if(key!==boardKey){boardKey=key;renderBoard();}}
 }
 function activeDirs(){const s=new Set();for(const a of (S.active||[]))if(a.dir)s.add(a.dir);return s;}
@@ -1364,9 +1364,11 @@ function renderBoard(){
   cols+=`<div class="bcol"><h3><label class="bselall" title="select all in this column">`+
    `<input type="checkbox" class="bselall" data-bselall="${esc(st)}"${allSel?' checked':''}>`+
    `${esc(st.toLowerCase())} · ${items.length}</label></h3>`;
-  for(const q of items){
-   const on=!!(q.worktree&&act.has(q.worktree));
-   const a=q.audit;
+   for(const q of items){
+    const wtOn=!!(q.worktree&&act.has(q.worktree));
+    const on=wtOn||q.moc_live||q.cogship_live;
+    const liveTitle=wtOn?'agent working':(q.moc_live?'master of coin auditing':'gatekeeper integrating '+(q.cogship_id||'convoy'));
+    const a=q.audit;
     const ops=BOARD_OPS[q.status]||[];
     let chips='';
     if(q.cogship_id)chips+=`<span class="bchip ship" title="stamped onto this cog ship convoy">🚢 ${esc(q.cogship_id)}</span>`;
@@ -1389,7 +1391,7 @@ function renderBoard(){
     (appLabel?`<span class="qbadge app-${esc(String(q.app||'').toLowerCase())}">${esc(appLabel)}</span>`:'')+
     `<span class="qgrow"></span>`+
     (q.dirty?'<span class="badge">dirty</span>':'')+
-    (on?'<span class="livedot" title="agent working"></span>':'')+`</div>`+
+     (on?`<span class="livedot" title="${liveTitle}"></span>`:'')+`</div>`+
     `<div class="btitle2">${esc(q.title||'')}</div>`+
     (desc?`<div class="bdesc" title="${esc(desc)}">${esc(desc)}</div>`:'')+
     (chips?`<div class="bchips">${chips}</div>`:'')+
@@ -3814,11 +3816,38 @@ class Handler(BaseHTTPRequestHandler):
             for k in [k for k, j in _JOBS.items()
                       if j.get("done") and j.get("ended", 0) < cutoff]:
                 _JOBS.pop(k, None)
+            # Quest liveness decoration: `_quests` is TTL-cached and shared,
+            # but `_all_quests()` returns fresh dicts per request — safe to
+            # decorate. Three causes light the card's working dot:
+            #   - a live agent in the quest's own worktree (serf/artist/MoC
+            #     evaluating in place) — matched client-side via S.active;
+            #   - a live master_of_coin whose --dir is the quest worktree or
+            #     a fork named after the quest id (coin forks are siblings,
+            #     not subdirs of the quest worktree);
+            #   - a live gatekeeper integrating the quest's stamped cogship
+            #     (gatehouse worktree) or running a size-1 convoy directly
+            #     in the quest worktree.
+            quests = _all_quests()
+            _norm = os.path.normpath
+            moc_dirs = [_norm(a["dir"]) for a in active.values()
+                        if a.get("agent") == "master_of_coin"]
+            gk_dirs = [_norm(a["dir"]) for a in active.values()
+                       if a.get("agent") == "gatekeeper"]
+            live_cogships = {m.group(1) for d in gk_dirs
+                             for m in [re.search(r"(cogship-\d+)", d)] if m}
+            for q in quests:
+                wt = _norm(q.get("worktree") or "")
+                qid = (q.get("id") or "").lower()
+                q["moc_live"] = any(
+                    wt == d or (qid and qid in d.lower()) for d in moc_dirs)
+                q["cogship_live"] = (
+                    q.get("cogship_id") in live_cogships
+                    or wt in gk_dirs)
             self._json({
                 "repos": repos,
                 "worktrees": all_wts,
                 "sessions": _sessions(),
-                "quests": _all_quests(),
+                "quests": quests,
                 "today": _today_totals(),
                 "active": sorted(active.values(),
                                  key=lambda a: a.get("started") or 0),

@@ -702,7 +702,21 @@ function applyHash(){
     const key=boardApp+'|'+(S.quests||[]).map(q=>q.id+q.status+(q.dirty?'d':'')+(q.app||'')+(q.cogship_id||'')+(q.moc_live?'m':'')+(q.cogship_live?'g':'')).join(',');
    if(key!==boardKey){boardKey=key;renderBoard();}}
 }
-function activeDirs(){const s=new Set();for(const a of (S.active||[]))if(a.dir)s.add(a.dir);return s;}
+// "Working" means the agent is actually emitting, not merely alive: kilo CLI
+// processes stay alive while an interactive session (artist studio, steward)
+// sits parked between turns, so a bare ps-liveness dot flashed forever.
+// A ps-sourced entry only lights when its dir's newest session was touched
+// inside the freshness window; console-spawned jobs stream while not done.
+// A session touched within the window is always inside _sessions()'s
+// most-recent-first window, so a live-but-unlisted dir is treated as parked.
+const WORKING_FRESH_MS=4*60*1000;
+function activeDirs(){const s=new Set();const now=Date.now();
+ const byDir={};for(const x of (S.sessions||[]))if(x.directory){const t=x.time_updated||0;if(t>(byDir[x.directory]||0))byDir[x.directory]=t;}
+ for(const a of (S.active||[])){if(!a.dir)continue;
+  if(a.source!=='ps'){s.add(a.dir);continue;}
+  const t=byDir[a.dir]||0;
+  if(t&&now-t<WORKING_FRESH_MS)s.add(a.dir);}
+ return s;}
 function renderNav(){
   const r=repo(); if(!r){$('nav').innerHTML='';return;}
   const act=activeDirs();
@@ -969,8 +983,8 @@ function greet(){
 function welcomeHTML(){
  if(!S)return '<div class="notice">summoning the court…</div>';
  const qs=S.quests||[];
- const working=qs.filter(q=>q.status==='WORKING').length;
- const act=(S.active||[]).length;
+  const working=qs.filter(q=>q.status==='WORKING').length;
+  const act=activeDirs().size;
  const g=greet();
  const sub=(working||act)?
   `The court is in motion — <b>${working}</b> quest${working===1?'':'s'} underway, <b>${act}</b> agent${act===1?'':'s'} working. What does M'lord require?`
@@ -1374,16 +1388,21 @@ function renderBoard(){
   let csCol=`<div class="bcol bcol-ship"><h3 class="shiphead"><span>🚢 cogships · ${csKeys.length}</span>`+
    (trunkAhead>0?`<span class="bchip ship" title="commits on the castle trunk not yet deployed to main — archived convoys ride in the next promote">trunk ↑${trunkAhead}</span>`:'')+
    '</h3>';
-  for(const cs of csKeys){
-   const members=byCs[cs];
-   const readyIds=members.filter(q=>q.ship_ready).map(q=>q.id);
-   const anyGate=members.some(q=>q.status==='GATE');
-   const chips=members.map(q=>{
-    const qn=(String(q.id).match(/^[A-Za-z]+\d+/)||[q.id])[0].toUpperCase();
-    const cls=q.ship_ready?'ok':(q.status==='GATE'?'warn':'');
-    return `<span class="bchip ${cls}" title="${esc(q.id)} — ${esc(String(q.status).toLowerCase())}">${esc(qn)}</span>`;}).join('');
-   csCol+=`<div class="bcard click" data-cs="${esc(cs)}" title="click to open the ship manifest document">`+
-    `<div class="btop"><span class="qnum" style="color:var(--blue)">🚢 ${esc(cs)}</span>`+
+   for(const cs of csKeys){
+    const members=byCs[cs];
+    const readyIds=members.filter(q=>q.ship_ready).map(q=>q.id);
+    const anyGate=members.some(q=>q.status==='GATE');
+    const liveM=members.filter(q=>(q.worktree&&act.has(q.worktree))||q.moc_live||q.cogship_live);
+    const csTitle=members.some(q=>q.cogship_live)?('integration in progress — '+cs):
+     (members.some(q=>q.moc_live)?'master of coin auditing':
+      'agent working in '+liveM.length+' member quest'+(liveM.length===1?'':'s'));
+    const chips=members.map(q=>{
+     const qn=(String(q.id).match(/^[A-Za-z]+\d+/)||[q.id])[0].toUpperCase();
+     const cls=q.ship_ready?'ok':(q.status==='GATE'?'warn':'');
+     return `<span class="bchip ${cls}" title="${esc(q.id)} — ${esc(String(q.status).toLowerCase())}">${esc(qn)}</span>`;}).join('');
+    csCol+=`<div class="bcard click" data-cs="${esc(cs)}" title="click to open the ship manifest document">`+
+     `<div class="btop">`+(liveM.length?`<span class="livedot" title="${esc(csTitle)}"></span>`:'')+
+     `<span class="qnum" style="color:var(--blue)">🚢 ${esc(cs)}</span>`+
     `<span class="qgrow"></span>`+
     (anyGate?'<span class="bchip warn">integrating</span>':'')+
     (readyIds.length?`<button class="bgo" data-csconfirm="${esc(cs)}" data-ids="${esc(readyIds.join(','))}" title="court ship --confirm ${esc(readyIds.join(','))} — promote castle to main and deploy to production">confirm</button>`:'')+
@@ -1404,7 +1423,7 @@ function renderBoard(){
    for(const q of items){
     const wtOn=!!(q.worktree&&act.has(q.worktree));
     const on=wtOn||q.moc_live||q.cogship_live;
-    const liveTitle=wtOn?'agent working':(q.moc_live?'master of coin auditing':'gatekeeper integrating '+(q.cogship_id||'convoy'));
+    const liveTitle=wtOn?'agent working':(q.moc_live?'master of coin auditing':'integration in progress — '+(q.cogship_id||'convoy'));
     const a=q.audit;
     const ops=BOARD_OPS[q.status]||[];
     let chips='';
@@ -1475,9 +1494,9 @@ function courtOp(op,id,status,btn){
  runCourtOp(op,id,status,btn,btn&&btn.closest('.bcard')).then(r=>{
   if(r&&r.error)alert(op.toUpperCase()+' '+id+' — '+r.error);});
 }
-async function runCourtOp(op,id,status,btn,card,ids){
+async function runCourtOp(op,id,status,btn,card,ids,confirmFlag){
  let d;
- try{d=await (await fetch('/api/court',{method:'POST',body:JSON.stringify(ids?{op,id:id||'',status,ids}:{op,id:id||'',status})})).json();}
+ try{d=await (await fetch('/api/court',{method:'POST',body:JSON.stringify(Object.assign(ids?{op,id:id||'',status,ids}:{op,id:id||'',status}, confirmFlag?{confirm:true}:{}))})).json();}
  catch(e){return {error:'failed: '+e};}
  if(d.error)return {error:d.error};
  const job=d.job;
@@ -1557,7 +1576,7 @@ async function bulkRun(op){
   if(!confirm('🚢 SHIP '+cs.toUpperCase()+' — PRODUCTION DEPLOY\n\ncourt ship --confirm '+ids+
    '\n\nPromotes castle → main and releases the fleet. This is the production deploy step — the convoy leaves the board once merged into main.'))
    return;
-  const r=await runCourtOp('ship',null,'',null,null,ids.split(','));
+  const r=await runCourtOp('ship',null,'',null,null,ids.split(','),true);
   renderBoard();
   if(r&&!r.ok)alert('ship failed — '+r.error);
  }
@@ -3064,7 +3083,9 @@ _COURT_OP_ARITY = {
     "studio": ("studio", "{id}"),
     "raze": ("raze", "{id}"),
     "dispatch": ("dispatch", "{id}", "--standup"),
-    "ship": ("ship", "--confirm", "{id}"),
+    # ship: --confirm is appended ONLY when the request carries confirm:true
+    # (dialog-acknowledged board confirm) — never baked into the template.
+    "ship": ("ship", "{id}"),
 }
 
 
@@ -3083,7 +3104,7 @@ def _find_quest_repo(qid):
     return None
 
 
-def _court_op(job, op, qid, status, note, ids=None):
+def _court_op(job, op, qid, status, note, ids=None, confirm=False):
     try:
         found = _find_quest_repo(qid)
         if not found and op in ("collect", "ship") and not qid:
@@ -3137,7 +3158,7 @@ def _court_op(job, op, qid, status, note, ids=None):
                 return
             root = roots.pop()
             argv = ["python3", "-m", "court.cli", op, ",".join(resolved)]
-            if op == "ship":
+            if op == "ship" and confirm:
                 argv.append("--confirm")
         else:
             tmpl = _COURT_OP_ARITY[op]
@@ -3145,7 +3166,7 @@ def _court_op(job, op, qid, status, note, ids=None):
                 # Selection-scoped: operate only on this quest.
                 argv = ["python3", "-m", "court.cli", op,
                         found["quest"]["id"]]
-                if op == "ship":
+                if op == "ship" and confirm:
                     argv.append("--confirm")
             else:
                 argv = ["python3", "-m", "court.cli"] + [
@@ -3175,6 +3196,41 @@ def _court_op(job, op, qid, status, note, ids=None):
                 pass
             rc = -99
             job["events"].append({"type": "error", "text": "court op timed out"})
+        if op == "raze" and rc == 0:
+            # `raze` verifies and queues only — it exits 0 even when it
+            # refuses (unmerged/dirty) or merely queues for teardown, and
+            # the card leaves the board only once the charter is archived.
+            # Chain archive when this quest actually razed (🔥 success
+            # line); refusal/dirty/pillory-hold runs stay on the board.
+            q = found.get("quest") or {}
+            razed = any(f"🔥 Razed {q.get('id', '')}" in (e.get("text") or "")
+                        for e in job["events"] if e.get("type") == "text")
+            if razed and q.get("path") and os.path.isfile(q["path"]):
+                argv2 = ["python3", "-m", "court.cli", "archive", q["id"]]
+                job["events"].append({"type": "status",
+                                      "text": "$ " + " ".join(argv2) + f"   (cwd {root})"})
+                proc2 = subprocess.Popen(
+                    argv2, cwd=root, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                rc2 = None
+                try:
+                    for ln in proc2.stdout:
+                        ln = ln.rstrip()
+                        if ln:
+                            job["events"].append({
+                                "type": "text",
+                                "text": ln[:400] + (" …" if len(ln) > 400 else "")})
+                    rc2 = proc2.wait(120)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(os.getpgid(proc2.pid), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    rc2 = -99
+                    job["events"].append({"type": "error",
+                                          "text": "archive step timed out"})
+                if rc2:
+                    rc = rc2
         job["exit"] = rc
         job["ended"] = time.time()
         job["done"] = True
@@ -3859,14 +3915,17 @@ class Handler(BaseHTTPRequestHandler):
             #     not subdirs of the quest worktree);
             #   - a live gatekeeper integrating the quest's stamped cogship
             #     (gatehouse worktree) or running a size-1 convoy directly
-            #     in the quest worktree.
+            #     in the quest worktree. Convoy liveness covers ANY agent in
+            #     the gatehouse worktree — remediation serfs working a
+            #     rejected convoy integrate too, not just the gatekeeper.
             quests = _all_quests()
             _norm = os.path.normpath
             moc_dirs = [_norm(a["dir"]) for a in active.values()
                         if a.get("agent") == "master_of_coin"]
             gk_dirs = [_norm(a["dir"]) for a in active.values()
-                       if a.get("agent") == "gatekeeper"]
-            live_cogships = {m.group(1) for d in gk_dirs
+                        if a.get("agent") == "gatekeeper"]
+            live_cogships = {m.group(1) for a in active.values()
+                             for d in [_norm(a.get("dir") or "")]
                              for m in [re.search(r"(cogship-\d+)", d)] if m}
             for q in quests:
                 wt = _norm(q.get("worktree") or "")
@@ -4092,9 +4151,14 @@ class Handler(BaseHTTPRequestHandler):
         if op == "advance" and status not in STATUS_ORDER:
             self._json({"error": "status not allowed"}, 403)
             return
-        if ids_sent and op not in ("collect", "studio"):
-            self._json({"error": "ids only allowed for collect/studio"}, 400)
+        if ids_sent and op not in ("collect", "studio", "ship"):
+            self._json({"error": "ids only allowed for collect/studio/ship"}, 400)
             return
+        # ship is the production deploy: --confirm only rides a request that
+        # carries confirm:true — set exclusively by the board's dialog-
+        # acknowledged confirm button. Any other ship call (scripts, stray
+        # curls, UI bugs) degrades to the read-only manifest report.
+        confirm = bool(body.get("confirm")) and op == "ship"
         if ids_sent and not ids:
             # A bulk request whose selection sanitized to nothing must fail
             # loudly — never degrade to a bare pack-everything run.
@@ -4107,7 +4171,7 @@ class Handler(BaseHTTPRequestHandler):
                "qid": ",".join(ids) if ids else qid}
         _JOBS[str(jid)] = job
         threading.Thread(target=_court_op, daemon=True,
-                         args=(job, op, qid, status, note, ids)).start()
+                         args=(job, op, qid, status, note, ids, confirm)).start()
         self._json({"ok": True, "job": str(jid)})
 
     def _stop(self):

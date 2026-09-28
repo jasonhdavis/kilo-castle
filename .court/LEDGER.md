@@ -849,3 +849,16 @@ every subsequent navigation/new document hits the deferred path → dead.
   - Live smoke: `--help` renders all flags; unknown-id error path clean. No
     real studio touched (pb-app studios live at 8250/8251 under active royal
     review).
+- **13:2xZ court ui — day/time on chat messages** (M'Lord request): per-message
+  timestamp footer (day · time) on user/assistant/reasoning bubbles, time next
+  to the role label, day dividers between calendar days (incl. leading divider
+  for the conversation's start day). History from kilo.db `time_created`
+  (epoch ms, already in /api/session); live blocks stamp at first render;
+  notices/tool/error rows untimestamped. Verified via node --check + behavior
+  harness on the touched functions + live page smoke on :8300. NOTE: the
+  change landed inside commit 40b541e ("card turn states") — a parallel
+  session committed ui_server.py seconds before this session's commit and
+  swept the shared working tree; the feature is shipped in HEAD, attributed
+  here. Suite green (233). Console serving it: pid 17897 (kilo-wrapper owned,
+  took :8300 in a bind race with the session's own restart — the session's
+  persistent instance lost the race and is stopped; console healthy).

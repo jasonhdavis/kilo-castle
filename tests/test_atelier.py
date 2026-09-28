@@ -139,7 +139,8 @@ class TestAtelierConvoyStandup(unittest.TestCase):
             q = store.load(qid, court_root=self.court_dir)
             self.assertEqual(q.status, "GATE")
             self.assertTrue(q.cogship_id.startswith("cogship-"))
-            self.assertEqual(q.artist_model, "openrouter/z-ai/glm-5.3")
+            from court import config as _cfg
+            self.assertEqual(q.artist_model, _cfg.get_model("artist"))
             ledger = q.body_sections.get("Castle Ledger", "")
             self.assertIn("Royal Atelier", ledger)
             self.assertIn("runserver port 8123", ledger)

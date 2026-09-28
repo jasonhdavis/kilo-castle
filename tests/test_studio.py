@@ -372,7 +372,8 @@ class TestStudioCommand(unittest.TestCase):
         self.assertEqual(lq1.status, "TRIBUTE_READY")
         self.assertEqual(lq2.status, "TRIBUTE_READY")
         self.assertEqual(lq1.cogship_id, "")
-        self.assertEqual(lq1.artist_model, "openrouter/z-ai/glm-5.3")
+        from court import config as _cfg
+        self.assertEqual(lq1.artist_model, _cfg.get_model("artist"))
         self.assertIn("combined artist studio q711-q712", lq1.body_sections.get("Castle Ledger", ""))
         self.assertIn("branch-wins", lq1.body_sections.get("Castle Ledger", ""))
         self.assertIn("union-resolved", lq2.body_sections.get("Castle Ledger", ""))
@@ -413,7 +414,8 @@ class TestStudioCommand(unittest.TestCase):
         self.assertEqual(data["studio"], "q721")
         self.assertEqual(data["branch"], "artist/q721-ui-studio")
         self.assertEqual(data["task"]["branchName"], "artist/q721-ui-studio")
-        self.assertEqual(data["model"], "openrouter/z-ai/glm-5.3")
+        from court import config as _cfg
+        self.assertEqual(data["model"], _cfg.get_model("artist"))
         self.assertIn("prompt", data["task"])
         self.assertEqual(data["freshness"]["age_hours"], 0.36)
         self.assertIn("conflict_policy", data)
@@ -502,7 +504,9 @@ class TestStudioSyncBack(unittest.TestCase):
         with patch("court.store.get_court_root", return_value=self.court_dir), \
              patch("court.cli.git_ops.get_repo_root", return_value=self.tmp_path), \
              patch("court.cli.git_ops._run", side_effect=recording), \
-             patch("court.cli._verify_branch_exists", return_value=True):
+             patch("court.cli._verify_branch_exists", return_value=True), \
+             patch("court.studio_close.base_drift_count", return_value=0), \
+             patch("court.studio_close.gatehouse_race", return_value=None):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 rc = main(["studio", quest_id, "--sync-back", "--branch", branch, "--no-commit"])

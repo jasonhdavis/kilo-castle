@@ -45,6 +45,7 @@ from . import config
 from . import migration_guard
 from . import migration_graph
 from . import browser as studio_browser
+from . import studio_close
 
 # The Ward's durable workspace: patrol ledger + Warden Report queue.
 WARD_DIR = Path(__file__).resolve().parent.parent / "ward"
@@ -3559,6 +3560,37 @@ def _studio_sync_back(args, auto_commit: bool, repo_root: Path) -> None:
         )
         sys.exit(1)
 
+    # Guarded primitive (studio_close doctrine): a drifted base replays stale
+    # lines into the Quest branches, and a Quest already stamped into a live
+    # convoy must never be synced behind the Gatekeeper's back.
+    from . import studio_close as _sc
+    drift = _sc.base_drift_count(repo_root, studio_branch, "castle")
+    threshold = _sc.drift_threshold(args)
+    if drift is None:
+        print("ERROR: base drift unmeasurable (merge-base failed) — refusing rather than guessing. "
+              "Cut a fresh studio or investigate the branch state.", file=sys.stderr)
+        sys.exit(1)
+    if drift > threshold and not getattr(args, "force_union", False):
+        print(
+            f"ERROR: base drift {drift} commits exceeds threshold {threshold} — a merge from this "
+            f"cut point would replay stale deltas into the Quest branches. Re-cut the studio from "
+            "the current castle tip, or pass --force-union to override.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if drift > threshold:
+        print(f"⚠️  base drift {drift} commits exceeds threshold {threshold} — proceeding via --force-union")
+    race_blocked: list[tuple[str, str]] = []
+    for quest in quests:
+        race = _sc.gatehouse_race(repo_root, quest)
+        if race:
+            race_blocked.append((quest.id, race))
+    if race_blocked:
+        for qid, why in race_blocked:
+            print(f"ERROR: {qid}: convoy-race guard — {why}", file=sys.stderr)
+        print("Refusing sync-back while these Quests sit in a live convoy lane.", file=sys.stderr)
+        sys.exit(1)
+
     results: list[tuple[str, str, str]] = []
     changed: list[Quest] = []
     for quest in quests:
@@ -3957,6 +3989,9 @@ def cmd_studio(args):
     """
     auto_commit = not getattr(args, "no_commit", False)
     repo_root = git_ops.get_repo_root()
+
+    if getattr(args, "close", False):
+        sys.exit(studio_close.run_close(args))
 
     if getattr(args, "sync_back", False):
         return _studio_sync_back(args, auto_commit, repo_root)
@@ -5968,7 +6003,14 @@ def build_parser():
     p_studio.add_argument("--port", type=int, help="Override worktree runserver port")
     p_studio.add_argument("--no-server", action="store_true", help="Skip starting the studio dev server (and the freshness gate)")
     p_studio.add_argument("--standup", action="store_true", help="Spawn the Court Artist session via Kilo CLI (Branch B fallback) and record it on every studio Quest")
-    p_studio.add_argument("--sync-back", action="store_true", help="Post-sign-off: merge the studio branch back into each selected Quest's own worktree branch (no auto-conflict-resolution)")
+    p_studio.add_argument("--sync-back", action="store_true", help="Post-sign-off: merge the studio branch back into each selected Quest's own worktree branch (no auto-conflict-resolution). Guarded: base-drift + convoy-race. Superseded by --close for the full lifecycle")
+    p_studio.add_argument("--close", action="store_true", help="Close-out lifecycle: five guards (sign-off proof, base-drift, convoy-race, labeled cherry-pick extraction, conflict->artist union brief), close-out manifest, gated teardown")
+    p_studio.add_argument("--signoff", default=None, metavar="NOTE", help="--close: write a dated 'studio sign-off' ledger stamp with NOTE at invocation (else a pre-existing stamp is required)")
+    p_studio.add_argument("--force-union", action="store_true", help="--close/--sync-back: override the base-drift refusal (drifted-base merges replay stale lines; know what you are doing)")
+    p_studio.add_argument("--drift-threshold", type=int, default=None, metavar="N", help="--close/--sync-back: base-drift threshold override (default: studio.close_max_base_drift, else 100)")
+    p_studio.add_argument("--override-manifest", action="store_true", help="--close: unlock teardown despite a not-all-green manifest (explicit override)")
+    p_studio.add_argument("--skip-teardown", action="store_true", help="--close: stop after the manifest; leave the studio worktree/server/session alive")
+    p_studio.add_argument("--artist-session", action="store_true", help="--close: stand up a dedicated artist session in the live studio worktree for union-pending quests")
     p_studio.add_argument("--prompt-only", action="store_true", help="Print only the rendered studio Court Artist prompt")
     p_studio.add_argument("--json", action="store_true", help="Output JSON format for agent_manager or scripts")
     p_studio.add_argument("--no-commit", action="store_true", help="Do not autocommit ledger changes")

@@ -222,11 +222,12 @@ class TestCourtArtist(unittest.TestCase):
             output = buf.getvalue()
             data = json.loads(output)
 
-            self.assertEqual(data["model"], "openrouter/z-ai/glm-5.3")
-            self.assertEqual(data["task"]["model"], "openrouter/z-ai/glm-5.3")
+            from court import config as _cfg
+            self.assertEqual(data["model"], _cfg.get_model("artist"))
+            self.assertEqual(data["task"]["model"], _cfg.get_model("artist"))
             self.assertEqual(data["provider"], "openrouter")
             self.assertEqual(data["task"]["provider"], "openrouter")
-            self.assertEqual(q.artist_model, "openrouter/z-ai/glm-5.3")
+            self.assertEqual(q.artist_model, _cfg.get_model("artist"))
             mock_save.assert_called_once()
 
     @patch("court.ward.audit_quest")

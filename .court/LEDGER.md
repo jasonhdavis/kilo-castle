@@ -780,3 +780,34 @@ every subsequent navigation/new document hits the deferred path → dead.
   script at start) — hence "still doesn't work" at 23:07 was expected until
   browser stop+start. Activation pending M'Lord's go (tabs close; login
   persists).
+
+## 2026-09-28 03:00Z — ENGINE BUG FIXED: `court ui` held the court write lock for its lifetime; Q001 studio-close chartered
+
+- **Bug**: the console server (`python3 -m court.cli ui --port 8300`) bootstraps
+  through `main()`'s unconditional `court_write_lock()` and `ui` was absent from
+  `_READ_ONLY_COMMANDS` — the server acquired the exclusive flock at boot
+  (9:57PM) and held it until death, deadlocking EVERY kilo-castle root-level
+  mutation (`court new`, `edict`, `set-section`, ...; pb-app unaffected — its
+  invocations lock pb-app's own lock file). Diagnosed via lsof (holder pid =
+  server pid 70858). **Fix** (one-line, commit 26a4d0d, castle trunk): add `ui`
+  to `_READ_ONLY_COMMANDS`; the server's in-process court ops already serialize
+  via short-lived subprocesses. Stale server killed, console restarted as
+  PERSISTENT bgp_0e5f460fe001jDGIkHZSusKLxZ (pid 20411) — verified: no lock
+  held at boot, console 200. NOTE: `court/ui_server.py` has uncommitted
+  in-flight edits from another session left untouched (52+/10-; parses clean).
+- **Q001-Castle-Studio-Close-Lifecycle** chartered (PLANNED, Feature) from
+  M'Lord's studio-close plot: `court studio <ids> --close` owns the back half
+  of the studio lifecycle — five guards (sign-off proof via dated ledger
+  marker/`--signoff`; merge-base drift ≤100 commits w/ `--force-union`;
+  convoy-race refusal on cogship stamps / `the-gatehouse/*` ancestry; labeled
+  cherry-pick extraction instead of branch-merge; conflict → artist union
+  brief + UNION-PENDING), close-out manifest at
+  `.court/studio-close/<slug>/manifest.md` gating teardown (all-green or
+  `--override-manifest`), teardown = runserver kill → worktree to Ashes
+  (session alive) → session stop, branch ref kept. Guards 2+3 also arm
+  `--sync-back`. Atelier close support = follow-up. Next: dispatch serf.
+- **03:35Z ROYAL PIVOT — NO QUEST, NO CASTLE-ON-CASTLE, DIRECT BUILD ON MAIN.**
+  The Q001 serf died instantly anyway (headless permission auto-reject, zero
+  commits — the known exit-1 class). Quest file deleted (a6b45dd), worktree +
+  branch torn down. The Steward implements `court studio --close` DIRECTLY on
+  main per M'Lord's directive; this ledger entry stands as the pivot record.

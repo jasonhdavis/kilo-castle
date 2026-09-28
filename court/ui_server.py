@@ -323,7 +323,7 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 .bchip.ship{color:var(--blue);border-color:rgba(88,166,255,.4);font-weight:700}
 .bselall{display:flex;align-items:center;gap:7px;cursor:pointer}
 .bselall input{accent-color:var(--primary);cursor:pointer;width:16px;height:16px}
-.btop{display:flex;align-items:center;gap:6px;min-width:0}
+.btop{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}
 .btop .qgrow{flex:1}
 .btitle2{font-size:13px;font-weight:600;line-height:1.45;margin-top:4px;color:var(--ink);
  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;
@@ -1387,12 +1387,12 @@ function renderBoard(){
    const appLabel=appBadge(q.app);
    const desc=[q.section,q.branch].filter(Boolean).join(' · ');
    cols+=`<div class="bcard click ${boardAttn(q)?'attn':''} ${BOARD_SEL.has(q.id)?'sel':''}" data-qid="${esc(q.id)}" ${q.worktree?`data-wt="${esc(q.worktree)}"`:''}>
-    <div class="btop"><input type="checkbox" class="bsel" data-bsel="${esc(q.id)}" title="select for bulk action"${BOARD_SEL.has(q.id)?' checked':''}>`+
-    `<span class="qnum">${esc(qnum)}</span>`+
-    (appLabel?`<span class="qbadge app-${esc(String(q.app||'').toLowerCase())}">${esc(appLabel)}</span>`:'')+
-    `<span class="qgrow"></span>`+
-    (q.dirty?'<span class="badge">dirty</span>':'')+
-     (on?`<span class="livedot" title="${liveTitle}"></span>`:'')+`</div>`+
+     <div class="btop"><input type="checkbox" class="bsel" data-bsel="${esc(q.id)}" title="select for bulk action"${BOARD_SEL.has(q.id)?' checked':''}>`+
+     (on?`<span class="livedot" title="${liveTitle}"></span>`:'')+
+     `<span class="qnum">${esc(qnum)}</span>`+
+     (appLabel?`<span class="qbadge app-${esc(String(q.app||'').toLowerCase())}">${esc(appLabel)}</span>`:'')+
+     `<span class="qgrow"></span>`+
+     (q.dirty?'<span class="badge">dirty</span>':'')+`</div>`+
     `<div class="btitle2">${esc(q.title||'')}</div>`+
     (desc?`<div class="bdesc" title="${esc(desc)}">${esc(desc)}</div>`:'')+
     (chips?`<div class="bchips">${chips}</div>`:'')+

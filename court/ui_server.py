@@ -6,9 +6,12 @@ whose parent is a verified kilo process), /api/mcp (flips the enabled flag of
 an inventoried MCP server in its own config file, with a .bak backup),
 /api/settings (validated merge into .court/config.json — role models, model
 presets/aliases, suite/harness/freshness commands, no_kilo_mode — atomic with
-a .bak), and /api/annotation (appends one studio-annotation JSON line to the
+a .bak), /api/annotation (appends one studio-annotation JSON line to the
 target worktree's .kilo/studio-annotations.jsonl; served CORS-open for the
-managed studio browser).
+managed studio browser), and the /monitor actions (/api/monitor/kill —
+SIGTERM->SIGKILL one target PID via a detached child, never the server's own
+ancestry; /api/monitor/schedule/delete — removes one schedule JSON file under
+the kilo cron/wakeup stores and logs it so reappearance is flagged).
 """
 
 import glob
@@ -19,8 +22,10 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
+import calendar
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -45,6 +50,36 @@ STATUS_ORDER = [
 # Roles carried by the manifest's models map (mirrors court.config).
 KNOWN_ROLE_MODELS = ("serf", "master_of_coin", "gatekeeper", "steward",
                      "artist", "scout")
+# Agent & Process Monitor (/monitor): local schedule stores owned by the
+# kilo runtime. cron/<sessionID>/*.json are recurring crons, wakeup/<sid>/*.json
+# one-shot wakeups; each file's owning session may already be gone (orphan).
+SCHED_CRON_DIR = os.path.expanduser("~/.local/share/kilo/storage/cron")
+SCHED_WAKEUP_DIR = os.path.expanduser("~/.local/share/kilo/storage/wakeup")
+MONITOR_SCHEDULE_DIRS = (SCHED_CRON_DIR, SCHED_WAKEUP_DIR)
+# Session status windows (ms since last activity heartbeat):
+#   <5min active, <60min idle, else stale.
+SESSION_ACTIVE_MS = 5 * 60 * 1000
+SESSION_IDLE_MS = 60 * 60 * 1000
+# Process flags: etime at/over this is "old", %cpu at/over this is "hot".
+PROC_OLD_S = 24 * 3600
+PROC_HOT_CPU = 50.0
+# Deletion log for schedule files (path -> {"ts": epoch}): deleted files that
+# reappear on a later load are flagged "resurrected" instead of showing
+# healthy — in-memory schedulers have been seen re-arming deleted schedules.
+SCHED_DELETE_LOG = {}
+# Detached one-shot killer: SIGTERM, then SIGKILL after ~3s if still alive.
+# Runs as its own session so a SIGKILL'd target can never take the server down.
+_KILLER_SRC = (
+    "import os,signal,sys,time\n"
+    "pid=int(sys.argv[1])\n"
+    "try:\n os.kill(pid,signal.SIGTERM)\n"
+    "except OSError:\n sys.exit(0)\n"
+    "for _ in range(15):\n"
+    " time.sleep(0.2)\n"
+    " try:\n  os.kill(pid,0)\n"
+    " except OSError:\n  sys.exit(0)\n"
+    "try:\n os.kill(pid,signal.SIGKILL)\n"
+    "except OSError:\n pass\n")
 
 PAGE = r"""<!doctype html>
 <html lang="en" data-theme="light"><head><meta charset="utf-8"><title>Castle</title>
@@ -2724,6 +2759,501 @@ def _processes(procs=None):
     return flagged, total
 
 
+# ---------------------------------------------------------------------------
+# Agent & Process Monitor (/monitor) — pure, unit-testable helpers.
+# Data sources: kilo.db (read-only, loader injects rows), schedule files under
+# ~/.local/share/kilo/storage/{cron,wakeup}/<sessionID>/*.json, and
+# `ps -axo pid=,ppid=,etime=,time=,%cpu=,command=`. No writes anywhere.
+# ---------------------------------------------------------------------------
+
+def parse_ps_duration(text):
+    """`ps` duration to seconds. Handles MM:SS(.hh), HH:MM:SS(.hh), and
+    DD-HH:MM:SS (etime / cputime columns). Returns 0.0 for junk."""
+    s = (text or "").strip()
+    if not s:
+        return 0.0
+    days = 0.0
+    if "-" in s:
+        d, _, s = s.partition("-")
+        try:
+            days = float(d)
+        except ValueError:
+            return 0.0
+    try:
+        parts = [float(p) for p in s.split(":")]
+    except ValueError:
+        return 0.0
+    secs = 0.0
+    for p in parts:
+        secs = secs * 60.0 + p
+    return days * 86400.0 + secs
+
+
+def parse_ps_output(text):
+    """Parse `ps axo pid=,ppid=,etime=,time=,%cpu=,command=` output into
+    [{pid, ppid, etime, etime_s, cpu_time, cpu_time_s, cpu_pct, command}]."""
+    out = []
+    for ln in (text or "").splitlines():
+        parts = ln.strip().split(None, 5)
+        if len(parts) < 5:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+            cpu_pct = float(parts[4])
+        except ValueError:
+            continue
+        etime = parts[2]
+        cpu_time = parts[3]
+        out.append({
+            "pid": pid, "ppid": ppid, "etime": etime, "cpu_time": cpu_time,
+            "etime_s": parse_ps_duration(etime),
+            "cpu_time_s": parse_ps_duration(cpu_time),
+            "cpu_pct": cpu_pct,
+            "command": parts[5].strip() if len(parts) > 5 else "",
+        })
+    return out
+
+
+def _ps_monitor_procs():
+    try:
+        r = subprocess.run(
+            ["ps", "axo", "pid=,ppid=,etime=,time=,%cpu=,command="],
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return []
+    return parse_ps_output(r.stdout)
+
+
+def _argv0(cmd):
+    return (cmd or "").split(None, 1)[0] if (cmd or "").strip() else ""
+
+
+def _is_kilo_proc(cmd):
+    """kilo serve/run/attach/__background-process-runner — matched on argv0
+    basename (or the runner marker), never a bare substring, so paths that
+    merely contain "kilo" (repo dirs, chrome --user-data-dir) stay out."""
+    a0 = _argv0(cmd).rsplit("/", 1)[-1].lower()
+    if a0 == "kilo":
+        return True
+    return "__background-process-runner" in (cmd or "")
+
+
+def _is_python_proc(cmd):
+    a0 = _argv0(cmd).rsplit("/", 1)[-1].lower()
+    return a0 in ("python", "python3", "python3.13", "python3.12",
+                  "python3.11", "python3.10")
+
+
+def select_monitor_processes(procs):
+    """Scope the full process table to: kilo processes, python processes, and
+    shells whose ancestry runs through either. Returns the in-scope subset in
+    table order (the ppid chain is resolved from the same snapshot)."""
+    by_pid = {p["pid"]: p for p in procs}
+    in_scope = set()
+    for p in procs:
+        if _is_kilo_proc(p["command"]) or _is_python_proc(p["command"]):
+            in_scope.add(p["pid"])
+            continue
+        seen, cur = set(), p
+        while True:
+            if cur["pid"] in seen:
+                break
+            seen.add(cur["pid"])
+            parent = by_pid.get(cur["ppid"])
+            if parent is None:
+                break
+            if _is_kilo_proc(parent["command"]) or \
+                    _is_python_proc(parent["command"]):
+                in_scope.add(p["pid"])
+                break
+            cur = parent
+    return [p for p in procs if p["pid"] in in_scope]
+
+
+def decorate_processes(procs, now=None, protected=None):
+    """Add monitor flags to in-scope processes (mutates + returns the list):
+    orphan (ppid=1 or parent missing from the table), old (etime >= 24h),
+    hot (cpu_pct >= 50), self (server process or one of its ancestors)."""
+    now = time.time() if now is None else now
+    protected = set(protected or ())
+    by_pid = {p["pid"]: p for p in procs}
+    for p in procs:
+        parent = by_pid.get(p["ppid"])
+        p["orphan"] = p["ppid"] <= 1 or parent is None
+        p["old"] = p["etime_s"] >= PROC_OLD_S
+        p["hot"] = p["cpu_pct"] >= PROC_HOT_CPU
+        p["self"] = p["pid"] in protected
+    return procs
+
+
+def _protected_chain(lookup=None, start=None):
+    """PIDs of this server plus every ancestor: the kill endpoint refuses
+    these targets, because killing the host serve severs live sessions."""
+    if lookup is None:
+        def lookup(pid):
+            try:
+                r = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)],
+                                   capture_output=True, text=True, timeout=5)
+            except Exception:
+                return None
+            out = r.stdout.strip()
+            if not out:
+                return None
+            try:
+                return int(out.split()[0])
+            except ValueError:
+                return None
+    chain, pid, seen = [], os.getpid() if start is None else start, set()
+    while pid and pid > 1 and pid not in seen:
+        seen.add(pid)
+        chain.append(pid)
+        pid = lookup(pid)
+    return chain
+
+
+def classify_session(age_ms):
+    """Heartbeat age (ms) -> status chip: active (<5min), idle (<60min),
+    stale (>=60min)."""
+    if age_ms is None:
+        return "stale"
+    if age_ms < SESSION_ACTIVE_MS:
+        return "active"
+    if age_ms < SESSION_IDLE_MS:
+        return "idle"
+    return "stale"
+
+
+def _sched_num(v):
+    """dueAt/expiresAt arrive as epoch ms; tolerate ISO strings and seconds."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    s = str(v).strip()
+    if not s:
+        return None
+    if s.replace("-", "").replace("+", "").isdigit():
+        try:
+            n = int(s)
+            return n if n > 10**11 else int(n * 1000)
+        except ValueError:
+            pass
+    try:
+        from datetime import datetime, timezone
+        t = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def _parse_schedule_file(path, kind):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except Exception:
+        return {"kind": kind, "path": path, "session_id": "", "schedule": None,
+                "recurring": False, "due_at": None, "expires_at": None,
+                "prompt": "", "broken": True,
+                "mtime": os.path.getmtime(path)}
+    if not isinstance(d, dict):
+        d = {}
+    sid = d.get("sessionID") or d.get("sessionId") or d.get("session_id") or ""
+    return {
+        "kind": kind, "path": path, "session_id": sid or "",
+        "schedule": d.get("schedule") if isinstance(d.get("schedule"), str)
+        else None,
+        "recurring": bool(d.get("recurring")),
+        "due_at": _sched_num(d.get("dueAt") if d.get("dueAt") is not None
+                             else d.get("due_at")),
+        "expires_at": _sched_num(
+            d.get("expiresAt") if d.get("expiresAt") is not None
+            else d.get("expires_at")),
+        "prompt": str(d.get("prompt") or ""),
+        "broken": False,
+        "mtime": os.path.getmtime(path),
+    }
+
+
+def load_schedule_files(dirs, _parse=_parse_schedule_file):
+    """Every schedule JSON under each store root, one level deep
+    (<root>/<sessionID>/<file>.json). Malformed files surface as broken
+    rows instead of vanishing."""
+    out = []
+    seen_paths = set()
+    for root in dirs:
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for sid_dir in entries:
+            dpath = os.path.join(root, sid_dir)
+            if not os.path.isdir(dpath):
+                continue
+            try:
+                files = sorted(os.listdir(dpath))
+            except OSError:
+                continue
+            for fname in files:
+                if not fname.endswith(".json"):
+                    continue
+                path = os.path.join(dpath, fname)
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                out.append(_parse(path, os.path.basename(root.rstrip("/"))))
+    return out
+
+
+def detect_orphans(schedules, session_ids):
+    """Flag schedules whose owning session has no row in kilo.db — their
+    owner was deleted but the schedule still fires and spawns fresh
+    sessions. Mutates each row's `orphaned` flag; returns the orphan list."""
+    ids = set(session_ids or ())
+    orphans = []
+    for s in schedules:
+        s["orphaned"] = bool(s.get("session_id")) and \
+            s["session_id"] not in ids
+        if s["orphaned"]:
+            orphans.append(s)
+    return orphans
+
+
+def mark_resurrections(schedules, delete_log):
+    """Deleted schedule files that reappeared on this load: flagged
+    `resurrected` (an in-memory scheduler re-armed it) instead of healthy."""
+    for s in schedules:
+        s["resurrected"] = bool(delete_log) and s.get("path") in delete_log
+    return [s for s in schedules if s.get("resurrected")]
+
+
+def _cron_field(expr, i):
+    """i-th field of a 5-field cron expr, or None."""
+    parts = (expr or "").split()
+    if len(parts) != 5:
+        return None
+    return parts[i]
+
+
+def _cron_matches(value, field, lo, hi):
+    """One cron field vs an integer value: `*`, lists, ranges, steps."""
+    if field is None:
+        return False
+    for tok in field.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        step = 1
+        if "/" in tok:
+            tok, _, sstep = tok.partition("/")
+            try:
+                step = int(sstep)
+            except ValueError:
+                return False
+            if step <= 0:
+                return False
+        if tok == "*":
+            return lo <= value <= hi and (value - lo) % step == 0
+        if "-" in tok:
+            a, _, b = tok.partition("-")
+            try:
+                a, b = int(a), int(b)
+            except ValueError:
+                return False
+            if a <= value <= b and (value - a) % step == 0:
+                return True
+        else:
+            try:
+                a = int(tok)
+            except ValueError:
+                return False
+            if a == value:
+                return True
+    return False
+
+
+def next_cron_fire(expr, now_epoch):
+    """Next UTC epoch second matching a 5-field cron expr
+    (min hour dom mon dow, dow 0-7 with 7 = Sunday). Returns None for
+    unparsable expressions. dom+dow both restricted -> either may match
+    (standard Vixie cron behavior)."""
+    fields = [_cron_field(expr, i) for i in range(5)]
+    if any(x is None for x in fields):
+        return None
+    start = (int(now_epoch) // 60 + 1) * 60
+    g0 = time.gmtime(start)
+    day_epoch = calendar.timegm((g0.tm_year, g0.tm_mon, g0.tm_mday,
+                                 0, 0, 0, 0, 0, 0))
+    dom_restricted = fields[2] != "*"
+    dow_restricted = fields[4] != "*"
+    for _ in range(370):
+        gt = time.gmtime(day_epoch)
+        dom_ok = _cron_matches(gt.tm_mday, fields[2], 1, 31)
+        dow_c = (gt.tm_wday + 1) % 7  # cron 0=Sunday .. 6=Saturday
+        dow_ok = (_cron_matches(dow_c, fields[4], 0, 7)
+                  or (dow_c == 0 and _cron_matches(7, fields[4], 0, 7)))
+        if dom_restricted and dow_restricted:
+            day_ok = dom_ok or dow_ok
+        elif dom_restricted:
+            day_ok = dom_ok
+        elif dow_restricted:
+            day_ok = dow_ok
+        else:
+            day_ok = True
+        if day_ok and _cron_matches(gt.tm_mon, fields[3], 1, 12):
+            first_day = day_epoch <= start < day_epoch + 86400
+            h0 = g0.tm_hour if first_day else 0
+            m0 = g0.tm_min if first_day else 0
+            for h in range(h0, 24):
+                if not _cron_matches(h, fields[1], 0, 23):
+                    continue
+                for m in range(m0 if h == h0 else 0, 60):
+                    if not _cron_matches(m, fields[0], 0, 59):
+                        continue
+                    ts = day_epoch + h * 3600 + m * 60
+                    if ts >= start:
+                        return ts
+        day_epoch += 86400
+        g0 = time.gmtime(day_epoch)
+    return None
+
+
+def schedule_due_ms(s, now_ms):
+    """Next due epoch-ms for a schedule row: cron rows get the next cron
+    fire, one-shots use dueAt verbatim (None = unknown)."""
+    if s.get("recurring") and s.get("schedule"):
+        nxt = next_cron_fire(s["schedule"], now_ms / 1000.0)
+        return int(nxt * 1000) if nxt is not None else None
+    return s.get("due_at")
+
+
+def _sched_sort_key(s):
+    return (0 if s.get("orphaned") else 1,
+            0 if s.get("resurrected") else 1,
+            s.get("next_due") if s.get("next_due") is not None else 9**15,
+            -(s.get("mtime") or 0))
+
+
+def _monitor_session_rows(limit=2000):
+    """All kilo sessions (read-only) with a message heartbeat: the latest
+    message.time_created per session, falling back to time_created for
+    sessions that never emitted a message."""
+    if not os.path.exists(KILO_DB):
+        return []
+    try:
+        db = sqlite3.connect(f"file:{KILO_DB}?mode=ro", uri=True, timeout=3)
+        db.execute("pragma query_only=1")
+        rows = db.execute(
+            "select s.id, s.directory, s.agent,"
+            " coalesce(json_extract(s.model,'$.id'), s.model),"
+            " s.time_created, s.time_updated, s.cost, s.parent_id,"
+            " (select max(m.time_created) from message m"
+            "  where m.session_id = s.id)"
+            " from session s order by s.time_updated desc limit ?",
+            (limit,)).fetchall()
+        db.close()
+    except Exception:
+        return []
+    return [{"id": r[0], "directory": r[1] or "", "agent": r[2] or "",
+             "model": (r[3] or "").replace("openrouter/", ""),
+             "time_created": r[4] or 0, "time_updated": r[5] or 0,
+             "cost": r[6] or 0.0, "parent_id": r[7],
+             "heartbeat": r[8] or r[4] or 0}
+            for r in rows]
+
+
+def build_monitor_snapshot(session_rows, schedules, processes, now_ms=0,
+                           today_start_ms=0, max_sessions=50,
+                           delete_log=None, protected_pids=None):
+    """Glue the three sources into the /api/monitor payload — pure: every
+    input is injected, nothing touches the DB, disk, or process table.
+    `processes` may be raw parse_ps_output rows; flags are (re)applied here
+    so callers don't have to pre-decorate."""
+    now_ms = now_ms or int(time.time() * 1000)
+    procs = decorate_processes(processes, now=now_ms / 1000.0,
+                               protected=protected_pids)
+    rows = sorted(session_rows, key=lambda r: -(r.get("heartbeat") or 0))
+    total_sessions = len(rows)
+    shown = rows[:max(0, max_sessions)]
+    live_cmd = {p["pid"]: p["command"] for p in procs}
+    out_sessions = []
+    for r in shown:
+        age = now_ms - (r.get("heartbeat") or 0)
+        pids = [pid for pid, cmd in live_cmd.items()
+                if r["id"] and r["id"] in cmd]
+        out_sessions.append({
+            "id": r["id"], "directory": r.get("directory") or "",
+            "project": (r.get("directory") or "").rstrip("/").rsplit("/", 1)[-1]
+            or r.get("directory") or "",
+            "agent": r.get("agent") or "", "model": r.get("model") or "",
+            "status": classify_session(age),
+            "last_activity": r.get("heartbeat") or 0,
+            "created": r.get("time_created") or 0,
+            "cost": round(r.get("cost") or 0.0, 4),
+            "parent_id": r.get("parent_id"), "pids": pids,
+        })
+    by_sid = {r["id"]: r for r in session_rows if r.get("id")}
+    sched_out = []
+    for s in schedules:
+        s = dict(s)
+        owner = by_sid.get(s.get("session_id") or "")
+        s["owner_project"] = (owner or {}).get("directory", "").rstrip(
+            "/").rsplit("/", 1)[-1] if owner else ""
+        s["owner_model"] = (owner or {}).get("model", "") if owner else ""
+        s["next_due"] = schedule_due_ms(s, now_ms)
+        s["past_due"] = (not s.get("recurring") and s.get("due_at") is not None
+                         and s["due_at"] < now_ms)
+        s["expired"] = (s.get("expires_at") is not None
+                        and s["expires_at"] < now_ms)
+        sched_out.append(s)
+    detect_orphans(sched_out, by_sid.keys())
+    mark_resurrections(sched_out, delete_log or SCHED_DELETE_LOG)
+    sched_out.sort(key=_sched_sort_key)
+    stale = sum(1 for s in out_sessions if s["status"] == "stale")
+    zombies = sum(1 for p in procs if p.get("orphan"))
+    cost_today = round(sum(
+        r.get("cost") or 0.0 for r in session_rows
+        if (r.get("heartbeat") or 0) >= (today_start_ms or 0)
+        and (today_start_ms or 0) > 0), 2)
+    return {
+        "generated_at": now_ms,
+        "sessions": out_sessions,
+        "session_total": total_sessions,
+        "schedules": sched_out,
+        "processes": procs,
+        "summary": {
+            "orphaned_schedules": sum(1 for s in sched_out if s["orphaned"]),
+            "resurrected_schedules": sum(
+                1 for s in sched_out if s.get("resurrected")),
+            "stale_sessions": stale,
+            "zombie_processes": zombies,
+            "cost_today": cost_today,
+            "active_sessions": sum(1 for s in out_sessions
+                                   if s["status"] == "active"),
+            "idle_sessions": sum(1 for s in out_sessions
+                                 if s["status"] == "idle"),
+        },
+    }
+
+
+def _monitor_state():
+    """Live /api/monitor payload: run the three read-only collectors and
+    hand them to the pure snapshot builder."""
+    now_s = time.time()
+    now_ms = int(now_s * 1000)
+    lt = time.localtime()
+    today_start_ms = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                                      0, 0, 0, 0, 0, -1))) * 1000
+    procs = select_monitor_processes(_ps_monitor_procs())
+    schedules = load_schedule_files(MONITOR_SCHEDULE_DIRS)
+    return build_monitor_snapshot(
+        _monitor_session_rows(), schedules, procs, now_ms=now_ms,
+        today_start_ms=today_start_ms, delete_log=SCHED_DELETE_LOG,
+        protected_pids=_protected_chain())
+
+
 def _strip_jsonc(text):
     out, i, n = [], 0, len(text)
     in_str = esc = False
@@ -3987,6 +4517,278 @@ def _annotation_append(rec):
     return total
 
 
+MONITOR_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Agent &amp; Process Monitor</title>
+<style>
+:root{
+ --bg:#0d1117; --surface:#161b22; --surface-2:#1c2129; --edge:#2d333b;
+ --edge-soft:rgba(240,246,252,.08); --ink:#e6edf3; --dim:#8b949e; --faint:#6e7681;
+ --primary:#ffb300; --blue:#58a6ff; --green:#3fb950; --red:#f85149; --amber:#d29922;
+ --r-md:8px; --r-sm:6px;
+}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--ink);
+ font:400 13px/1.5 "Inter","Roboto",-apple-system,"Segoe UI",sans-serif;
+ display:flex;flex-direction:column;min-height:100vh}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:var(--edge);border-radius:4px}
+::-webkit-scrollbar-track{background:transparent}
+header{display:flex;align-items:center;gap:14px;padding:0 20px;height:52px;flex:none;
+ background:var(--surface);border-bottom:1px solid var(--edge);z-index:2}
+header .title{font-weight:700;font-size:13px;letter-spacing:.12em;text-transform:uppercase}
+header .title em{color:var(--primary);font-style:normal}
+header .spacer{flex:1}
+header .stamp{color:var(--faint);font-size:11px}
+header a{color:var(--blue);font-size:11.5px;text-decoration:none}
+header a:hover{text-decoration:underline}
+button{background:var(--surface-2);border:1px solid var(--edge);color:var(--dim);
+ border-radius:var(--r-sm);padding:4px 14px;cursor:pointer;font-size:10.5px;font-weight:600;
+ letter-spacing:.06em;text-transform:uppercase;transition:all .12s ease}
+button:hover{border-color:var(--blue);color:var(--ink)}
+button.danger:hover{border-color:var(--red);color:var(--red);background:rgba(248,81,73,.08)}
+button:disabled{opacity:.5;cursor:default}
+#wrap{flex:1;overflow-y:auto;padding:16px 20px 40px}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 12px;border-radius:999px;
+ font-size:11.5px;font-weight:500;background:var(--surface-2);border:1px solid var(--edge);
+ color:var(--dim);white-space:nowrap}
+.chip b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
+.chip.alert{border-color:rgba(248,81,73,.45);color:var(--red);background:rgba(248,81,73,.08)}
+.chip.alert b{color:var(--red)}
+.chip.warn{border-color:rgba(210,153,34,.45);color:var(--amber);background:rgba(210,153,34,.08)}
+.chip.warn b{color:var(--amber)}
+.chip.ok{border-color:rgba(63,185,80,.35);color:var(--green)}
+.chip.ok b{color:var(--green)}
+.chip.blue{border-color:rgba(88,166,255,.35)}
+.chip.blue b{color:var(--blue)}
+#summary{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+section{margin-bottom:22px}
+.shead{display:flex;align-items:baseline;gap:10px;margin-bottom:6px}
+.shead h2{font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+ color:var(--faint)}
+.shead .note{color:var(--faint);font-size:11px}
+.card{background:var(--surface);border:1px solid var(--edge);border-radius:var(--r-md);
+ padding:6px 10px 2px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:6px 10px;color:var(--faint);font-size:10px;font-weight:600;
+ text-transform:uppercase;letter-spacing:.1em;border-bottom:1px solid var(--edge)}
+td{padding:6px 10px;border-bottom:1px solid var(--edge-soft);vertical-align:top}
+tbody tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(240,246,252,.02)}
+.mono{font-family:ui-monospace,Menlo,monospace;font-size:11px}
+.dim{color:var(--dim)} .faint{color:var(--faint)}
+.num{font-variant-numeric:tabular-nums}
+.cut{max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cut2{max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badge{display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;
+ font-size:9.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+ border:1px solid var(--edge);color:var(--dim);white-space:nowrap}
+.badge.red{border-color:rgba(248,81,73,.5);color:var(--red);background:rgba(248,81,73,.1)}
+.badge.amber{border-color:rgba(210,153,34,.5);color:var(--amber);background:rgba(210,153,34,.1)}
+.badge.green{border-color:rgba(63,185,80,.4);color:var(--green);background:rgba(63,185,80,.08)}
+.badge.blue{border-color:rgba(88,166,255,.4);color:var(--blue);background:rgba(88,166,255,.08)}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;
+ vertical-align:1px;background:var(--faint)}
+.dot.active{background:var(--green);box-shadow:0 0 6px var(--green)}
+.dot.idle{background:var(--blue)}
+.dot.stale{background:var(--red)}
+.legend{color:var(--faint);font-size:10.5px;margin:8px 2px 0}
+.empty-note{color:var(--faint);text-align:center;padding:22px;font-size:12px}
+</style></head><body>
+<header>
+ <div class="title">Agent &amp; <em>Process</em> Monitor</div>
+ <span class="stamp" id="stamp"></span>
+ <div class="spacer"></div>
+ <a href="/">console</a>
+ <button id="refresh">Refresh</button>
+</header>
+<div id="wrap">
+ <div id="summary"><span class="chip">loading…</span></div>
+ <section>
+  <div class="shead"><h2>Agent Sessions</h2><span class="note" id="sess_note"></span></div>
+  <div class="card" id="agents"></div>
+ </section>
+ <section>
+  <div class="shead"><h2>Schedules</h2><span class="note" id="sched_note"></span></div>
+  <div class="card" id="schedules"></div>
+ </section>
+ <section>
+  <div class="shead"><h2>Processes</h2><span class="note" id="proc_note"></span></div>
+  <div class="card" id="processes"></div>
+  <div class="legend">flags: orphan = PPID 1 or parent no longer alive ·
+   old = running &gt;24h · hot = CPU% ≥ 50 · this server = the monitor itself
+   (kill refused)</div>
+ </section>
+</div>
+<script>
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>(
+ {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function ago(ms){
+ if(!ms)return '—';
+ const d=Date.now()-ms;
+ if(d<60e3)return 'just now';
+ if(d<3600e3)return Math.floor(d/60e3)+'m ago';
+ if(d<86400e3)return Math.floor(d/3600e3)+'h ago';
+ return Math.floor(d/86400e3)+'d ago';
+}
+function inRel(ms){
+ if(!ms)return '—';
+ const d=ms-Date.now();
+ if(d<=0)return 'now';
+ if(d<3600e3)return 'in '+Math.max(1,Math.round(d/60e3))+'m';
+ if(d<86400e3)return 'in '+Math.round(d/3600e3)+'h';
+ return 'in '+Math.round(d/86400e3)+'d';
+}
+function absT(ms){
+ if(!ms)return '—';
+ const dt=new Date(ms);
+ return dt.toLocaleDateString(undefined,{month:'short',day:'numeric'})+' '+
+  dt.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});
+}
+function statusChip(st){
+ const c={active:'green',idle:'blue',stale:'red'}[st]||'';
+ return '<span class="badge '+c+'"><span class="dot '+esc(st)+'"></span>'+esc(st)+'</span>';
+}
+function flagsCell(p){
+ const f=[];
+ if(p.orphan)f.push('<span class="badge red">orphan</span>');
+ if(p.old)f.push('<span class="badge amber">old</span>');
+ if(p.hot)f.push('<span class="badge amber">hot cpu</span>');
+ if(p.self)f.push('<span class="badge blue">this server</span>');
+ return f.join(' ')||'<span class="faint">—</span>';
+}
+let LAST=null;
+async function load(){
+ const btn=document.getElementById('refresh');
+ btn.disabled=true;
+ try{
+  const d=await (await fetch('/api/monitor')).json();
+  LAST=d;render(d);
+  document.getElementById('stamp').textContent=
+   'updated '+new Date().toLocaleTimeString()+' · auto-refresh 10s';
+ }catch(e){
+  document.getElementById('stamp').textContent='refresh failed: '+e;
+ }
+ btn.disabled=false;
+}
+function render(d){
+ renderSummary(d);renderAgents(d);renderSchedules(d);renderProcesses(d);
+}
+function renderSummary(d){
+ const s=d.summary||{};
+ const chips=[];
+ chips.push('<span class="chip'+(s.orphaned_schedules?' alert':' ok')+'">orphaned schedules <b>'+
+  (s.orphaned_schedules||0)+'</b></span>');
+ if(s.resurrected_schedules)chips.push('<span class="chip warn">resurrected? <b>'+
+  s.resurrected_schedules+'</b></span>');
+ chips.push('<span class="chip'+(s.stale_sessions?' warn':' ok')+'">stale sessions <b>'+
+  (s.stale_sessions||0)+'</b></span>');
+ chips.push('<span class="chip'+(s.zombie_processes?' alert':' ok')+'">zombie processes <b>'+
+  (s.zombie_processes||0)+'</b></span>');
+ chips.push('<span class="chip blue">agent cost today <b>$'+
+  (Number(s.cost_today)||0).toFixed(2)+'</b></span>');
+ chips.push('<span class="chip">active <b>'+(s.active_sessions||0)+'</b></span>'+
+  '<span class="chip">idle <b>'+(s.idle_sessions||0)+'</b></span>');
+ document.getElementById('summary').innerHTML=chips.join(' ');
+}
+function renderAgents(d){
+ const el=document.getElementById('agents');
+ const list=d.sessions||[];
+ document.getElementById('sess_note').textContent=
+  'showing '+list.length+' most recent of '+d.session_total+' sessions · '+
+  'active &lt;5m · idle &lt;60m · stale ≥60m since last activity';
+ if(!list.length){el.innerHTML='<div class="empty-note">no sessions found</div>';return;}
+ el.innerHTML='<table><thead><tr><th>project</th><th>agent</th><th>model</th>'+
+  '<th>status</th><th>last activity</th><th>cost</th><th>live pids</th></tr></thead><tbody>'+
+  list.map(s=>{
+   const proj=esc(s.project||s.directory);
+   const pids=(s.pids||[]).map(p=>'<span class="mono">'+p+'</span>').join(' ')||'<span class="faint">—</span>';
+   return '<tr><td class="cut2" title="'+esc(s.directory)+'">'+proj+'</td>'+
+    '<td>'+esc(s.agent||'—')+'</td>'+
+    '<td class="mono dim">'+esc(s.model||'—')+'</td>'+
+    '<td>'+statusChip(s.status)+'</td>'+
+    '<td class="num" title="'+esc(absT(s.last_activity))+'">'+ago(s.last_activity)+'</td>'+
+    '<td class="num">$'+Number(s.cost||0).toFixed(4)+'</td>'+
+    '<td>'+pids+'</td></tr>';
+  }).join('')+'</tbody></table>';
+}
+function renderSchedules(d){
+ const el=document.getElementById('schedules');
+ const list=d.schedules||[];
+ document.getElementById('sched_note').textContent=
+  list.length?list.length+' schedule file(s) under cron/ and wakeup/ stores · orphans first':'';
+ if(!list.length){el.innerHTML='<div class="empty-note">no scheduled automations</div>';return;}
+ el.innerHTML='<table><thead><tr><th>kind</th><th>cadence / due</th><th>next due</th>'+
+  '<th>expires</th><th>owning session</th><th>prompt</th><th>state</th><th></th></tr></thead><tbody>'+
+  list.map(s=>{
+   const kind=s.recurring?'<span class="badge blue">recurring cron</span>'
+    :'<span class="badge">one-shot</span>';
+   const cad=s.recurring?('<span class="mono">'+esc(s.schedule||'')+'</span>')
+    :absT(s.due_at);
+   const state=[];
+   if(s.broken)state.push('<span class="badge amber">unreadable</span>');
+   if(s.orphaned)state.push('<span class="badge red">orphaned</span>');
+   if(s.resurrected)state.push('<span class="badge amber">resurrected?</span>');
+   if(s.past_due&&!s.recurring)state.push('<span class="badge amber">past due</span>');
+   if(s.expired)state.push('<span class="badge amber">expired</span>');
+   const owner=s.orphaned
+    ?'<span class="mono dim">'+esc(s.session_id)+'</span> <span class="badge red">missing</span>'
+    :'<span title="'+esc((s.owner_project?'project ':'')+s.owner_model||'')+'">'+
+     esc(s.owner_project||s.session_id)+(s.owner_model?
+      ' <span class="mono dim">'+esc(s.owner_model)+'</span>':'')+'</span>';
+   return '<tr><td>'+kind+'</td><td>'+cad+'</td>'+
+    '<td class="num" title="'+esc(absT(s.next_due))+'">'+inRel(s.next_due)+'</td>'+
+    '<td class="num" title="'+esc(absT(s.expires_at))+'">'+(s.expires_at?absT(s.expires_at):'never')+'</td>'+
+    '<td class="cut2">'+owner+'</td>'+
+    '<td class="cut" title="'+esc(s.prompt)+'">'+esc((s.prompt||'').slice(0,100))+'</td>'+
+    '<td>'+(state.join(' ')||'<span class="badge green">ok</span>')+'</td>'+
+    '<td><button class="danger" onclick="delSched(this)" data-path="'+esc(s.path)+'">delete</button></td></tr>';
+  }).join('')+'</tbody></table>';
+}
+function renderProcesses(d){
+ const el=document.getElementById('processes');
+ const list=d.processes||[];
+ document.getElementById('proc_note').textContent=
+  list.length+' in-scope process(es) (kilo / python / shells under them)';
+ if(!list.length){el.innerHTML='<div class="empty-note">no matching processes</div>';return;}
+ el.innerHTML='<table><thead><tr><th>pid</th><th>ppid</th><th>elapsed</th>'+
+  '<th>cpu time</th><th>cpu%</th><th>command</th><th>flags</th><th></th></tr></thead><tbody>'+
+  list.map(p=>
+   '<tr><td class="mono">'+p.pid+'</td><td class="mono'+(p.orphan?' dim':'')+'">'+
+   p.ppid+'</td><td class="mono num">'+esc(p.etime)+'</td>'+
+   '<td class="mono num">'+esc(p.cpu_time)+'</td>'+
+   '<td class="num">'+Number(p.cpu_pct).toFixed(1)+'</td>'+
+   '<td class="mono cut" title="'+esc(p.command)+'">'+esc(p.command.slice(0,140))+'</td>'+
+   '<td>'+flagsCell(p)+'</td><td>'+
+   (p.self?'<span class="faint mono">kill refused</span>'
+    :'<button class="danger" onclick="killProc(this)" data-pid="'+p.pid+'">kill</button>')+
+   '</td></tr>').join('')+'</tbody></table>';
+}
+function killProc(btn){
+ const pid=parseInt(btn.dataset.pid,10);
+ if(!confirm('Kill process '+pid+'?\nSIGTERM now, SIGKILL after 3s if still alive.'))return;
+ fetch('/api/monitor/kill',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({pid:pid})})
+  .then(r=>r.json()).then(d=>{
+   if(d.error){alert('refused: '+d.error);return;}
+   setTimeout(load,600);}).catch(e=>alert('failed: '+e));
+}
+function delSched(btn){
+ const path=btn.dataset.path;
+ if(!confirm('Delete schedule file?\n'+path+
+  '\n\nIf it reappears, it will be flagged "resurrected?" on the next refresh.'))return;
+ fetch('/api/monitor/schedule/delete',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({path:path})})
+  .then(r=>r.json()).then(d=>{
+   if(d.error){alert('refused: '+d.error);return;}
+   setTimeout(load,400);}).catch(e=>alert('failed: '+e));
+}
+document.getElementById('refresh').addEventListener('click',load);
+load();
+setInterval(load,10000);
+</script></body></html>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -4024,6 +4826,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/monitor":
+            body = MONITOR_PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/monitor":
+            try:
+                self._json(_monitor_state())
+            except Exception as exc:
+                self._json({"error": f"monitor snapshot failed: {exc}"}, 500)
         elif self.path.startswith("/api/send/"):
             from urllib.parse import parse_qs
             path, _, qstr = self.path.partition("?")
@@ -4267,6 +5082,10 @@ class Handler(BaseHTTPRequestHandler):
             self._session_delete()
         elif self.path == "/api/annotation":
             self._annotation_add()
+        elif self.path == "/api/monitor/kill":
+            self._monitor_kill()
+        elif self.path == "/api/monitor/schedule/delete":
+            self._monitor_sched_delete()
         else:
             self.send_error(404)
 
@@ -4567,6 +5386,78 @@ class Handler(BaseHTTPRequestHandler):
         except (ProcessLookupError, PermissionError):
             pass
         self._json({"ok": True, "reaped": pid})
+
+    def _monitor_kill(self):
+        """Kill one PID from the monitor: SIGTERM, escalated to SIGKILL after
+        3s by a detached one-shot child (a SIGKILL'd target can never take the
+        server down). Refuses the server's own PID and every ancestor —
+        killing the host serve would sever live sessions."""
+        try:
+            pid = self._read_body().get("pid")
+        except Exception:
+            self._json({"error": "bad request"}, 400)
+            return
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            self._json({"error": "bad pid"}, 400)
+            return
+        if pid <= 1:
+            self._json({"error": "refusing pid <= 1"}, 403)
+            return
+        protected = _protected_chain()
+        if pid in protected:
+            self._json({"error": "refusing this server or one of its "
+                        "ancestors (pid %d)" % pid}, 403)
+            return
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            self._json({"error": "no such process"}, 404)
+            return
+        except PermissionError:
+            self._json({"error": "process not owned by this user"}, 403)
+            return
+        except OSError as exc:
+            self._json({"error": f"signal probe failed: {exc}"}, 500)
+            return
+        try:
+            subprocess.Popen(
+                [sys.executable, "-c", _KILLER_SRC, str(pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, start_new_session=True)
+        except Exception as exc:
+            self._json({"error": f"killer spawn failed: {exc}"}, 500)
+            return
+        self._json({"ok": True, "pid": pid,
+                    "signal": "SIGTERM, SIGKILL after 3s if still alive"})
+
+    def _monitor_sched_delete(self):
+        """Delete one schedule JSON file. The path is logged so the next
+        /api/monitor load can flag a resurrection if the file reappears."""
+        try:
+            path = self._read_body().get("path")
+        except Exception:
+            self._json({"error": "bad request"}, 400)
+            return
+        if not isinstance(path, str) or not path.endswith(".json"):
+            self._json({"error": "bad path"}, 400)
+            return
+        path = os.path.normpath(path)
+        roots = tuple(os.path.normpath(r) for r in MONITOR_SCHEDULE_DIRS)
+        if not any(path == r or path.startswith(r + os.sep) for r in roots):
+            self._json({"error": "path is not inside the schedule stores"}, 403)
+            return
+        if not os.path.isfile(path):
+            self._json({"error": "no such schedule file"}, 404)
+            return
+        try:
+            os.remove(path)
+        except OSError as exc:
+            self._json({"error": f"delete failed: {exc}"}, 500)
+            return
+        SCHED_DELETE_LOG[path] = {"ts": time.time()}
+        self._json({"ok": True, "deleted": path})
 
 
 def serve(port=8300):

@@ -560,7 +560,8 @@ html[data-theme="light"] .iconbtn .bcount{color:#fff}
 <div class="chip rss">kilo RSS <b id="t_rss">—</b></div>
 <div class="iconbtn" id="theme_btn" title="toggle light / dark" onclick="toggleTheme()">☾</div>
 <div class="iconbtn" title="recent turns" onclick="openTurns()">≡</div>
-<div class="iconbtn" title="search sessions" onclick="openSearch()">⌕</div></header>
+<div class="iconbtn" title="search sessions" onclick="openSearch()">⌕</div>
+<div class="iconbtn" id="gsync_btn" title="global sync — court sync --all (branch-tip quest paperwork onto the main checkout)" onclick="globalSync(this)">⇅</div></header>
 <main><nav id="nav"></nav>
 <section id="chat">
   <div id="chatbar">
@@ -2044,7 +2045,23 @@ function syncEaselChip(){
  }else{el.style.display='none';el.title='';}
 }
 $('chatbar').addEventListener('click',e=>{
- if(e.target.closest('[data-easel]'))openEaselNotes();});
+  if(e.target.closest('[data-easel]'))openEaselNotes();});
+let GSYNC_BUSY=false;
+async function globalSync(btn){
+ if(GSYNC_BUSY)return;
+ if(!confirm('GLOBAL SYNC — court sync --all?\n\nFolds branch-tip quest paperwork onto the main checkout for every quest (branch-wins union; true edit wars report and refuse to run).'))return;
+ GSYNC_BUSY=true;
+ const orig=btn.textContent;
+ btn.classList.add('busy');btn.innerHTML='<span class="spin">⟳</span>';
+ try{
+  const r=await runCourtOp('sync','','',btn,null);
+  poll();
+  if(r&&r.error)alert('global sync — '+r.error);
+ }finally{
+  GSYNC_BUSY=false;
+  if(btn.isConnected){btn.classList.remove('busy');btn.textContent=orig;}
+ }
+}
 let annSeq=0;
 async function openEaselNotes(){
  const wt=selWt;const seq=++annSeq;

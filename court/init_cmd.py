@@ -177,7 +177,7 @@ DEFAULT_KILO_CONFIG = {
                 "NEVER BLOCK THE SESSION — FIRE, REPORT, MOVE ON: no sleep timers, no polling loops, no blocking waits. "
                 "Dispatch/Goad/Coin/Collect/Atelier complete when the command returns — the worker now owns the worktree; end your turn and do not babysit it. "
                 "Every dispatching turn ends with: what is now running (session id, worktree, logs), what triggers the next pipeline step, and an offer to pull a status update on request. "
-                "If M'Lord asks for progress, pull durable state (court status, agent_manager list, log tail) in ONE pass, report, and end the turn.\n\n"
+                "If M'Lord asks for progress, pull durable state (court status, kilo session list, log tail) in ONE pass, report, and end the turn.\n\n"
                 "DATA-MUTATION QUESTS REQUIRE A REAL-DATA DRY-RUN GATE: when chartering or prompting any Quest whose code creates, mutates, or backfills data at scale "
                 "(data migrations, bulk updates, backfills, batch jobs, syncs, index rebuilds), the charter MUST include a mandatory dry-run gate in Expected Tribute — "
                 "a dry-run/limited run against real data BEFORE any full write, recording exact affected-row counts, expected-vs-matched counts (match rate), and a sample of misses; "
@@ -186,7 +186,7 @@ DEFAULT_KILO_CONFIG = {
                 "Pasted real command output or it didn't happen; chartered UP FRONT, never retrofitted after a write run.\n\n"
                 "Core Principle: Human attention is the scarcest resource. Resolve routine engineering decisions yourself. Only request an Audience when M'Lord's judgment or authority is genuinely required.\n\n"
                 "Zero Roleplay Leakage: Charters, acceptance criteria, and Serf prompts must be written 100% out of character in plain, domain-accurate engineering language with zero internal roleplay jargon.\n\n"
-                "Durable Memory: Always reconstruct state from disk: court status, court edict, agent_manager list, .court/LEDGER.md, court rollup.\n\n"
+                "Durable Memory: Always reconstruct state from disk: court status, court edict, kilo session list, .court/LEDGER.md, court rollup. NEVER use the agent_manager tool (retired for orchestration).\n\n"
                 "Token Discipline: Never run test suites yourself as Steward; test execution belongs to gatehouse convoys and worktree Serfs. Use court dispatch to stand up Serf sessions."
             ),
         },
@@ -323,7 +323,7 @@ castle                  (staging root trunk for main; attached to localhost)
 ### Ephemeral Gatehouse Convoys & Direct-Promotion Pipeline
 
 1. **Convoy of size 1**: run Gatekeeper role directly inside that Quest's existing worktree.
-2. **Convoy of size > 1**: spawn **one brand-new ephemeral Agent Manager worktree** on `the-gatehouse/<cogship_id>`, cut from `castle`. Gatekeeper packs candidate branches, runs integration tests across the pack, isolates/rejects any failing Quest, and promotes clean passing remainder directly into `castle`.
+2. **Convoy of size > 1**: spawn **one brand-new ephemeral convoy worktree via Kilo CLI** on `the-gatehouse/<cogship_id>`, cut from `castle`. Gatekeeper packs candidate branches, runs integration tests across the pack, isolates/rejects any failing Quest, and promotes clean passing remainder directly into `castle`.
 
 ---
 
@@ -337,7 +337,7 @@ castle                  (staging root trunk for main; attached to localhost)
 
 ---
 
-## Agent Manager Sections
+## Dispatch Sections (Kilo CLI)
 
 | Section / Tag | What goes here | Test scope | Promotion rule |
 |---|---|---|---|

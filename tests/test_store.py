@@ -241,3 +241,67 @@ def test_normalize_cogship_id():
     assert store.normalize_cogship_id("cogship_012") == "cogship-012"
     assert store.normalize_cogship_id("") is None
     assert store.normalize_cogship_id(None) is None
+
+
+def _make_charter_text(extra_section: str = "Royal Ruling") -> str:
+    q = Quest(id="Q700-Wipe-Victim", title="Wipe Victim", app="test", concern="wipe")
+    q.set_section("The Kingdom Requires", "Original requirement text.")
+    text = q.to_markdown()
+    return text + f"\n## {extra_section}\n\nCustom content that must survive re-renders.\n"
+
+
+def test_extra_body_sections_survive_load_save_cycle(tmp_path):
+    """Custom (non-default) charter sections must not be dropped by
+    from_markdown/to_markdown round-trips (dispatch re-render wipe vector)."""
+    p = store.path_for(Quest(id="Q700-Wipe-Victim", title="Wipe Victim"), court_root=tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(_make_charter_text(), encoding="utf-8")
+
+    q = Quest.from_markdown(p.read_text(encoding="utf-8"))
+    assert "Custom content that must survive re-renders." in q.body_sections.get("Royal Ruling", "")
+    rendered = q.to_markdown()
+    assert "## Royal Ruling" in rendered
+    assert "Custom content that must survive re-renders." in rendered
+
+
+def test_stale_snapshot_save_preserves_disk_body_edits(tmp_path):
+    """A field-only save from a stale in-memory snapshot (the dispatch /
+    dispatch-complete pattern) must preserve body edits committed to disk
+    after the snapshot was taken."""
+    p = store.path_for(Quest(id="Q700-Wipe-Victim", title="Wipe Victim"), court_root=tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(_make_charter_text(), encoding="utf-8")
+
+    stale = Quest.from_markdown(p.read_text(encoding="utf-8"))
+
+    # Someone (M'Lord) edits the committed file body after the snapshot.
+    disk_text = p.read_text(encoding="utf-8").replace(
+        "Original requirement text.", "REVISED RULING: requirement amended by M'Lord."
+    )
+    p.write_text(disk_text, encoding="utf-8")
+
+    # The dispatch path: mutate only a frontmatter field, then save.
+    stale.serf_session_id = "ses_fresh123"
+    store.save(stale, court_root=tmp_path, auto_commit=False)
+
+    saved = p.read_text(encoding="utf-8")
+    assert "REVISED RULING: requirement amended by M'Lord." in saved
+    assert "## Royal Ruling" in saved
+    assert "Custom content that must survive re-renders." in saved
+    assert "ses_fresh123" in saved
+
+
+def test_dirty_section_still_wins_over_disk(tmp_path):
+    """Sections the caller deliberately changed (set_section) must win over
+    the on-disk version — the merge guard only protects untouched sections."""
+    p = store.path_for(Quest(id="Q700-Wipe-Victim", title="Wipe Victim"), court_root=tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(_make_charter_text(), encoding="utf-8")
+
+    stale = Quest.from_markdown(p.read_text(encoding="utf-8"))
+    stale.set_section("Tribute Rendered", "Fresh tribute from the serf.")
+    store.save(stale, court_root=tmp_path, auto_commit=False)
+
+    saved = p.read_text(encoding="utf-8")
+    assert "Fresh tribute from the serf." in saved
+    assert "## Royal Ruling" in saved

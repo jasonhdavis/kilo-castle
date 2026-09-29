@@ -265,6 +265,25 @@ def _write(quest: Quest, root: Path) -> list[Path]:
     prior_events = eventlog.read_events(ev_path)
     prior_quest = eventlog.fold_events(prior_events, quest.id, quest.kind) if prior_events else None
     ts = quest.updated_at or now_iso()
+
+    # Disk-merge guard: never clobber committed body edits that the in-memory
+    # snapshot hasn't explicitly touched. dispatch/dispatch-complete style
+    # load→mutate-field→save cycles previously re-rendered the file from a
+    # stale snapshot, wiping body edits (rulings, addenda, ledger prose) that
+    # were committed to the file after this process loaded it. Sections the
+    # caller deliberately changed (set_section / log_ledger) still win.
+    if p.exists():
+        try:
+            disk_quest = Quest.from_markdown(p.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            disk_quest = None
+        if disk_quest is not None:
+            for section, disk_content in disk_quest.body_sections.items():
+                if section in quest._dirty_sections:
+                    continue
+                if quest.body_sections.get(section, "") != disk_content:
+                    quest.body_sections[section] = disk_content
+
     new_events = eventlog.build_events_for_save(quest, prior_quest, ts)
 
     paths_to_commit = [p]

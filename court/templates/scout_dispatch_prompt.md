@@ -1,7 +1,7 @@
 # Scout Dispatch Prompt Template — Reconnaissance & Proof-of-Concept
 
 Fill in every `{{ }}` placeholder before sending this as the initial prompt
-to a new Agent Manager Scout session (`scout/<id>-<slug>`).
+to a new headless Scout session via Kilo CLI (branch `scout/<id>-<slug>`).
 
 ---
 

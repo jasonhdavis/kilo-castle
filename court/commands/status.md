@@ -26,6 +26,6 @@ Reconstruct current state using single-shot deterministic Court status:
 5. Footer:
    - `Hear the quest ballads with /bard /atone /coffers /tally and /murmur`
    - `Ready to Ship - Use /ship --confirm to launch` (when Cogships ready)
-   - `Note: X orphaned worktrees exist in Agent Manager...`
+   - `Note: X orphaned worktrees exist...`
 
 Keep it concise and high-signal. Do not make redundant tool calls or loop over individual files.

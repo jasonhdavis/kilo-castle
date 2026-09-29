@@ -43,4 +43,9 @@ htmlcov/
 # Kilo & Agent Manager local state (keep repo clean)
 .kilo/worktrees/
 .kilo/worktree-ports.json
+# Repo-wide scratch task slots: per-worker ephemeral prompts (TASK / TASK_COIN
+# / TASK_GOAD / TASK_ARTIST) conflict in every branch merge — the only
+# conflicts left on the Q707-era studio branches. Untracked now; per-quest
+# durable paperwork lives in .court/quests/.
+.kilo/TASK*.md
 .court/archive/

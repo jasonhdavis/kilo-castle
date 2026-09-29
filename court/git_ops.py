@@ -1336,6 +1336,94 @@ _SUITE_PROOF_DIRNAME = ".court/suites"
 _PYTEST_COUNT_RE = re.compile(r"(?<![\w.])(\d+)\s+passed(?:[,\s]|$)", re.MULTILINE)
 _DJANGO_RAN_RE = re.compile(r"Ran\s+(\d+)\s+tests?")
 
+# Stale kept test DBs (Q620 class): a migration renumber (0038 -> 0039) makes a
+# --keepdb/--reuse-db database fail with "column already exists" / duplicate
+# table errors, because the kept DB recorded the OLD migration set. The fix is
+# to fingerprint the migrations tree per worktree and, when it changes, run the
+# suite ONCE with the DB-reuse flag dropped (Django --keepdb) or a forced
+# recreate added (pytest-django --create-db) — that run rebuilds the test DB
+# from the current migrations, and subsequent runs may keep it again.
+_KEEPDB_FP_FILENAME = ".testdb-fingerprint.json"
+_MIGRATIONS_SCAN_SKIP_DIRS = {
+    ".git", ".kilo", ".court", "node_modules", "venv", ".venv", "env", "__pycache__",
+}
+
+
+def suite_keepdb_mode(cmd_str: str) -> Optional[str]:
+    """Classify a suite command's test-DB reuse flag: "django" for --keepdb,
+    "pytest" for pytest-django --reuse-db, None when the DB is rebuilt every
+    run (nothing to go stale)."""
+    tokens = cmd_str.split()
+    if "--keepdb" in tokens:
+        return "django"
+    if "--reuse-db" in tokens:
+        return "pytest"
+    return None
+
+
+def keepdb_recreate_command(cmd_str: str, mode: str) -> str:
+    """Return the suite command variant that DESTROYS + rebuilds the test DB:
+    Django loses --keepdb (a plain test run recreates and then removes the DB),
+    pytest-django gains --create-db (overrides --reuse-db for that one run)."""
+    tokens = [t for t in cmd_str.split() if not (mode == "django" and t == "--keepdb")]
+    if mode == "pytest" and "--create-db" not in tokens:
+        tokens.append("--create-db")
+    return " ".join(tokens)
+
+
+def migrations_fingerprint(worktree_path: Path) -> str:
+    """Content fingerprint of every migrations/*.py file in a checkout. A
+    migration renumber changes filenames and contents alike, so any renumber
+    (or edit) produces a different fingerprint."""
+    import hashlib
+
+    p = Path(worktree_path)
+    entries: list[str] = []
+    for mig_dir in sorted(p.rglob("migrations")):
+        if not mig_dir.is_dir():
+            continue
+        rel_parent = mig_dir.parent.relative_to(p)
+        if any(part in _MIGRATIONS_SCAN_SKIP_DIRS for part in mig_dir.parts):
+            continue
+        for f in sorted(mig_dir.glob("*.py")):
+            try:
+                content = f.read_bytes()
+            except OSError:
+                continue
+            entries.append(f"{rel_parent / f.name}:{len(content)}:{hashlib.sha256(content).hexdigest()}")
+    if not entries:
+        return ""
+    return hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
+
+
+def keepdb_recreate_decision(
+    cmd_str: str,
+    fingerprint: str,
+    stored: Optional[dict],
+) -> tuple[bool, str, str]:
+    """Decide whether the kept test DB must be rebuilt before this suite run.
+
+    Returns (recreate, run_command, reason). Recreate when a stored fingerprint
+    exists, the DB-reuse mode matches, and the migrations fingerprint changed
+    (or the mode itself changed). No stored fingerprint means nothing has gone
+    stale yet — keep the DB and start recording."""
+    mode = suite_keepdb_mode(cmd_str)
+    if mode is None:
+        return False, cmd_str, ""
+    if not stored:
+        return False, cmd_str, ""
+    if (stored.get("mode") or "") != mode:
+        return True, keepdb_recreate_command(cmd_str, mode), f"DB-reuse mode changed to {mode}"
+    if fingerprint and (stored.get("fingerprint") or "") != fingerprint:
+        return True, keepdb_recreate_command(cmd_str, mode), (
+            "migrations tree changed since the kept DB was built (renumber/edit)"
+        )
+    return False, cmd_str, ""
+
+
+def _keepdb_fingerprint_path(worktree_path: Path) -> Path:
+    return Path(worktree_path) / _SUITE_PROOF_DIRNAME / _KEEPDB_FP_FILENAME
+
 
 def _suite_proof_path(cwd: Optional[Path | str] = None, cogship_id: str = "", quest_id: str = "") -> Optional[Path]:
     root = get_repo_root(cwd)
@@ -1441,8 +1529,24 @@ def run_unified_suite(
         graph = {"mode": "not_applicable"}
         result["migration_graph_ok"] = None
 
-    # Stage 2 — the test battery itself.
+    # Stage 2 — the test battery itself. When the suite keeps its test DB
+    # (--keepdb / --reuse-db), a migration renumber since the DB was built
+    # makes it fail with "column already exists"; rebuild it once instead.
     cmd_str = command or _detect_suite_command(p)
+    test_db_recreated = ""
+    keepdb_mode = suite_keepdb_mode(cmd_str)
+    fp_path = _keepdb_fingerprint_path(p)
+    migrations_fp = ""
+    if keepdb_mode:
+        migrations_fp = migrations_fingerprint(p)
+        stored = None
+        try:
+            stored = json.loads(fp_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            stored = None
+        recreate, cmd_str, reason = keepdb_recreate_decision(cmd_str, migrations_fp, stored)
+        if recreate:
+            test_db_recreated = reason
     argv = cmd_str.split()
     try:
         proc = subprocess.run(argv, cwd=str(p), capture_output=True, text=True, timeout=timeout)
@@ -1458,6 +1562,18 @@ def run_unified_suite(
         return result
     finished = datetime.now(timezone.utc).isoformat()
 
+    if keepdb_mode:
+        # Record the fingerprint AFTER the run: on a recreate run the kept DB
+        # now matches these migrations; on a normal run nothing changed.
+        try:
+            fp_path.parent.mkdir(parents=True, exist_ok=True)
+            fp_path.write_text(
+                json.dumps({"fingerprint": migrations_fp, "mode": keepdb_mode, "finished": finished}, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
     m_pytest = _PYTEST_COUNT_RE.search(output)
     m_dj = _DJANGO_RAN_RE.search(output)
     ran_tests = int(m_pytest.group(1)) if m_pytest else (int(m_dj.group(1)) if m_dj else None)
@@ -1472,6 +1588,7 @@ def run_unified_suite(
         "ran_tests": ran_tests,
         "migration_graph_ok": result["migration_graph_ok"],
         "migration_graph_mode": graph.get("mode"),
+        "test_db_recreated": test_db_recreated,
         "started": started,
         "finished": finished,
         "output_tail": output[-4000:],
@@ -1489,6 +1606,7 @@ def run_unified_suite(
         "ran_tests": ran_tests,
         "head_sha": head_sha,
         "command": cmd_str,
+        "test_db_recreated": test_db_recreated,
     })
     return result
 

@@ -1,6 +1,6 @@
 # Bear Tribute / Report to the King — Serf Prompt Template
 
-Send this prompt to an active Serf session (`agent_manager` `prompt`) when requesting a full progress report, audit, or end-of-stage Tribute handoff.
+Send this prompt into the Serf's worktree via Kilo CLI (`kilo run --agent serf --model "$(python3 -m court.cli model serf)" --dir <wt>`, or `court goad <id>` for a stalled session) when requesting a full progress report, audit, or end-of-stage Tribute handoff.
 
 ---
 

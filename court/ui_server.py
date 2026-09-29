@@ -264,7 +264,7 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
  padding:4px 14px;border-radius:999px;background:var(--surface-2);border:1px solid var(--edge);
  color:var(--dim);cursor:pointer;flex:none;transition:all .12s ease}
 #composer .cont .newbtn:hover{border-color:var(--red);color:var(--red)}
-#composer .row{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap}
+ #composer .row{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap}
 #composer .rgrow{flex:1}
 #composer textarea{display:block;width:100%;background:var(--bg);border:1px solid var(--edge);color:var(--ink);
  border-radius:var(--r-md);font:13px/1.45 "Inter",sans-serif;padding:10px 12px;resize:none;
@@ -585,6 +585,7 @@ html[data-theme="light"] .iconbtn .bcount{color:#fff}
    <div class="cont" id="c_cont">new session — pick a worktree, or open the ☰ sessions menu to continue one</div>
    <textarea id="c_prompt" placeholder="message the agent… (Enter to send, Shift+Enter for newline)"></textarea>
    <div class="row">
+    <span class="rgrow"></span>
     <select id="c_model" title="model preset — any preset pairs with any agent class; edit the list in settings"
      style="width:250px;min-width:0;height:34px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);
      border-radius:8px;padding:0 8px;font:11.5px ui-monospace,Menlo,monospace"></select>
@@ -593,8 +594,8 @@ html[data-theme="light"] .iconbtn .bcount{color:#fff}
      width:250px;min-width:0;height:34px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);
      border-radius:8px;padding:0 10px;font:11.5px ui-monospace,Menlo,monospace">
     <datalist id="model_dl"></datalist>
-    <select id="c_agent" style="height:34px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);border-radius:8px;padding:0 8px"></select>
-    <span class="rgrow"></span>
+    <select id="c_agent" title="persona — defaults to the role that owns this area"
+     style="height:34px;background:var(--bg);border:1px solid var(--edge);color:var(--ink);border-radius:8px;padding:0 8px"></select>
     <button class="send stop" id="c_stop" style="display:none" onclick="stopTurn()">STOP</button>
     <button class="send" id="c_send" onclick="sendComposer()">SEND</button>
    </div>
@@ -746,6 +747,7 @@ function applyHash(){
     const wi=(repo().worktrees||[]).find(x=>x.path===w.path);
     setWtLabel(wi&&wi.branch||w.branch||w.path.split('/').pop(),w.path);
     $('wt_badge').innerHTML=wi&&wi.dirty?'<span class="badge">dirty</span>':'';
+   applyDefaultAgent();
    renderNav();renderSessionsBar();
     if(p.sess&&/^[\w-]+$/.test(p.sess))openSess(p.sess);
     else{const s=sessionsFor(selWt);if(s.length)openSess(s[0].id);else newSess();}
@@ -874,7 +876,7 @@ window.addEventListener('popstate',()=>{
    for(const a of (S.active||[]))if(a.dir===w.path)agents.add(a.agent);
    if(agents.has('master_of_coin'))addUnit(secs.treasury,w.path,w.branch,w);
    if(agents.has('gatekeeper'))addUnit(secs.gatehouse,w.path,w.branch,w);
-   if(agents.has('artist'))addUnit(secs.artist,w.path,w.branch,w);
+   if(agents.has('artist')&&w.branch.startsWith('artist/'))addUnit(secs.artist,w.path,w.branch,w);
   }
   for(const sec of SECTION_ORDER){
    const s=secs[sec.id];
@@ -955,11 +957,12 @@ function pickWt(path,branch){
   const w=(repo().worktrees||[]).find(x=>x.path===path);
   setWtLabel(branch||w&&w.branch||path.split('/').pop(),path);
   $('wt_badge').innerHTML=w&&w.dirty?'<span class="badge">dirty</span>':'';
- }else{
-  $('wt_label').innerHTML=esc(branch||'?')+' <span class="dim">· no worktree</span>';
-  $('wt_badge').innerHTML='';
- }
-   renderNav();renderSessionsBar();renderTranscript();syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();syncMarkRead();
+  }else{
+   $('wt_label').innerHTML=esc(branch||'?')+' <span class="dim">· no worktree</span>';
+   $('wt_badge').innerHTML='';
+  }
+   applyDefaultAgent();
+    renderNav();renderSessionsBar();renderTranscript();syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();syncMarkRead();
   $('c_cont').innerHTML='new session — pick a worktree, or click a session tab to continue it';
  const sess=sessionsFor(path);
  if(sess.length)openSess(sess[0].id);
@@ -1503,11 +1506,11 @@ function openQuestWt(p){
  if(p&&((repo().worktrees||[]).some(w=>w.path===p)))pickWt(p);
  else poll();
 }
-const BOARD_OPS={WORKING:[["goad","goad","go"],["sync","sync","go"]],
- TRIBUTE_READY:[["coin","coin","go"],["studio","🎨 studio","go"],["advance","advance","GATE",""],["sync","sync","go"]],
- GATE:[["collect","🚢 collect","go"],["studio","🎨 studio","go"],["sync","sync","go"]],
- READY_TO_RAZE:[["raze","raze","warn"],["sync","sync","go"]],
- PLANNED:[["dispatch","dispatch","go"],["sync","sync","go"]]};
+const BOARD_OPS={WORKING:[["goad","goad","go"]],
+ TRIBUTE_READY:[["coin","coin","go"],["studio","🎨 studio","go"],["advance","advance","GATE",""]],
+ GATE:[["collect","🚢 collect","go"],["studio","🎨 studio","go"]],
+ READY_TO_RAZE:[["raze","raze","warn"]],
+ PLANNED:[["dispatch","dispatch","go"]]};
 function boardAttn(q){
  const a=q.audit;
  return !!(a&&(a.violations>0||a.pending_audience||a.forced_transition));
@@ -1520,7 +1523,7 @@ function renderBoardBar(){
  let h='<div class="bfil"><span class="chipx '+(boardApp==='all'?'on':'')+'" data-app="all">all · '+qs.length+'</span>'+
   Object.keys(apps).sort().map(a=>`<span class="chipx ${a===boardApp?'on':''}" data-app="${esc(a)}">${esc(a)} · ${apps[a]}</span>`).join('')+
   (nAttn?`<span class="chipx" style="border-color:rgba(248,81,73,.5);color:var(--red)">${nAttn} need attention</span>`:'')+
-  (BOARD_SEL.size?`<div class="bbulk"><b>${BOARD_SEL.size} selected</b>`+
+  '<button class="bgo" data-bulk="syncall" title="court sync --all — pull branch-tip quest paperwork onto the main checkout for every quest (branch-wins union; true edit wars report)">⇅ sync all</button>'+  (BOARD_SEL.size?`<div class="bbulk"><b>${BOARD_SEL.size} selected</b>`+
    '<button class="bgo" data-bulk="collect">🚢 pack</button>'+
    '<button class="bgo" data-bulk="studio">🎨 studio</button>'+
    '<button class="bgo" data-bulk="coin">coin</button>'+
@@ -1641,7 +1644,7 @@ function renderBoard(){
 }
 $('boardbar').addEventListener('click',e=>{
  const bulk=e.target.closest('[data-bulk]');
- if(bulk){bulkRun(bulk.dataset.bulk);return;}
+ if(bulk){bulkRun(bulk.dataset.bulk,bulk);return;}
  const c=e.target.closest('[data-app]');if(c)boardFilter(c.dataset.app);});
  $('boardcols').addEventListener('click',e=>{
   const bread=e.target.closest('[data-bread]');
@@ -1702,7 +1705,12 @@ async function runCourtOp(op,id,status,btn,card,ids,confirmFlag){
  poll();
  return res;
 }
-async function bulkRun(op){
+async function bulkRun(op,btn){
+ if(op==='syncall'){
+  const r=await runCourtOp('sync','','',btn,null);
+  poll();
+  if(r&&r.error)alert('sync all — '+r.error);
+  return;}
  const ids=[...BOARD_SEL];
  if(!ids.length)return;
  if(op==='clear'){BOARD_SEL=new Set();renderBoard();return;}
@@ -2127,10 +2135,10 @@ function jumpToSession(sid){
  if(!s){alert('session not in recent list; use search');return;}
  const r=(S.repos||[]).find(r=>s.directory&&s.directory.startsWith(r.root));
  if(r)selRepo=r.key;
-  if(s.directory){
-   const w=(r&&r.worktrees||[]).find(w=>s.directory.startsWith(w.path));
-   if(w){selWt=w.path;setWtLabel(w.branch||w.path.split('/').pop(),w.path);}
-  }
+   if(s.directory){
+    const w=(r&&r.worktrees||[]).find(w=>s.directory.startsWith(w.path));
+    if(w){selWt=w.path;setWtLabel(w.branch||w.path.split('/').pop(),w.path);applyDefaultAgent();}
+   }
  selSess=sid;
  setView('chat');
  openSess(sid);
@@ -2171,6 +2179,28 @@ function syncRoleModel(){
  if(!META)return;
  const roleModel=(META.role_models||{})[$('c_agent').value]||'';
  if(roleModel)setComposerModel(roleModel);}
+// Persona defaults follow the area the selected worktree lives in — the same
+// shapes the nav sections classify: trunk/castle → steward, artist/ → artist,
+// the-gatehouse/ → gatekeeper, scout/ → scout, quest|epic → serf, and a
+// worktree that has only ever hosted master_of_coin audits → master_of_coin.
+function defaultAgentFor(path,branch){
+ const r=repo();
+ if((r&&path===r.root)||(branch&&TRUNKS.includes(branch)))return'steward';
+ if((branch||'').startsWith('artist/'))return'artist';
+ if((branch||'').startsWith('the-gatehouse/'))return'gatekeeper';
+ if((branch||'').startsWith('scout/'))return'scout';
+ if((branch||'').startsWith('quest/')||(branch||'').startsWith('epic/'))return'serf';
+ if(path&&S&&sessionsFor(path).some(s=>s.agent==='master_of_coin'))return'master_of_coin';
+ return'steward';
+}
+function applyDefaultAgent(){
+ if(!S||!META||!selWt)return;
+ const r=repo();
+ const w=(r.worktrees||[]).find(x=>x.path===selWt);
+ const a=defaultAgentFor(selWt,w&&w.branch);
+ if(META.agents.includes(a))$('c_agent').value=a;
+ syncRoleModel();
+}
 $('c_agent').addEventListener('change',syncRoleModel);
 $('c_model').addEventListener('change',()=>{
  const custom=$('c_model').value==='__custom__';
@@ -2180,9 +2210,9 @@ $('c_model').addEventListener('change',()=>{
  $('c_agent').innerHTML=META.agents.map(x=>`<option>${x}</option>`).join('');
  $('model_dl').innerHTML=(META.models||[]).map(m=>`<option value="${esc(m)}"></option>`).join('');
  const sel=$('c_model');
- sel.innerHTML=(META.presets||[]).map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join('')+
-  '<option value="__custom__">custom…</option>';
- syncRoleModel();
+  sel.innerHTML=(META.presets||[]).map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join('')+
+   '<option value="__custom__">custom…</option>';
+  if(selWt)applyDefaultAgent();else syncRoleModel();
 }catch(e){}})();
 const bootHi=$('boot_hi');if(bootHi)bootHi.textContent=greet();
 const bootGl=$('boot_glyph');if(bootGl)bootGl.innerHTML=ROOK;
@@ -3803,9 +3833,10 @@ _COURT_OP_ARITY = {
     "studio": ("studio", "{id}"),
     "raze": ("raze", "{id}"),
     "dispatch": ("dispatch", "{id}", "--standup"),
-    # sync: pull branch-tip quest ledger onto the main checkout (Q696's
-    # transitional reconcile) — branch-wins, mixed forks refuse with a report.
-    "sync": ("sync", "{id}"),
+    # sync: GLOBAL board sync — `court sync --all` (branch-tip paperwork for
+    # every quest onto the main checkout; section-level branch-wins union,
+    # true edit wars refuse). Per-item sync retired 2026-09-29.
+    "sync": ("sync", "--all"),
     # ship: --confirm is appended ONLY when the request carries confirm:true
     # (dialog-acknowledged board confirm) — never baked into the template.
     "ship": ("ship", "{id}"),
@@ -3830,8 +3861,9 @@ def _find_quest_repo(qid):
 def _court_op(job, op, qid, status, note, ids=None, confirm=False):
     try:
         found = _find_quest_repo(qid)
-        if not found and op in ("collect", "ship") and not qid:
-            # Bare collect/ship (no selection): explicit pack/launch intent.
+        if not found and op in ("collect", "ship", "sync") and not qid:
+            # Bare collect/ship/sync (no selection): explicit intent.
+            # sync with no id runs the global `court sync --all`.
             found = {"root": COURT_DIR}
         if not found and op == "studio" and not ids and not qid:
             job["events"].append({"type": "error",
@@ -4263,9 +4295,11 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
         cmd += ["--model", manifest_model or "openrouter/z-ai/glm-5.3-flash"]
     cmd.append(prompt[:20000])
     try:
+        from court.cli import _engine_spawn_env
+
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            start_new_session=True)
+            start_new_session=True, env=_engine_spawn_env(Path(directory)))
     except Exception as exc:
         job["events"].append({"type": "error", "text": str(exc)})
         job["done"] = True

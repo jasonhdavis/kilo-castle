@@ -205,6 +205,22 @@ _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
 _KNOWN_SECTION_NAMES = frozenset(DEFAULT_BODY_SECTIONS) | frozenset(LEGACY_SECTION_ALIASES)
 
 
+class _DirtyTrackingSections(dict):
+    """Body-sections dict that records every key written to it, so
+    `store._write`'s disk-merge guard knows which sections the caller
+    deliberately changed (set_section, commute, ward repair, direct writes)
+    versus sections merely carried over from a load. Initial content passed
+    to the constructor is NOT dirty — only in-place writes are."""
+
+    def __init__(self, dirty: set, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._dirty = dirty
+
+    def __setitem__(self, key, value):
+        self._dirty.add(key)
+        super().__setitem__(key, value)
+
+
 def detect_body_shape(body_text: str) -> str:
     """Return "new" if the body uses `##` section headers (post-Charter shape),
     "legacy" if it uses single-`#` headers (pre-rename shape).
@@ -265,6 +281,7 @@ class Quest:
     created_at: str = ""
     updated_at: str = ""
     body_sections: dict = field(default_factory=dict)
+    _dirty_sections: set = field(default_factory=set, repr=False, compare=False)
 
     def __post_init__(self):
         if not self.created_at:
@@ -273,6 +290,8 @@ class Quest:
             self.updated_at = self.created_at
         if not self.tags and self.section:
             self.tags = self.section
+        if not isinstance(self.body_sections, _DirtyTrackingSections):
+            self.body_sections = _DirtyTrackingSections(self._dirty_sections, self.body_sections)
         for section in DEFAULT_BODY_SECTIONS:
             self.body_sections.setdefault(section, "")
 
@@ -312,8 +331,13 @@ class Quest:
         frontmatter = "---\n" + "\n".join(fm_lines) + "\n---\n"
         title_line = f"# {self.id} — {self.title}\n"
         body_parts = []
-        for section in DEFAULT_BODY_SECTIONS:
+        ordered = list(DEFAULT_BODY_SECTIONS) + [
+            s for s in self.body_sections if s not in DEFAULT_BODY_SECTIONS
+        ]
+        for section in ordered:
             content = self.body_sections.get(section, "").rstrip()
+            if not content and section not in DEFAULT_BODY_SECTIONS:
+                continue
             body_parts.append(f"## {section}\n\n{content}\n" if content else f"## {section}\n")
         return frontmatter + "\n" + title_line + "\n" + "\n".join(body_parts)
 
@@ -333,12 +357,18 @@ class Quest:
         is_new_shape = detect_body_shape(body_text) == "new"
         header_re = re.compile(r"^##\s+(.+)$") if is_new_shape else re.compile(r"^#\s+(.+)$")
 
+        # New-shape (## charter) files: preserve EVERY section verbatim —
+        # custom/extra sections (royal addenda, rulings, one-off logs) must
+        # survive load→save cycles. Old-shape (# charter) files keep the
+        # known-name filter because the `# Title` line also matches `^#\s+`.
         sections = {}
         current = None
         buf = []
         for line in body_text.splitlines():
             header_m = header_re.match(line)
-            if header_m and header_m.group(1).strip() in _KNOWN_SECTION_NAMES:
+            if header_m and (
+                is_new_shape or header_m.group(1).strip() in _KNOWN_SECTION_NAMES
+            ):
                 if current is not None:
                     sections[current] = "\n".join(buf).strip("\n")
                 current = header_m.group(1).strip()
@@ -357,7 +387,9 @@ class Quest:
                 else:
                     sections[canonical] = legacy_content
 
-        known_fields = {f.name for f in fields(cls) if f.name != "body_sections"}
+        known_fields = {
+            f.name for f in fields(cls) if f.name not in ("body_sections", "_dirty_sections")
+        }
         kwargs = {k: v for k, v in data.items() if k in known_fields}
         return cls(**kwargs, body_sections=sections)
 
@@ -370,6 +402,7 @@ class Quest:
         else:
             bullet = f"- **{ts}** — {note}" if note else f"- **{ts}** — {to_status or from_status or 'note'}"
         self.body_sections["Castle Ledger"] = (existing.rstrip() + "\n" + bullet).strip()
+        self._dirty_sections.add("Castle Ledger")
         self.updated_at = ts
 
     def append_history(self, from_status: str, to_status: str, note: str = "") -> None:
@@ -390,6 +423,7 @@ class Quest:
             self.body_sections[section_name] = (existing.rstrip() + "\n\n" + content).strip()
         else:
             self.body_sections[section_name] = content.strip()
+        self._dirty_sections.add(section_name)
         self.updated_at = now_iso()
 
     def extract_tribute_subsection(self, target_section: str) -> str:

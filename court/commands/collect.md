@@ -43,20 +43,20 @@ Follow the Collect Protocol (absorbing gate progression):
 
 3. **Summon the Gatekeeper & Execute Unified Integration**:
    - **Gatehouse routing is by convoy size (2026-09-05 re-architecture — the persistent
-     `the-gatehouse/north|south|east|west` named stations are retired):** `agent_manager` has
-     no way to attach a fresh session to an already-existing, sessionless worktree — only
-     create new — which is exactly why those 4 stations kept going stale (seen up to 751
-     commits behind castle) between convoys: nothing fast-forwards a dormant worktree with
-     no session running in it.
-     - **Convoy of 1 Quest**: skip a separate Gatehouse worktree entirely. Prompt that
-       Quest's own EXISTING worktree session via `agent_manager` `action: "prompt"` to act
-       as Gatekeeper directly there — merge castle in, run the full suite, promote on a
-       clean pass. Nothing to batch, so no reason for a separate integration point.
+     `the-gatehouse/north|south|east|west` named stations are retired):** all Gatekeeper
+     sessions spawn headless via the Kilo CLI — never via the `agent_manager` tool (retired
+     for orchestration; calls hang and time out).
+     - **Convoy of 1 Quest**: skip a separate Gatehouse worktree entirely. Run the
+       Gatekeeper directly in that Quest's own EXISTING worktree via Kilo CLI:
+       `kilo run --agent gatekeeper --model "$(python3 -m court.cli model gatekeeper)" --dir <wt>`
+       — merge castle in, run the full suite, promote on a clean pass. Nothing to batch, so
+       no reason for a separate integration point.
      - **Convoy of >1 Quest** (the common case): spawn ONE brand-new ephemeral worktree via
-       `agent_manager` `mode: "worktree"`, `branchName: "the-gatehouse/<cogship_id>"`, off
-       castle's current tip — never an old/idle named station. Prompt that new session to
-       act as Gatekeeper. Tear the worktree down (Ashes/stop) once promoted; it is scoped to
-       this one convoy only, not meant to persist for reuse.
+       `kilo worktree create` on branch `the-gatehouse/<cogship_id>` off castle's current
+       tip — never an old/idle named station — then
+       `kilo run --agent gatekeeper --model "$(python3 -m court.cli model gatekeeper)" --dir <gatehouse_wt>`.
+       Tear the worktree down once promoted; it is scoped to this one convoy only, not meant
+       to persist for reuse.
      - **NEVER** run Gatekeeper as a background task, background process, or on castle.
      - Gatekeeper is a model pinned in `.court/config.json` (`models.gatekeeper`).
      - Allowed to spawn sequential non-background tasks (`background: false`) for integration verification.
@@ -76,13 +76,13 @@ Follow the Collect Protocol (absorbing gate progression):
      status to `READY_TO_RAZE` ("Ready to Raze"), and queues worktrees for **Ashes** (including the
      ephemeral Gatehouse worktree itself, for a size->1 convoy — it does not persist between convoys).
    - Generate the full deployment manifest via `python3 -m court.cli ship --cogship <id>` (or default rollup pillars: Bard, Coffers, Tally, Atone, Murmur).
-   - **Teardown is the Steward's job, not the Gatekeeper's own.** The Gatekeeper never calls
-     `agent_manager stop` on its own session (same self-stop timing risk as Master of Coin —
-     see `AGENTS.md`). It reports the promoted commit hash(es) back; the Steward runs
+   - **Teardown is the Steward's job, not the Gatekeeper's own.** The Gatekeeper never stops
+     its own session (same self-stop timing risk as Master of Coin — see `AGENTS.md`). It
+     reports the promoted commit hash(es) back; the Steward runs
      `python3 -m court.cli fork-teardown-list` to confirm the promotion actually landed
-     on `castle` and get the exact next commands. For an ELIGIBLE convoy: `agent_manager` `move`
-     the session into **Ashes** first (while it's still alive), then `agent_manager` `stop` it —
-     never the reverse, and never `git worktree remove` (M'Lord prunes the directory by hand).
+     on `castle` and get the cleanup steps. Session teardown is via Kilo CLI
+     (`kilo session delete <sessionID>`); never `git worktree remove` (M'Lord prunes the
+     directory by hand).
 
 5. **Report to M'Lord (Cog Ship Voyage Report)**:
    - Present the synthesized deployment summary using `status_label()` names:

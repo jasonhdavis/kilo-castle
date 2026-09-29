@@ -83,10 +83,13 @@ def fold_events(events: list[dict], quest_id: str, kind: str = "quest") -> Quest
                 field_values[name] = value
         elif target.startswith(SECTION_PREFIX):
             name = target[len(SECTION_PREFIX):]
-            if name in _KNOWN_SECTION_TARGETS:
+            # Any section is foldable — custom/extra sections round-trip too.
+            if name and "\n" not in name and len(name) <= 120:
                 section_values[name] = value
 
-    known_fields = {f.name for f in dc_fields(Quest) if f.name != "body_sections"}
+    known_fields = {
+        f.name for f in dc_fields(Quest) if f.name not in ("body_sections", "_dirty_sections")
+    }
     kwargs = {k: v for k, v in field_values.items() if k in known_fields and v != ""}
     kwargs["id"] = field_values.get("id") or quest_id
     kwargs.setdefault("kind", kind)
@@ -105,7 +108,10 @@ def build_events_for_save(quest: Quest, prior: Optional[Quest], ts: str) -> list
         if new_val != old_val:
             events.append({"ts": ts, "target": f"{FIELD_PREFIX}{f}", "value": new_val})
 
-    for section in DEFAULT_BODY_SECTIONS:
+    section_order = list(DEFAULT_BODY_SECTIONS) + [
+        s for s in quest.body_sections if s not in DEFAULT_BODY_SECTIONS
+    ]
+    for section in section_order:
         new_val = quest.body_sections.get(section, "") or ""
         old_val = ((prior.body_sections.get(section, "") if prior is not None else "") or "")
         if new_val != old_val:

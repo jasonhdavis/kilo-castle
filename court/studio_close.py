@@ -809,7 +809,7 @@ def _print_close(slug, studio_branch, rows, meta, manifest, teardown_info, artis
         for pid in teardown_info.get("cli_kills") or []:
             print(f"  stopped headless artist pid {pid}")
         for cmd in teardown_info.get("agent_manager") or []:
-            print(f"  agent_manager: {cmd['op']} sessionID={cmd.get('sessionID', '-')} "
+            print(f"  manual cleanup (M'Lord): {cmd['op']} sessionID={cmd.get('sessionID', '-')} "
                   f"sectionID={cmd.get('sectionID', '-')} — {cmd.get('why', '')}")
     if artist_spawn:
         for k, v in artist_spawn.items():

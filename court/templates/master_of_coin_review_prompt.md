@@ -26,7 +26,7 @@ Decrees, and the Steward charters a brand-new Quest+worktree from those Decrees.
 5. **Mandatory sync-back**: because the advance/set-section commands in step 4 only ever commit onto the fork branch, the verdict is invisible to the real
    Serf branch until it is explicitly pushed back: `git push . HEAD:{{ branch }}` from inside the fork.
    If that push is rejected, `git merge {{ branch }}` into the fork first, re-verify anything that changed, then push.
-6. **Do not call `agent_manager stop` on your own session as your last action.** Teardown of this fork worktree (and its session)
+6. **Do not stop your own session as your last action.** Teardown of this fork worktree (and its session)
    is the Steward's job, done only after it confirms the sync-back in step 5 actually landed on the real branch.
 
 ---
@@ -71,6 +71,7 @@ Requires**, **Expected Tribute**, and the Serf's **Tribute Rendered**.
 3. **Expected vs. Delivered Line-by-Line**
    - Check the branch diff (`git diff castle...{{ branch }}` or equivalent) against every item on the **baseline Expected Tribute as committed on `castle`**.
    - Does the implementation satisfy EVERY item? Where a Tribute claim is checkable with a live command, **run it yourself** and confirm it matches.
+   - Stale kept test DB: when a scoped test run fails with "column already exists" / duplicate-table errors after a migration renumber (0038→0039 class), the `--keepdb`/`--reuse-db` database predates the new migrations. Recreate it for that run (drop `--keepdb`, or add `--create-db` for pytest-django; `court runsuite` does this automatically) — never hand-patch or delete migration files to appease a kept DB.
 
 4. **Duplication & Architecture Check**
    - Grep the codebase for the capability the Serf just built. Did the repository already possess an existing service or module that does the same thing?

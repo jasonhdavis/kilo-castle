@@ -1,7 +1,7 @@
 # Warden Dispatch Prompt Template — Hunting Grounds Patrol
 
 Fill in every `{{ }}` placeholder before sending this as the initial prompt
-to a new Agent Manager Warden session on a dedicated `ward/*` branch
+to a new headless Warden session via Kilo CLI on a dedicated `ward/*` branch
 (e.g. `ward/hunting-grounds` or `ward/{{ patrol_date }}-patrol`).
 
 ---

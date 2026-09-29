@@ -31,12 +31,12 @@ interrogation, logged as a dated entry in that Quest's own `## Audience Log`.
 1. **Load the Quest's coordinates**: `python3 -m court.cli show <quest_id>` for
    `branch`, `worktree`, and `master_of_coin_session_id`.
 2. **Reuse an existing Master of Coin session if one is live** for this Quest:
-   `agent_manager` `action: "list"` — if `master_of_coin_session_id` shows up there
-   (any state except `offline`/missing), send it the filled interrogation prompt via
-   `agent_manager` `action: "prompt"`, `sessionID: "<master_of_coin_session_id>"`.
+   `kilo session list` — if `master_of_coin_session_id` shows up there (any state except
+   `offline`/missing), deliver the filled interrogation prompt into its worktree via Kilo CLI:
+   `kilo run --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir <wt>`.
 3. **Otherwise spawn a fresh, dedicated session** bound to the Quest's exact existing
-   branch — `agent_manager` `start`, `mode: "worktree"`, `branchName: "<branch>"`,
-   `model` resolved from `.court/config.json` (`models.master_of_coin`), `provider: "openrouter"` — with the filled
+   worktree/branch via Kilo CLI (same command as above; `model` resolved from
+   `.court/config.json`) — with the filled
    `.court/templates/master_of_coin_interrogate_prompt.md` as its initial prompt.
    **Never** hijack the Serf's own `serf_session_id`, and **never** run this as a
    `task` subagent on `castle`. Record the new session so future interrogations (and

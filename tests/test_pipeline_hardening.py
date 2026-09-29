@@ -261,6 +261,7 @@ class TestOpLock:
 
 class TestAutoFlag:
     def test_standup_cmd_includes_auto(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("COURT_WATCH_DISABLE", "1")
         launched = {}
 
         class FakeProc:

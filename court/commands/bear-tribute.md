@@ -12,8 +12,8 @@ Follow the Steward's Bear Tribute protocol:
 
 2. For each target Quest:
    - Load Quest details: `python3 -m court.cli show <id>`.
-   - Retrieve the Serf's session ID (`serf_session_id`) and verify it in `agent_manager list`.
-   - Dispatch the Bear Tribute prompt (`.court/templates/bear_tribute_prompt.md`) to the Serf session via `agent_manager` (`action: "prompt"`).
+   - Retrieve the Serf's session ID (`serf_session_id`) and verify it in `kilo session list`.
+   - Dispatch the Bear Tribute prompt (`.court/templates/bear_tribute_prompt.md`) into the Serf's worktree via Kilo CLI (`kilo run --agent serf --model "$(python3 -m court.cli model serf)" --dir <wt>`), or `court goad <id>` for a stalled session. Never via the `agent_manager` tool.
     - Ingest the Serf's response and extract the five required sections:
       - **Ballad**: Narrative summary of work and decisions.
       - **Tribute**: Provable work product (files touched, git status/commits, tests run, and **The Tally** production/UI verification runbook).

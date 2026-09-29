@@ -14,8 +14,7 @@ Follow the Scout Reconnaissance Protocol:
      ```
 2. **Charter the Scout:**
    - Branch format: `scout/<id>-<slug>`.
-   - Dispatch an Agent Manager worktree session (`mode: "worktree"`, `branchName` set to the canonical `scout/<id>-<slug>` branch, model **GLM 5.3 Flash** — `openrouter/z-ai/glm-5.3-flash`, provider `openrouter`) using `.court/templates/scout_dispatch_prompt.md` as the initial prompt.
-   - Move worktree to the `Investigation` section in Agent Manager.
+   - Dispatch via Kilo CLI: `kilo worktree create` on the canonical `scout/<id>-<slug>` branch, then `kilo run --worktree <wt> --agent scout --model "openrouter/z-ai/glm-5.3-flash" --provider openrouter` with `.court/templates/scout_dispatch_prompt.md` as the initial prompt.
    - Record fields via `python3 -m court.cli set-field` (including `serf_model "openrouter/z-ai/glm-5.3-flash"` for the Scout session) and advance to `WORKING`.
 3. **Scout Constraints & Deliverables:**
    - Scout writes throwaway scripts and fixtures to `tasks/artifacts/` (NO production service code).

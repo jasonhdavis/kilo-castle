@@ -60,7 +60,7 @@ they do not need you watching, and you do not need them finished.
   (c) an explicit offer: "say the word and I'll pull a status update / goad it."
   M'Lord decides when to re-engage — not a timer.
 - If M'Lord asks for progress on a running thread, pull durable state
-  (`court status`, `agent_manager list`, the worker's log tail) in ONE pass,
+  (`court status`, `kilo session list`, the worker's log tail) in ONE pass,
   report, and end the turn. Never hold the session open to "keep an eye on it."
 
 ## Data-Mutation Quests Require a Real-Data Dry-Run Gate
@@ -109,7 +109,7 @@ of current state), reconstruct reality from disk + live tool state:
 
 1. `python3 -m court.cli status` (or `tree`) — full Quest/Epic pipeline dashboard.
 2. `python3 -m court.cli edict` — active Royal Decrees and strategic priorities from M'Lord.
-3. `agent_manager` `list` — live Agent Manager sections/worktrees/sessions.
+3. `kilo session list` (plus `court timber`) — live Kilo sessions and physical worktrees. NEVER use the `agent_manager` tool: it is retired for orchestration and unresponsive.
 4. `.court/LEDGER.md` — your standing decisions and cross-Quest notes.
 5. `python3 -m court.cli rollup` (or `court tally`) — deterministic extraction of Ballads, Tributes, Tallies (verification runbooks), Penances, Humble Opinions, and Commutations across Quests.
 
@@ -119,7 +119,7 @@ of current state), reconstruct reality from disk + live tool state:
 - Never run test suites yourself as the Steward. All test suite execution belongs to the
   `gatehouse` layer (ephemeral Gatekeeper convoy sessions) and worktree Serfs.
 - Never run Gatekeeper as a background task or subagent on `castle`.
-- Use `agent_manager` for session lifecycle (dispatching, moving, answering questions).
+- Drive all session lifecycle through the Kilo CLI (`court dispatch`, `court goad`, `kilo run`) — never through the `agent_manager` tool (retired for orchestration; calls hang and time out).
 - Do not poll on a timer. State is pulled on-demand.
 
 ## The Quest Lifecycle
@@ -184,7 +184,7 @@ python3 -m court.cli dispatch-complete <id> --session-id <ses_id> --branch <bran
 ### 6. Levy & Review (`/levy`)
 - Run `python3 -m court.cli levy` to audit working Quests and rebase them to zero drift.
 - When Tribute is rendered and zero drift reached, advance to `TRIBUTE_READY`.
-- Dispatch **Master of Coin** (`master_of_coin_review_prompt.md`) via a dedicated Agent Manager session in the Quest's worktree (`model` resolved from `.court/config.json` (`models.master_of_coin`) / the configured `models` entry in `.court/config.json`).
+- Dispatch **Master of Coin** (`master_of_coin_review_prompt.md`) via Kilo CLI directly in the Quest's worktree (`python3 -m court.cli coin <id>`, or `kilo run --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir <wt>`; `model` resolved from `.court/config.json`).
 - Master of Coin verifies the claims live, fixes paperwork, identifies commutation steps, and advances to `GATE`.
 
 ### 6b. Court Artist & UI Review (`/artist`)
@@ -208,4 +208,4 @@ The deployment summary built and packed by the Gatekeeper before promoting `cast
 When a Quest is promoted into `castle`:
 1. **Deterministic Verification & Diff Alignment**: Run `court raze <id>` (or `court raze all`). This verifies merge status into `castle` (with independent ancestor verification), fast-forwards/syncs the worktree branch with `castle` (`behind: 0`), and advances to `READY_TO_RAZE`.
 2. **Move scaffolding worktrees to Ashes/Treasury, then Stop**: Run `court fork-teardown-list` to get the deterministic move+stop commands for ephemeral Master of Coin and Gatekeeper worktrees.
-3. **Manual Deletion Notice**: Physical deletion of directories is M'Lord's manual action in the Agent Manager UI. Run `court teardown-list` to display clean worktrees ready to prune.
+3. **Manual Deletion Notice**: Physical deletion of directories is M'Lord's manual action. Run `court teardown-list` to display clean worktrees ready to prune.

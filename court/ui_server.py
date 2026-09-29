@@ -343,6 +343,7 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
  padding:0 6px;font-style:normal}
 .vtabs{display:flex;gap:5px}
 .vtabs .app{flex:none;padding:6px 14px}
+.vtabs a.app{text-decoration:none;display:flex;align-items:center;justify-content:center}
 #board{display:none;flex-direction:column;overflow:hidden;background:var(--bg)}
 .bfil{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .chipx{display:inline-flex;align-items:center;padding:4px 12px;border-radius:999px;
@@ -551,6 +552,7 @@ html[data-theme="light"] .iconbtn .bcount{color:#fff}
 <header><div class="brand"><span class="glyph"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><path fill="currentColor" d="M32 192L32 48c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 40c0 4.4 3.6 8 8 8l32 0c4.4 0 8-3.6 8-8l0-40c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 40c0 4.4 3.6 8 8 8l32 0c4.4 0 8-3.6 8-8l0-40c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 144c0 10.1-4.7 19.6-12.8 25.6L352 256l16 144L80 400 96 256 44.8 217.6C36.7 211.6 32 202.1 32 192zm176 96l32 0c8.8 0 16-7.2 16-16l0-48c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 48c0 8.8 7.2 16 16 16zM22.6 473.4L64 432l320 0 41.4 41.4c4.2 4.2 6.6 10 6.6 16c0 12.5-10.1 22.6-22.6 22.6L38.6 512C26.1 512 16 501.9 16 489.4c0-6 2.4-11.8 6.6-16z"/></svg></span><em>CASTLE</em></div>
 <div class="vtabs"><div class="app on" id="v_chat" onclick="setView('chat')">chat</div>
 <div class="app" id="v_board" onclick="setView('board')">board</div>
+<a class="app" id="v_monitor" href="/monitor" title="agent &amp; process monitor — sessions, schedules, processes">monitor</a>
 <div class="app" id="v_settings" onclick="setView('settings')">settings</div></div>
 <div class="vdiv"></div><div id="totals" style="display:flex;gap:8px"></div>
 <div class="spacer"></div>

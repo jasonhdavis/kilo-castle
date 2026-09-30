@@ -7,7 +7,7 @@ concern: dev-console-monitor-view
 parent_epic: 
 section: Feature
 tags: Feature
-status: PLANNED
+status: WORKING
 cogship_id: 
 cogship_station: 
 cogship_promoted_commit: 
@@ -16,9 +16,9 @@ pillory_of:
 pilloried_by: 
 scout_of: 
 branch: quest/q001-castle-dev-console-monitor-view
-worktree: 
-serf_session_id: 
-serf_model: 
+worktree: /Users/scrummage/Python/kilo-castle/.kilo/worktrees/quest-q001-castle-dev-console-monitor-view
+serf_session_id: kilo-serf-94923
+serf_model: openrouter/z-ai/glm-5.3-flash
 master_of_coin_session_id: 
 master_of_coin_model: 
 gatekeeper_session_id: 
@@ -27,7 +27,7 @@ artist_session_id:
 artist_model: 
 vassal_session_id: 
 created_at: 2026-09-30T00:13:21Z
-updated_at: 2026-09-30T00:13:59Z
+updated_at: 2026-09-30T00:14:36Z
 ---
 
 # Q001-Castle-Dev-Console-Monitor-View — Castle Dev Console: Integrate Monitor as In-App View with Theme Support
@@ -36,6 +36,8 @@ updated_at: 2026-09-30T00:13:59Z
 
 - **2026-09-30T00:13:21Z** — - → OPEN: Quest created
 - **2026-09-30T00:13:59Z** — OPEN → PLANNED: Chartered via composite `court charter`
+- **2026-09-30T00:14:36Z** — PLANNED → DISPATCHED: Serf dispatched (`court dispatch`)
+- **2026-09-30T00:14:36Z** — DISPATCHED → WORKING: Serf toiling in worktree (`court dispatch`)
 
 ## The Kingdom Requires
 
@@ -61,6 +63,12 @@ Out of scope: new monitor features (filtering, sorting, historical charts), chan
 
 ## Expected Tribute
 
+- [ ] `monitor` is a native console view: the header tab switches via `setView('monitor')` with NO page navigation; monitor content lives in a `<section id="monitor">` on the console page; the external `<a href="/monitor">` tab is gone.
+- [ ] Theme parity: the monitor view renders legibly under BOTH `html[data-theme="light"]` and `html[data-theme="dark"]`, using the console's shared CSS variables (no hardcoded dark palette); the global ☾/☀ toggle restyles the visible monitor view live.
+- [ ] Functionality preserved end-to-end: `/api/monitor` fetch, 10s auto-refresh, manual Refresh, summary chips, Agent Sessions table, Schedules table with delete confirm flow, Processes table with kill confirm flow, updated-stamp, flags legend.
+- [ ] API surface unchanged: `GET /api/monitor`, `POST /api/monitor/kill`, `POST /api/monitor/schedule/delete` behave exactly as before; pure helpers (`select_monitor_processes`, `build_monitor_snapshot`, `_monitor_state`) untouched.
+- [ ] `GET /monitor` no longer serves a standalone page — it returns a 302 redirect to `/`; `MONITOR_PAGE` and its duplicate CSS/markup are removed, not left dead.
+- [ ] `tests/test_monitor.py` updated for the redirect (and any removed page assertions) and passing via the repo's standard runner; no Court/Castle roleplay vocabulary in any UI copy.
 - [ ] **Self-advance (do this LAST)**: once Tribute is rendered and `git rev-list --count HEAD..castle` is 0, run `python3 -m court.cli advance Q001-Castle-Dev-Console-Monitor-View TRIBUTE_READY` yourself. Nothing else flips the status out of WORKING.
 
 ## Tribute Rendered

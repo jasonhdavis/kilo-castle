@@ -1,0 +1,13 @@
+{"target": "field:id", "ts": "2026-09-30T00:13:21Z", "value": "Q001-Castle-Dev-Console-Monitor-View"}
+{"target": "field:title", "ts": "2026-09-30T00:13:21Z", "value": "Castle Dev Console: Integrate Monitor as In-App View with Theme Support"}
+{"target": "field:kind", "ts": "2026-09-30T00:13:21Z", "value": "quest"}
+{"target": "field:app", "ts": "2026-09-30T00:13:21Z", "value": "castle"}
+{"target": "field:concern", "ts": "2026-09-30T00:13:21Z", "value": "dev-console-monitor-view"}
+{"target": "field:section", "ts": "2026-09-30T00:13:21Z", "value": "Feature"}
+{"target": "field:tags", "ts": "2026-09-30T00:13:21Z", "value": "Feature"}
+{"target": "field:status", "ts": "2026-09-30T00:13:21Z", "value": "OPEN"}
+{"target": "field:branch", "ts": "2026-09-30T00:13:21Z", "value": "quest/q001-castle-dev-console-monitor-view"}
+{"target": "field:created_at", "ts": "2026-09-30T00:13:21Z", "value": "2026-09-30T00:13:21Z"}
+{"target": "field:updated_at", "ts": "2026-09-30T00:13:21Z", "value": "2026-09-30T00:13:21Z"}
+{"target": "section:Castle Ledger", "ts": "2026-09-30T00:13:21Z", "value": "- **2026-09-30T00:13:21Z** — - → OPEN: Quest created"}
+{"target": "section:Expected Tribute", "ts": "2026-09-30T00:13:21Z", "value": "- [ ] **Self-advance (do this LAST)**: once Tribute is rendered and `git rev-list --count HEAD..castle` is 0, run `python3 -m court.cli advance Q001-Castle-Dev-Console-Monitor-View TRIBUTE_READY` yourself. Nothing else flips the status out of WORKING."}

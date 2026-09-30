@@ -25,12 +25,14 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -42,6 +44,8 @@ from . import branch_ops
 from . import config
 from . import migration_guard
 from . import migration_graph
+from . import browser as studio_browser
+from . import studio_close
 
 # The Ward's durable workspace: patrol ledger + Warden Report queue.
 WARD_DIR = Path(__file__).resolve().parent.parent / "ward"
@@ -54,6 +58,7 @@ WARD_REPORTS_DIR = WARD_DIR / "reports"
 SERF_DISPATCH_TEMPLATE = ".court/templates/serf_dispatch_prompt.md"
 ARTIST_DISPATCH_TEMPLATE = ".court/templates/court_artist_prompt.md"
 ATELIER_DISPATCH_TEMPLATE = ".court/templates/court_artist_convoy_prompt.md"
+STUDIO_DISPATCH_TEMPLATE = ".court/templates/court_artist_studio_prompt.md"
 REPO_ROOT = git_ops.get_repo_root()
 MANAGE_SERVERS_PATH = REPO_ROOT / ".kilo" / "manage_servers.sh"
 
@@ -98,6 +103,99 @@ def find_kilo_binary() -> Optional[Path]:
     return None
 
 
+def _court_package_root(worktree_path: Optional[Path] = None) -> Optional[Path]:
+    """Locate the checkout that owns the importable `court` package.
+
+    The engine package is git-excluded from target repositories (`court init`
+    vendors only .court/, .kilo/ assets), so a worktree spawned inside one of
+    those repos has NO court/ of its own — roles there must import from the
+    parent checkout (the exact reach-around whose permission prompt kills
+    headless runs). Resolution order:
+      1. the worktree itself (castle's own worktrees track court/)
+      2. the main checkout (git common-dir parent)
+      3. the first ancestor directory with court/__init__.py
+      4. the site-installed court package
+    """
+    candidates: list[Path] = []
+    if worktree_path is not None:
+        wt = Path(worktree_path)
+        candidates.append(wt)
+        try:
+            res = git_ops._run(
+                ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], wt
+            )
+            common = (res.get("stdout") or "").strip()
+            if common:
+                candidates.append(Path(common).parent)
+        except Exception:
+            pass
+        cur = wt.resolve()
+        for _ in range(6):
+            parent = cur.parent
+            if parent == cur:
+                break
+            cur = parent
+            candidates.append(cur)
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("court")
+        if spec and spec.origin:
+            candidates.append(Path(spec.origin).resolve().parent.parent)
+    except Exception:
+        pass
+    for cand in candidates:
+        if cand and (cand / "court" / "__init__.py").is_file():
+            return cand
+    return None
+
+
+def _engine_spawn_env(worktree_path: Optional[Path] = None) -> dict:
+    """Environment for engine-spawned worker processes: PYTHONPATH is
+    prepended with the court-owning checkout so `python3 -m court.cli` (and
+    `court runsuite`) resolve inside ANY worktree — no more reaching into the
+    parent checkout via an extra shell permission."""
+    env = os.environ.copy()
+    pkg_root = _court_package_root(worktree_path)
+    if pkg_root is None:
+        return env
+    parts = [str(pkg_root)]
+    existing = env.get("PYTHONPATH", "")
+    if existing:
+        parts.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    return env
+
+
+COURT_SHIM_HEADER = """#!/bin/sh
+# court engine launcher shim: resolves the engine from the checkout that owns
+# the `court` package, so roles inside git-excluded worktrees can run
+# `.kilo/court <subcommand>` (e.g. `.kilo/court runsuite --cogship X`) without
+# an extra permission prompt to reach the parent checkout.
+"""
+
+
+def write_court_shim(worktree_path: Path) -> Optional[Path]:
+    """Write the `.kilo/court` launcher shim into a worktree (idempotent)."""
+    pkg_root = _court_package_root(worktree_path)
+    if pkg_root is None:
+        return None
+    kilo_dir = worktree_path / ".kilo"
+    try:
+        kilo_dir.mkdir(parents=True, exist_ok=True)
+        shim = kilo_dir / "court"
+        shim.write_text(
+            COURT_SHIM_HEADER
+            + f'PYTHONPATH="{pkg_root}$([ -n "$PYTHONPATH" ] && echo ":$PYTHONPATH")" '
+            + 'exec python3 -m court.cli "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(shim.stat().st_mode | 0o111)
+        return shim
+    except OSError:
+        return None
+
+
 def build_serf_task_prompt(quest: Quest) -> str:
     """Generate the clean, pure task-only prompt for a Serf.
 
@@ -137,6 +235,11 @@ def setup_worktree_agent_config(worktree_path: Path, agent: str = "serf") -> Non
     defaulting to the specified agent (default: 'serf')."""
     kilo_dir = worktree_path / ".kilo"
     kilo_dir.mkdir(parents=True, exist_ok=True)
+    # `.kilo/court` launcher shim: in target repos the court package is
+    # git-excluded, so worktree roles need a stable way to invoke the engine
+    # without a parent-checkout permission prompt (Q-rec: court importable in
+    # worktrees). Written on every standup; idempotent.
+    write_court_shim(worktree_path)
     cfg_file = kilo_dir / "kilo.json"
     cfg = {"$schema": "https://app.kilo.ai/config.json", "default_agent": agent}
     if cfg_file.is_file():
@@ -150,9 +253,188 @@ def setup_worktree_agent_config(worktree_path: Path, agent: str = "serf") -> Non
     cfg_file.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 
 
+def ensure_worktree_browser_mcp(worktree_path: Path, port: int) -> bool:
+    """Merge the chrome-devtools MCP server into the worktree's untracked
+    ``.kilo/kilo.json`` (the same file setup_worktree_agent_config maintains),
+    preserving every existing key. Returns True on success.
+
+    Its tools attach to the shared studio browser over CDP automatically.
+    """
+    try:
+        kilo_dir = worktree_path / ".kilo"
+        kilo_dir.mkdir(parents=True, exist_ok=True)
+        cfg_file = kilo_dir / "kilo.json"
+        cfg: dict[str, Any] = {}
+        if cfg_file.is_file():
+            try:
+                existing = json.loads(cfg_file.read_text(encoding="utf-8"))
+                if isinstance(existing, dict):
+                    cfg = existing
+            except Exception:
+                cfg = {}
+        mcp = cfg.get("mcp") if isinstance(cfg.get("mcp"), dict) else {}
+        mcp["chrome-devtools"] = {
+            "type": "local",
+            "command": [
+                "npx", "-y", "chrome-devtools-mcp@latest",
+                "--browserUrl", f"http://127.0.0.1:{int(port)}",
+            ],
+            "enabled": True,
+        }
+        cfg["mcp"] = mcp
+        cfg_file.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
 # Q455: canonical_model_id moved to engine.config — alias resolution now reads
 # the manifest's model_aliases block instead of an engine-side hardcoded table.
 canonical_model_id = config.canonical_model_id
+
+
+SESSION_FRESH_MS = 30 * 60 * 1000  # 30 min: a session updated within this window is presumed live
+
+
+def latest_session_activity_ms(worktree_path: Path) -> Optional[int]:
+    """Return the max session time_updated (epoch ms) recorded in kilo.db for a
+    worktree, or None when the db is missing/unreadable or the worktree has no
+    sessions."""
+    db_path = Path.home() / ".local" / "share" / "kilo" / "kilo.db"
+    wt_str = str(worktree_path.resolve())
+    if not db_path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=1.0)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT MAX(time_updated) FROM session WHERE directory = ?",
+            (wt_str,),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            return int(row[0])
+    except Exception:
+        pass
+    return None
+
+
+def session_is_fresh(worktree_path: Path, max_age_ms: int = SESSION_FRESH_MS) -> bool:
+    """True when the worktree has a kilo session updated within max_age_ms."""
+    act = latest_session_activity_ms(worktree_path)
+    if act is None:
+        return False
+    return (time.time() * 1000 - act) <= max_age_ms
+
+
+def gatehouse_convoy_is_live(cogship_id: str, repo_root: Optional[Path] = None) -> tuple[bool, str]:
+    """Mechanical version of the 'grep cogship_id before standing up a
+    Gatekeeper' ritual (2026-09-09 lesson): a convoy is live when its ephemeral
+    gatehouse worktree exists AND has a freshly-updated kilo session (an active
+    Gatekeeper), or when the convoy branch exists ahead of castle."""
+    norm = store.normalize_cogship_id(cogship_id)
+    if not norm:
+        return False, "unnormalized cogship id"
+    root = repo_root or git_ops.get_repo_root()
+    wt = root / ".kilo" / "worktrees" / f"the-gatehouse-{norm}"
+    if wt.is_dir():
+        if session_is_fresh(wt):
+            return True, f"gatehouse worktree {wt} has a session updated in the last 30 min"
+        return False, f"gatehouse worktree {wt} exists but has no fresh session (stale convoy)"
+    res = git_ops._run(
+        ["git", "rev-parse", "--verify", "--quiet", f"the-gatehouse/{norm}^{{commit}}"], root
+    )
+    if res.get("ok") and (res.get("stdout") or "").strip():
+        return False, f"branch the-gatehouse/{norm} exists but no gatehouse worktree"
+    return False, "no gatehouse worktree or branch found"
+
+
+_OP_LOCK_DIR = Path("/tmp") / "kilo-castle-op-locks"
+
+
+def _op_lock_path(name: str) -> Path:
+    """Repo-scoped lock path: two different checkouts' courts must not share
+    one lock, two windows on the same repo must."""
+    import hashlib
+    try:
+        repo = str(git_ops.get_repo_root())
+    except Exception:
+        repo = os.environ.get("COURT_DIR") or os.getcwd()
+    tag = hashlib.sha1(repo.encode("utf-8")).hexdigest()[:10]
+    return _OP_LOCK_DIR / f"{name}-{tag}.lock"
+
+
+def acquire_op_lock(name: str, stale_seconds: int = 900) -> bool:
+    """Advisory cross-window single-writer lock (Class 3: two Steward windows
+    double-running collect/ship within seconds). Held via O_EXCL lockfile for
+    the remainder of the process lifetime — the OS releases it on exit, so no
+    cleanup path is needed. Re-acquiring within the same process is idempotent
+    (sequential runs in one process are legitimate); stale locks (holder
+    crashed) are stolen after stale_seconds."""
+    _OP_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = _op_lock_path(name)
+    for _attempt in range(2):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            # Lock present: same process (idempotent), live holder, or stale?
+            try:
+                holder = lock_path.read_text().strip()
+                holder_pid = int(holder or "0")
+            except (OSError, ValueError):
+                holder, holder_pid = "", 0
+            if holder_pid == os.getpid():
+                # Re-entrant within this process: touch and succeed.
+                try:
+                    os.utime(lock_path, None)
+                except OSError:
+                    pass
+                return True
+            if holder_pid > 0:
+                try:
+                    os.kill(holder_pid, 0)
+                    return False  # holder alive; genuinely concurrent
+                except ProcessLookupError:
+                    pass  # holder died: steal, regardless of age
+                except PermissionError:
+                    return False  # alive under another user
+                except OSError:
+                    return False
+            else:
+                # Unparseable pid: fall back to the age grace before stealing.
+                try:
+                    age = time.time() - lock_path.stat().st_mtime
+                except OSError:
+                    continue  # vanished between attempts; retry create
+                if age < stale_seconds:
+                    return False
+            try:
+                lock_path.unlink()
+            except OSError:
+                return False
+            continue  # retry the exclusive create
+        except OSError:
+            return False
+        with os.fdopen(fd, "w") as f:
+            f.write(str(os.getpid()))
+        return True
+    return False
+
+
+def require_op_lock(name: str) -> None:
+    if not acquire_op_lock(name):
+        try:
+            holder = _op_lock_path(name).read_text().strip()
+        except OSError:
+            holder = "?"
+        print(
+            f"ERROR: another `{name}` run is already in progress (holder pid {holder}). "
+            f"Concurrent operators double-run convoys (cogship-040/041, cogship-247/248, "
+            f"the v1332 double-ship). Wait for it to finish instead of racing it.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def query_kilo_session_ids(worktree_path: Path) -> set[str]:
@@ -222,8 +504,15 @@ def standup_kilo_session(
     server_port: Optional[int] = None,
     server_password: Optional[str] = None,
     run_now: bool = True,
+    provider_hint: Optional[str] = None,
+    watch_quest: str = "",
 ) -> dict:
     """Stand up a Kilo session in a worktree with explicit agent mode.
+
+    A detached continuation watchdog (`court watch`) is spawned beside the
+    worker: when the single-turn run ends mid-task, the watchdog re-prompts
+    the SAME session (generalized goad). `watch_quest` binds the durable
+    quest state the watchdog checks for completion.
 
     Returns dict with keys:
     - 'ok': bool
@@ -283,7 +572,7 @@ def standup_kilo_session(
     if bin_path and run_now:
         try:
             pre_existing = query_kilo_session_ids(worktree_path)
-            qual_model = canonical_model_id(model, provider=config.get_provider("serf"))
+            qual_model = canonical_model_id(model, provider=config.get_provider(provider_hint or "serf"))
             log_dir = worktree_path / ".kilo"
             log_dir.mkdir(parents=True, exist_ok=True)
             log_file = log_dir / f"{agent}.log"
@@ -300,6 +589,7 @@ def standup_kilo_session(
                     "--model", qual_model,
                     "--dir", str(worktree_path),
                     "--title", title,
+                    "--auto",
                     prompt,
                 ]
                 proc = subprocess.Popen(
@@ -309,16 +599,65 @@ def standup_kilo_session(
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
                     start_new_session=True,
+                    env=_engine_spawn_env(worktree_path),
                 )
             finally:
                 log_out.close()
 
-            session_id = query_latest_kilo_session_id(worktree_path, timeout_seconds=2.5, exclude_ids=pre_existing) or f"kilo-{agent}-{proc.pid}"
+            session_id = query_latest_kilo_session_id(worktree_path, timeout_seconds=2.5, exclude_ids=pre_existing)
+            if session_id:
+                watch_pid = _spawn_watchdog(
+                    worktree_path, agent, proc.pid, session_id,
+                    model=qual_model,
+                    quest_ids=watch_quest,
+                    task_file="TASK.md",
+                    exclude_ids=pre_existing,
+                )
+                return {
+                    "ok": True,
+                    "mode": "cli",
+                    "session_id": session_id,
+                    "pid": proc.pid,
+                    "watchdog_pid": watch_pid,
+                    "message": f"Stood up session {session_id} (pid {proc.pid}) via Kilo CLI",
+                    "log": str(log_file),
+                }
+            # kilo-coin-36177 class (Q699): the detached process died instantly
+            # and the PID-fallback id recorded a session that never existed.
+            # poll() -> int is a real exit code; anything else (None/MagicMock
+            # in tests) is treated as alive.
+            poll_res = proc.poll()
+            if isinstance(poll_res, int):
+                tail = ""
+                try:
+                    tail = "\n".join(log_file.read_text(encoding="utf-8").splitlines()[-8:])
+                except Exception:
+                    pass
+                return {
+                    "ok": False,
+                    "mode": "dead-spawn",
+                    "session_id": "",
+                    "pid": proc.pid,
+                    "message": (
+                        f"{agent} process exited immediately (exit {poll_res}); no session was created. "
+                        f"Log tail ({log_file}):\n{tail}"
+                    ),
+                    "log": str(log_file),
+                }
+            session_id = f"kilo-{agent}-{proc.pid}"
+            watch_pid = _spawn_watchdog(
+                worktree_path, agent, proc.pid, "",
+                model=qual_model,
+                quest_ids=watch_quest,
+                task_file="TASK.md",
+                exclude_ids=pre_existing,
+            )
             return {
                 "ok": True,
                 "mode": "cli",
                 "session_id": session_id,
                 "pid": proc.pid,
+                "watchdog_pid": watch_pid,
                 "log": str(log_file),
                 "message": f"Spawned background Kilo CLI {agent} session {session_id} (PID {proc.pid})",
             }
@@ -582,6 +921,425 @@ def cmd_update(args):
     """Update and sync .court/engine/, templates, commands, prompts, and agents."""
     from court import init_cmd
     init_cmd.run_init(force=True)
+
+
+def _git_out(repo: Path, *argv: str) -> str:
+    res = subprocess.run(["git", *argv], cwd=repo, capture_output=True, text=True)
+    return res.stdout if res.returncode == 0 else ""
+
+
+
+def _push_file_to_branch(repo: Path, branch: str, rel_path: str, content: str) -> tuple[bool, str]:
+    """Commit ONE file's content onto a branch without a working tree: a
+    temporary git index is seeded from the branch tree, the file blob replaces
+    its entry (nested paths included), then write-tree/commit-tree/update-ref
+    move the branch ref. Used by `court sync` to push a royal castle ruling
+    (PUNISHED/HELD side-state) DOWN onto the quest branch so worktree roles
+    read authoritative state — without folding branch work into castle and
+    without the fast-forward assumption a plain `git push .` would need."""
+    env = {**os.environ,
+           "GIT_AUTHOR_NAME": "court", "GIT_AUTHOR_EMAIL": "court@castle",
+           "GIT_COMMITTER_NAME": "court", "GIT_COMMITTER_EMAIL": "court@castle"}
+    old_parent = _git_out(repo, "rev-parse", branch).strip()
+    if not old_parent:
+        return False, f"branch {branch} unresolvable"
+
+    blob = subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"], cwd=str(repo), input=content.encode("utf-8"),
+        capture_output=True, timeout=30,
+    )
+    if blob.returncode != 0:
+        return False, (blob.stderr or b"").decode(errors="replace").strip() or "hash-object failed"
+    blob_sha = blob.stdout.decode().strip()
+
+    mode_out = _git_out(repo, "ls-tree", branch, "--", rel_path).split()
+    mode = mode_out[0] if mode_out else "100644"
+
+    fd, index_path = tempfile.mkstemp(prefix="court-sync-idx-")
+    os.close(fd)
+    try:
+        idx_env = {**env, "GIT_INDEX_FILE": index_path}
+        r1 = subprocess.run(["git", "read-tree", branch], cwd=str(repo), env=idx_env, capture_output=True, timeout=30)
+        if r1.returncode != 0:
+            return False, (r1.stderr or b"").decode(errors="replace").strip() or "read-tree failed"
+        r2 = subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", f"{mode},{blob_sha},{rel_path}"],
+            cwd=str(repo), env=idx_env, capture_output=True, timeout=30,
+        )
+        if r2.returncode != 0:
+            return False, (r2.stderr or b"").decode(errors="replace").strip() or "update-index failed"
+        r3 = subprocess.run(["git", "write-tree"], cwd=str(repo), env=idx_env, capture_output=True, timeout=30)
+        if r3.returncode != 0:
+            return False, (r3.stderr or b"").decode(errors="replace").strip() or "write-tree failed"
+        tree_sha = r3.stdout.decode().strip()
+    finally:
+        try:
+            os.unlink(index_path)
+        except OSError:
+            pass
+
+    commit = subprocess.run(
+        ["git", "commit-tree", tree_sha, "-p", old_parent, "-m",
+         f"court: sync royal side-state ruling down to {branch}"],
+        cwd=str(repo), env=env, capture_output=True, timeout=30,
+    )
+    if commit.returncode != 0:
+        return False, (commit.stderr or b"").decode(errors="replace").strip() or "commit-tree failed"
+    commit_sha = commit.stdout.decode().strip()
+    res = subprocess.run(
+        ["git", "update-ref", f"refs/heads/{branch}", commit_sha, old_parent],
+        cwd=str(repo), capture_output=True, timeout=30,
+    )
+    if res.returncode != 0:
+        return False, (res.stderr or b"").decode(errors="replace").strip() or "update-ref failed"
+    git_ops.clear_git_cache()
+    return True, commit_sha[:12]
+
+
+def _union_events(branch_text: str, castle_text: str) -> str:
+    """Union two diverged .events.jsonl streams: keep every line from both
+    (deduped), stably ordered by ts so the fold's last-by-ts rule resolves
+    the effective state. Branch lines win equal-ts ties (castle extras are
+    appended after the branch stream before the stable sort)."""
+    b_lines = [ln for ln in (branch_text or "").splitlines() if ln.strip()]
+    c_lines = [ln for ln in (castle_text or "").splitlines() if ln.strip()]
+    if not c_lines:
+        return branch_text or ""
+    seen = set(b_lines)
+    extras = [ln for ln in c_lines if ln not in seen]
+    if not extras:
+        return branch_text or ""
+    merged = b_lines + extras
+
+    def _ts(ln: str) -> str:
+        try:
+            return str(json.loads(ln).get("ts", ""))
+        except Exception:
+            return ""
+
+    merged.sort(key=_ts)
+    return "\n".join(merged) + "\n"
+
+
+def _union_merge_quest(base_md: str, castle_md: str, branch_md: str):
+    """Three-way section-level union of diverged charter paperwork.
+
+    Per the established conflict policy (charter paperwork -> branch-wins),
+    a section only conflicts when BOTH sides changed it to DIFFERENT content
+    relative to the merge-base. Castle-only changes (dispatch stamps, master
+    charter advances) and branch-only changes (tribute, ledger prose) both
+    survive. Returns (merged_text | None, conflicts, disclosures)."""
+    from court import models as _models
+    try:
+        base_q = _models.Quest.from_markdown(base_md or "")
+        castle_q = _models.Quest.from_markdown(castle_md or "")
+        branch_q = _models.Quest.from_markdown(branch_md or "")
+    except ValueError:
+        return None, ["not in modern charter shape"], []
+
+    fields_out = {}
+    for f in _models.FRONTMATTER_FIELDS:
+        bv = str(getattr(branch_q, f, "") or "")
+        cv = str(getattr(castle_q, f, "") or "")
+        basev = str(getattr(base_q, f, "") or "")
+        fields_out[f] = cv if (bv == basev and cv != basev) else bv
+
+    section_keys = []
+    for src in (base_q.body_sections, castle_q.body_sections, branch_q.body_sections):
+        for k in src:
+            if k not in section_keys:
+                section_keys.append(k)
+
+    conflicts, disclosures = [], []
+    sections_out = {}
+    for section in section_keys:
+        basev = (base_q.body_sections.get(section, "") or "").strip()
+        cv = (castle_q.body_sections.get(section, "") or "").strip()
+        bv = (branch_q.body_sections.get(section, "") or "").strip()
+        if cv == basev:
+            sections_out[section] = bv
+        elif bv == basev:
+            if cv:
+                disclosures.append(f"section '{section}': castle-side change kept")
+            sections_out[section] = cv
+        elif bv == cv:
+            sections_out[section] = bv
+        else:
+            conflicts.append(section)
+    if conflicts:
+        return None, conflicts, disclosures
+    quest = _models.Quest(**fields_out, body_sections=sections_out)
+    return quest.to_markdown(), [], disclosures
+
+
+def cmd_sync(args):
+    """Pull branch-tip quest paperwork into the main checkout.
+
+    The manual half of the ledger single-source-of-truth fix (punished Q696):
+    serf self-advances and coin audits commit paperwork on the quest branch,
+    while the board and `collect` read the main checkout's ledger — the two
+    fork silently. For each quest this reads the committed branch tip (never
+    the worktree working tree), compares it against the main checkout's
+    copies, and applies the established conflict policy:
+
+      - branch changed, main checkout unchanged since the merge-base
+            -> branch-wins: charter + events copied onto the main checkout.
+      - main checkout changed, branch unchanged
+            -> castle-ahead: nothing to do.
+      - both changed
+            -> section-level union: branch paperwork wins conflicts,
+               castle-only changes survive; only a true edit war (both sides
+               rewrote the SAME section differently) refuses.
+    """
+    repo = git_ops.get_repo_root()
+    quests_dir = store.get_quests_dir()
+    base = getattr(args, "base", None) or "castle"
+
+    ids = [x for x in (args.quest_ids or []) if x]
+    if getattr(args, "all", False):
+        ids = [p.stem for p in sorted(quests_dir.glob("*.md"))]
+        ids = [i for i in ids if not i.endswith(".events")]
+    if not ids:
+        if getattr(args, "all", False):
+            # A cron-driven `sync --all` on an empty ledger is normal, not an
+            # error (the engine repo itself keeps only events files).
+            print("Ledger sync: ledger has no quest files — nothing to sync")
+            return
+        print("No quest ids given (usage: court sync <id> [<id>...] | --all)")
+        sys.exit(2)
+
+    synced, united, clean, ahead, mixed, missing, frozen, pushed = [], [], [], [], [], [], [], []
+    staged: list[Path] = []
+    for qid in ids:
+        qpath = store.find_path(qid, quests_dir.parent)
+        if not qpath or not qpath.exists():
+            missing.append(qid)
+            print(f"  ? {qid}: quest file not found in the main checkout")
+            continue
+        rel = qpath.relative_to(repo).as_posix()
+        rel_events = rel[: -len(".md")] + ".events.jsonl"
+        head_fm = qpath.read_text(encoding="utf-8")[:2000]
+        m = re.search(r"^branch:\s*(\S+)", head_fm, re.MULTILINE)
+        branch = m.group(1) if m else ""
+        if not branch:
+            print(f"  - {qpath.stem}: no branch in frontmatter — skipping")
+            continue
+        if not _git_out(repo, "rev-parse", "--verify", "--quiet", branch):
+            print(f"  - {qpath.stem}: branch {branch} not found — skipping")
+            continue
+
+        # Direction guard (Q707-era roll-up failures): a castle PUNISHED/HELD
+        # ruling is royal authority — NEVER fold a branch tip over it, even a
+        # branch that also changed. The ruling is pushed DOWN onto the branch
+        # instead so worktree roles read the authoritative state (only the
+        # side-state stamp travels, never a fold of work).
+        try:
+            castle_quest = Quest.from_markdown(qpath.read_text(encoding="utf-8"))
+        except ValueError:
+            castle_quest = None
+        if castle_quest is not None and castle_quest.status in ("PUNISHED", "HELD"):
+            b_show = _git_out(repo, "show", f"{branch}:{rel}")
+            try:
+                b_status = Quest.from_markdown(b_show).status if b_show else ""
+            except ValueError:
+                b_status = ""
+            if b_show and b_status != castle_quest.status:
+                ok, detail = _push_file_to_branch(repo, branch, rel, qpath.read_text(encoding="utf-8"))
+                if ok:
+                    pushed.append(qpath.stem)
+                    print(f"  ⚓ {qpath.stem}: castle side-state [{castle_quest.status}] is royal — branch NOT folded; ruling committed to {branch}")
+                else:
+                    print(f"  ⚓ {qpath.stem}: castle side-state [{castle_quest.status}] kept (branch fold refused); push-down failed: {detail}")
+            else:
+                print(f"  ⚓ {qpath.stem}: castle side-state [{castle_quest.status}] is royal — nothing to fold")
+            frozen.append(qpath.stem)
+            continue
+
+        b_md = _git_out(repo, "show", f"{branch}:{rel}")
+        b_events = _git_out(repo, "show", f"{branch}:{rel_events}")
+        c_md = qpath.read_text(encoding="utf-8")
+        c_events_p = qpath.with_suffix(".events.jsonl")
+        c_events = c_events_p.read_text(encoding="utf-8") if c_events_p.exists() else ""
+
+        if b_md == c_md and b_events == c_events:
+            clean.append(qpath.stem)
+            print(f"  = {qpath.stem}: clean (branch tip matches the main checkout)")
+            continue
+
+        mb = _git_out(repo, "merge-base", base, branch).strip()
+        paths = [rel] + ([rel_events] if c_events or b_events else [])
+        castle_changed = bool(_git_out(repo, "diff", "--name-only", f"{mb}..{base}", "--", *paths).strip()) if mb else True
+        branch_changed = bool(_git_out(repo, "diff", "--name-only", f"{mb}..{branch}", "--", *paths).strip()) if mb else True
+
+        if castle_changed and branch_changed:
+            base_md = _git_out(repo, "show", f"{mb}:{rel}") if mb else ""
+            merged_md, conflicts, disclosures = _union_merge_quest(base_md, c_md, b_md)
+            if merged_md is None:
+                mixed.append(qpath.stem)
+                print(f"  ✗ {qpath.stem}: MIXED fork — both sides rewrote the same sections; refusing (resolve manually)")
+                for csection in conflicts[:4]:
+                    print(f"      conflicting section: {csection}")
+                continue
+            qpath.write_text(merged_md, encoding="utf-8")
+            staged.append(qpath)
+            merged_events = _union_events(b_events, c_events)
+            qpath.with_suffix(".events.jsonl").write_text(merged_events, encoding="utf-8")
+            staged.append(qpath.with_suffix(".events.jsonl"))
+            united.append(qpath.stem)
+            print(f"  ⊕ {qpath.stem}: mixed fork united (branch paperwork + castle-only changes)")
+            for d in disclosures[:4]:
+                print(f"      {d}")
+            continue
+        if castle_changed and not branch_changed:
+            ahead.append(qpath.stem)
+            # Castle-ahead sync-down (Q707: an hour of stale charters in the
+            # worktree): dispatch records and M'Lord's amendments live on
+            # castle only — push the charter DOWN into the quest worktree and
+            # commit it on the branch so the serf reads the current charter.
+            wt_dir = Path(castle_quest.worktree) if (castle_quest and castle_quest.worktree) else None
+            if wt_dir and wt_dir.is_dir():
+                dirty = subprocess.run(
+                    ["git", "status", "--porcelain"], cwd=str(wt_dir),
+                    capture_output=True, text=True, timeout=30,
+                ).stdout.strip()
+                if dirty:
+                    print(f"  > {qpath.stem}: castle-ahead — worktree dirty, charter NOT pushed down (don't stomp live work)")
+                else:
+                    wt_charter = wt_dir / ".court" / "quests" / qpath.name
+                    try:
+                        wt_charter.parent.mkdir(parents=True, exist_ok=True)
+                        wt_charter.write_text(c_md, encoding="utf-8")
+                        wt_events = wt_charter.with_suffix(".events.jsonl")
+                        if c_events:
+                            wt_events.write_text(c_events, encoding="utf-8")
+                        add = subprocess.run(
+                            ["git", "add", "--", wt_charter.name] + ([wt_events.name] if c_events else []),
+                            cwd=str(wt_charter.parent), capture_output=True, timeout=30,
+                        )
+                        commit = subprocess.run(
+                            ["git", "commit", "-m", f"court: sync castle charter down to worktree ({qpath.stem})"],
+                            cwd=str(wt_dir), capture_output=True, timeout=60,
+                            env={**os.environ,
+                                 "GIT_AUTHOR_NAME": "court", "GIT_AUTHOR_EMAIL": "court@castle",
+                                 "GIT_COMMITTER_NAME": "court", "GIT_COMMITTER_EMAIL": "court@castle"},
+                        )
+                    except OSError as e:
+                        add = commit = None
+                        print(f"  > {qpath.stem}: castle-ahead — sync-down failed: {e}")
+                    commit_out = "" if commit is None else ((commit.stdout or b"") + (commit.stderr or b"")).decode(errors="replace")
+                    if add is not None and add.returncode != 0:
+                        print(f"  > {qpath.stem}: castle-ahead — sync-down add failed: {(add.stderr or b'').decode(errors='replace').strip()[:200]}")
+                    elif commit is not None and commit.returncode == 0:
+                        pushed.append(qpath.stem)
+                        git_ops.clear_git_cache()
+                        print(f"  ⇣ {qpath.stem}: castle-ahead charter synced DOWN to the worktree (dispatch records/amendments)")
+                    elif commit is not None and "nothing to commit" in commit_out:
+                        print(f"  > {qpath.stem}: castle-ahead — worktree charter already current")
+                    elif commit is not None:
+                        print(f"  > {qpath.stem}: castle-ahead — sync-down commit failed: {commit_out.strip()[:200]}")
+            else:
+                print(f"  > {qpath.stem}: castle-ahead — main checkout already newer, nothing to do")
+            continue
+
+        # branch strictly ahead: branch-wins for charter paperwork
+        qpath.write_text(b_md, encoding="utf-8")
+        staged.append(qpath)
+        if b_events:
+            qpath.with_suffix(".events.jsonl").write_text(b_events, encoding="utf-8")
+            staged.append(qpath.with_suffix(".events.jsonl"))
+        elif c_events:
+            print(f"      note: branch carries no events file; kept the main checkout's events")
+        synced.append(qpath.stem)
+        print(f"  ✓ {qpath.stem}: synced branch paperwork onto the main checkout (branch-wins)")
+
+    if staged:
+        msg = "court: sync quest ledger from branch — " + ", ".join(synced[:6]) + ("…" if len(synced) > 6 else "")
+        res = git_ops.git_commit_paths(staged, msg, cwd=repo)
+        if not res.get("ok", True):
+            print(f"  commit failed: {res}")
+            sys.exit(1)
+    print()
+    print(f"Ledger sync: {len(synced)} synced, {len(united)} united, {len(clean)} clean, {len(ahead)} castle-ahead, {len(frozen)} side-state-royal ({len(pushed)} ruling(s) pushed down), {len(mixed)} MIXED, {len(missing)} not found")
+    if mixed:
+        print(f"  Unresolvable edit wars need manual resolution: {', '.join(mixed)}")
+        if getattr(args, "all", False):
+            print("  (global sync: edit wars are reported, not fatal — resolve them by hand)")
+        else:
+            sys.exit(1)
+
+
+def cmd_events_repair(args):
+    """Rebuild a canonical body section (default: Tribute Rendered) whose
+    event-fold view was blinded by mis-keyed section events — the
+    cogship-253 / Q661 / Q688 incident (2026-09-30), where tribute part
+    headers (## Ballad, ...) were parsed as top-level sections and the
+    canonical section was saved empty, last-write-wins over the real content.
+
+    Recovery order: (1) the latest non-empty historical value of the section
+    itself from the event log; (2) reassembly from the mis-keyed tribute-part
+    events in first-appearance order. The repair appends one corrective event
+    through the normal save path — the event log stays append-only; nothing
+    is rewritten or deleted."""
+    from .models import DEFAULT_BODY_SECTIONS, _TRIBUTE_PART_ALIASES, _TRIBUTE_PART_ORDER
+
+    section = args.section or "Tribute Rendered"
+    if section not in DEFAULT_BODY_SECTIONS:
+        print(f"ERROR: {section!r} is not a canonical body section.", file=sys.stderr)
+        sys.exit(1)
+    quest = store.load(args.quest_id)
+    path = store.find_path(quest.id)
+    if path is None:
+        print(f"ERROR: no file found for {quest.id}", file=sys.stderr)
+        sys.exit(1)
+    events = store.eventlog.read_events(store.eventlog.events_path_for(path))
+    current = quest.body_sections.get(section, "")
+    if current.strip() and not args.force:
+        print(f"ℹ️  {quest.id}.{section} is non-empty ({len(current)} chars) in the current fold; nothing to repair (use --force to rebuild anyway).")
+        return
+
+    rebuilt = ""
+    strategy = ""
+    for ev in events:
+        if ev.get("target") == f"section:{section}":
+            val = str(ev.get("value") or "")
+            if val.strip():
+                rebuilt = val
+                strategy = "latest non-empty historical value"
+    if not rebuilt.strip():
+        part_val: dict = {}
+        part_seq: dict = {}
+        for seq, ev in enumerate(events):
+            target = ev.get("target") or ""
+            if not target.startswith("section:") or target == f"section:{section}":
+                continue
+            name = target[len("section:"):]
+            if name.lower() not in _TRIBUTE_PART_ALIASES:
+                continue
+            val = str(ev.get("value") or "")
+            if val.strip():
+                part_seq.setdefault(name, seq)
+                part_val[name] = val
+        if part_val:
+            canon_lower = [c.lower() for c in _TRIBUTE_PART_ORDER]
+
+            def _part_order(item):
+                name, _first_seq = item
+                canon = _TRIBUTE_PART_ALIASES.get(name.lower(), "")
+                idx = canon_lower.index(canon) if canon in canon_lower else len(canon_lower)
+                return (idx, part_seq[name])
+
+            rebuilt = "\n\n".join(
+                f"## {name}\n\n{part_val[name].strip()}"
+                for name, _ in sorted(part_val.items(), key=_part_order)
+            )
+            strategy = f"reassembled from {len(part_val)} mis-keyed tribute-part events"
+    if not rebuilt.strip():
+        print(f"ERROR: no recoverable {section} content found in {quest.id}'s event log.", file=sys.stderr)
+        sys.exit(1)
+    quest.set_section(section, rebuilt)
+    quest.updated_at = now_iso()
+    store.save(quest, commit_msg=f"court: events-repair {section} for {quest.id}")
+    print(f"🩹 Repaired {quest.id}.{section}: {len(rebuilt)} chars restored ({strategy}); corrective event appended.")
 
 
 def cmd_ward(args):
@@ -975,13 +1733,14 @@ def cmd_status(args):
                 "tags": q.tags,
                 "status": q.status,
                 "branch": q.branch,
-                "worktree": audit.worktree,
+                "worktree": audit.worktree_path,
                 "serf_session_id": q.serf_session_id,
                 "serf_model": q.serf_model,
                 "master_of_coin_session_id": q.master_of_coin_session_id,
                 "gatekeeper_session_id": q.gatekeeper_session_id,
                 "parent_epic": q.parent_epic,
                 "scout_of": getattr(q, "scout_of", ""),
+                "cogship_id": q.cogship_id or "",
                 "is_compliant": audit.is_compliant,
                 "git_status": audit.git_status,
                 "task_progress": audit.task_progress,
@@ -1181,7 +1940,7 @@ def cmd_status(args):
 
     orphans = find_orphaned_worktrees()
     if orphans:
-        print(f"Note: {len(orphans)} orphaned worktrees exist in Agent Manager (court timber / court raze / court fork-teardown-list available for cleanup).")
+        print(f"Note: {len(orphans)} orphaned worktrees exist on disk (court timber / court raze / court fork-teardown-list available for cleanup).")
 
 
 def cmd_pillory(args):
@@ -1268,6 +2027,90 @@ def cmd_advance(args):
                 forced_note = (
                     f"(FORCED - {len(audit.violations)} COMPLIANCE VIOLATION(S): "
                     f"{'; '.join(audit.violations)}) {args.note}"
+                ).strip()
+                quest.set_status(new_status, forced_note)
+            else:
+                quest.set_status(new_status, args.note or "")
+
+        elif new_status == "TRIBUTE_READY":
+            # Hardened TRIBUTE_READY guard (Q277/Q696 class): the most-used
+            # transition ran on a bare else — no tribute-completeness, no
+            # unchecked-checklist, no base-drift check — so quests like Q277
+            # self-advanced with an empty Tribute Rendered, unchecked Expected
+            # Tribute boxes, and 187 commits of drift. GATE and READY_TO_RAZE
+            # already carry hardened, --force-marked guards; TRIBUTE_READY now
+            # matches them. ward.audit_quest only flags tribute gaps once the
+            # quest is *already* TRIBUTE_READY+, so completeness is checked
+            # here explicitly with ward.check_tribute_sections (status-free).
+            tribute_present, _present_secs, missing_secs, _extracted = ward.check_tribute_sections(quest)
+            blockers: list[str] = []
+            if not tribute_present:
+                blockers.append(
+                    "Tribute Rendered is empty or a placeholder — render the required "
+                    "sections (Ballad, Tribute, Tally, Penance, Audience, Opinion; scouts: "
+                    "Survey, Map, Dangers, Tribute, Plot) before advancing."
+                )
+            elif missing_secs:
+                blockers.append(
+                    f"Incomplete tribute: missing required subsection(s): {', '.join(missing_secs)}."
+                )
+
+            checklist = ward.parse_markdown_checklist(quest.body_sections.get("Expected Tribute", ""))
+            # Hotfix fast-track exemption: patchwork quests carry an advisory
+            # checklist and promote via inline verification (the hotfix collect
+            # auto-advance never checked it either); the hard checklist gate
+            # would block the exact flow the hotfix doctrine prescribes.
+            is_hotfix = bool(getattr(quest, "is_hotfix", False)) or "hotfix" in (quest.tags or "").lower()
+            if (
+                not is_hotfix
+                and checklist.get("total", 0) > 0
+                and checklist.get("unchecked", 0) > 0
+            ):
+                blockers.append(
+                    f"Expected Tribute has {checklist['unchecked']} unchecked item(s) of "
+                    f"{checklist['total']} — complete the checklist or mark cancelled [~] before advancing."
+                )
+
+            wt_for_guard = quest.worktree if (quest.worktree and Path(quest.worktree).is_dir()) else None
+            base_branch = getattr(args, "base", None) or "castle"
+            if wt_for_guard:
+                git_stat = git_ops.get_worktree_git_status(Path(wt_for_guard), base=base_branch)
+                if git_stat.get("dirty"):
+                    blockers.append(
+                        "Worktree has uncommitted files — stage and commit deliverables "
+                        "(Gate 2) before advancing."
+                    )
+                behind = git_stat.get("behind")
+                if behind is not None and behind > 0:
+                    blockers.append(
+                        f"{behind} commit(s) behind {base_branch} — run the deferred rebase "
+                        f"`git merge {base_branch}` (zero drift) before advancing."
+                    )
+                actual_branch = (git_stat.get("branch") or "").replace("refs/heads/", "")
+                quest_branch = (quest.branch or "").replace("refs/heads/", "")
+                if actual_branch and quest_branch and actual_branch != quest_branch:
+                    blockers.append(
+                        f"Worktree is on branch '{actual_branch}' but frontmatter says "
+                        f"'{quest_branch}' — reconcile before advancing."
+                    )
+            elif not wt_for_guard and quest.kind not in ("epic", "scout"):
+                blockers.append(
+                    "Quest has no resolvable worktree — a code-bearing quest cannot render "
+                    "tribute without one."
+                )
+
+            if blockers and not force:
+                blocker_lines = "\n".join(f"  🔴 {b}" for b in blockers)
+                print(
+                    f"ERROR: Cannot advance {quest.id} to TRIBUTE_READY: {len(blockers)} blocker(s).\n"
+                    f"{blocker_lines}\n\n"
+                    f"To bypass this check, use: python3 -m court.cli advance {quest.id} TRIBUTE_READY --force --note \"<reason>\"",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            elif blockers:
+                forced_note = (
+                    f"(FORCED - {len(blockers)} TRIBUTE-READINESS BLOCKER(S): {'; '.join(blockers)}) {args.note}"
                 ).strip()
                 quest.set_status(new_status, forced_note)
             else:
@@ -1579,7 +2422,7 @@ def _print_charter_next_steps(quest: Quest, am_section: str) -> None:
             f'   kilo worktree create {wt_name}',
             f'   kilo run --agent serf --model "{config.get_model("serf")}" --provider "{config.get_provider("serf")}" --dir <WORKTREE_PATH> "<TASK_PROMPT>"',
             f"",
-            f"2. Or if manually spawning an Agent Manager UI session in section \"{section_display}\":",
+            f"2. Or if manually spawning a session in any UI in section \"{section_display}\":",
             f"   python3 -m court.cli dispatch-complete {quest.id} \\",
             f"       --session-id <SESSION_ID> --branch {branch} --worktree <WORKTREE_PATH>",
         ],
@@ -1635,7 +2478,7 @@ def _print_migration_lane_advisory(chartered_quest: Quest, base_ref: str = "cast
 def cmd_charter(args):
     """Composite charter (Q183): fold M'Lord's notes into `The Kingdom Requires`,
     idempotently advance OPEN -> PLANNED, compute the canonical branch when
-    unset, and print the NEXT STEPS block for the irreducible `agent_manager`
+    unset, and print the NEXT STEPS block for the Kilo CLI
     Serf spawn. One command, ONE commit — replaces the old 2-invocation
     pre-dispatch plumbing sequence (set-section --append + advance PLANNED).
 
@@ -1847,6 +2690,7 @@ def cmd_dispatch(args):
         title=f"{quest.id} {role_label} Worker",
         kilo_bin=kilo_bin,
         run_now=run_now,
+        watch_quest=quest.id,
     )
     if not session_id:
         if getattr(args, "create_worktree", False) or getattr(args, "native", False):
@@ -1861,7 +2705,11 @@ def cmd_dispatch(args):
     quest.updated_at = now_iso()
 
     entered_working = False
-    if quest.status in ("OPEN", "PLANNED"):
+    if quest.status in ("OPEN", "PLANNED", "CHARTERED"):
+        # Q695 (2026-09-28): CHARTERED quests were skipped here ("already
+        # [CHARTERED] — transitions skipped"), leaving a freshly dispatched
+        # serf toiling under a stale status. CHARTERED is dispatchable like
+        # PLANNED — route it through the same DISPATCHED -> WORKING path.
         quest.set_status("DISPATCHED", f"{role_label} dispatched (`court dispatch`)")
         quest.set_status("WORKING", f"{role_label} toiling in worktree (`court dispatch`)")
         entered_working = True
@@ -2013,7 +2861,7 @@ def cmd_patchwork(args):
             print(f"🪙 Inline Master of Coin audit recorded for {quest.id}.")
 
         if quest.status != "GATE":
-            cogship_id = store.stamp_cogship([quest], cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit)
+            cogship_id = store.stamp_cogship([quest], cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit, force=getattr(args, "force_stamp", False))
             quest.set_status("GATE", f"Hotfix packed in {cogship_id} for solo gatehouse promotion")
             store.save(quest, auto_commit=auto_commit, commit_msg=f"court: advance {quest.id} to GATE in {cogship_id}")
             print(f"🛡️  Advanced {quest.id} to GATE in {cogship_id}.")
@@ -2058,7 +2906,7 @@ def cmd_patchwork(args):
                 sys.exit(1)
 
         if not quest.cogship_id:
-            cogship_id = store.stamp_cogship([quest], cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit)
+            cogship_id = store.stamp_cogship([quest], cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit, force=getattr(args, "force_stamp", False))
         if not quest.body_sections.get("Master of Coin's Audit", "").strip():
             quest.set_section("Master of Coin's Audit", "### Master of Coin Audit (Hotfix Fast-Track)\n- **Verdict**: PASS (Hotfix inline verified)\n- **Commutation**: None required\n- **UI Review**: None required\n")
         quest.set_status("READY_TO_RAZE", f"Hotfix promoted directly into {base_branch}")
@@ -2146,6 +2994,7 @@ def cmd_coin(args):
         "--model", qual_model,
         "--dir", str(wt),
         "--title", title,
+        "--auto",
         rendered_prompt,
     ]
 
@@ -2155,12 +3004,25 @@ def cmd_coin(args):
     if wait:
         print(f"🪙 Running Master of Coin audit for {quest.id} synchronously (agent: master_of_coin, model: {qual_model})...")
         pre_existing = query_kilo_session_ids(wt)
-        res = subprocess.run(cmd, cwd=str(wt))
+        res = subprocess.run(cmd, cwd=str(wt), env=_engine_spawn_env(wt))
         session_id = query_latest_kilo_session_id(wt, exclude_ids=pre_existing) or query_latest_kilo_session_id(wt)
         if session_id:
             quest.master_of_coin_session_id = session_id
             quest.master_of_coin_model = model
             store.save(quest, auto_commit=auto_commit, commit_msg=f"court: record MoC session {session_id} for {quest.id}")
+        # Q699 class: kilo-coin-36177 died with an empty audit on both copies
+        # while the dispatch printed success. A completed run that produced no
+        # verdict is a failed audit, not a success.
+        fresh = store.load(quest.id)
+        audit_body = fresh.body_sections.get("Master of Coin's Audit", "").strip()
+        if res.returncode == 0 and (not audit_body or ward.is_placeholder(audit_body)):
+            print(
+                f"ERROR: Master of Coin run exited 0 but produced no verdict — "
+                f"'Master of Coin's Audit' is empty on {quest.id}. Re-dispatch "
+                f"(`court coin {quest.id}`) and check the log: tail -40 {log_file}",
+                file=sys.stderr,
+            )
+            return 1
         return res.returncode
     else:
         pre_existing = query_kilo_session_ids(wt)
@@ -2175,10 +3037,32 @@ def cmd_coin(args):
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
+                env=_engine_spawn_env(wt),
             )
         finally:
             log_out.close()
-        session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5, exclude_ids=pre_existing) or f"kilo-coin-{proc.pid}"
+        _spawn_watchdog(
+            wt, "master_of_coin", proc.pid, "",
+            model=qual_model,
+            quest_ids=quest.id,
+            task_file="TASK_COIN.md",
+            exclude_ids=pre_existing,
+        )
+        session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5, exclude_ids=pre_existing)
+        # kilo-coin-36177 class (Q699): verify the detached process actually
+        # survived spawn before recording a session id. A PID-fallback id for
+        # an instantly-dead process is a session that never existed — the
+        # empty '## Master of Coin's Audit' both copies showed. A MagicMock
+        # poll() (tests) is treated as alive.
+        poll_res = proc.poll() if hasattr(proc, "poll") else None
+        if session_id is None and isinstance(poll_res, int):
+            print(
+                f"ERROR: Master of Coin process exited immediately (exit {poll_res}); no session was created. "
+                f"Log tail: tail -20 {log_file}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        session_id = session_id or f"kilo-coin-{proc.pid}"
         quest.master_of_coin_session_id = session_id
         quest.master_of_coin_model = model
         store.save(quest, auto_commit=auto_commit, commit_msg=f"court: dispatch MoC {session_id} for {quest.id}")
@@ -2249,6 +3133,7 @@ def cmd_goad(args):
         "--model", qual_model,
         "--dir", str(wt),
         "--title", title,
+        "--auto",
         rendered_prompt,
     ]
 
@@ -2265,10 +3150,29 @@ def cmd_goad(args):
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            env=_engine_spawn_env(wt),
         )
     finally:
         log_out.close()
-    session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5, exclude_ids=pre_existing) or f"kilo-{agent_role}-{proc.pid}"
+    _spawn_watchdog(
+        wt, agent_role, proc.pid, "",
+        model=qual_model,
+        quest_ids=quest.id,
+        task_file="TASK_GOAD.md",
+        exclude_ids=pre_existing,
+    )
+    session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5, exclude_ids=pre_existing)
+    # Same instant-death verification as cmd_coin (Q699 class): refuse to
+    # record a session id for a process that died on spawn.
+    poll_res = proc.poll() if hasattr(proc, "poll") else None
+    if session_id is None and isinstance(poll_res, int):
+        print(
+            f"ERROR: Goaded {role_label} process exited immediately (exit {poll_res}); no session was created. "
+            f"Log tail: tail -20 {log_file}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    session_id = session_id or f"kilo-{agent_role}-{proc.pid}"
     quest.serf_session_id = session_id
     store.save(quest, auto_commit=auto_commit, commit_msg=f"court: goad {role_label} session {session_id} for {quest.id}")
     print(f"⚡ Goaded {role_label} for {quest.id}:")
@@ -2277,6 +3181,320 @@ def cmd_goad(args):
     print(f"   Model:    {qual_model}")
     print(f"   Worktree: {wt}")
     print(f"   Log:      tail -f {log_file}")
+
+
+# ---------------------------------------------------------------------------
+# Continuation watchdog (single-turn death class): `kilo run` exits when the
+# agent ends its turn — two of three cogship-253-era Gatekeeper attempts died
+# exactly there, mid-task, and long Serf runs only survived via manual goads.
+# The engine now spawns a detached `court watch` process beside every worker
+# spawn; it waits for the worker process to exit and, when the durable quest
+# state says the work is NOT done, re-prompts the SAME session
+# (`kilo run --session <id>`) up to N attempts. Generalizes `court goad` to
+# every role, mechanically, without babysitting the dispatching session.
+# ---------------------------------------------------------------------------
+
+WATCH_POLL_SECONDS = 5
+WATCH_MAX_ATTEMPTS = 3
+WATCH_WALL_CAP_SECONDS = 24 * 3600
+
+# A worker's turn may end early ONLY while its quest sits in one of these
+# pre-terminal states; anything else means the run finished its durable
+# paperwork (or is human-blocked in HELD/PUNISHED) and must not be re-prompted.
+_WATCH_ROLE_ACTIVE_STATES = {
+    "serf": ("DISPATCHED", "WORKING"),
+    "scout": ("DISPATCHED", "WORKING"),
+    "gatekeeper": ("GATE",),
+    "master_of_coin": ("TRIBUTE_READY",),
+}
+
+
+def watch_should_continue(
+    role: str,
+    quests: list,
+    exit_code: Optional[int] = None,
+) -> tuple[bool, str]:
+    """Decide whether an ended worker turn needs a same-session continuation.
+
+    Pure decision over durable state: non-zero exit always re-prompts (crashed
+    or permission-killed turn); a clean exit re-prompts only while the quest
+    still sits in the role's active (pre-terminal) state. Roles without a quest
+    binding (artist) are never re-prompted."""
+    if isinstance(exit_code, int) and exit_code != 0:
+        return True, f"process exited {exit_code} before completing"
+    active = _WATCH_ROLE_ACTIVE_STATES.get(role or "")
+    if not quests or not active:
+        return False, "no quest in an active state (turn complete or role has no quest)"
+    stuck = [q.id for q in quests if q.status in active]
+    if stuck:
+        return True, f"{role} turn ended while {', '.join(stuck)} still in active state ({'/'.join(active)})"
+    return False, "quest advanced past the role's active state (work rendered)"
+
+
+def _watch_state_path(worktree: Path, role: str) -> Path:
+    return worktree / ".kilo" / "watch" / f"{role}.json"
+
+
+def _watch_write_state(worktree: Path, role: str, payload: dict) -> None:
+    try:
+        p = _watch_state_path(worktree, role)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _watch_log(worktree: Path, role: str, line: str) -> None:
+    try:
+        log_file = worktree / ".kilo" / f"{role}.log"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n--- watch ({role}): {line} ---\n")
+    except OSError:
+        pass
+
+
+def _load_watch_quests(quest_ids: str, worktree: Optional[Path]) -> list:
+    """Load the quest binding for a watch decision from the WORKTREE's own
+    ledger (the freshest copy — the branch store the worker itself advances)."""
+    out = []
+    for qid in [x.strip() for x in (quest_ids or "").split(",") if x.strip()]:
+        try:
+            out.append(store.load(qid, court_root=(worktree / ".court") if worktree else None))
+        except Exception:
+            continue
+    return out
+
+
+def _process_alive(pid: Optional[int]) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def cmd_watch(args):
+    """Detached continuation watchdog for an engine-spawned worker run.
+
+    Waits for the kilo run process (pid) to exit; when the durable quest state
+    says the run ended mid-task, re-prompts the SAME --session up to
+    --max-attempts times. Never re-prompts human-blocked (HELD/PUNISHED) or
+    completed work. State lands in .kilo/watch/<role>.json."""
+    wt = Path(args.dir).resolve() if args.dir else None
+    role = args.agent
+    session_id = (args.session or "").strip()
+    attempt = max(1, int(getattr(args, "attempt", 1)))
+    max_attempts = max(1, int(args.max_attempts))
+    deadline = time.time() + int(args.wall_cap)
+    exclude = {x for x in (getattr(args, "exclude", "") or "").split(",") if x}
+
+    pid = args.pid
+    if pid and not _process_alive(pid):
+        print(f"watch: worker pid {pid} already gone before watch started", file=sys.stderr)
+        return
+
+    # A pid-fallback spawn has no resolvable session yet: poll for it briefly
+    # so a crash-free spawn can still be continued on the right session.
+    if wt and not session_id and exclude:
+        for _ in range(int(args.session_resolve_seconds) // 2):
+            session_id = query_latest_kilo_session_id(wt, timeout_seconds=2, exclude_ids=exclude) or ""
+            if session_id:
+                break
+            if pid and not _process_alive(pid):
+                break
+
+    while True:
+        # Wait for the worker process to end its turn.
+        while pid and _process_alive(pid):
+            if time.time() > deadline:
+                _watch_log(wt or Path.cwd(), role, f"wall cap reached; abandoning watch of {session_id or pid}")
+                return
+            time.sleep(WATCH_POLL_SECONDS)
+
+        quests = _load_watch_quests(getattr(args, "quest", "") or "", wt)
+        # The watchdog is not the worker's parent, so no exit code is
+        # observable — the durable quest state is the completion signal.
+        cont, why = watch_should_continue(role, quests, None)
+        _watch_log(wt or Path.cwd(), role, f"turn ended (pid {pid}, session {session_id or '-'}): {why}")
+        _watch_write_state(wt or Path.cwd(), role, {
+            "role": role,
+            "session_id": session_id,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "quests": [q.id for q in quests],
+            "continue": cont,
+            "reason": why,
+            "ts": now_iso(),
+        })
+        if not cont:
+            return
+        if attempt >= max_attempts:
+            _watch_log(wt or Path.cwd(), role, f"attempt {attempt}/{max_attempts} still incomplete — manual goad required")
+            print(f"watch: attempt {attempt}/{max_attempts} ended mid-task ({why}); manual `court goad` required", file=sys.stderr)
+            return
+        if not (session_id or (wt and exclude)):
+            _watch_log(wt or Path.cwd(), role, "no resolvable session id — cannot re-prompt the same session")
+            return
+
+        # Re-prompt the SAME session with a continuation of the original task.
+        task_text = ""
+        for tf in ((getattr(args, "task_file", "") or "TASK.md"), "TASK.md"):
+            if wt and tf:
+                p = wt / ".kilo" / tf
+                if p.is_file():
+                    try:
+                        task_text = p.read_text(encoding="utf-8")
+                    except OSError:
+                        task_text = ""
+                    break
+        continuation = (
+            "Your previous turn ended before the assigned task was complete "
+            f"(continuation attempt {attempt + 1} of {max_attempts}). Continue from where you "
+            "stopped and drive the task to completion end-to-end: finish the deliverables, run "
+            "the required verifications, and complete the durable paperwork for your role "
+            "before ending your turn. Do not end the turn with the task unfinished.\n\n"
+            "Original task:\n\n" + (task_text.strip() or "(see .kilo/TASK.md in this worktree)")
+        )
+        kilo_bin = find_kilo_binary()
+        if not kilo_bin:
+            _watch_log(wt or Path.cwd(), role, "kilo binary not found — cannot re-prompt")
+            return
+        target_session = session_id or query_latest_kilo_session_id(wt, timeout_seconds=5, exclude_ids=exclude) or ""
+        if not target_session:
+            _watch_log(wt or Path.cwd(), role, "no resolvable session id — cannot re-prompt the same session")
+            return
+        cmd = [
+            str(kilo_bin), "run",
+            "--agent", role,
+            "--dir", str(wt or Path.cwd()),
+            "--session", target_session,
+            "--auto",
+            continuation,
+        ]
+        if args.model:
+            cmd += ["--model", args.model]
+        log_file = (wt or Path.cwd()) / ".kilo" / f"{role}.log"
+        (wt or Path.cwd()).mkdir(parents=True, exist_ok=True)
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n--- watch continuation {attempt + 1}/{max_attempts} for {role} ({datetime.now().isoformat()}) ---\n")
+        log_out = open(log_file, "a", encoding="utf-8")
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(wt or Path.cwd()),
+                stdout=log_out,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                env=_engine_spawn_env(wt),
+            )
+        finally:
+            log_out.close()
+        attempt += 1
+        pid = proc.pid
+
+
+def _spawn_watchdog(
+    worktree_path: Path,
+    role: str,
+    pid: int,
+    session_id: str,
+    model: str,
+    quest_ids: str = "",
+    task_file: str = "TASK.md",
+    exclude_ids: Optional[set] = None,
+    max_attempts: int = WATCH_MAX_ATTEMPTS,
+) -> Optional[int]:
+    """Launch the detached continuation watchdog for a freshly spawned worker.
+    Returns the watchdog pid, or None when disabled (COURT_WATCH_DISABLE=1) or
+    unspawnable (tests, no python, ...). Never raises."""
+    if os.environ.get("COURT_WATCH_DISABLE") == "1":
+        return None
+    cmd = [
+        sys.executable, "-m", "court.cli", "watch",
+        "--pid", str(pid),
+        "--dir", str(worktree_path),
+        "--agent", role,
+        "--model", model,
+        "--session", session_id or "",
+        "--task-file", task_file,
+        "--max-attempts", str(max_attempts),
+        "--exclude", ",".join(sorted(exclude_ids or set())),
+        "--attempt", "1",
+    ]
+    if quest_ids:
+        cmd += ["--quest", quest_ids]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(_court_package_root(worktree_path) or worktree_path),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=_engine_spawn_env(worktree_path),
+        )
+        return proc.pid
+    except Exception:
+        return None
+
+
+def cmd_artist_say(args):
+    """Deliver M'Lord's instruction to an existing Court Artist session.
+
+    Mirrors the goad path: runs one whole agent turn via the Kilo CLI against
+    the session recorded on the Quest (artist_session_id), streaming output.
+    """
+    try:
+        quest = store.load(args.quest_id)
+    except Exception as e:
+        print(f"ERROR: {args.quest_id}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    wt = git_ops.find_worktree_for_quest(quest)
+    if not wt or not wt.is_dir():
+        print(
+            f"ERROR: No active worktree found on disk for {quest.id} (branch: {quest.branch or '-'})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    session_id = (getattr(quest, "artist_session_id", "") or "").strip()
+    if not session_id:
+        print(
+            f"ERROR: {quest.id} has no recorded Court Artist session — the frontmatter field "
+            f"`artist_session_id` is empty. Summon one first (`court artist {quest.id}` or "
+            f"`court studio <ids> --standup`), then record it: "
+            f"python3 -m court.cli set-field {quest.id} artist_session_id <session_id>",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    kilo_bin = find_kilo_binary()
+    if not kilo_bin:
+        print("ERROR: Kilo binary not found. Cannot deliver the instruction via CLI.", file=sys.stderr)
+        sys.exit(1)
+
+    model = quest.artist_model or config.get_model("artist")
+    qual_model = canonical_model_id(model)
+    cmd = [
+        str(kilo_bin),
+        "run",
+        "--dir", str(wt),
+        "--agent", "artist",
+        "--session", session_id,
+        "--model", qual_model,
+        args.instruction,
+    ]
+    print(f"🎨 Delivering instruction to Court Artist session {session_id} ({quest.id}, model {qual_model})…")
+    result = subprocess.run(cmd, env=_engine_spawn_env(wt))
+    raise SystemExit(result.returncode)
 
 
 def _extract_target_routes(quest: Quest, worktree: Optional[Path] = None) -> list[str]:
@@ -2426,12 +3644,27 @@ def cmd_artist(args):
     store.save(quest, auto_commit=auto_commit, commit_msg=f"court: summon artist for {quest.id}")
 
     short_id = quest.id.split("-")[0]
-    task_desc = {
-        "name": f"{short_id} Court Artist",
-        "branchName": quest.branch,
+    # Single unified spawn path (2026-09-28): Agent Manager prompting is
+    # retired — headless Kilo CLI sessions are the one documented way to
+    # launch the Court Artist. The brief is written to the worktree so the
+    # printed `kilo run` line and the JSON spawn payload carry it verbatim.
+    brief_file = wt / ".kilo" / "TASK_ARTIST.md"
+    try:
+        brief_file.parent.mkdir(parents=True, exist_ok=True)
+        brief_file.write_text(prompt, encoding="utf-8")
+    except Exception:
+        brief_file = None
+    spawn_desc = {
+        "argv": [
+            "kilo", "run",
+            "--agent", "artist",
+            "--model", model,
+            "--dir", str(wt),
+            *([f"$(cat {brief_file})"] if brief_file else [prompt]),
+        ],
+        "interactive": f"cd {wt} && kilo   # default_agent already set to artist",
         "model": model,
         "provider": provider,
-        "prompt": prompt,
     }
 
     if getattr(args, "prompt_only", False):
@@ -2450,7 +3683,7 @@ def cmd_artist(args):
             "provider": provider,
             "routes": routes,
             "prompt": prompt,
-            "task": task_desc,
+            "spawn": spawn_desc,
         }
         print(json.dumps(out, indent=2))
         return
@@ -2471,9 +3704,15 @@ def cmd_artist(args):
         print(f"  • {url_line}")
     print()
     print("Next Steps for M'Lord & Steward:")
-    print(f"  1. Launch the Court Artist session in Agent Manager:")
-    print(f"     agent_manager start (mode: 'worktree', branchName: '{quest.branch}', model: '{model}', name: '{short_id} Court Artist')")
-    print(f"     (Slash command: `/artist {quest.id}` spawns this automatically).")
+    print("  1. Launch the Court Artist session via Kilo CLI (the single unified path —")
+    print("     Agent Manager prompting is retired; it defaults to steward mode and lacks")
+    print("     agent parameterization):")
+    if brief_file:
+        print(f"     kilo run --agent artist --model \"{model}\" --dir {wt} \"$(cat {brief_file})\"")
+    else:
+        print(f"     kilo run --agent artist --model \"{model}\" --dir {wt} \"<the brief>\"")
+    print(f"     (or interactive: cd {wt} && kilo — default_agent already set to artist).")
+    print(f"     (Slash command: `/artist {quest.id}` drives this flow.)")
     print(f"  2. Open the live preview in your browser: {runserver_url}")
     print("  3. Direct the Court Artist on layout, typography, colors, and design system compliance.")
     print("  4. The Court Artist will edit templates live and prompt you to refresh.")
@@ -2782,8 +4021,11 @@ def cmd_raze(args):
         # If worktree does not exist anywhere and was already deleted
         if not wt_exists and not found_wt_id:
             if quest.status == "READY_TO_RAZE" and args.archive_pruned:
-                dst = store.archive(quest.id)
-                print(f"🪦 {quest.id}: Worktree already pruned from disk/AM -> Archived to {dst}")
+                try:
+                    dst = store.archive(quest.id)
+                    print(f"🪦 {quest.id}: Worktree already pruned from disk/AM -> Archived to {dst}")
+                except FileNotFoundError:
+                    print(f"🪦 {quest.id}: Worktree pruned and quest already in archive.")
                 return
             elif quest.status == "READY_TO_RAZE":
                 print(f"ℹ️ {quest.id}: Worktree already pruned from disk/AM (ready to archive: python3 -m court.cli archive {quest.id})")
@@ -2862,7 +4104,7 @@ def cmd_raze(args):
         print(f"   - Session ID: {found_session_id or quest.serf_session_id or 'None'}")
         print(f"   - Ashes Section ID: {ashes_section_id}")
         if found_session_id and ashes_section_id:
-            print(f"   👉 Move command: agent_manager move sessionID: {found_session_id} sectionID: {ashes_section_id}")
+            print(f"   👉 Stop the idle session via Kilo CLI: kilo session delete {found_session_id} (Ashes section: {ashes_section_id}; M'Lord prunes the directory by hand)")
 
         # This Quest is a pillory successor: raze its frozen predecessor
         # together with it, in the same pass, per the Pillory protocol.
@@ -2921,6 +4163,8 @@ def cmd_runsuite(args):
     else:
         if res.get("proof_path"):
             print(f"🧾 Proof stamped: {res['proof_path']}")
+        if res.get("test_db_recreated"):
+            print(f"♻️  Stale kept test DB rebuilt ({res['test_db_recreated']})")
         if res.get("ok"):
             print(f"✅ Suite PASSED ({res.get('ran_tests')} tests, exit 0) at {res.get('head_sha', '')[:12]} — {res.get('command')}")
         else:
@@ -2969,7 +4213,12 @@ def cmd_collect(args):
         if quest.status not in ("TRIBUTE_READY", "GATE"):
             skipped.append((quest.id, f"status is [{quest.status}], not TRIBUTE_READY or GATE"))
             continue
-        moc_audit = quest.body_sections.get("Master of Coin's Audit", "").strip()
+        # Gates read the worktree charter first (freshest: coin verdicts and
+        # UI-review approvals commit on the branch before any convoy promotes),
+        # falling back to the castle copy when no worktree exists.
+        wt_quest = _quest_worktree_charter(quest)
+        effective_quest = wt_quest if wt_quest is not None else quest
+        moc_audit = effective_quest.body_sections.get("Master of Coin's Audit", "").strip() or quest.body_sections.get("Master of Coin's Audit", "").strip()
         is_hotfix = quest.is_hotfix or (getattr(args, "hotfix", False) is True)
         if not moc_audit:
             if is_hotfix:
@@ -2994,7 +4243,7 @@ def cmd_collect(args):
                     "pack unaudited tribute into a convoy (dispatch `/levy <id>` first)",
                 ))
                 continue
-        ui_status = quest.extract_ui_review_status()
+        ui_status = effective_quest.extract_ui_review_status() or quest.extract_ui_review_status()
         if ui_status.upper().startswith("PENDING") and not getattr(args, "skip_ui_review", False) and not is_hotfix:
             skipped.append((
                 quest.id,
@@ -3035,7 +4284,70 @@ def cmd_collect(args):
         print("(no Master-of-Coin-approved Quests ready to pack into a Cog Ship)")
         return
 
-    cogship_id = store.stamp_cogship(accepted, cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit)
+    # Single-writer serialization for the convoy-minting tail: stamp + standup
+    # is where double-running operators minted duplicate convoys and duplicate
+    # Gatekeepers. The lock is advisory and auto-releases on process exit.
+    require_op_lock("collect")
+
+    # Single-convoy guard (Q707-era, enforced by hand until now): a convoy
+    # whose gatehouse worktree still hosts a LIVE Gatekeeper must never be
+    # raced by a second collect — concurrent convoys race on the castle
+    # promotion itself. A live convoy blocks ANY new pack, regardless of which
+    # quests the candidates belong to.
+    repo_root = git_ops.get_repo_root()
+    live_convoy: Optional[tuple[str, str]] = None
+    for wt_dir in sorted((repo_root / ".kilo" / "worktrees").glob("the-gatehouse-*")):
+        m = re.match(r"the-gatehouse-(cogship-\d+)$", wt_dir.name)
+        if not m or not session_is_fresh(wt_dir):
+            continue
+        live_convoy = (m.group(1), str(wt_dir))
+        break
+    if live_convoy is not None:
+        print(
+            f"ERROR: convoy {live_convoy[0]} is LIVE — its gatehouse worktree "
+            f"({live_convoy[1]}) has a session updated in the last 30 min, meaning a Gatekeeper "
+            f"is mid-integration. Concurrent convoys race on the castle promotion; wait for it "
+            f"to finish (or tear it down by hand) instead of starting another.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # cogship-040/041 + cogship-247/248 guard: quests already stamped on a
+    # prior convoy are re-packed only when that convoy is provably dead. A
+    # live prior convoy (fresh Gatekeeper session in its gatehouse worktree)
+    # means another operator's integration is in flight — skip, don't race it.
+    requested_cogship = getattr(args, "cogship", None)
+    live_skipped: list[tuple[str, str]] = []
+    repackable: list = []
+    for q in accepted:
+        prior = store.normalize_cogship_id(q.cogship_id or "")
+        if not prior or prior == store.normalize_cogship_id(requested_cogship or ""):
+            repackable.append(q)
+            continue
+        is_live, why = gatehouse_convoy_is_live(prior, repo_root=git_ops.get_repo_root())
+        if is_live:
+            live_skipped.append((q.id, why))
+        else:
+            repackable.append(q)
+    for qid, why in live_skipped:
+        print(f"⏭️  Skipping {qid}: prior convoy still live — {why}")
+    if live_skipped and not repackable:
+        print("(all candidates belong to live prior convoys — nothing packed)")
+        return
+    # force=True is required whenever any candidate carries a prior stamp from
+    # a dead convoy (deliberate re-pack); fresh quests take the guarded path.
+    repack_force = any(q.cogship_id for q in repackable)
+    try:
+        cogship_id = store.stamp_cogship(
+            repackable,
+            cogship_id=requested_cogship,
+            auto_commit=auto_commit,
+            force=repack_force,
+        )
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    accepted = repackable
     print(f"🚢 Stamped {len(accepted)} Quest(s) onto {cogship_id}.")
 
     for quest in accepted:
@@ -3102,11 +4414,16 @@ def cmd_collect(args):
         if kilo_bin:
             if len(accepted) == 1:
                 solo = accepted[0]
-                if solo.worktree and Path(solo.worktree).is_dir():
+                if solo.gatekeeper_session_id:
+                    # cogship-247/248: a re-run collect --standup spawned a
+                    # duplicate Gatekeeper beside the live one. One convoy,
+                    # one Gatekeeper — resume the recorded session instead.
+                    print(f"⏭️  Skipping Gatekeeper standup: {solo.id} already records Gatekeeper session {solo.gatekeeper_session_id}. Resume it instead of spawning a duplicate.")
+                elif solo.worktree and Path(solo.worktree).is_dir():
                     wt = Path(solo.worktree)
                     setup_worktree_agent_config(wt, "gatekeeper")
                     prompt = f"Act as Gatekeeper for {solo.id} on {cogship_id}: merge castle in, run test suite, and on clean pass merge into castle."
-                    res = standup_kilo_session(wt, agent="gatekeeper", model=qual_gatekeeper, prompt=prompt, title=f"{cogship_id} Gatekeeper", kilo_bin=kilo_bin, run_now=True)
+                    res = standup_kilo_session(wt, agent="gatekeeper", model=qual_gatekeeper, prompt=prompt, title=f"{cogship_id} Gatekeeper", kilo_bin=kilo_bin, run_now=True, watch_quest=solo.id)
                     sid = res.get("session_id")
                     if sid:
                         solo.gatekeeper_session_id = sid
@@ -3127,6 +4444,28 @@ def cmd_collect(args):
                 wt_name = f"the-gatehouse-{cogship_id}"
                 branch_name = f"the-gatehouse/{cogship_id}"
                 wt_path = root / ".kilo" / "worktrees" / wt_name
+                if wt_path.is_dir():
+                    # The convoy worktree already exists: never blind-create or
+                    # re-stand over it. A fresh session in it means a Gatekeeper
+                    # is already integrating this convoy (cogship-247/248
+                    # duplicate-Gatekeeper incident); a stale one means an
+                    # earlier convoy died mid-integration and must be resumed
+                    # or torn down by hand, not silently re-created.
+                    if session_is_fresh(wt_path):
+                        print(
+                            f"ERROR: Gatehouse worktree {wt_path} already has a session updated in the "
+                            f"last 30 min — a Gatekeeper is already integrating {cogship_id}. "
+                            f"Do not stand up a duplicate; resume that session instead.",
+                            file=sys.stderr,
+                        )
+                        sys.exit(1)
+                    print(
+                        f"ERROR: Gatehouse worktree {wt_path} already exists (no fresh session — a prior "
+                        f"convoy likely died mid-integration). Refusing to re-create it: resume the "
+                        f"existing worktree by hand or tear it down first: git -C {wt_path} status",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
                 try:
                     # Timeouts are mandatory here: `kilo worktree create` used to
                     # be the only unbounded subprocess in court, so a prompt/hang
@@ -3137,7 +4476,7 @@ def cmd_collect(args):
                     subprocess.run(["git", "-C", str(wt_path), "merge", base_branch, "--ff-only"], capture_output=True, timeout=120)
                     setup_worktree_agent_config(wt_path, "gatekeeper")
                     prompt = f"Act as Gatekeeper for {cogship_id}: integrate Quests {accepted_ids}, run integration suite, promote to castle."
-                    res = standup_kilo_session(wt_path, agent="gatekeeper", model=qual_gatekeeper, prompt=prompt, title=f"{cogship_id} Gatekeeper", kilo_bin=kilo_bin, run_now=True)
+                    res = standup_kilo_session(wt_path, agent="gatekeeper", model=qual_gatekeeper, prompt=prompt, title=f"{cogship_id} Gatekeeper", kilo_bin=kilo_bin, run_now=True, watch_quest=accepted_ids)
                     sid = res.get("session_id")
                     if sid:
                         for q in accepted:
@@ -3169,6 +4508,32 @@ def _verify_branch_exists(branch: str, repo_root: Path) -> bool:
     return bool(res.get("ok") and (res.get("stdout") or "").strip())
 
 
+def _quest_worktree_charter(quest: Quest) -> Optional[Quest]:
+    """Load the quest's charter from its OWN worktree when one exists.
+
+    The chicken-and-egg collection-gate fix (studio four, Q707-era): royal
+    UI-review APPROVED lines and coin verdicts are committed on the quest
+    branch/worktree and cannot reach the castle baseline until a convoy
+    promotes — but `collect` reads the castle ledger, so it saw stale PENDING
+    forever. The anti-tampering machinery already reads the worktree charter;
+    the collection gates do the same now, falling back to the castle copy
+    only when no worktree exists."""
+    wt = (quest.worktree or "").strip()
+    if not wt:
+        return None
+    wt_path = Path(wt)
+    if not wt_path.is_dir():
+        return None
+    for base in (wt_path / ".court" / "quests", wt_path / ".court" / "epics"):
+        p = base / f"{quest.id}.md"
+        if p.is_file():
+            try:
+                return Quest.from_markdown(p.read_text(encoding="utf-8"))
+            except ValueError:
+                return None
+    return None
+
+
 def _pack_quest_branches(quests: list, wt_path: Path, cogship_id: str) -> tuple[list, list]:
     """Sequentially merge candidate Quest branches into the convoy worktree.
 
@@ -3191,6 +4556,364 @@ def _pack_quest_branches(quests: list, wt_path: Path, cogship_id: str) -> tuple[
         reason = ((res.get("stderr") or "") + (res.get("stdout") or "")).strip().splitlines()
         isolated.append((quest.id, reason[-1][:200] if reason else "merge failed"))
     return merged, isolated
+
+
+# ---------------------------------------------------------------------------
+# Combined Artist Studio (Q-2): deterministic multi-quest studio command.
+# Formalizes the hand-run recipe exercised on the Q472/Q473/Q412, Q589, and
+# Q617 cohorts: studio worktree from castle tip, merge N quest branches under
+# the established conflict policy, freshness-gated runserver, studio + session
+# recorded in the ledger, and both documented spawn paths kept intact.
+# ---------------------------------------------------------------------------
+
+# Charter-paperwork paths where a studio merge conflict is ALWAYS resolved
+# branch-wins: the Quest branch carries the freshest paperwork (tribute,
+# audit, ledger trail) and the trunk-side copy is by definition older. Every
+# other conflicted path is a genuine code overlap and goes through the
+# disclosed union resolution.
+STUDIO_PAPERWORK_PREFIXES = (
+    ".court/quests/",
+    ".court/epics/",
+    ".court/archive/",
+)
+STUDIO_PAPERWORK_FILES = (
+    ".court/LEDGER.md",
+    ".court/EDICTS.md",
+    ".kilo/TASK.md",
+    ".kilo/TASK_ARTIST.md",
+)
+
+
+def _is_paperwork_path(path: str) -> bool:
+    """Pure classifier: is this conflicted path charter paperwork (branch-wins)
+    or genuine code overlap (disclosed union resolution)?"""
+    p = (path or "").strip().strip('"').strip("'")
+    return p.startswith(STUDIO_PAPERWORK_PREFIXES) or p in STUDIO_PAPERWORK_FILES
+
+
+def _conflicted_paths(wt_path: Path) -> list[str]:
+    res = git_ops._run(["git", "diff", "--name-only", "--diff-filter=U"], wt_path)
+    if not res.get("ok"):
+        return []
+    return [ln.strip() for ln in (res.get("stdout") or "").splitlines() if ln.strip()]
+
+
+def _checkout_theirs_path(wt_path: Path, path: str) -> bool:
+    """Branch-wins resolution for one paperwork path (the Quest branch holds the
+    full tribute + audit). Honors a branch-side deletion."""
+    res = git_ops._run(["git", "checkout", "--theirs", "--", path], wt_path)
+    if res.get("ok"):
+        return bool(git_ops._run(["git", "add", "--", path], wt_path).get("ok"))
+    return bool(git_ops._run(["git", "rm", "-q", "--", path], wt_path).get("ok"))
+
+
+def _union_merge_path(wt_path: Path, path: str) -> tuple[bool, str]:
+    """Deterministic union resolution for one genuinely code-overlapped path.
+
+    Mechanizes the hand-run studio policy: take BOTH sides' line-level changes
+    (git merge-file --union) instead of exercising aesthetic judgment, then
+    guard the result — no conflict markers may remain, and .py sources must
+    still byte-compile. Paths union cannot resolve (add/add, modify/delete —
+    no common base to merge against) are left for isolation, never hand-merged
+    here. The resolution is disclosed to the Court Artist for live sanity-check.
+    """
+    blobs: dict[str, Optional[str]] = {}
+    for label, stage in (("base", ":1"), ("ours", ":2"), ("theirs", ":3")):
+        res = git_ops._run(["git", "show", f"{stage}:{path}"], wt_path)
+        blobs[label] = res.get("stdout") if res.get("ok") else None
+    ours, theirs, base = blobs["ours"], blobs["theirs"], blobs["base"]
+    if ours is None or theirs is None:
+        return False, "modify/delete conflict — no both-side content to union"
+    if ours == theirs:
+        (wt_path / path).write_text(ours if ours.endswith("\n") else ours + "\n", encoding="utf-8")
+        if not git_ops._run(["git", "add", "--", path], wt_path).get("ok"):
+            return False, "could not stage identical content"
+        return True, "both sides identical (staged as-is)"
+    if base is None:
+        return False, "add/add conflict — no common base for a union; needs hand resolution"
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpd = Path(tmp)
+        f_ours, f_base, f_theirs = tmpd / "ours", tmpd / "base", tmpd / "theirs"
+        f_ours.write_text(ours, encoding="utf-8")
+        f_base.write_text(base, encoding="utf-8")
+        f_theirs.write_text(theirs, encoding="utf-8")
+        res = git_ops._run(
+            ["git", "merge-file", "--union", "-p", str(f_ours), str(f_base), str(f_theirs)],
+            wt_path,
+        )
+    merged = res.get("stdout") or ""
+    if not merged.strip():
+        return False, f"union merge produced no output ({((res.get('stderr') or 'unknown'))[:160]})"
+    if "<<<<<<<" in merged or ">>>>>>>" in merged:
+        return False, "union left conflict markers; needs hand resolution"
+    if path.endswith(".py"):
+        try:
+            compile(merged, path, "exec")
+        except SyntaxError as e:
+            return False, f"union broke {path} syntax ({str(e)[:120]}); needs hand resolution"
+    (wt_path / path).write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
+    if not git_ops._run(["git", "add", "--", path], wt_path).get("ok"):
+        return False, "could not stage union result"
+    return True, "union of both sides' line-level changes"
+
+
+def _merge_quest_branches_with_policy(quests: list, wt_path: Path, studio_label: str) -> tuple[list, list[dict]]:
+    """Sequentially merge candidate Quest branches into the studio worktree
+    under the established conflict policy (Q-2; hand-run Q472/Q473/Q412, Q589,
+    and Q617 cohorts):
+
+    - charter paperwork (.court/quests/**, ledger, task files) -> branch-wins;
+      the Quest branch carries the full tribute + audit, the trunk-side copy
+      is older
+    - genuine code overlap -> disclosed union of both sides' line-level
+      changes (git merge-file --union), guarded by marker + syntax checks
+    - anything the policy cannot resolve -> the branch is isolated (merge
+      aborted, tree restored) and reported; it never enters the review
+      half-merged
+
+    Returns (merged_quests, per-quest reports). Each report is
+    ``{"id", "paperwork": [paths], "union": ["path — note"], "isolated": reason|None}``.
+    """
+    merged: list = []
+    reports: list[dict] = []
+    for quest in quests:
+        res = git_ops._run(
+            [
+                "git", "merge", quest.branch, "--no-edit", "-m",
+                f"court: merge {quest.id} into combined artist studio {studio_label}",
+            ],
+            wt_path,
+        )
+        if res.get("ok"):
+            merged.append(quest)
+            reports.append({"id": quest.id, "paperwork": [], "union": [], "isolated": None})
+            continue
+        paths = _conflicted_paths(wt_path)
+        if not paths:
+            git_ops._run(["git", "merge", "--abort"], wt_path)
+            git_ops._run(["git", "reset", "--hard", "HEAD"], wt_path)
+            reason = ((res.get("stderr") or "") + (res.get("stdout") or "")).strip().splitlines()
+            reports.append({
+                "id": quest.id, "paperwork": [], "union": [],
+                "isolated": reason[-1][:200] if reason else "merge failed",
+            })
+            continue
+        paperwork: list[str] = []
+        union: list[tuple[str, str]] = []
+        unresolved: list[str] = []
+        for p in paths:
+            if _is_paperwork_path(p):
+                if _checkout_theirs_path(wt_path, p):
+                    paperwork.append(p)
+                else:
+                    unresolved.append(f"{p} (branch-wins checkout failed)")
+            else:
+                ok, note = _union_merge_path(wt_path, p)
+                if ok:
+                    union.append((p, note))
+                else:
+                    unresolved.append(f"{p} ({note})")
+        union_str = [f"{p} — {note}" for p, note in union]
+        if unresolved:
+            git_ops._run(["git", "merge", "--abort"], wt_path)
+            git_ops._run(["git", "reset", "--hard", "HEAD"], wt_path)
+            reports.append({
+                "id": quest.id, "paperwork": paperwork, "union": union_str,
+                "isolated": "unresolved conflicts: " + "; ".join(unresolved),
+            })
+            continue
+        commit_res = git_ops._run(["git", "commit", "--no-edit"], wt_path)
+        if commit_res.get("ok"):
+            merged.append(quest)
+            reports.append({"id": quest.id, "paperwork": paperwork, "union": union_str, "isolated": None})
+        else:
+            git_ops._run(["git", "merge", "--abort"], wt_path)
+            git_ops._run(["git", "reset", "--hard", "HEAD"], wt_path)
+            reason = ((commit_res.get("stderr") or "") + (commit_res.get("stdout") or "")).strip().splitlines()
+            reports.append({
+                "id": quest.id, "paperwork": paperwork, "union": union_str,
+                "isolated": reason[-1][:200] if reason else "commit after conflict resolution failed",
+            })
+    return merged, reports
+
+
+def _studio_slug(quests: list) -> str:
+    """Hand-run naming: `artist-studio-q617-q627-q628` / branch
+    `artist/q617-q627-q628-ui-studio` — short id segments, lowercased."""
+    return "-".join((q.id.split("-", 1)[0] or q.id).lower() for q in quests)
+
+
+def _run_freshness_gate(repo_root: Path) -> dict:
+    """24h freshness gate for the studio runserver (Q672 doctrine): WARN-ONLY.
+
+    Runs the project-specific `studio.freshness_command` from the manifest
+    (e.g. pb-app: `python3 scripts/db/local_db.py --age`, reporting the local
+    production mirror's sync age). NEVER auto-syncs — a stale mirror surfaces
+    as a loud warning and the review proceeds.
+    """
+    gate = config.get_studio_freshness()
+    out: dict[str, Any] = {
+        "configured": bool(gate["command"]),
+        "command": gate["command"],
+        "max_age_hours": gate["max_age_hours"],
+        "age_hours": None,
+        "fresh": None,
+        "detail": "",
+    }
+    if not gate["command"]:
+        out["detail"] = "no studio.freshness_command configured in .court/config.json"
+        return out
+    try:
+        res = subprocess.run(
+            shlex.split(gate["command"]),
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception as e:
+        out["detail"] = f"freshness command failed to run ({e}) — WARN-ONLY, continuing"
+        return out
+    text = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
+    out["detail"] = text[-600:]
+    m = re.search(r"Freshness:\s*(\w+)", text)
+    if m:
+        out["fresh"] = m.group(1).upper() == "FRESH"
+    a = re.search(r"\(([\d.]+)\s*([smhd])\s*ago\)", text)
+    if a:
+        mult = {"s": 1.0 / 3600.0, "m": 1.0 / 60.0, "h": 1.0, "d": 24.0}[a.group(2)]
+        out["age_hours"] = round(float(a.group(1)) * mult, 2)
+    if res.returncode != 0 and out["fresh"] is None:
+        out["detail"] += "\n(freshness command exited non-zero — WARN-ONLY, continuing)"
+    return out
+
+
+def _freshness_verdict(freshness: dict) -> str:
+    """One-line WARN-ONLY verdict for the studio report and ledger note."""
+    if not freshness.get("configured"):
+        return "freshness gate not configured (no studio.freshness_command in .court/config.json)"
+    max_age = freshness.get("max_age_hours", 24)
+    age = freshness.get("age_hours")
+    if age is not None:
+        if age > max_age:
+            return (
+                f"STALE WARN — mirror age {age}h exceeds the {max_age}h freshness gate; "
+                "review proceeds, NEVER auto-syncs (run the configured freshness command's sync out-of-band)"
+            )
+        return f"OK — mirror age {age}h (gate: {max_age}h)"
+    if freshness.get("fresh") is False:
+        return "STALE WARN per the freshness command; review proceeds, NEVER auto-syncs"
+    if freshness.get("fresh") is True:
+        return "OK per the freshness command"
+    return "unparsed freshness output — WARN-ONLY, review proceeds"
+
+
+def _studio_sync_back(args, auto_commit: bool, repo_root: Path) -> None:
+    """Post-sign-off submode: merge the studio branch back into each selected
+    Quest's own worktree branch (the hand-run one-convoy sync-back pattern).
+
+    Deliberately NOT auto-resolving here: a sync-back conflict means the Quest
+    worktree drifted since the studio was cut, and the Quest branch is the
+    integration target — conflicts are disclosed for a remediation turn, the
+    merge is aborted, and the studio branch is never forced.
+    """
+    quests = resolve_quest_selection(args, batchable=True, required=True)
+    studio_branch = getattr(args, "branch", None) or f"artist/{_studio_slug(quests)}-ui-studio"
+    if not _verify_branch_exists(studio_branch, repo_root):
+        print(
+            f"ERROR: studio branch '{studio_branch}' not found in this repo. If the studio was "
+            "cut with a different cohort or --branch, pass the exact studio branch.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Guarded primitive (studio_close doctrine): a drifted base replays stale
+    # lines into the Quest branches, and a Quest already stamped into a live
+    # convoy must never be synced behind the Gatekeeper's back.
+    from . import studio_close as _sc
+    drift = _sc.base_drift_count(repo_root, studio_branch, "castle")
+    threshold = _sc.drift_threshold(args)
+    if drift is None:
+        print("ERROR: base drift unmeasurable (merge-base failed) — refusing rather than guessing. "
+              "Cut a fresh studio or investigate the branch state.", file=sys.stderr)
+        sys.exit(1)
+    if drift > threshold and not getattr(args, "force_union", False):
+        print(
+            f"ERROR: base drift {drift} commits exceeds threshold {threshold} — a merge from this "
+            f"cut point would replay stale deltas into the Quest branches. Re-cut the studio from "
+            "the current castle tip, or pass --force-union to override.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if drift > threshold:
+        print(f"⚠️  base drift {drift} commits exceeds threshold {threshold} — proceeding via --force-union")
+    race_blocked: list[tuple[str, str]] = []
+    for quest in quests:
+        race = _sc.gatehouse_race(repo_root, quest)
+        if race:
+            race_blocked.append((quest.id, race))
+    if race_blocked:
+        for qid, why in race_blocked:
+            print(f"ERROR: {qid}: convoy-race guard — {why}", file=sys.stderr)
+        print("Refusing sync-back while these Quests sit in a live convoy lane.", file=sys.stderr)
+        sys.exit(1)
+
+    results: list[tuple[str, str, str]] = []
+    changed: list[Quest] = []
+    for quest in quests:
+        wt = quest.worktree
+        if not wt or not Path(wt).is_dir():
+            results.append((quest.id, "SKIPPED", f"no Quest worktree at '{wt or '-'}'"))
+            continue
+        wtp = Path(wt)
+        status = git_ops._run(["git", "status", "--porcelain"], wtp)
+        if (status.get("stdout") or "").strip():
+            results.append((quest.id, "SKIPPED", "dirty worktree — commit or stash first"))
+            continue
+        res = git_ops._run(
+            [
+                "git", "merge", studio_branch, "--no-edit", "-m",
+                f"court: sync-back combined studio {studio_branch} into {quest.id}",
+            ],
+            wtp,
+        )
+        if res.get("ok"):
+            results.append((quest.id, "MERGED", f"{studio_branch} merged into {quest.branch}"))
+            quest.log_ledger(
+                quest.status, quest.status,
+                f"Synced combined studio {studio_branch} into {quest.branch} (royal sign-off complete; collection next)",
+            )
+            changed.append(quest)
+        else:
+            conflicts = _conflicted_paths(wtp)
+            if conflicts:
+                git_ops._run(["git", "merge", "--abort"], wtp)
+                git_ops._run(["git", "reset", "--hard", "HEAD"], wtp)
+                results.append((
+                    quest.id, "CONFLICT",
+                    f"sync-back conflicts {conflicts} — merge aborted, worktree restored; "
+                    "needs a remediation turn (studio branch was NOT forced)",
+                ))
+            else:
+                reason = ((res.get("stderr") or "") + (res.get("stdout") or "")).strip().splitlines()
+                results.append((quest.id, "FAILED", reason[-1][:200] if reason else "merge failed"))
+
+    if changed:
+        store.save_many(
+            changed,
+            f"court: record combined-studio sync-back for {', '.join(q.id for q in changed)}",
+            auto_commit=auto_commit,
+        )
+
+    print("=" * 76)
+    print("🔀 COMBINED STUDIO SYNC-BACK")
+    print("=" * 76)
+    print(f"Studio branch: {studio_branch}")
+    for qid, outcome, detail in results:
+        icon = {"MERGED": "✅", "SKIPPED": "⏭️ ", "CONFLICT": "⚠️ ", "FAILED": "❌"}.get(outcome, "•")
+        print(f"  {icon} {qid}: {outcome} — {detail}")
+    print("=" * 76)
 
 
 def cmd_atelier(args):
@@ -3233,14 +4956,16 @@ def cmd_atelier(args):
         if quest.status not in ("TRIBUTE_READY", "GATE"):
             skipped.append((quest.id, f"status is [{quest.status}], not TRIBUTE_READY or GATE"))
             continue
-        if not quest.body_sections.get("Master of Coin's Audit", "").strip():
+        wt_quest = _quest_worktree_charter(quest)
+        effective_quest = wt_quest if wt_quest is not None else quest
+        if not (effective_quest.body_sections.get("Master of Coin's Audit", "").strip() or quest.body_sections.get("Master of Coin's Audit", "").strip()):
             skipped.append((
                 quest.id,
                 "no recorded Master of Coin's Audit content -- refusing to pack unaudited "
                 "tribute into a convoy (dispatch `/levy <id>` first)",
             ))
             continue
-        ui_status = quest.extract_ui_review_status()
+        ui_status = effective_quest.extract_ui_review_status() or quest.extract_ui_review_status()
         if not ui_status.upper().startswith("PENDING"):
             skipped.append((
                 quest.id,
@@ -3284,7 +5009,10 @@ def cmd_atelier(args):
               f"per-Quest review is `/artist {accepted[0].id}` (no convoy worktree needed). "
               "Proceeding with the atelier anyway for the Royal Addendum protocol.")
 
-    cogship_id = store.stamp_cogship(accepted, cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit)
+    # Atelier is a deliberate single-operator batch flow (M'Lord drives it
+    # interactively); re-rolls of already-stamped UI quests are intentional,
+    # so the duplicate-convoy backstop is overridden here.
+    cogship_id = store.stamp_cogship(accepted, cogship_id=getattr(args, "cogship", None), auto_commit=auto_commit, force=True)
     print(f"🎨 Stamped {len(accepted)} UI Quest(s) onto {cogship_id} for the Royal Atelier (pre-integration review).")
 
     for quest in accepted:
@@ -3393,6 +5121,16 @@ def cmd_atelier(args):
         quest.log_ledger("GATE", "GATE", note)
     store.save_many(accepted, f"court: record atelier routing for {cogship_id}", auto_commit=auto_commit)
 
+    # Write the artist brief into the convoy worktree so the single unified
+    # spawn path (`kilo run ... "$(cat ...)"`) carries it verbatim.
+    atelier_brief_path = wt_path / ".kilo" / "TASK_ARTIST.md"
+    try:
+        atelier_brief_path.parent.mkdir(parents=True, exist_ok=True)
+        atelier_brief_path.write_text(prompt, encoding="utf-8")
+    except Exception as e:
+        atelier_brief_path = None
+        print(f"⚠️  could not write {atelier_brief_path} ({e}); use --prompt-only for the brief")
+
     if getattr(args, "prompt_only", False):
         print(prompt)
         return
@@ -3412,12 +5150,17 @@ def cmd_atelier(args):
             "model": model,
             "provider": provider,
             "prompt": prompt,
-            "task": {
-                "name": f"{cogship_id} Atelier",
-                "branchName": branch_name,
+            "spawn": {
+                "argv": [
+                    "kilo", "run",
+                    "--agent", "artist",
+                    "--model", model,
+                    "--dir", str(wt_path),
+                    *([f"$(cat {atelier_brief_path})"] if atelier_brief_path else [prompt]),
+                ],
+                "interactive": f"cd {wt_path} && kilo   # default_agent already set to artist",
                 "model": model,
                 "provider": provider,
-                "prompt": prompt,
             },
         }
         print(json.dumps(out, indent=2))
@@ -3441,10 +5184,14 @@ def cmd_atelier(args):
         print(f"  • {url_line}")
     print()
     print("Next Steps for M'Lord & Steward:")
-    print("  1. Spawn the Court Artist session in the convoy worktree (it is pre-configured")
-    print(f"     as the sole writer there): `cd {wt_path} && kilo` (default_agent: artist),")
-    print(f"     or via Agent Manager: agent_manager start (mode: 'worktree', branchName: '{branch_name}',")
-    print(f"     model: '{model}', name: '{short_id} Atelier').")
+    print("  1. Launch the Court Artist session in the convoy worktree (it is pre-configured")
+    print("     as the sole writer there) via Kilo CLI — the single unified path; Agent")
+    print("     Manager prompting is retired:")
+    if atelier_brief_path:
+        print(f"     kilo run --agent artist --model \"{model}\" --dir {wt_path} \"$(cat {atelier_brief_path})\"")
+    else:
+        print(f"     kilo run --agent artist --model \"{model}\" --dir {wt_path} \"<the brief>\"")
+    print(f"     (or interactive: cd {wt_path} && kilo — default_agent already set to artist).")
     print(f"     (Slash command: `/atelier {merged_ids}` drives this whole flow.)")
     print(f"  2. Record the session on each packed Quest: python3 -m court.cli set-field <id> artist_session_id <session_id>")
     print(f"  3. Open the live preview: {runserver_url} — review every Quest's UI in one session.")
@@ -3459,6 +5206,480 @@ def cmd_atelier(args):
     print(f"     \"Act as Gatekeeper for {cogship_id}: candidate branches already merged; run the unified")
     print(f"     suite via court runsuite, promote the clean convoy into castle, advance passing Quests")
     print(f"     to READY_TO_RAZE, and pack the manifest with court ship.\"")
+    print("=" * 76)
+
+
+# Shared-studio MCP wiring verdict (probe 2026-09-27, /var/folders/.../kilo/mcp-probe):
+# a `.kilo/kilo.json` containing only an mcp block IS sufficient — Kilo loads it
+# even with an empty global config: variant A (.kilo/kilo.json) reported
+# "MCP server: chrome-devtools" and listed the shared browser's tabs; the
+# no-config control reported "MCP servers: None". So studio worktrees get the
+# chrome-devtools MCP pre-configured in their untracked .kilo/kilo.json.
+STUDIO_MCP_WORKTREE_CONFIG = True
+
+
+def render_browser_note(
+    wt_path: Path,
+    browser_info: Optional[dict[str, Any]],
+    mcp_wired: bool,
+) -> str:
+    """Pure renderer for the studio brief's shared-browser note.
+
+    Independent of quests and the running browser so it stays unit-testable.
+    """
+    port = (browser_info or {}).get("port") or studio_browser.DEFAULT_PORT
+    cdp_url = (browser_info or {}).get("cdp_url") or f"http://127.0.0.1:{port}"
+    annotations_file = Path(wt_path) / ".kilo" / "studio-annotations.jsonl"
+
+    if not browser_info:
+        manual = f"npx chrome-devtools-mcp@latest --browserUrl http://127.0.0.1:{studio_browser.DEFAULT_PORT}"
+        return (
+            "- Shared studio browser: not running (start it with "
+            f"`python3 -m court.cli browser start --annotate {wt_path}`).\n"
+            f"- To give the browser tools to this session, attach the MCP manually: `{manual}`.\n"
+            f"- Annotation notes file: `{annotations_file}` (append-only JSONL)."
+        )
+
+    if mcp_wired:
+        mcp_line = (
+            f"- Shared studio browser: the chrome-devtools MCP is pre-configured in this worktree "
+            f"(`.kilo/kilo.json`); its tools connect automatically to the shared browser at `{cdp_url}`."
+        )
+    else:
+        mcp_line = (
+            f"- Shared studio browser: attach its tools manually with "
+            f"`npx chrome-devtools-mcp@latest --browserUrl {cdp_url}` (CDP port {port})."
+        )
+    return (
+        mcp_line + "\n"
+        f"- M'Lord's annotation notes land in `{annotations_file}` (append-only JSONL) — "
+        "read it before and during the review."
+    )
+
+
+def cmd_studio(args):
+    """Deterministic Multi-Quest Combined Studio (Q-2): formalize the hand-run
+    artist-studio recipe (Q472/Q473/Q412, Q589, Q617 cohorts) into one command.
+
+    Cuts an `artist-studio-<ids>` worktree from the castle tip on branch
+    `artist/<ids>-ui-studio`, merges every candidate Quest branch with the
+    established conflict policy (charter paperwork -> branch-wins; genuine
+    code overlap -> disclosed union resolution; unresolvable -> isolation),
+    copies the gitignored .env into the fresh worktree, starts the runserver
+    behind the WARN-ONLY freshness gate, renders the artist brief to
+    `.kilo/TASK_ARTIST.md`, and records the studio + session in each Quest's
+    Castle Ledger (`artist_session_id` / `artist_model`) — with a single
+    unified spawn path: Kilo CLI prompting (`--standup` lets this command
+    spawn and record the session; the printed `kilo run` line is the manual
+    equivalent). Agent Manager prompting is retired (2026-09-28): it defaults
+    sessions to steward mode, lacks agent parameterization, and its launcher
+    is flaky (see LEDGER).
+
+    Unlike /atelier, the studio does NOT stamp a Cog Ship or advance statuses:
+    Quests keep their pipeline place and sync-back happens per Quest
+    (`court studio <ids> --sync-back`), with collection remaining the
+    Steward's. Single-writer: the studio belongs to the Court Artist until
+    royal sign-off.
+    """
+    auto_commit = not getattr(args, "no_commit", False)
+    repo_root = git_ops.get_repo_root()
+
+    if getattr(args, "close", False):
+        sys.exit(studio_close.run_close(args))
+
+    if getattr(args, "sync_back", False):
+        return _studio_sync_back(args, auto_commit, repo_root)
+
+    base_branch = getattr(args, "base", "castle") or "castle"
+    candidates = resolve_quest_selection(
+        args, batchable=True, required=True, default_status="TRIBUTE_READY,GATE",
+    )
+
+    accepted: list[Quest] = []
+    skipped: list[tuple[str, str]] = []
+    any_status = bool(getattr(args, "any_status", False))
+    for quest in candidates:
+        if quest.status == "PUNISHED":
+            skipped.append((quest.id, "PUNISHED (side-state, frozen pending its pillory successor)"))
+            continue
+        if quest.status not in ("TRIBUTE_READY", "GATE") and not any_status:
+            skipped.append((quest.id, f"status is [{quest.status}], not TRIBUTE_READY or GATE (use --any-status to override)"))
+            continue
+        wt_quest = _quest_worktree_charter(quest)
+        effective_quest = wt_quest if wt_quest is not None else quest
+        if not (effective_quest.body_sections.get("Master of Coin's Audit", "").strip() or quest.body_sections.get("Master of Coin's Audit", "").strip()):
+            skipped.append((
+                quest.id,
+                "no recorded Master of Coin's Audit content -- refusing to merge unaudited "
+                "work into a royal studio (dispatch `/levy <id>` first)",
+            ))
+            continue
+        ui_status = effective_quest.extract_ui_review_status() or quest.extract_ui_review_status()
+        if not ui_status.upper().startswith("PENDING"):
+            skipped.append((
+                quest.id,
+                f"UI Review is not PENDING ('{ui_status or 'not recorded'}') -- nothing for the "
+                "artist to review; route through /collect instead",
+            ))
+            continue
+        if not quest.branch or not _verify_branch_exists(quest.branch, repo_root):
+            skipped.append((quest.id, f"branch '{quest.branch or '-'}' not found in this repo -- nothing to merge"))
+            continue
+        audit = ward.audit_quest(quest, base_branch=base_branch)
+        if audit.git_status.get("dirty"):
+            skipped.append((quest.id, "dirty working tree"))
+            continue
+        if audit.violations:
+            skipped.append((quest.id, f"{len(audit.violations)} compliance violation(s): {'; '.join(audit.violations)}"))
+            continue
+        try:
+            contraband = migration_guard.scan_branch_contraband(repo_root, base_branch, quest.branch)
+        except Exception as e:
+            print(f"⚠️  {quest.id}: migration contraband scan failed ({e}); Gatekeeper graph check remains the backstop")
+        else:
+            if contraband:
+                skipped.append((quest.id, migration_guard.remediation_message(contraband, base_branch)))
+                continue
+        accepted.append(quest)
+
+    as_json = bool(getattr(args, "json", False))
+    if skipped and not as_json:
+        print(f"⏭️  Skipped {len(skipped)} candidate(s) (not studio material):")
+        for qid, reason in skipped:
+            print(f"   - {qid}: {reason}")
+
+    if not accepted:
+        print("(no UI-review-pending Quests ready to combine into a studio)")
+        return
+
+    if len(accepted) == 1 and not as_json:
+        print(f"ℹ️  Only one Quest accepted ({accepted[0].id}) — for a single Quest the lighter "
+              f"per-Quest review is `/artist {accepted[0].id}` (no studio worktree needed). "
+              "Proceeding with the combined studio anyway.")
+
+    slug = _studio_slug(accepted)
+    wt_name = f"artist-studio-{slug}"
+    branch_name = getattr(args, "branch", None) or f"artist/{slug}-ui-studio"
+    if not branch_name.startswith("artist/"):
+        print(f"ERROR: --branch must use the artist/ folder namespace (got '{branch_name}').", file=sys.stderr)
+        sys.exit(1)
+    wt_path = repo_root / ".kilo" / "worktrees" / wt_name
+    if wt_path.exists():
+        print(
+            f"ERROR: studio worktree already exists at {wt_path} — a combined studio is already "
+            f"stood up for this cohort. Single-writer rule: tear the existing worktree down or "
+            "pass --branch to cut a different studio.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if _verify_branch_exists(branch_name, repo_root):
+        print(
+            f"ERROR: branch '{branch_name}' already exists — a studio for this cohort was already "
+            "cut. Pass --branch to name a fresh studio branch.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    kilo_bin = find_kilo_binary()
+    created = False
+    if kilo_bin:
+        try:
+            subprocess.run(
+                [str(kilo_bin), "worktree", "create", wt_name],
+                cwd=str(repo_root), capture_output=True, check=True, timeout=300,
+            )
+            git_ops.clear_git_cache()
+            subprocess.run(["git", "-C", str(wt_path), "branch", "-m", branch_name], capture_output=True, timeout=60)
+            created = True
+        except Exception as e:
+            print(f"⚠️ kilo worktree create failed ({e}); falling back to git worktree add")
+    if not created:
+        res = git_ops._run(["git", "worktree", "add", str(wt_path), "-b", branch_name, base_branch], repo_root)
+        if not res.get("ok"):
+            print(f"ERROR: could not create studio worktree at {wt_path}: {res.get('stderr')}", file=sys.stderr)
+            sys.exit(1)
+
+    ff_res = git_ops._run(["git", "merge", base_branch, "--ff-only"], wt_path)
+    if not ff_res.get("ok"):
+        print(f"ERROR: studio worktree could not fast-forward to {base_branch}: {ff_res.get('stderr')}", file=sys.stderr)
+        sys.exit(1)
+
+    merged_quests, reports = _merge_quest_branches_with_policy(accepted, wt_path, slug)
+    isolated = [(r["id"], r["isolated"]) for r in reports if r["isolated"]]
+    if not as_json:
+        for r in reports:
+            if r["paperwork"]:
+                print(f"📄 {r['id']}: charter paperwork conflicts resolved branch-wins "
+                      f"(branch holds the full tribute + audit): {', '.join(r['paperwork'])}")
+            for u in r["union"]:
+                print(f"🔀 {r['id']}: code overlap union-resolved and disclosed to the Artist: {u}")
+        for qid, reason in isolated:
+            print(f"⚠️  Isolated {qid}: {reason}. It stays OUT of this studio — review it per-Quest "
+                  f"(/artist {qid}) or let a later convoy integrate it after remediation.")
+    if not merged_quests:
+        print("ERROR: every candidate branch failed to merge into the studio — no merged state to review.", file=sys.stderr)
+        sys.exit(1)
+
+    setup_worktree_agent_config(wt_path, "artist")
+
+    # .env plumbing — the gitignored per-checkout env file is absent in fresh worktrees
+    # (the Q617 studio's first boot failed on the missing QSTASH_URL before this copy).
+    env_note = ""
+    root_env = repo_root / ".env"
+    if root_env.is_file() and not (wt_path / ".env").exists():
+        shutil.copy2(root_env, wt_path / ".env")
+        env_note = ".env copied from the castle root (gitignored per-checkout file)"
+
+    no_server = getattr(args, "no_server", False)
+    port, runserver_url, server_status = _ensure_worktree_server(
+        wt_path,
+        port_override=getattr(args, "port", None),
+        no_server=no_server,
+    )
+    freshness = _run_freshness_gate(repo_root) if not no_server else {
+        "configured": False, "command": "", "max_age_hours": 24,
+        "age_hours": None, "fresh": None, "detail": "server skipped (--no-server)",
+    }
+    fresh_verdict = _freshness_verdict(freshness)
+
+    model = getattr(args, "model", None) or config.get_model("artist")
+    provider = getattr(args, "provider", None) or config.get_provider("artist")
+
+    # Shared studio browser + annotation overlay. Best-effort: the studio must
+    # not die because the browser failed to start.
+    browser_info: Optional[dict[str, Any]] = None
+    browser_wired_mcp = False
+    if not getattr(args, "no_browser", False):
+        try:
+            browser_info = studio_browser.start_browser(annotate_worktree=wt_path)
+            try:
+                (wt_path / ".worktree-browser").write_text(
+                    json.dumps(
+                        {
+                            "port": browser_info.get("port"),
+                            "cdp_url": browser_info.get("cdp_url"),
+                            "profile": browser_info.get("profile"),
+                            "annotator": True,
+                        },
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"⚠️  shared studio browser not started ({e}); the Artist brief carries manual attach instructions")
+            browser_info = None
+        if browser_info and STUDIO_MCP_WORKTREE_CONFIG:
+            browser_wired_mcp = ensure_worktree_browser_mcp(wt_path, int(browser_info.get("port") or 0))
+    browser_mcp_line = render_browser_note(wt_path, browser_info, browser_wired_mcp)
+
+    quest_blocks: list[str] = []
+    routes_by_id: dict[str, list[str]] = {}
+    for quest in merged_quests:
+        routes = _extract_target_routes(quest, worktree=wt_path)
+        routes_by_id[quest.id] = routes
+        route_str = "\n".join(f"  - {runserver_url}{r}" if not r.startswith("http") else f"  - {r}" for r in routes)
+        quest_blocks.append(
+            f"### {quest.id} — {quest.title}\n- Branch: `{quest.branch}`\n"
+            f"- Charter: `.court/quests/{quest.id}.md` (merged into this worktree)\n"
+            f"- Preview routes:\n{route_str}"
+        )
+
+    merge_disclosure_lines: list[str] = []
+    for r in reports:
+        if r["paperwork"] or r["union"] or r["isolated"]:
+            bits = []
+            if r["paperwork"]:
+                bits.append("paperwork branch-wins: " + ", ".join(r["paperwork"]))
+            if r["union"]:
+                bits.append("code union (verify live): " + "; ".join(r["union"]))
+            if r["isolated"]:
+                bits.append(f"ISOLATED (not in this studio): {r['isolated']}")
+            merge_disclosure_lines.append(f"- **{r['id']}**: " + " | ".join(bits))
+
+    sync_back_commands = "\n".join(
+        f"git -C {q.worktree} merge {branch_name} --no-edit -m \"court: sync-back combined studio {slug} into {q.id}\""
+        if q.worktree else
+        f"# {q.id}: locate its worktree (court show {q.id}), then: git -C <worktree> merge {branch_name} --no-edit"
+        for q in merged_quests
+    )
+    sync_back_commands += (
+        f"\n# or, deterministic equivalent: python3 -m court.cli studio "
+        f"{','.join(q.id for q in merged_quests)} --sync-back --branch {branch_name}"
+    )
+
+    tmpl_path = REPO_ROOT / STUDIO_DISPATCH_TEMPLATE
+    if not tmpl_path.exists():
+        tmpl_path = Path(__file__).resolve().parent / "templates" / "court_artist_studio_prompt.md"
+    if tmpl_path.exists():
+        tmpl_text = tmpl_path.read_text(encoding="utf-8")
+    else:
+        tmpl_text = (
+            "You are the Court Artist for combined studio {{ studio_slug }}. Worktree: {{ worktree }}. "
+            "Runserver: {{ runserver_url }}. Quests: {{ quest_ids }}"
+        )
+
+    prompt = (
+        tmpl_text
+        .replace("{{ studio_slug }}", slug)
+        .replace("{{ worktree }}", str(wt_path))
+        .replace("{{ branch }}", branch_name)
+        .replace("{{ base_branch }}", base_branch)
+        .replace("{{ runserver_url }}", runserver_url)
+        .replace("{{ port }}", str(port))
+        .replace("{{ model }}", model)
+        .replace("{{ freshness_note }}", fresh_verdict)
+        .replace("{{ browser_mcp_line }}", browser_mcp_line)
+        .replace("{{ annotations_file }}", str(wt_path / ".kilo" / "studio-annotations.jsonl"))
+        .replace("{{ vision_model }}", config.get_model("artist_vision", default=model))
+        .replace("{{ merge_disclosures }}", "\n".join(merge_disclosure_lines) or "- (clean merges — no policy resolutions needed)")
+        .replace("{{ sync_back_commands }}", sync_back_commands)
+        .replace("{{ target_routes }}", "\n".join(
+            f"- {runserver_url}{r}" if not r.startswith("http") else f"- {r}"
+            for r in [x for routes in routes_by_id.values() for x in routes]
+        ))
+        .replace("{{ quest_blocks }}", "\n\n".join(quest_blocks))
+        .replace("{{ quest_ids }}", ", ".join(q.id for q in merged_quests))
+    )
+
+    brief_path = wt_path / ".kilo" / "TASK_ARTIST.md"
+    try:
+        brief_path.parent.mkdir(parents=True, exist_ok=True)
+        brief_path.write_text(prompt, encoding="utf-8")
+    except Exception as e:
+        print(f"⚠️  could not write {brief_path} ({e}); the rendered brief is in the command output")
+
+    ledger_note_tail = (
+        f"runserver port {port} ({fresh_verdict.split(' — ')[0]})"
+        if not no_server else "runserver skipped (--no-server)"
+    )
+    for quest in merged_quests:
+        quest.artist_model = model
+        bits = [f"Routed to combined artist studio {slug} (worktree {wt_name}, branch {branch_name})"]
+        r = next(x for x in reports if x["id"] == quest.id)
+        if r["paperwork"]:
+            bits.append(f"conflicts resolved branch-wins: {', '.join(r['paperwork'])}")
+        if r["union"]:
+            bits.append(f"code overlaps union-resolved: {len(r['union'])} (disclosed to Artist)")
+        bits.append(ledger_note_tail)
+        if env_note:
+            bits.append(env_note)
+        quest.log_ledger(quest.status, quest.status, "; ".join(bits))
+    store.save_many(
+        merged_quests,
+        f"court: record combined studio {slug} routing ({len(merged_quests)} quest(s))",
+        auto_commit=auto_commit,
+    )
+
+    if getattr(args, "prompt_only", False):
+        print(prompt)
+        return
+
+    if getattr(args, "json", False):
+        out = {
+            "studio": slug,
+            "quests": [
+                {"id": q.id, "title": q.title, "branch": q.branch, "routes": routes_by_id.get(q.id, [])}
+                for q in merged_quests
+            ],
+            "isolated": [{"id": qid, "reason": reason} for qid, reason in isolated],
+            "conflict_policy": {
+                r["id"]: {
+                    "paperwork_branch_wins": r["paperwork"],
+                    "union_resolved": r["union"],
+                    "isolated": r["isolated"],
+                }
+                for r in reports
+            },
+            "worktree": str(wt_path),
+            "branch": branch_name,
+            "base": base_branch,
+            "port": port,
+            "runserver_url": runserver_url,
+            "freshness": {"verdict": fresh_verdict, "age_hours": freshness.get("age_hours"),
+                          "command": freshness.get("command"), "detail": freshness.get("detail")},
+            "model": model,
+            "provider": provider,
+            "brief_path": str(brief_path),
+            "prompt": prompt,
+            "spawn": {
+                "argv": [
+                    "kilo", "run",
+                    "--agent", "artist",
+                    "--model", model,
+                    "--dir", str(wt_path),
+                    f"$(cat {brief_path})",
+                ],
+                "interactive": f"cd {wt_path} && kilo   # default_agent already set to artist",
+                "model": model,
+                "provider": provider,
+            },
+        }
+        print(json.dumps(out, indent=2))
+        return
+
+    if getattr(args, "standup", False):
+        spawn = standup_kilo_session(
+            wt_path,
+            agent="artist",
+            model=model,
+            prompt=prompt,
+            title=f"{slug} Combined Studio",
+            kilo_bin=kilo_bin,
+            provider_hint="artist",
+        )
+        session_id = spawn.get("session_id") or ""
+        # Record only REAL sessions (api/cli); the config-mode placeholder id
+        # ("kilo-artist", worktree merely pre-configured) is not a session.
+        if session_id and spawn.get("mode") in ("api", "cli"):
+            for quest in merged_quests:
+                quest.artist_session_id = session_id
+            store.save_many(
+                merged_quests,
+                f"court: record combined studio {slug} artist session {session_id}",
+                auto_commit=auto_commit,
+            )
+        print(f"🎨 Branch B spawn: {spawn.get('message')}")
+
+    merged_ids = ", ".join(q.id for q in merged_quests)
+    print("=" * 76)
+    print("🎨 COMBINED ARTIST STUDIO STOOD UP — DETERMINISTIC MULTI-QUEST REVIEW")
+    print("=" * 76)
+    print(f"Studio:      {slug}")
+    print(f"Quests:      {merged_ids}" + (f"  (isolated: {', '.join(qid for qid, _ in isolated)})" if isolated else ""))
+    print(f"Branch:      {branch_name} (cut from {base_branch})")
+    print(f"Worktree:    {wt_path}")
+    print(f"Runserver:   {runserver_url} (Port {port}) [{server_status}]")
+    print(f"Freshness:   {fresh_verdict}")
+    print(f"Model:       {model} ({provider})")
+    _browser_lines = browser_mcp_line.splitlines() or ["not configured"]
+    print(f"Browser:     {_browser_lines[0].lstrip('- ')}")
+    for _bline in _browser_lines[1:]:
+        print(f"             {_bline.lstrip('- ')}")
+    if env_note:
+        print(f"Env:         {env_note}")
+    print()
+    print("Live Preview URLs:")
+    for r in [x for routes in routes_by_id.values() for x in routes]:
+        url_line = f"{runserver_url}{r}" if not r.startswith("http") else r
+        print(f"  • {url_line}")
+    print()
+    print("Next Steps for M'Lord & Steward (single unified spawn path — prompting):")
+    print("  Spawn the Court Artist session via Kilo CLI (Agent Manager prompting is")
+    print("  retired: it defaults sessions to steward mode and lacks agent parameterization):")
+    print(f"    kilo run --agent artist --model \"$(python3 -m court.cli model artist)\" --dir {wt_path} \"$(cat {brief_path})\"")
+    print("    (or `--standup` next time to let this command spawn and record it), or interactive:")
+    print(f"    cd {wt_path} && kilo   # default_agent already set to artist")
+    print("    then record the session: python3 -m court.cli set-field <id> artist_session_id <session_id>")
+    print(f"  Brief:    {brief_path} (also rendered above with --prompt-only)")
+    print()
+    print("🛡️ AFTER THE ROYAL SIGN-OFF (single-writer — no Gatekeeper in this worktree):")
+    print(f"  1. Sync the studio back per Quest: python3 -m court.cli studio {merged_ids} --sync-back")
+    print(f"     --branch {branch_name}")
+    print("  2. Collection remains the Steward's: levy/collect the signed-off Quests into a")
+    print("     Cog Ship as usual — the studio branch itself is never promoted directly.")
     print("=" * 76)
 
 
@@ -3484,7 +5705,7 @@ def cmd_stamp(args):
     cogship_id = None if (not cogship_arg or cogship_arg.lower() == "new") else cogship_arg
     auto_commit = not getattr(args, "no_commit", False)
     try:
-        stamped = store.stamp_cogship(quests, cogship_id=cogship_id, auto_commit=auto_commit)
+        stamped = store.stamp_cogship(quests, cogship_id=cogship_id, auto_commit=auto_commit, force=getattr(args, "force", False))
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
@@ -3585,6 +5806,107 @@ def cmd_timber(args):
         print("-" * 78)
 
 
+def cmd_ui(args):
+    from court import ui_server
+    if args.open:
+        import threading, webbrowser
+        threading.Timer(
+            0.8, lambda: webbrowser.open(f"http://127.0.0.1:{args.port}")).start()
+    ui_server.serve(port=args.port)
+
+
+# Lifecycle teardown sweep constants (Q707-era: 4 stranded scaffolding
+# worktrees, 2 superseded easels, old cogship-245, and a serf alive since
+# Sunday on a punished quest — all found by hand).
+TEARDOWN_DONE_GRACE_HOURS = 24.0
+_TEARDOWN_SWEEP_SESSION_STATES = ("PUNISHED", "DONE", "READY_TO_RAZE")
+
+
+def monitor_lifecycle_sweep(now: Optional[datetime] = None) -> dict:
+    """Classify sessions whose quests are past their useful life:
+      - punished/done/ready-to-raze quests whose worker session id is stale
+        (updated more than TEARDOWN_DONE_GRACE_HOURS ago, or whose process is
+        simply gone) -> candidates for `kilo session delete`.
+      - fork-scaffolding worktrees (master_of_coin / gatekeeper) on such
+        quests -> candidates for `court fork-teardown-list` triage.
+    Pure classification (no kills) so it is unit-testable and cron-safe."""
+    now = now or datetime.now(timezone.utc)
+    stale_sessions: list[dict] = []
+    scaffolding: list[dict] = []
+    for q in store.list_all():
+        if q.status not in _TEARDOWN_SWEEP_SESSION_STATES:
+            continue
+        finished_at = q.updated_at or ""
+        age_h: Optional[float] = None
+        try:
+            finished = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+            if finished.tzinfo is None:
+                finished = finished.replace(tzinfo=timezone.utc)
+            age_h = (now - finished).total_seconds() / 3600.0
+        except Exception:
+            age_h = None
+        for field_name in ("serf_session_id", "master_of_coin_session_id", "gatekeeper_session_id", "artist_session_id"):
+            sid = (getattr(q, field_name, "") or "").strip()
+            if not sid:
+                continue
+            # PID-fallback ids (kilo-serf-12345) have no real session behind
+            # them; real ids (ses_*) are deletable only past the grace window.
+            if sid.startswith("ses_") and age_h is not None and age_h < TEARDOWN_DONE_GRACE_HOURS:
+                continue
+            stale_sessions.append({
+                "quest": q.id, "status": q.status, "field": field_name,
+                "session_id": sid, "age_hours": round(age_h, 1) if age_h is not None else None,
+                "worktree": q.worktree or "",
+            })
+        if q.status in ("PUNISHED", "DONE") and q.worktree and (
+            "coin" in q.worktree or "gatehouse" in q.worktree or "master-of-coin" in q.worktree
+        ):
+            scaffolding.append({"quest": q.id, "status": q.status, "worktree": q.worktree})
+    return {"stale_sessions": stale_sessions, "scaffolding_worktrees": scaffolding}
+
+
+def cmd_monitor(args):
+    """One-shot status roll-up + lifecycle sweep for the recurring cron.
+
+    Runs the classified `court sync --all` (branch-ahead folds branch-wins;
+    castle PUNISHED/HELD is royal and pushes down; castle-ahead charters sync
+    down into idle worktrees), then reports lifecycle teardown candidates.
+    Exits 0 always — a cron job must not page on routine drift."""
+    print("== court monitor — status roll-up ==")
+    try:
+        rc = subprocess.run(
+            [sys.executable, "-m", "court.cli", "sync", "--all"],
+            cwd=str(git_ops.get_repo_root()),
+            capture_output=True, text=True, timeout=600,
+        )
+        out = (rc.stdout or "").strip()
+        print(out if out else "(sync produced no output)")
+        if rc.returncode != 0:
+            print(f"⚠️  sync exited {rc.returncode}: {(rc.stderr or '').strip()[:300]}")
+    except Exception as e:
+        print(f"⚠️  sync failed: {e}")
+
+    print()
+    print("== lifecycle teardown sweep ==")
+    sweep = monitor_lifecycle_sweep()
+    stale = sweep["stale_sessions"]
+    scaff = sweep["scaffolding_worktrees"]
+    if not stale and not scaff:
+        print("Nothing past its useful life — no teardown candidates.")
+        return
+    if stale:
+        print(f"Stale sessions on finished/frozen quests ({len(stale)}):")
+        for s in stale:
+            age = f"{s['age_hours']}h" if s["age_hours"] is not None else "age unknown"
+            print(f"  * {s['quest']} [{s['status']}] {s['field']}={s['session_id']} ({age})")
+        print("  → `kilo session delete <id>` per line (or `court teardown-list` for worktree state)")
+    if scaff:
+        print(f"Scaffolding worktrees on finished/frozen quests ({len(scaff)}):")
+        for s in scaff:
+            print(f"  * {s['quest']} [{s['status']}] — {s['worktree']}")
+        print("  → run `court fork-teardown-list` for the move/stop/triage order")
+
+
 def cmd_teardown_list(args):
     import json
     am_path = agent_manager_json_path()
@@ -3660,7 +5982,7 @@ def cmd_teardown_list(args):
     print("=" * 76)
 
     if active_in_ashes:
-        print(f"\n🔥 Resting in Ashes Section (Safe for M'Lord to delete in Agent Manager UI) ({len(active_in_ashes)}):")
+        print(f"\n🔥 Resting in Ashes Section (Safe for M'Lord to delete by hand) ({len(active_in_ashes)}):")
         for item in active_in_ashes:
             q = item["quest"]
             aligned = "✅ Aligned (0 drift)" if item["behind"] == "0" and item["ahead"] == "0" and item["dirty_count"] == 0 else f"⚠️ Drift (behind={item['behind']}, ahead={item['ahead']}, dirty={item['dirty_count']})"
@@ -3673,7 +5995,7 @@ def cmd_teardown_list(args):
             print(f"   * {q.id}: {item['wt_id']} ({item['path']}) [Section: {item['sec_id']}]")
 
     if already_pruned:
-        print(f"\n📦 Already Pruned from Agent Manager / Disk ({len(already_pruned)} Quests ready to archive):")
+        print(f"\n📦 Already Pruned from Disk ({len(already_pruned)} Quests ready to archive):")
         for q in already_pruned:
             print(f"   * {q.id} (branch={q.branch or '-'})")
         print(f"\n   👉 Archive all {len(already_pruned)} pruned quests with: python3 -m court.cli raze")
@@ -3793,7 +6115,7 @@ def cmd_fork_teardown_list(args):
     print("🗄️  FORK TEARDOWN LIST — MASTER OF COIN & GATEKEEPER SCAFFOLDING")
     print("=" * 78)
     print("Order is MOVE (while session is alive) -> STOP -> never `git worktree")
-    print("remove` (M'Lord prunes the directory by hand in the Agent Manager UI).\n")
+    print("remove` (M'Lord prunes the directory by hand).\n")
 
     if moc_eligible:
         print(f"✅ ELIGIBLE — Master of Coin forks, verdict synced, safe to move+stop ({len(moc_eligible)}):")
@@ -3803,8 +6125,7 @@ def cmd_fork_teardown_list(args):
             print(f"   * {q.id} [{q.status}] — {e['branch']}")
             print(f"     {e['reason']}")
             if e["session_id"]:
-                print(f"     👉 agent_manager move sessionID={e['session_id']} sectionID={target}")
-                print(f"     👉 agent_manager stop sessionID={e['session_id']}   (AFTER the move above lands)")
+                print(f"     👉 kilo session delete sessionID={e['session_id']}   (session no longer needed; M'Lord prunes the directory by hand)")
             else:
                 print(f"     ⚠️  Session already gone — worktree stranded in section {e['sec_id'] or '(ungrouped)'}."
                       f" Cannot be moved by this tool anymore (move requires a live session); ask M'Lord to drag"
@@ -3818,10 +6139,10 @@ def cmd_fork_teardown_list(args):
             print(f"   * {q.id} [{q.status}] — {e['branch']}")
             print(f"     {e['reason']}")
             if e["session_id"] and e["session_name"]:
-                print(f"     👉 agent_manager prompt sessionID={e['session_id']}: \"Confirm your verdict is written under "
+                print(f"     👉 kilo run --agent master_of_coin --dir <this fork worktree> --model \"$(python3 -m court.cli model master_of_coin)\": \"Confirm your verdict is written under "
                       f"## Master of Coin's Audit in .court/quests/{q.id}*.md, then run `git push . HEAD:{q.branch}` "
-                      f"from this fork worktree and report back the exact push result. Do not call agent_manager stop "
-                      f"yourself.\"")
+                      f"from this fork worktree and report back the exact push result. Do not stop "
+                      f"your own session.\"")
             else:
                 print(f"     ⚠️  No live session left to re-prompt — this audit stalled without ever finishing."
                       f" Re-dispatch a fresh Master of Coin session per master_of_coin_review_prompt.md rather than"
@@ -3834,8 +6155,7 @@ def cmd_fork_teardown_list(args):
             print(f"   * {e['branch']}")
             print(f"     {e['reason']}")
             if e["session_id"]:
-                print(f"     👉 agent_manager move sessionID={e['session_id']} sectionID={ashes_id or '<Ashes section id>'}")
-                print(f"     👉 agent_manager stop sessionID={e['session_id']}   (AFTER the move above lands)")
+                print(f"     👉 kilo session delete sessionID={e['session_id']}   (promotion confirmed; M'Lord prunes the directory by hand)")
             else:
                 print(f"     ⚠️  Session already gone — worktree stranded in section {e['sec_id'] or '(ungrouped)'}."
                       f" Ask M'Lord to drag it into Ashes by hand, or leave it — it is inert.")
@@ -3915,6 +6235,9 @@ def cmd_edict(args):
 
 
 def cmd_ship(args):
+    # v1332 double-ship guard: two operators (or two agents) packing the
+    # manifest concurrently produce two Cog Ship manifests for one convoy.
+    require_op_lock("ship")
     base_branch = getattr(args, "base", "main")
     head_branch = getattr(args, "head", "castle")
 
@@ -4457,7 +6780,7 @@ def cmd_levy(args):
     print("\n" + "=" * 78)
     print("💡 RECOMMENDED NEXT STEPS & ACTIONS:")
     print("  • For WORKING Quests showing [Tasks: X/Y (100%)] [CLEAN] zero drift (Serf-complete, paperwork-only): dispatch Master of Coin directly (`.court/templates/master_of_coin_review_prompt.md`) — do NOT `/goad`, that signature is paperwork, not code.")
-    print("  • For WORKING Quests genuinely idle/incomplete (checklist < 100% and/or dirty tree): Run `/goad <quest_id>` or prod the session via Agent Manager to update charter & continue.")
+    print("  • For WORKING Quests genuinely idle/incomplete (checklist < 100% and/or dirty tree): Run `/goad <quest_id>` to prod the session to update charter & continue.")
     print("  • For completed Quests in Review: Summon Master of Coin via `/levy <id>` (`.kilo/commands/levy.md`).")
     print("  • For Quests ready for Gatehouse integration: Run `/collect` (`.kilo/commands/collect.md`).")
     print("  • For a real merge conflict flagged above: dispatch the Serf to resolve it, then re-run `court rebase <id>`.")
@@ -4650,6 +6973,80 @@ def cmd_fix_branches(args):
         sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# Shared studio browser verbs (thin wrappers over court.browser)
+# ---------------------------------------------------------------------------
+
+
+def cmd_browser_start(args):
+    annotate_wt = Path(args.annotate).expanduser().resolve() if getattr(args, "annotate", None) else None
+    if annotate_wt and not annotate_wt.is_dir():
+        print(f"ERROR: --annotate worktree does not exist: {annotate_wt}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        info = studio_browser.start_browser(
+            headless=bool(getattr(args, "headless", False)),
+            port=getattr(args, "port", None),
+            profile=None,
+            annotate_worktree=annotate_wt,
+        )
+    except Exception as e:
+        print(f"ERROR: could not start the shared studio browser: {e}", file=sys.stderr)
+        sys.exit(1)
+    print("🌐 Shared studio browser is up:")
+    print(f"  CDP:      {info.get('cdp_url')}")
+    print(f"  Port:     {info.get('port')}")
+    print(f"  PID:      {info.get('pid')}")
+    print(f"  Profile:  {info.get('profile')}")
+    print(f"  Headless: {info.get('headless')}")
+    annotator_pid = info.get("annotator_pid")
+    if annotate_wt:
+        print(f"  Injector: {'PID ' + str(annotator_pid) if annotator_pid else 'not started'} (worktree: {annotate_wt})")
+        print(f"  Notes:    {Path(annotate_wt) / '.kilo' / 'studio-annotations.jsonl'}")
+    print(f"  State:    {studio_browser.STATE_PATH}")
+    if info.get("headless"):
+        print(f"  Attach:   npx chrome-devtools-mcp@latest --browserUrl {info.get('cdp_url')}")
+
+
+def cmd_browser_status(args):
+    info = studio_browser.browser_status()
+    if getattr(args, "json", False):
+        print(json.dumps(info, indent=2))
+        return
+    recorded = info.get("recorded")
+    if not recorded:
+        print("🌐 No shared studio browser recorded (never started, or state file removed).")
+        return
+    if info.get("running"):
+        print("🌐 Shared studio browser is RUNNING:")
+        print(f"  CDP:      http://127.0.0.1:{recorded.get('port')}")
+        print(f"  PID:      {recorded.get('pid')} ({info.get('cdp', {}).get('browser') or 'chromium'})")
+        print(f"  Profile:  {recorded.get('profile')}")
+        print(f"  Injector: {'alive (PID ' + str(recorded.get('annotator_pid')) + ')' if info.get('annotator_alive') else 'not running'}")
+    else:
+        print("🌐 Shared studio browser is NOT running (stale state file):")
+        print(f"  Recorded PID: {recorded.get('pid')} — alive: {info.get('pid_alive')} — CDP: {info.get('cdp_responsive')}")
+        print("  Start it with: python3 -m court.cli browser start")
+
+
+def cmd_browser_stop(args):
+    result = studio_browser.stop_browser()
+    if not result.get("had_state"):
+        print("🌐 Nothing to stop (no state file).")
+        return
+    if not result.get("actions"):
+        print("🌐 Stopped: state file cleared (recorded processes were already gone).")
+        return
+    for action in result["actions"]:
+        outcome = action.get("outcome", "")
+        for key, value in action.items():
+            if key != "outcome":
+                print(f"  {key} {value}: {outcome}")
+    print("🌐 Shared studio browser stopped.")
+
+
+def cmd_browser_inject_worker(args):
+    studio_browser._inject_worker(args.worktree)
 
 
 def build_parser():
@@ -4699,6 +7096,7 @@ def build_parser():
     p_patchwork.add_argument("--native", action="store_true", help="Force native git worktree without Kilo CLI")
     p_patchwork.add_argument("--create-worktree", action="store_true", help="Create native git worktree automatically")
     p_patchwork.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
+    p_patchwork.add_argument("--force-stamp", action="store_true", help="Allow re-stamping a quest already stamped on another cogship (duplicate-convoy guard override)")
     p_patchwork.set_defaults(func=cmd_patchwork)
 
     p_charter = sub.add_parser(
@@ -4717,7 +7115,7 @@ def build_parser():
         "--section",
         choices=("Bug fix", "Feature", "Optimization"),
         default=None,
-        help="Override the Agent Manager section lane for the dispatch NEXT STEPS",
+        help="Override the dispatch lane label for the dispatch NEXT STEPS",
     )
     p_charter.add_argument("--dispatch", action="store_true", help="Immediately stand up worktree and dispatch to WORKING")
     p_charter.add_argument("--standup", action="store_true", help="Automate Kilo worktree creation and standup")
@@ -4774,9 +7172,9 @@ def build_parser():
         help="Composite: record branch/worktree/serf_session_id/serf_model, advance DISPATCHED -> WORKING, print levy reminder — one command, one commit (Q183)",
     )
     p_dispatch_complete.add_argument("quest_id")
-    p_dispatch_complete.add_argument("--session-id", required=True, dest="session_id", help="Serf Agent Manager session id returned by the agent_manager tool call")
+    p_dispatch_complete.add_argument("--session-id", required=True, dest="session_id", help="Serf session id returned by the spawn step")
     p_dispatch_complete.add_argument("--branch", required=True, help="Canonical Quest branch (slash hierarchy)")
-    p_dispatch_complete.add_argument("--worktree", required=True, help="Quest worktree path returned by the agent_manager tool call")
+    p_dispatch_complete.add_argument("--worktree", required=True, help="Quest worktree path returned by the spawn step")
     p_dispatch_complete.add_argument(
         "--model", "--serf-model",
         dest="serf_model",
@@ -4805,7 +7203,7 @@ def build_parser():
     p_artist.add_argument("--no-server", action="store_true", help="Skip starting the worktree dev server")
     p_artist.add_argument("--no-commit", action="store_true", help="Do not autocommit quest updates")
     p_artist.add_argument("--prompt-only", action="store_true", help="Print only the rendered Court Artist prompt")
-    p_artist.add_argument("--json", action="store_true", help="Output JSON format for agent_manager or scripts")
+    p_artist.add_argument("--json", action="store_true", help="Output JSON format for scripts (spawn payload uses the unified Kilo CLI path)")
     p_artist.set_defaults(func=cmd_artist)
 
     p_show = sub.add_parser("show", help="Print a Quest/Epic's full markdown or extracted section")
@@ -4853,6 +7251,12 @@ def build_parser():
     p_log.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_log.set_defaults(func=cmd_log)
 
+    p_sync = sub.add_parser("sync", help="Pull branch-tip quest ledger (charter + events) onto the main checkout — branch-wins union; true edit wars refuse")
+    p_sync.add_argument("quest_ids", nargs="*", help="Quest ID(s), or empty with --all")
+    p_sync.add_argument("--all", action="store_true", help="Sync every quest in the main checkout's ledger")
+    p_sync.add_argument("--base", default="castle", help="Base branch for merge-base classification (default: castle)")
+    p_sync.set_defaults(func=cmd_sync)
+
     p_commute = sub.add_parser("commute", help="Record a post-deployment commutation as completed (appends a dated entry to the Quest's Cogship Log)")
     p_commute.add_argument("quest_id")
     p_commute.add_argument("--note", "--content", dest="note", default="", help="What was executed to complete the commutation")
@@ -4892,6 +7296,12 @@ def build_parser():
     p_section.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_section.set_defaults(func=cmd_set_section)
 
+    p_events_repair = sub.add_parser("events-repair", help="Rebuild a body section blinded in the event-fold (append-only repair)")
+    p_events_repair.add_argument("quest_id")
+    p_events_repair.add_argument("--section", default="Tribute Rendered")
+    p_events_repair.add_argument("--force", action="store_true", help="Rebuild even if the section is non-empty in the current fold")
+    p_events_repair.set_defaults(func=cmd_events_repair)
+
     p_verify = sub.add_parser("verify", help="Run a deterministic worktree/test check")
     p_verify.add_argument("quest_id")
     p_verify.add_argument("--test-cmd", default=None)
@@ -4919,6 +7329,11 @@ def build_parser():
 
     p_teardown = sub.add_parser("teardown-list", help="List worktrees ready for M'Lord to prune")
     p_teardown.set_defaults(func=cmd_teardown_list)
+
+    p_ui = sub.add_parser("ui", help="Serve the localhost dev console (zero dependencies)")
+    p_ui.add_argument("--port", type=int, default=8300)
+    p_ui.add_argument("--open", action="store_true", help="Open the browser on start")
+    p_ui.set_defaults(func=cmd_ui)
 
     p_fork_teardown = sub.add_parser(
         "fork-teardown-list",
@@ -4974,14 +7389,94 @@ def build_parser():
     p_atelier.add_argument("--port", type=int, help="Override worktree runserver port")
     p_atelier.add_argument("--no-server", action="store_true", help="Skip starting the convoy dev server")
     p_atelier.add_argument("--prompt-only", action="store_true", help="Print only the rendered convoy Court Artist prompt")
-    p_atelier.add_argument("--json", action="store_true", help="Output JSON format for agent_manager or scripts")
+    p_atelier.add_argument("--json", action="store_true", help="Output JSON format for scripts (spawn payload uses the unified Kilo CLI path)")
     p_atelier.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_atelier.set_defaults(func=cmd_atelier)
+
+    p_studio = sub.add_parser(
+        "studio",
+        help="Deterministic Multi-Quest Combined Studio (Q-2): cut an artist-studio worktree from "
+             "castle tip, merge N Quest branches with the established conflict policy (charter "
+             "paperwork branch-wins; code overlap disclosed-union), start the freshness-gated "
+             "runserver, and record the studio + session in the ledger",
+    )
+    add_quest_selector(p_studio, batchable=True, filters=("status", "app", "epic", "any-status"))
+    p_studio.add_argument("--base", default="castle", help="Base branch the studio worktree is cut from (default: castle)")
+    p_studio.add_argument("--branch", default=None, help="Studio branch override (default: artist/<ids>-ui-studio; must start with artist/)")
+    p_studio.add_argument("--model", default=None, help="Court Artist model override (default from .court/config.json models.artist)")
+    p_studio.add_argument("--provider", default=None, help="Court Artist provider override")
+    p_studio.add_argument("--port", type=int, help="Override worktree runserver port")
+    p_studio.add_argument("--no-server", action="store_true", help="Skip starting the studio dev server (and the freshness gate)")
+    p_studio.add_argument("--standup", action="store_true", help="Spawn the Court Artist session via Kilo CLI (Branch B fallback) and record it on every studio Quest")
+    p_studio.add_argument("--sync-back", action="store_true", help="Post-sign-off: merge the studio branch back into each selected Quest's own worktree branch (no auto-conflict-resolution). Guarded: base-drift + convoy-race. Superseded by --close for the full lifecycle")
+    p_studio.add_argument("--close", action="store_true", help="Close-out lifecycle: five guards (sign-off proof, base-drift, convoy-race, labeled cherry-pick extraction, conflict->artist union brief), close-out manifest, gated teardown")
+    p_studio.add_argument("--signoff", default=None, metavar="NOTE", help="--close: write a dated 'studio sign-off' ledger stamp with NOTE at invocation (else a pre-existing stamp is required)")
+    p_studio.add_argument("--force-union", action="store_true", help="--close/--sync-back: override the base-drift refusal (drifted-base merges replay stale lines; know what you are doing)")
+    p_studio.add_argument("--drift-threshold", type=int, default=None, metavar="N", help="--close/--sync-back: base-drift threshold override (default: studio.close_max_base_drift, else 100)")
+    p_studio.add_argument("--override-manifest", action="store_true", help="--close: unlock teardown despite a not-all-green manifest (explicit override)")
+    p_studio.add_argument("--skip-teardown", action="store_true", help="--close: stop after the manifest; leave the studio worktree/server/session alive")
+    p_studio.add_argument("--artist-session", action="store_true", help="--close: stand up a dedicated artist session in the live studio worktree for union-pending quests")
+    p_studio.add_argument("--prompt-only", action="store_true", help="Print only the rendered studio Court Artist prompt")
+    p_studio.add_argument("--json", action="store_true", help="Output JSON format for scripts (spawn payload uses the unified Kilo CLI path)")
+    p_studio.add_argument("--no-commit", action="store_true", help="Do not autocommit ledger changes")
+    p_studio.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Do not start/adopt the shared studio browser for this studio",
+    )
+    p_studio.set_defaults(func=cmd_studio)
+
+    p_browser = sub.add_parser(
+        "browser",
+        help="Shared studio browser: one headed Chromium with a persistent profile that the "
+             "Court Artist attaches to over CDP (chrome-devtools MCP) and the annotation "
+             "overlay is pinned into",
+    )
+    browser_sub = p_browser.add_subparsers(dest="browser_command")
+    p_browser.set_defaults(func=lambda _args: p_browser.print_help() or sys.exit(2))
+
+    p_browser_start = browser_sub.add_parser(
+        "start",
+        help="Start (or adopt the already-running) shared studio browser and its annotation injector",
+    )
+    p_browser_start.add_argument("--headless", action="store_true", help="Run headless (probe/testing mode)")
+    p_browser_start.add_argument("--port", type=int, default=None, help="CDP port override (default: 9335 or first free port)")
+    p_browser_start.add_argument(
+        "--annotate",
+        default=None,
+        metavar="WORKTREE",
+        help="Worktree whose annotation notes the injector serves (pins the overlay script into every page)",
+    )
+    p_browser_start.set_defaults(func=cmd_browser_start)
+
+    p_browser_status = browser_sub.add_parser("status", help="Show shared browser state, liveness, and CDP probe result")
+    p_browser_status.add_argument("--json", action="store_true", help="Output JSON format")
+    p_browser_status.set_defaults(func=cmd_browser_status)
+
+    p_browser_stop = browser_sub.add_parser("stop", help="Stop the shared browser and injector recorded in the state file (only those)")
+    p_browser_stop.set_defaults(func=cmd_browser_stop)
+
+    p_browser_inject = browser_sub.add_parser(
+        "_inject_worker",
+        help="internal: long-running annotation injector loop (spawned by `browser start`)",
+        description="Internal: long-running annotation injector loop (spawned by `browser start`)",
+    )
+    p_browser_inject.add_argument("worktree", help="Worktree whose studio annotations the injector serves")
+    p_browser_inject.set_defaults(func=cmd_browser_inject_worker)
+
+    p_artist_say = sub.add_parser(
+        "artist-say",
+        help="Deliver M'Lord's instruction to an existing Court Artist session (kilo run --agent artist --session <artist_session_id>)",
+    )
+    p_artist_say.add_argument("quest_id", help="Quest ID with a recorded artist_session_id (e.g. Q196)")
+    p_artist_say.add_argument("instruction", help="The instruction to deliver to the artist session")
+    p_artist_say.set_defaults(func=cmd_artist_say)
 
     p_stamp = sub.add_parser("stamp", help="Stamp Quests onto a Cog Ship convoy id (allocates next cogship-NNN unless --cogship given)")
     p_stamp.add_argument("quest_ids", help="Comma-separated Quest IDs (e.g. Q101,Q102,Q105)")
     p_stamp.add_argument("--cogship", default=None, help="Existing Cog Ship ID to stamp (e.g. cogship-002); omit or pass 'new' to allocate the next id")
     p_stamp.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
+    p_stamp.add_argument("--force", action="store_true", help="Allow re-stamping quests already stamped on another cogship (duplicate-convoy guard override)")
     p_stamp.set_defaults(func=cmd_stamp)
 
     p_edict = sub.add_parser("edict", help="View or add royal edicts and strategic priorities")
@@ -5049,6 +7544,30 @@ def build_parser():
     p_runsuite.add_argument("--json", action="store_true", help="Output JSON format")
     p_runsuite.set_defaults(func=cmd_runsuite)
 
+    p_watch = sub.add_parser(
+        "watch",
+        help="Detached continuation watchdog: when a single-turn worker run ends mid-task, re-prompt the SAME session (generalized goad; spawned automatically beside every engine worker spawn)",
+    )
+    p_watch.add_argument("--pid", type=int, default=None, help="Worker process id to wait on (optional; no pid means poll the quest state once)")
+    p_watch.add_argument("--dir", default=None, help="Worktree the worker runs in (watch state, logs, and ledger reads resolve here)")
+    p_watch.add_argument("--agent", required=True, help="Worker role (serf | scout | gatekeeper | master_of_coin)")
+    p_watch.add_argument("--model", default=None, help="Model for continuation turns (defaults to the worker's recorded model resolution)")
+    p_watch.add_argument("--session", default="", help="Worker session id to re-prompt (resolved from kilo.db when omitted)")
+    p_watch.add_argument("--quest", default="", help="Comma-separated quest ids bound to the run (durable completion signal)")
+    p_watch.add_argument("--task-file", dest="task_file", default="TASK.md", help="Task file under .kilo/ whose text seeds the continuation prompt (default TASK.md)")
+    p_watch.add_argument("--max-attempts", dest="max_attempts", type=int, default=WATCH_MAX_ATTEMPTS, help="Maximum total turns (default 3)")
+    p_watch.add_argument("--attempt", type=int, default=1, help="Starting attempt number (internal)")
+    p_watch.add_argument("--exclude", default="", help="Comma-separated pre-existing session ids to exclude when resolving the worker session")
+    p_watch.add_argument("--session-resolve-seconds", dest="session_resolve_seconds", type=int, default=6, help="How long to poll kilo.db for the worker session id when only a pid is known")
+    p_watch.add_argument("--wall-cap", type=int, default=WATCH_WALL_CAP_SECONDS, help="Hard wall-clock cap for the whole watch (seconds)")
+    p_watch.set_defaults(func=cmd_watch)
+
+    p_monitor = sub.add_parser(
+        "monitor",
+        help="One-shot cron task: classified `court sync --all` status roll-up + lifecycle teardown sweep (safe to schedule; exits 0)",
+    )
+    p_monitor.set_defaults(func=cmd_monitor)
+
     p_verify_manifest = sub.add_parser(
         "verify-manifest",
         help="Post-promotion integrity: assert each manifest Quest's branch TIP is an ancestor of the trunk AND carries production content (would have caught cogship-076/077)",
@@ -5108,7 +7627,17 @@ def build_parser():
 # checkout's index / dirty tree. Read-only reporting commands never take it.
 _READ_ONLY_COMMANDS = {
     "status", "show", "list", "tally", "ward", "ship", "diff", "timber",
-    "model", "verify-merged", "verify-manifest", "runsuite",
+    "model", "verify-merged", "verify-manifest", "runsuite", "browser",
+    # `watch` only observes durable state and re-prompts sessions; it never
+    # commits, so it must not serialize behind the write lock (a watchdog
+    # blocking on a busy castle would delay continuations). `monitor` runs
+    # sync as its own subprocess which takes the lock itself.
+    "watch", "monitor",
+    # `ui` is a long-lived server: it must never hold the court-wide write
+    # lock for its whole lifetime (that deadlocked every root-level mutation
+    # until the server died). Its in-process court ops shell out as
+    # short-lived subprocesses which serialize on the lock themselves.
+    "ui",
 }
 
 

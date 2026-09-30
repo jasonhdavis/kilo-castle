@@ -204,6 +204,33 @@ _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
 
 _KNOWN_SECTION_NAMES = frozenset(DEFAULT_BODY_SECTIONS) | frozenset(LEGACY_SECTION_ALIASES)
 
+# Tribute sub-part header aliases (lowercase). These are CONTENT headers inside
+# `## Tribute Rendered` (serf reports: Ballad/Tribute/Tally/Penance/Audience/
+# Opinion; scout reports: Survey/Map/Dangers/Plot) — never top-level sections.
+# Keep in sync with Quest.extract_tribute_subsection's canonical_map. Parsing
+# them as section boundaries re-keyed whole tributes into spurious
+# body_sections keys and emptied `Tribute Rendered`, blinding the event-fold
+# (cogship-253 / Q661 / Q688 incident, 2026-09-30).
+_TRIBUTE_PART_ALIASES = {
+    "ballad": "Ballad", "the ballad": "Ballad",
+    "tribute": "Tribute", "the tribute": "Tribute",
+    "tally": "Tally", "the tally": "Tally",
+    "verification": "Tally", "the verification": "Tally",
+    "verification runbook": "Tally", "verification paths": "Tally",
+    "production verification": "Tally", "ui verification": "Tally",
+    "how to verify": "Tally",
+    "penance": "Penance", "atone": "Penance", "the penance": "Penance",
+    "audience": "Audience", "the audience": "Audience",
+    "opinion": "Opinion", "humble opinion": "Opinion",
+    "humble_opinion": "Opinion", "the humble opinion": "Opinion",
+    "survey": "Survey", "the survey": "Survey", "summary": "Survey",
+    "map": "Map", "the map": "Map",
+    "dangers": "Dangers", "the dangers": "Dangers",
+    "plot": "Plot", "the plot": "Plot",
+}
+# Canonical display order for reassembling a tribute from its parts.
+_TRIBUTE_PART_ORDER = ("Ballad", "Tribute", "Tally", "Penance", "Audience", "Opinion", "Survey", "Map", "Dangers", "Plot")
+
 
 class _DirtyTrackingSections(dict):
     """Body-sections dict that records every key written to it, so
@@ -294,6 +321,10 @@ class Quest:
             self.body_sections = _DirtyTrackingSections(self._dirty_sections, self.body_sections)
         for section in DEFAULT_BODY_SECTIONS:
             self.body_sections.setdefault(section, "")
+        # Canonical sections the caller deliberately cleared via set_section("").
+        # The event writer refuses to emit section-wipe events for anything not
+        # in this set (cogship-253/Q661/Q688 fold-blinding guard).
+        self._explicit_wipes: set = set()
 
     @property
     def tree_branch(self) -> str:
@@ -332,7 +363,8 @@ class Quest:
         title_line = f"# {self.id} — {self.title}\n"
         body_parts = []
         ordered = list(DEFAULT_BODY_SECTIONS) + [
-            s for s in self.body_sections if s not in DEFAULT_BODY_SECTIONS
+            s for s in self.body_sections
+            if s not in DEFAULT_BODY_SECTIONS and s.lower() not in _TRIBUTE_PART_ALIASES
         ]
         for section in ordered:
             content = self.body_sections.get(section, "").rstrip()
@@ -364,15 +396,32 @@ class Quest:
         sections = {}
         current = None
         buf = []
+        in_tribute_rendered = False
         for line in body_text.splitlines():
             header_m = header_re.match(line)
-            if header_m and (
-                is_new_shape or header_m.group(1).strip() in _KNOWN_SECTION_NAMES
-            ):
+            header_name = header_m.group(1).strip() if header_m else ""
+            # Tribute part headers (## Ballad, ## Tally, ...) are content inside
+            # `## Tribute Rendered`, never section boundaries while the parser
+            # sits inside that section — parsing them as boundaries re-keyed
+            # whole tributes into spurious body_sections keys and emptied
+            # Tribute Rendered, blinding the event-fold
+            # (cogship-253/Q661/Q688 incident). Outside Tribute Rendered,
+            # new-shape part-named headers keep their historical boundary
+            # behavior (e.g. a custom section followed by "## Penance").
+            if header_name in _KNOWN_SECTION_NAMES:
+                is_section_boundary = True
+            elif is_new_shape:
+                is_section_boundary = not (
+                    in_tribute_rendered and header_name.lower() in _TRIBUTE_PART_ALIASES
+                )
+            else:
+                is_section_boundary = False
+            if header_m and is_section_boundary:
                 if current is not None:
                     sections[current] = "\n".join(buf).strip("\n")
-                current = header_m.group(1).strip()
+                current = header_name
                 buf = []
+                in_tribute_rendered = current == "Tribute Rendered"
             else:
                 buf.append(line)
         if current is not None:
@@ -423,6 +472,9 @@ class Quest:
             self.body_sections[section_name] = (existing.rstrip() + "\n\n" + content).strip()
         else:
             self.body_sections[section_name] = content.strip()
+            if not content.strip():
+                # Deliberate clear: the event writer may emit the wipe event.
+                self._explicit_wipes.add(section_name)
         self._dirty_sections.add(section_name)
         self.updated_at = now_iso()
 

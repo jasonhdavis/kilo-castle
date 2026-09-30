@@ -131,7 +131,7 @@ def validate_branch_name(branch: str) -> tuple[bool, str]:
         return True, ""
     if branch in ("main", "castle", "the-gatehouse"):
         return True, ""
-    if branch.startswith(("epic/", "quest/", "scout/", "ward/", "the-gatehouse/")):
+    if branch.startswith(("epic/", "quest/", "scout/", "ward/", "the-gatehouse/", "artist/")):
         return True, ""
     if branch.startswith(("quest-", "scout-", "epic-", "ward-")):
         parts = branch.split("-", 1)
@@ -140,7 +140,8 @@ def validate_branch_name(branch: str) -> tuple[bool, str]:
             f"Use organizational folder slash namespace like '{parts[0]}/{parts[1]}' instead."
         )
     return False, (
-        f"Branch '{branch}' must use organizational folder prefix ('epic/...', 'quest/...', 'scout/...', 'ward/...', or 'the-gatehouse/...')."
+        f"Branch '{branch}' must use organizational folder prefix ('epic/...', 'quest/...', "
+        f"'scout/...', 'ward/...', 'the-gatehouse/...', or 'artist/...')."
     )
 
 
@@ -203,6 +204,49 @@ _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
 
 _KNOWN_SECTION_NAMES = frozenset(DEFAULT_BODY_SECTIONS) | frozenset(LEGACY_SECTION_ALIASES)
 
+# Tribute sub-part header aliases (lowercase). These are CONTENT headers inside
+# `## Tribute Rendered` (serf reports: Ballad/Tribute/Tally/Penance/Audience/
+# Opinion; scout reports: Survey/Map/Dangers/Plot) — never top-level sections.
+# Keep in sync with Quest.extract_tribute_subsection's canonical_map. Parsing
+# them as section boundaries re-keyed whole tributes into spurious
+# body_sections keys and emptied `Tribute Rendered`, blinding the event-fold
+# (cogship-253 / Q661 / Q688 incident, 2026-09-30).
+_TRIBUTE_PART_ALIASES = {
+    "ballad": "Ballad", "the ballad": "Ballad",
+    "tribute": "Tribute", "the tribute": "Tribute",
+    "tally": "Tally", "the tally": "Tally",
+    "verification": "Tally", "the verification": "Tally",
+    "verification runbook": "Tally", "verification paths": "Tally",
+    "production verification": "Tally", "ui verification": "Tally",
+    "how to verify": "Tally",
+    "penance": "Penance", "atone": "Penance", "the penance": "Penance",
+    "audience": "Audience", "the audience": "Audience",
+    "opinion": "Opinion", "humble opinion": "Opinion",
+    "humble_opinion": "Opinion", "the humble opinion": "Opinion",
+    "survey": "Survey", "the survey": "Survey", "summary": "Survey",
+    "map": "Map", "the map": "Map",
+    "dangers": "Dangers", "the dangers": "Dangers",
+    "plot": "Plot", "the plot": "Plot",
+}
+# Canonical display order for reassembling a tribute from its parts.
+_TRIBUTE_PART_ORDER = ("Ballad", "Tribute", "Tally", "Penance", "Audience", "Opinion", "Survey", "Map", "Dangers", "Plot")
+
+
+class _DirtyTrackingSections(dict):
+    """Body-sections dict that records every key written to it, so
+    `store._write`'s disk-merge guard knows which sections the caller
+    deliberately changed (set_section, commute, ward repair, direct writes)
+    versus sections merely carried over from a load. Initial content passed
+    to the constructor is NOT dirty — only in-place writes are."""
+
+    def __init__(self, dirty: set, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._dirty = dirty
+
+    def __setitem__(self, key, value):
+        self._dirty.add(key)
+        super().__setitem__(key, value)
+
 
 def detect_body_shape(body_text: str) -> str:
     """Return "new" if the body uses `##` section headers (post-Charter shape),
@@ -264,6 +308,7 @@ class Quest:
     created_at: str = ""
     updated_at: str = ""
     body_sections: dict = field(default_factory=dict)
+    _dirty_sections: set = field(default_factory=set, repr=False, compare=False)
 
     def __post_init__(self):
         if not self.created_at:
@@ -272,8 +317,14 @@ class Quest:
             self.updated_at = self.created_at
         if not self.tags and self.section:
             self.tags = self.section
+        if not isinstance(self.body_sections, _DirtyTrackingSections):
+            self.body_sections = _DirtyTrackingSections(self._dirty_sections, self.body_sections)
         for section in DEFAULT_BODY_SECTIONS:
             self.body_sections.setdefault(section, "")
+        # Canonical sections the caller deliberately cleared via set_section("").
+        # The event writer refuses to emit section-wipe events for anything not
+        # in this set (cogship-253/Q661/Q688 fold-blinding guard).
+        self._explicit_wipes: set = set()
 
     @property
     def tree_branch(self) -> str:
@@ -311,8 +362,14 @@ class Quest:
         frontmatter = "---\n" + "\n".join(fm_lines) + "\n---\n"
         title_line = f"# {self.id} — {self.title}\n"
         body_parts = []
-        for section in DEFAULT_BODY_SECTIONS:
+        ordered = list(DEFAULT_BODY_SECTIONS) + [
+            s for s in self.body_sections
+            if s not in DEFAULT_BODY_SECTIONS and s.lower() not in _TRIBUTE_PART_ALIASES
+        ]
+        for section in ordered:
             content = self.body_sections.get(section, "").rstrip()
+            if not content and section not in DEFAULT_BODY_SECTIONS:
+                continue
             body_parts.append(f"## {section}\n\n{content}\n" if content else f"## {section}\n")
         return frontmatter + "\n" + title_line + "\n" + "\n".join(body_parts)
 
@@ -332,16 +389,39 @@ class Quest:
         is_new_shape = detect_body_shape(body_text) == "new"
         header_re = re.compile(r"^##\s+(.+)$") if is_new_shape else re.compile(r"^#\s+(.+)$")
 
+        # New-shape (## charter) files: preserve EVERY section verbatim —
+        # custom/extra sections (royal addenda, rulings, one-off logs) must
+        # survive load→save cycles. Old-shape (# charter) files keep the
+        # known-name filter because the `# Title` line also matches `^#\s+`.
         sections = {}
         current = None
         buf = []
+        in_tribute_rendered = False
         for line in body_text.splitlines():
             header_m = header_re.match(line)
-            if header_m and header_m.group(1).strip() in _KNOWN_SECTION_NAMES:
+            header_name = header_m.group(1).strip() if header_m else ""
+            # Tribute part headers (## Ballad, ## Tally, ...) are content inside
+            # `## Tribute Rendered`, never section boundaries while the parser
+            # sits inside that section — parsing them as boundaries re-keyed
+            # whole tributes into spurious body_sections keys and emptied
+            # Tribute Rendered, blinding the event-fold
+            # (cogship-253/Q661/Q688 incident). Outside Tribute Rendered,
+            # new-shape part-named headers keep their historical boundary
+            # behavior (e.g. a custom section followed by "## Penance").
+            if header_name in _KNOWN_SECTION_NAMES:
+                is_section_boundary = True
+            elif is_new_shape:
+                is_section_boundary = not (
+                    in_tribute_rendered and header_name.lower() in _TRIBUTE_PART_ALIASES
+                )
+            else:
+                is_section_boundary = False
+            if header_m and is_section_boundary:
                 if current is not None:
                     sections[current] = "\n".join(buf).strip("\n")
-                current = header_m.group(1).strip()
+                current = header_name
                 buf = []
+                in_tribute_rendered = current == "Tribute Rendered"
             else:
                 buf.append(line)
         if current is not None:
@@ -356,7 +436,9 @@ class Quest:
                 else:
                     sections[canonical] = legacy_content
 
-        known_fields = {f.name for f in fields(cls) if f.name != "body_sections"}
+        known_fields = {
+            f.name for f in fields(cls) if f.name not in ("body_sections", "_dirty_sections")
+        }
         kwargs = {k: v for k, v in data.items() if k in known_fields}
         return cls(**kwargs, body_sections=sections)
 
@@ -369,6 +451,7 @@ class Quest:
         else:
             bullet = f"- **{ts}** — {note}" if note else f"- **{ts}** — {to_status or from_status or 'note'}"
         self.body_sections["Castle Ledger"] = (existing.rstrip() + "\n" + bullet).strip()
+        self._dirty_sections.add("Castle Ledger")
         self.updated_at = ts
 
     def append_history(self, from_status: str, to_status: str, note: str = "") -> None:
@@ -389,6 +472,10 @@ class Quest:
             self.body_sections[section_name] = (existing.rstrip() + "\n\n" + content).strip()
         else:
             self.body_sections[section_name] = content.strip()
+            if not content.strip():
+                # Deliberate clear: the event writer may emit the wipe event.
+                self._explicit_wipes.add(section_name)
+        self._dirty_sections.add(section_name)
         self.updated_at = now_iso()
 
     def extract_tribute_subsection(self, target_section: str) -> str:
@@ -592,8 +679,21 @@ class Quest:
         aud = self.extract_audience()
         if not aud or _is_placeholder(aud):
             return False
-        cleaned = aud.strip().lower().rstrip(".")
-        if cleaned in ("none", "none required", "none outstanding", "no audience required", "no audience requested", "n/a"):
+        stripped = aud.strip()
+        # Reason: Serfs overwhelmingly write "None required. <reasoning why no
+        # decision was needed>" rather than the bare phrase alone — the trailing
+        # explanatory sentence is normal, expected style, not a hedge. Matching
+        # the whole paragraph verbatim against the "no decision" phrasings made
+        # every such well-formed Audience section a false-positive Pending Serf
+        # Audience flag. Only the LEADING clause/sentence carries the verdict;
+        # anything after it is rationale, so split it off before comparing.
+        first_clause = re.split(r"[.\n]", stripped, maxsplit=1)[0]
+        cleaned = first_clause.strip().lower().rstrip(".:")
+        none_phrases = (
+            "none", "none required", "none outstanding", "none otherwise",
+            "no audience required", "no audience requested", "n/a",
+        )
+        if cleaned in none_phrases:
             return False
         aud_log = self.body_sections.get("Audience Log", "").strip()
         if aud_log and not _is_placeholder(aud_log):

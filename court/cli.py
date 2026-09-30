@@ -1268,6 +1268,80 @@ def cmd_sync(args):
             sys.exit(1)
 
 
+def cmd_events_repair(args):
+    """Rebuild a canonical body section (default: Tribute Rendered) whose
+    event-fold view was blinded by mis-keyed section events — the
+    cogship-253 / Q661 / Q688 incident (2026-09-30), where tribute part
+    headers (## Ballad, ...) were parsed as top-level sections and the
+    canonical section was saved empty, last-write-wins over the real content.
+
+    Recovery order: (1) the latest non-empty historical value of the section
+    itself from the event log; (2) reassembly from the mis-keyed tribute-part
+    events in first-appearance order. The repair appends one corrective event
+    through the normal save path — the event log stays append-only; nothing
+    is rewritten or deleted."""
+    from .models import DEFAULT_BODY_SECTIONS, _TRIBUTE_PART_ALIASES, _TRIBUTE_PART_ORDER
+
+    section = args.section or "Tribute Rendered"
+    if section not in DEFAULT_BODY_SECTIONS:
+        print(f"ERROR: {section!r} is not a canonical body section.", file=sys.stderr)
+        sys.exit(1)
+    quest = store.load(args.quest_id)
+    path = store.find_path(quest.id)
+    if path is None:
+        print(f"ERROR: no file found for {quest.id}", file=sys.stderr)
+        sys.exit(1)
+    events = store.eventlog.read_events(store.eventlog.events_path_for(path))
+    current = quest.body_sections.get(section, "")
+    if current.strip() and not args.force:
+        print(f"ℹ️  {quest.id}.{section} is non-empty ({len(current)} chars) in the current fold; nothing to repair (use --force to rebuild anyway).")
+        return
+
+    rebuilt = ""
+    strategy = ""
+    for ev in events:
+        if ev.get("target") == f"section:{section}":
+            val = str(ev.get("value") or "")
+            if val.strip():
+                rebuilt = val
+                strategy = "latest non-empty historical value"
+    if not rebuilt.strip():
+        part_val: dict = {}
+        part_seq: dict = {}
+        for seq, ev in enumerate(events):
+            target = ev.get("target") or ""
+            if not target.startswith("section:") or target == f"section:{section}":
+                continue
+            name = target[len("section:"):]
+            if name.lower() not in _TRIBUTE_PART_ALIASES:
+                continue
+            val = str(ev.get("value") or "")
+            if val.strip():
+                part_seq.setdefault(name, seq)
+                part_val[name] = val
+        if part_val:
+            canon_lower = [c.lower() for c in _TRIBUTE_PART_ORDER]
+
+            def _part_order(item):
+                name, _first_seq = item
+                canon = _TRIBUTE_PART_ALIASES.get(name.lower(), "")
+                idx = canon_lower.index(canon) if canon in canon_lower else len(canon_lower)
+                return (idx, part_seq[name])
+
+            rebuilt = "\n\n".join(
+                f"## {name}\n\n{part_val[name].strip()}"
+                for name, _ in sorted(part_val.items(), key=_part_order)
+            )
+            strategy = f"reassembled from {len(part_val)} mis-keyed tribute-part events"
+    if not rebuilt.strip():
+        print(f"ERROR: no recoverable {section} content found in {quest.id}'s event log.", file=sys.stderr)
+        sys.exit(1)
+    quest.set_section(section, rebuilt)
+    quest.updated_at = now_iso()
+    store.save(quest, commit_msg=f"court: events-repair {section} for {quest.id}")
+    print(f"🩹 Repaired {quest.id}.{section}: {len(rebuilt)} chars restored ({strategy}); corrective event appended.")
+
+
 def cmd_ward(args):
     last_survey = _read_last_survey_timestamp()
     pending_reports = _list_pending_warden_reports()
@@ -7221,6 +7295,12 @@ def build_parser():
     p_section.add_argument("--append", action="store_true")
     p_section.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_section.set_defaults(func=cmd_set_section)
+
+    p_events_repair = sub.add_parser("events-repair", help="Rebuild a body section blinded in the event-fold (append-only repair)")
+    p_events_repair.add_argument("quest_id")
+    p_events_repair.add_argument("--section", default="Tribute Rendered")
+    p_events_repair.add_argument("--force", action="store_true", help="Rebuild even if the section is non-empty in the current fold")
+    p_events_repair.set_defaults(func=cmd_events_repair)
 
     p_verify = sub.add_parser("verify", help="Run a deterministic worktree/test check")
     p_verify.add_argument("quest_id")

@@ -108,13 +108,21 @@ def build_events_for_save(quest: Quest, prior: Optional[Quest], ts: str) -> list
         if new_val != old_val:
             events.append({"ts": ts, "target": f"{FIELD_PREFIX}{f}", "value": new_val})
 
-    section_order = list(DEFAULT_BODY_SECTIONS) + [
-        s for s in quest.body_sections if s not in DEFAULT_BODY_SECTIONS
-    ]
-    for section in section_order:
+    # Canonical targets only. Non-canonical body_sections keys (tribute parts
+    # mis-keyed by a bad parse, custom sections) are dropped by fold_events on
+    # read, so emitting them only poisons union-merged stores while never
+    # surviving a fold — cogship-253/Q661/Q688 fold-blinding incident.
+    for section in DEFAULT_BODY_SECTIONS:
         new_val = quest.body_sections.get(section, "") or ""
         old_val = ((prior.body_sections.get(section, "") if prior is not None else "") or "")
         if new_val != old_val:
+            # Fold-blinding guard: never emit a section wipe from a partial or
+            # mangled in-memory view. Emptying a previously non-empty canonical
+            # section requires explicit intent (set_section("") marks
+            # quest._explicit_wipes); anything else is skipped so the fold
+            # keeps the last good value.
+            if new_val == "" and old_val != "" and section not in getattr(quest, "_explicit_wipes", ()):
+                continue
             events.append({"ts": ts, "target": f"{SECTION_PREFIX}{section}", "value": new_val})
 
     return events

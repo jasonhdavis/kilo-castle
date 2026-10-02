@@ -748,6 +748,20 @@ def is_quest_merged_into(
         if st.get("is_merged_target") or st.get("is_ancestor_target"):
             return True
 
+        # Post-promotion paperwork drift (cogship-257/261 staleness): quest
+        # branches keep receiving .court/ bookkeeping commits after the
+        # convoy's code was merged, so branch-tip ancestry alone reports
+        # sailed convoys as unmerged and resurrects deploys that already
+        # shipped as "ready to confirm". Deliverable-level fallback: when the
+        # branch's unique changes relative to target_ref touch only court
+        # paperwork paths (.court/), the production deliverables are already
+        # merged; the outstanding paperwork rides the trunk deploy backlog.
+        diff_res = _run(["git", "diff", "--name-only", f"{target_ref}...{branch}"], root)
+        if diff_res.get("ok"):
+            files = [f.strip() for f in (diff_res.get("stdout") or "").splitlines() if f.strip()]
+            if all(f.startswith(".court/") for f in files):
+                return True
+
     return False
 
 

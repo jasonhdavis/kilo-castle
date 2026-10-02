@@ -680,8 +680,12 @@ function qnumOf(id){const m=String(id||'').match(/^[A-Za-z]+\d+/);return m?m[0].
 const APP_LABELS={platform:'Platform',shops:'Shops',orders:'Orders',common:'Common',
  inventory:'Inventory',intelligence:'Intel',forecasting:'Forecast',tasks:'Tasks',
  purchases:'Purchases',crm:'CRM',core:'Core'};
-function appBadge(app){
- const a=String(app||'').trim().toLowerCase();
+// Convoy membership is active only at integration-or-later stages; a stamp on
+// a pre-integration quest (e.g. returned to WORKING after a GATE rejection) is
+// historical pack paperwork, not live membership (Q717/cogship-261 fix).
+const CS_ACTIVE_STATUSES=['GATE','READY_TO_RAZE','READY_FOR_TEARDOWN','DONE'];
+function csActive(q){return CS_ACTIVE_STATUSES.includes(q.status);}
+function appBadge(app){ const a=String(app||'').trim().toLowerCase();
  if(!a)return '';
  return APP_LABELS[a]||a.replace(/_/g,' ').replace(/^./,c=>c.toUpperCase());
 }
@@ -903,7 +907,9 @@ window.addEventListener('popstate',()=>{
       const nsess=sessionsFor(w.path).length;
       const a=q.audit;
       let chips='';
-      if(q.cogship_id)chips+=`<span class="bchip ship" title="stamped onto this cog ship convoy">🚢 ${esc(q.cogship_id)}</span>`;
+     if(q.cogship_id)chips+=csActive(q)?
+      `<span class="bchip ship" title="stamped onto this cog ship convoy">🚢 ${esc(q.cogship_id)}</span>`:
+      `<span class="bchip ship dim" title="historical convoy stamp — returned to ${esc(String(q.status).toLowerCase())} before integration">🚢 ${esc(q.cogship_id)} ↩</span>`;
       if(a&&a.tasks_total)chips+=`<span class="bchip ${a.tasks_pct>=100?'ok':''}">${a.tasks_done}/${a.tasks_total} tasks</span>`;
      if(q.tribute_total)chips+=`<span class="bchip ${q.tribute_done>=q.tribute_total?'ok':''}">${q.tribute_done}/${q.tribute_total} tribute</span>`;
      else if(a&&a.tribute_present)chips+='<span class="bchip ok">tribute</span>';
@@ -1547,10 +1553,10 @@ function renderBoard(){
   // but-undeployed (ship_ready). Click a card → ship manifest document;
   // confirm button → court ship --confirm for the convoy's ready members.
   // Fully-deployed/archived convoys drop off.
-  const rel=qs.filter(q=>boardApp==='all'||(q.app||q.repo)===boardApp);
-  const trunkAhead=rel.length?Math.max(0,...rel.map(q=>q.trunk_ahead||0)):0;
-  const byCs={};
-  for(const q of rel)if(q.cogship_id)(byCs[q.cogship_id]=byCs[q.cogship_id]||[]).push(q);
+   const rel=qs.filter(q=>boardApp==='all'||(q.app||q.repo)===boardApp);
+   const trunkAhead=rel.length?Math.max(0,...rel.map(q=>q.trunk_ahead||0)):0;
+   const byCs={};
+   for(const q of rel)if(q.cogship_id&&csActive(q))(byCs[q.cogship_id]=byCs[q.cogship_id]||[]).push(q);
   const csKeys=Object.keys(byCs).filter(cs=>byCs[cs].some(q=>
    q.ship_ready||q.status==='GATE')).sort((a,b)=>{
     const na=parseInt(a.replace(/\D/g,''),10),nb=parseInt(b.replace(/\D/g,''),10);
@@ -1608,7 +1614,9 @@ function renderBoard(){
     const a=q.audit;
     const ops=BOARD_OPS[q.status]||[];
     let chips='';
-    if(q.cogship_id)chips+=`<span class="bchip ship" title="stamped onto this cog ship convoy">🚢 ${esc(q.cogship_id)}</span>`;
+    if(q.cogship_id)chips+=csActive(q)?
+     `<span class="bchip ship" title="stamped onto this cog ship convoy">🚢 ${esc(q.cogship_id)}</span>`:
+     `<span class="bchip ship dim" title="historical convoy stamp — returned to ${esc(String(q.status).toLowerCase())} before integration">🚢 ${esc(q.cogship_id)} ↩</span>`;
     if(a){
     if(a.tasks_total)chips+=`<span class="bchip ${a.tasks_pct>=100?'ok':''}">${a.tasks_done}/${a.tasks_total} tasks</span>`;
     if(q.tribute_total)chips+=`<span class="bchip ${q.tribute_done>=q.tribute_total?'ok':''}">${q.tribute_done}/${q.tribute_total} tribute</span>`;

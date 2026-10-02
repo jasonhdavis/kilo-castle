@@ -241,12 +241,24 @@ def setup_worktree_agent_config(worktree_path: Path, agent: str = "serf") -> Non
     # worktrees). Written on every standup; idempotent.
     write_court_shim(worktree_path)
     cfg_file = kilo_dir / "kilo.json"
-    cfg = {"$schema": "https://app.kilo.ai/config.json", "default_agent": agent}
+    # agent_manager is permission-denied in every worktree too: the tool has no
+    # backend in headless CLI runs (calls hang until timeout) and Agent Manager
+    # cannot see CLI-spawned sessions anyway (AGENTS.md: AM is human-viewing only).
+    cfg = {
+        "$schema": "https://app.kilo.ai/config.json",
+        "default_agent": agent,
+        "permission": {"agent_manager": "deny"},
+    }
     if cfg_file.is_file():
         try:
             existing = json.loads(cfg_file.read_text(encoding="utf-8"))
             if isinstance(existing, dict):
                 existing["default_agent"] = agent
+                perm = existing.get("permission")
+                if not isinstance(perm, dict):
+                    perm = {}
+                perm.setdefault("agent_manager", "deny")
+                existing["permission"] = perm
                 cfg = existing
         except Exception:
             pass
@@ -2252,6 +2264,20 @@ def cmd_advance(args):
                 quest.set_status(new_status, forced_note)
                 quest.cogship_promoted_commit = promo["tip"]
             else:
+                # Durable promote-stamp (cogship-257/261 staleness): the clean
+                # merged case passes this gate now, but later paperwork commits
+                # keep moving quest branch tips, which breaks branch-tip
+                # ancestry and can resurrect shipped convoys as "ready to
+                # confirm". Record the tip that provably reached the trunk at
+                # this moment so is_quest_merged_into() short-circuits on the
+                # stamp after that, regardless of later paperwork.
+                if not is_scout and quest.branch:
+                    tip_res = git_ops._run(
+                        ["git", "rev-parse", "--verify", f"refs/heads/{quest.branch}"],
+                        git_ops.get_repo_root(),
+                    )
+                    if tip_res.get("ok") and (tip_res.get("stdout") or "").strip():
+                        quest.cogship_promoted_commit = tip_res["stdout"].strip()
                 quest.set_status(new_status, args.note or "")
         else:
             quest.set_status(new_status, args.note or "")
@@ -6383,7 +6409,7 @@ def cmd_ship(args):
     # Q147: `--confirm` promotes the staged convoy into production. Everything
     # above stays a read-only report; only this branch mutates git/remote/Fly.
     if getattr(args, "confirm", False):
-        rc = _execute_ship_deployment(args, base_branch, head_branch)
+        rc = _execute_ship_deployment(args, base_branch, head_branch, quests=quests)
         sys.exit(rc)
 
 
@@ -6506,7 +6532,7 @@ def _ship_merge(main_wt: Path, base_branch: str, head_branch: str) -> dict:
     return {"ok": False, "already_up_to_date": False, "output": merge_res}
 
 
-def _execute_ship_deployment(args, base_branch: str, head_branch: str) -> int:
+def _execute_ship_deployment(args, base_branch: str, head_branch: str, quests=None) -> int:
     """The mutating half of `court ship --confirm`: merge `head_branch` (castle)
     into `base_branch` (main) and push `base_branch` to origin, kicking off the
     remote autodeploy pipeline. Returns process exit code (0 = success, 1 = error)."""
@@ -6557,6 +6583,24 @@ def _execute_ship_deployment(args, base_branch: str, head_branch: str) -> int:
         print(f"   The merge to local {base_branch} succeeded; reconcile the remote and re-push manually.")
         return 1
     print(f"✅ Pushed {base_branch} -> origin/{base_branch}")
+
+    # Durable deploy stamps (cogship-257/261 staleness): record the
+    # post-promotion tip on every shipped quest so ship-readiness predicates
+    # short-circuit on the stamp instead of fragile branch-tip ancestry —
+    # quest branches keep receiving .court/ paperwork commits after deploy.
+    shipped = [q for q in (quests or []) if getattr(q, "kind", "") != "scout"]
+    if shipped:
+        tip_res = git_ops._run(["git", "rev-parse", base_branch], main_wt)
+        promoted_tip = (tip_res.get("stdout") or "").strip()
+        if promoted_tip:
+            stamped = 0
+            for q in shipped:
+                q.cogship_promoted_commit = promoted_tip
+                store.save(q, auto_commit=True, commit_msg=(
+                    f"court: stamp {q.id} promoted commit {promoted_tip[:12]}"
+                ))
+                stamped += 1
+            print(f"📌 Stamped promoted commit {promoted_tip[:12]} on {stamped} shipped quest(s)")
 
     print("\n" + "=" * 76)
     print(f"🏰 SHIP CONFIRMED — {head_branch} merged into {base_branch} and pushed to origin (autodeploy triggered)")

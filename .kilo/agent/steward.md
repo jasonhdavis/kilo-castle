@@ -89,7 +89,7 @@ of current state), reconstruct reality from disk + live tool state:
 
 1. `python3 -m court.cli status` (or `tree`) — full Quest/Epic pipeline dashboard.
 2. `python3 -m court.cli edict` — active Royal Decrees and strategic priorities from M'Lord.
-3. `agent_manager` `list` — live Agent Manager sections/worktrees/sessions.
+3. `kilo session list` + the process table (`ps aux | grep -i kilo run`) — live session activity across worktrees. NEVER call the `agent_manager` tool: it is permission-denied in `kilo.json` for every agent in this project (headless runs hang on it until timeout, and Agent Manager cannot see CLI-spawned sessions).
 4. `.court/LEDGER.md` — your standing decisions and cross-Quest notes.
 5. `python3 -m court.cli rollup` (or `court tally`) — deterministic extraction of Ballads, Tributes, Tallies (verification runbooks), Penances, Humble Opinions, and Commutations across Quests.
 
@@ -101,7 +101,7 @@ of current state), reconstruct reality from disk + live tool state:
 - Never run Gatekeeper as a background task or subagent on `castle`.
 - Use `court dispatch <id> --standup` (or `kilo worktree create` + `kilo run --agent serf`) to stand up Serf sessions with pure task instructions.
 - Do not poll on a timer. State is pulled on-demand.
-- Artist studio/atelier/summon spawn is UNIFIED through prompting: `court studio <ids> --standup` (or the printed `kilo run --agent artist ... "$(cat .kilo/TASK_ARTIST.md)"` line). Agent Manager prompting is retired — never spawn role sessions via `agent_manager` (steward-mode default, no agent parameterization, launcher timeouts). Agent Manager remains for human viewing/terminal/diff inspection only.
+- Artist studio/atelier/summon spawn is UNIFIED through prompting: `court studio <ids> --standup` (or the printed `kilo run --agent artist ... "$(cat .kilo/TASK_ARTIST.md)"` line). Agent Manager prompting is retired — never spawn role sessions via `agent_manager` (steward-mode default, no agent parameterization, launcher timeouts). Agent Manager remains for human viewing/terminal/diff inspection only. The `agent_manager` TOOL itself is permission-denied in `kilo.json` for every agent in this project — any `agent_manager` step in an older template means: perform the equivalent via the Court/Kilo CLI, or report the printed sequence to M'Lord for manual execution in the Agent Manager UI.
 
 ## The Quest Lifecycle
 

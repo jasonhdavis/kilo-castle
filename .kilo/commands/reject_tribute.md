@@ -34,9 +34,12 @@ size > 1) — see `gatekeeper_review_prompt.md`.)
    ```
 
 3. **Dispatch a Fresh Serf Session in the SAME Worktree**:
-   - Using `agent_manager`, start a new Serf session in the Quest's existing worktree
-     (or prompt the existing idle Serf session) with `.court/templates/serf_remediation_prompt.md`,
-     filled with the exact failing command, traceback, and required fixes.
+   - Via the Court CLI: `python3 -m court.cli dispatch <quest_id> --standup` (fresh Serf in the
+     Quest's existing worktree) or `python3 -m court.cli goad <quest_id>` (prompt the existing
+     resumable Serf session), with `.court/templates/serf_remediation_prompt.md`,
+     filled with the exact failing command, traceback, and required fixes. NEVER call
+     `agent_manager` — the tool is permission-denied in `kilo.json` for every agent in this
+     project (headless runs hang on it; it cannot see CLI-spawned sessions).
    - Model: the standard Serf model (`z-ai/glm-5.3-flash`); this is mechanical repair work.
 
 4. **Serf Remediation Contract** (what the fresh Serf does):

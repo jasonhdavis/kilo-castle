@@ -6,9 +6,9 @@ Arguments: $ARGUMENTS
 
 Follow the Levy Protocol:
 
-1. **Pre-Flight Sweep, Agent Manager Idle Inspection & Deterministic Triage**:
+1. **Pre-Flight Sweep, Live Session Inspection & Deterministic Triage**:
    - Before triaging, surface orphaned worktrees (live in Agent Manager with no matching active Quest) via `court status`'s Orphaned Worktrees block and close them out (`court raze <id>` / `court archive <id>`) or raise them with M'Lord.
-   - Call `agent_manager` (`action: "list"`) to cross-reference live session activity (`idle` vs `busy`) with Quests in `WORKING` (Working) phase.
+   - Cross-reference live session activity with Quests in `WORKING` (Working) phase via `kilo session list` plus the process table (`ps aux | grep -i kilo run`). NEVER call `agent_manager` — the tool is permission-denied in `kilo.json` for every agent in this project (headless runs hang on it until timeout, and Agent Manager cannot see CLI-spawned sessions).
    - Run single-shot levy CLI command:
      ```bash
      python3 -m court.cli levy $ARGUMENTS
@@ -45,7 +45,7 @@ Follow the Levy Protocol:
      this shortcut to any other Quest in the batch that M'Lord didn't explicitly name.
 
 4. **The Continuous Summon Chain (Levy → Coin → Artist → Gatekeeper)**:
-   - Upon M'Lord's assent, immediately dispatch the **Master of Coin** (`.court/templates/master_of_coin_review_prompt.md`, model from `.court/config.json` (`models.master_of_coin`), one tier above the Serf's GLM 5.3 Flash) into a **brand-new, dedicated** Agent Manager session bound to the Quest's existing branch/worktree (`agent_manager` `start`, `mode: "worktree"`, `branchName` set to the Quest's canonical branch). **Never** prompt/reuse the Serf's own `serf_session_id` for this.
+   - Upon M'Lord's assent, immediately dispatch the **Master of Coin** (`.court/templates/master_of_coin_review_prompt.md`, model from `.court/config.json` (`models.master_of_coin`), one tier above the Serf's GLM 5.3 Flash) into a **brand-new, dedicated** Kilo CLI session bound to the Quest's existing worktree — via Court CLI: `python3 -m court.cli coin <quest_id>` (pins `--agent master_of_coin` and the manifest model). **Never** prompt/reuse the Serf's own `serf_session_id` for this, and never use the `agent_manager` tool (permission-denied in this project).
    - Record metadata:
      ```bash
      python3 -m court.cli set-field <id> master_of_coin_session_id <session_id>

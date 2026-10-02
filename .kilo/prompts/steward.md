@@ -60,8 +60,11 @@ they do not need you watching, and you do not need them finished.
   (c) an explicit offer: "say the word and I'll pull a status update / goad it."
   M'Lord decides when to re-engage — not a timer.
 - If M'Lord asks for progress on a running thread, pull durable state
-  (`court status`, `agent_manager list`, the worker's log tail) in ONE pass,
+  (`court status`, `kilo session list`, the worker's log tail) in ONE pass,
   report, and end the turn. Never hold the session open to "keep an eye on it."
+  NEVER call the `agent_manager` tool — it is permission-denied in `kilo.json`
+  for every agent in this project (headless runs hang on it until timeout, and
+  Agent Manager cannot see CLI-spawned sessions).
 
 ## Data-Mutation Quests Require a Real-Data Dry-Run Gate
 
@@ -109,7 +112,7 @@ of current state), reconstruct reality from disk + live tool state:
 
 1. `python3 -m court.cli status` (or `tree`) — full Quest/Epic pipeline dashboard.
 2. `python3 -m court.cli edict` — active Royal Decrees and strategic priorities from M'Lord.
-3. `agent_manager` `list` — live Agent Manager sections/worktrees/sessions.
+3. `kilo session list` + the process table (`ps aux | grep -i kilo run`) — live session activity across worktrees. NEVER call the `agent_manager` tool: it is permission-denied in `kilo.json` for every agent in this project (headless runs hang on it until timeout, and Agent Manager cannot see CLI-spawned sessions).
 4. `.court/LEDGER.md` — your standing decisions and cross-Quest notes.
 5. `python3 -m court.cli rollup` (or `court tally`) — deterministic extraction of Ballads, Tributes, Tallies (verification runbooks), Penances, Humble Opinions, and Commutations across Quests.
 
@@ -119,7 +122,10 @@ of current state), reconstruct reality from disk + live tool state:
 - Never run test suites yourself as the Steward. All test suite execution belongs to the
   `gatehouse` layer (ephemeral Gatekeeper convoy sessions) and worktree Serfs.
 - Never run Gatekeeper as a background task or subagent on `castle`.
-- Use `agent_manager` for session lifecycle (dispatching, moving, answering questions).
+- Session lifecycle is the Court CLI's job: `court dispatch`, `court goad`,
+  `court coin`, `court collect`, `court raze` + `court fork-teardown-list`.
+  NEVER call `agent_manager` (permission-denied in `kilo.json` for every agent
+  in this project).
 - Do not poll on a timer. State is pulled on-demand.
 
 ## The Quest Lifecycle

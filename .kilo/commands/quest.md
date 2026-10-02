@@ -8,7 +8,7 @@ Follow the Steward protocol's Intake step exactly (see `.kilo/prompts/steward.md
 §"1. Intake"):
 1. Determine `app` and `concern`. Grep `tasks/ACTIVE.md`, the relevant
    `tasks/apps/<app>/` folder, and the codebase for duplication risk first.
-2. Determine the Agent Manager section (`Bug fix`, `Feature`,
+2. Determine the Quest's section kind (`Bug fix`, `Feature`,
    `Optimization`, or `Investigation`) per `AGENTS.md`'s existing rules.
 3. Create the Quest (write `--goal` and expected deliverables **100% out of character** in plain, professional engineering terms — NEVER use Castle/Court metaphors):
    ```

@@ -18,9 +18,9 @@ Follow the Raze Protocol:
      c) Advances Quest status to `READY_TO_RAZE`. (A `PUNISHED` Quest is never razed alone — its joint teardown with its successor happens automatically once the successor reaches `READY_TO_RAZE`/`DONE`; see `/pillory`.)
      d) Auto-archives any Quests whose worktrees were already deleted/pruned from disk and Agent Manager (`court archive <id>`).
 
-2. **Move to Ashes Section in Agent Manager**:
-   - Inspect the `raze` command output for the worktree's session ID and the Ashes section ID (`sec-...`).
-   - Move the worktree session to the Ashes section using `agent_manager` `move`.
+2. **Report the Ashes sequence to M'Lord**:
+   - NEVER call the `agent_manager` tool — it is permission-denied in `kilo.json` for every agent in this project (headless runs hang on it until timeout, and Agent Manager cannot see CLI-spawned sessions; its registry only tracks sessions it created itself).
+   - Inspect the `raze` command output for the worktree's session ID and the Ashes section ID (`sec-...`). If `raze` prints an `agent_manager move` sequence, pass it to M'Lord verbatim for manual execution in the Agent Manager UI.
    - Never move broken, ghost, or unrelated worktrees to Ashes.
    - Never delete or stop the worktree directory directly — worktree removal is always M'Lord's manual action in the Agent Manager UI.
 
@@ -33,20 +33,19 @@ Follow the Raze Protocol:
      worktrees Agent Manager created because it can only ever create, never attach to an existing
      one (see `AGENTS.md` "Master of Coin / Gatekeeper Worktree Forking..."). They are never Quests
      themselves, so `teardown-list` above cannot see them.
-   - **ELIGIBLE entries** (verdict/promotion already confirmed synced onto the real branch): for each
-     one with a live session, run, **in this exact order**:
-     1. `agent_manager` `move` → the printed target section (**The Treasury** for Master of Coin
-        forks, **Ashes** for Gatekeeper convoys). This step needs the live `ses_...` session ID —
-        it fails once the session is gone.
-     2. `agent_manager` `stop` on that same session, **only after** the move above has landed.
-   - **Never call `agent_manager stop` before the move, and never run `git worktree remove` /
-     delete the directory yourself** — the former makes the worktree permanently un-movable by this
-     tool (stranded in whatever section it was already in), and the latter desyncs Agent Manager's
-     own bookkeeping into a stale, unkillable session entry. Physical directory deletion is always
-     M'Lord's manual action in the Agent Manager UI, exactly like the Quest-worktree Ashes flow
-     above — this command only ever tells you what to move/stop, never deletes anything itself.
-   - **HOLD entries** (verdict not yet synced back): do not touch the worktree. If a live session
-     is listed, send the printed `agent_manager prompt` re-prompt verbatim so the stalled MoC/
-     Gatekeeper session pushes its sync-back itself. If no session remains, the audit stalled
+- **ELIGIBLE entries** (verdict/promotion already confirmed synced onto the real branch): the `agent_manager` tool is permission-denied in this project, so pass each printed sequence to M'Lord verbatim for manual execution in the Agent Manager UI — in this exact order:
+      1. `agent_manager` `move` → the printed target section (**The Treasury** for Master of Coin
+         forks, **Ashes** for Gatekeeper convoys), while the live `ses_...` session still exists.
+      2. `agent_manager` `stop` on that same session, **only after** the move above has landed.
+    - **Never stop before the move, and never run `git worktree remove` /
+      delete the directory yourself** — the former makes the worktree permanently un-movable by the
+      tool (stranded in whatever section it was already in), and the latter desyncs Agent Manager's
+      own bookkeeping into a stale, unkillable session entry. Physical directory deletion is always
+      M'Lord's manual action in the Agent Manager UI, exactly like the Quest-worktree Ashes flow
+      above — this command only ever tells you what to move/stop, never deletes anything itself.
+    - **HOLD entries** (verdict not yet synced back): do not touch the worktree. If a live session
+      is listed, send the printed re-prompt to the stalled session via the Kilo CLI
+      (`kilo run --session <ses_id> --dir <fork_worktree> --agent <role> "<re-prompt>"`) so the stalled MoC/
+      Gatekeeper session pushes its sync-back itself. If no session remains, the audit stalled
      without ever finishing — leave that fork alone and re-dispatch a fresh session per
      `master_of_coin_review_prompt.md` / `gatekeeper_review_prompt.md` instead of resurrecting it.

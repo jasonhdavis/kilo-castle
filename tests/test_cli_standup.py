@@ -84,6 +84,9 @@ class TestCliStandup(unittest.TestCase):
         self.assertTrue(kilo_cfg_path.is_file())
         cfg = json.loads(kilo_cfg_path.read_text(encoding="utf-8"))
         self.assertEqual(cfg.get("default_agent"), "serf")
+        # agent_manager is permission-denied in every worktree (headless runs
+        # hang on the tool; Agent Manager cannot see CLI-spawned sessions).
+        self.assertEqual(cfg.get("permission", {}).get("agent_manager"), "deny")
 
         # Test updating an existing config preserves existing keys
         kilo_cfg_path.write_text(json.dumps({"custom_setting": True}), encoding="utf-8")
@@ -91,6 +94,7 @@ class TestCliStandup(unittest.TestCase):
         cfg_updated = json.loads(kilo_cfg_path.read_text(encoding="utf-8"))
         self.assertEqual(cfg_updated.get("default_agent"), "serf")
         self.assertTrue(cfg_updated.get("custom_setting"))
+        self.assertEqual(cfg_updated.get("permission", {}).get("agent_manager"), "deny")
 
     def test_find_kilo_binary_env_var(self):
         """Verify KILO_BIN environment variable override works."""

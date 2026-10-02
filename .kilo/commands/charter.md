@@ -17,7 +17,7 @@ Follow the Charter Protocol in `.kilo/prompts/steward.md` §"Charter":
      python3 -m court.cli charter <id> --notes "M'Lord's Charter Notes: <notes>" --section "Feature"
      ```
    - `--notes` is optional (omit when M'Lord supplied nothing new); `--section` overrides the Agent Manager lane (defaults to the Quest's existing `section` field). The command is idempotent — a Quest already `PLANNED` or beyond is left in place, and it still folds any `--notes`.
-   - The command prints a **NEXT STEPS** block with everything needed for step 3: the canonical `branchName`, the mandatory `model`/`provider` pair, the Serf template path, and the target Agent Manager section.
+   - The command prints a **NEXT STEPS** block with everything needed for step 3: the canonical `branchName`, the mandatory `model`/`provider` pair, the Serf template path, and the Quest's section kind.
 
 3. **Dispatch and Stand Up the Serf via Court CLI**:
    - Stand up the Serf worktree and session directly via Court CLI:
@@ -26,10 +26,10 @@ Follow the Charter Protocol in `.kilo/prompts/steward.md` §"Charter":
      ```
      (or combine both steps with `python3 -m court.cli charter <id> --dispatch`).
    - This directly invokes Kilo's CLI standup (`kilo worktree create` + `kilo run --agent serf` / API), creating the worktree under `.kilo/worktrees/`, configuring `.kilo/kilo.json` with `"default_agent": "serf"`, enforcing `task: deny` permissions, and passing pure charter task instructions without persona prompt corruption.
-   - Alternatively, if manually creating an Agent Manager UI session in section `Bug fix`/`Feature`/`Optimization`, record its IDs via `python3 -m court.cli dispatch-complete <id> --session-id <SESSION_ID> --branch <branch> --worktree <worktree_path>`.
+   - Alternatively, if M'Lord manually creates a session in the Agent Manager UI (section `Bug fix`/`Feature`/`Optimization` — a human action, not an agent tool call), record its IDs via `python3 -m court.cli dispatch-complete <id> --session-id <SESSION_ID> --branch <branch> --worktree <worktree_path>`.
 
 4. **Record Metadata and Land at Working in One Command**:
-   - The old six-invocation sequence (four `set-field` + two `advance`) is replaced by the composite command, using the real IDs the `agent_manager` tool call returned:
+   - The old six-invocation sequence (four `set-field` + two `advance`) is replaced by the composite command, using the real IDs the standup printed (for a M'Lord-created Agent Manager UI session, take them from the UI):
      ```bash
      python3 -m court.cli dispatch-complete <id> --session-id <SESSION_ID> --branch <branch> --worktree <worktree_path>
      ```

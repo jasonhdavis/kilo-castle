@@ -7,7 +7,8 @@ Doctrine:
   - keepers exported to a sidecar db BEFORE any delete
   - chunked DELETEs + wal_checkpoint(TRUNCATE) between chunks (bounded WAL on
     a nearly-full disk)
-  - explicit child-first deletes (FK enforcement is off by default in SQLite)
+  - explicit child-first deletes, parent session rows last (FK enforcement
+    is off by default in SQLite)
   - in-place VACUUM as a separate step with a disk-headroom preflight
   - never touches account/project/credential/auth tables
 
@@ -173,6 +174,30 @@ def cmd_prune(args):
             print(f"  {table}: {total}/{n_old} id-chunks, "
                   f"{cur.rowcount} rows last chunk", flush=True)
         print(f"{table}: done ({total} session ids scanned)")
+
+    # parent session rows last (candidate #5): old_ids carries the tool's
+    # whole guard set — older-than-cutoff, share-protected sessions already
+    # excluded — and FK enforcement is off, but doctrine is child-first, so
+    # parents go after every child table. Chunked like the children; on a
+    # resumed run the child deletes above are no-ops and this still completes
+    # the purge in one pass instead of leaving orphan parent shells behind.
+    total = 0
+    while True:
+        db.execute("BEGIN")
+        chunk = [r[0] for r in db.execute(
+            "SELECT id FROM old_ids LIMIT ? OFFSET ?",
+            (SESSION_CHUNK, total)).fetchall()]
+        if not chunk:
+            db.execute("COMMIT")
+            break
+        q = ",".join("?" * len(chunk))
+        cur = db.execute(f"DELETE FROM session WHERE id IN ({q})", chunk)
+        total += len(chunk)
+        db.execute("COMMIT")
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        print(f"  session parents: {total}/{n_old} deleted "
+              f"({cur.rowcount} last chunk)", flush=True)
+    print(f"session: done ({total} parent rows deleted)")
 
     # events: delete oldest by rowid window (insertion-ordered), chunked
     mx = db.execute("select max(rowid) from event").fetchone()[0] or 0

@@ -293,7 +293,14 @@ class CourtMigrationGraphPreflightTests(unittest.TestCase):
         self.assertFalse(res["migration_graph_ok"])
         self.assertIn("migration graph preflight failed", res["error"])
         # Fail fast: the test battery must not run on a broken graph.
-        mock_suite_run.assert_not_called()
+        # (subprocess.run IS legitimately called for auxiliary git probes —
+        # the env-provisioning helper resolves the primary repo root — so the
+        # assertion targets the suite battery itself.)
+        suite_calls = [c for c in mock_suite_run.call_args_list
+                       if c.args and isinstance(c.args[0], (list, tuple))
+                       and any(x in " ".join(str(t) for t in c.args[0])
+                               for x in ("pytest", "manage.py", "manage", "test"))]
+        self.assertEqual(suite_calls, [])
         proof = json.loads(proof_path.read_text())
         self.assertFalse(proof["migration_graph_ok"])
         self.assertEqual(proof["exit_code"], 2)

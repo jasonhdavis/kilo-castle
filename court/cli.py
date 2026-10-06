@@ -46,6 +46,7 @@ from . import migration_guard
 from . import migration_graph
 from . import browser as studio_browser
 from . import studio_close
+from . import lease as worker_lease
 
 # The Ward's durable workspace: patrol ledger + Warden Report queue.
 WARD_DIR = Path(__file__).resolve().parent.parent / "ward"
@@ -518,6 +519,8 @@ def standup_kilo_session(
     run_now: bool = True,
     provider_hint: Optional[str] = None,
     watch_quest: str = "",
+    holder: str = "standup",
+    force: bool = False,
 ) -> dict:
     """Stand up a Kilo session in a worktree with explicit agent mode.
 
@@ -526,9 +529,14 @@ def standup_kilo_session(
     the SAME session (generalized goad). `watch_quest` binds the durable
     quest state the watchdog checks for completion.
 
+    Worker lease (2026-10-06 Q799 stack class): claims the per-(worktree,
+    role) single-writer lease BEFORE spawning; a live holder refuses the
+    spawn (mode 'lease-held') instead of stacking a second concurrent
+    writer on the same worktree. `force=True` supersedes the holder.
+
     Returns dict with keys:
     - 'ok': bool
-    - 'mode': 'api' | 'cli' | 'config'
+    - 'mode': 'api' | 'cli' | 'config' | 'lease-held'
     - 'session_id': str
     - 'message': str
     """
@@ -585,6 +593,27 @@ def standup_kilo_session(
         try:
             pre_existing = query_kilo_session_ids(worktree_path)
             qual_model = canonical_model_id(model, provider=config.get_provider(provider_hint or "serf"))
+            # Worker lease: claim BEFORE spawning so a racing spawner (manual
+            # goad, console continue) is refused before it creates a
+            # duplicate concurrent writer on this worktree (Q799 stack class).
+            claimed, claim_reason, holder_payload = worker_lease.claim(
+                worktree_path, agent, holder=holder, pending=True, force=force,
+            )
+            if not claimed:
+                why = holder_payload or {}
+                return {
+                    "ok": False,
+                    "mode": "lease-held",
+                    "session_id": (why.get("session_id") or ""),
+                    "pid": why.get("pid"),
+                    "message": (
+                        f"worker lease held: a live {agent} worker already runs in this worktree "
+                        f"({claim_reason}; holder {why.get('holder') or '?'}, pid {why.get('pid')}, "
+                        f"session {why.get('session_id') or '-'}). Inspect .kilo/{agent}.log — "
+                        f"or supersede it with --force if it is genuinely wedged."
+                    ),
+                    "log": str(worktree_path / ".kilo" / f"{agent}.log"),
+                }
             log_dir = worktree_path / ".kilo"
             log_dir.mkdir(parents=True, exist_ok=True)
             log_file = log_dir / f"{agent}.log"
@@ -616,14 +645,28 @@ def standup_kilo_session(
             finally:
                 log_out.close()
 
+            # Finalize the lease claim with the real worker pid + process
+            # group (pending -> final; the claim is ours by construction).
+            try:
+                worker_pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, OSError):
+                worker_pgid = proc.pid
+            worker_lease.update(
+                worktree_path, agent,
+                pid=proc.pid, pgid=worker_pgid, pending=False,
+                holder=holder, model=qual_model,
+            )
+
             session_id = query_latest_kilo_session_id(worktree_path, timeout_seconds=2.5, exclude_ids=pre_existing)
             if session_id:
+                worker_lease.update(worktree_path, agent, session_id=session_id)
                 watch_pid = _spawn_watchdog(
                     worktree_path, agent, proc.pid, session_id,
                     model=qual_model,
                     quest_ids=watch_quest,
                     task_file="TASK.md",
                     exclude_ids=pre_existing,
+                    pgid=worker_pgid,
                 )
                 return {
                     "ok": True,
@@ -640,6 +683,7 @@ def standup_kilo_session(
             # in tests) is treated as alive.
             poll_res = proc.poll()
             if isinstance(poll_res, int):
+                worker_lease.release(worktree_path, agent)
                 tail = ""
                 try:
                     tail = "\n".join(log_file.read_text(encoding="utf-8").splitlines()[-8:])
@@ -663,6 +707,7 @@ def standup_kilo_session(
                 quest_ids=watch_quest,
                 task_file="TASK.md",
                 exclude_ids=pre_existing,
+                pgid=worker_pgid,
             )
             return {
                 "ok": True,
@@ -1765,6 +1810,7 @@ def cmd_status(args):
                 "commutation": q.extract_commutation(),
                 "commutation_done": q.commutation_complete(),
                 "pending_audience": q.has_pending_audience(),
+                "worker": _worker_verdict_for_quest(q, audit.worktree_path),
             }
             results.append(q_dict)
         out = {
@@ -1820,6 +1866,10 @@ def cmd_status(args):
             git_badge = f"[DIRTY: {dirty_cnt} files]" if gs.get("dirty") else "[CLEAN]"
             badges.append(git_badge)
 
+        worker_badge = worker_lease.format_badge(_worker_verdict_for_quest(q, audit.worktree_path))
+        if worker_badge:
+            badges.append(worker_badge)
+
         if badges:
             print(f"      {' '.join(badges)}")
 
@@ -1863,6 +1913,16 @@ def cmd_status(args):
     if questing:
         for q in questing:
             _render_item(q)
+        stalled = []
+        for q in questing:
+            wv = _worker_verdict_for_quest(q, getattr(q, "worktree", "") or "")
+            if wv.get("state") in ("stalled", "exited"):
+                stalled.append((q.id, worker_lease.format_badge(wv)))
+        if stalled:
+            print(f"  ⚠️ {len(stalled)} worker(s) stalled or exited mid-task (worker lease):")
+            for qid, badge in stalled:
+                print(f"      - {qid} {badge}")
+            print("      → inspect .kilo/<role>.log in the worktree; `court goad <id> --force` supersedes a wedged holder")
     else:
         print("  (no serfs currently questing in the field)")
 
@@ -2717,7 +2777,14 @@ def cmd_dispatch(args):
         kilo_bin=kilo_bin,
         run_now=run_now,
         watch_quest=quest.id,
+        holder="dispatch",
     )
+    if standup_res.get("mode") == "lease-held":
+        # A live worker already holds this worktree: recording a second
+        # serf session (or advancing the ledger again) would stack a second
+        # concurrent writer on the branch — abort before ledger writes.
+        print(f"ERROR: {standup_res.get('message')}", file=sys.stderr)
+        sys.exit(1)
     if not session_id:
         if getattr(args, "create_worktree", False) or getattr(args, "native", False):
             session_id = "native"
@@ -3026,11 +3093,36 @@ def cmd_coin(args):
 
     auto_commit = not getattr(args, "no_commit", False)
     wait = getattr(args, "wait", False)
+    coin_force = getattr(args, "force", False)
+
+    # Worker lease (Q799 stack class): one live Master of Coin per worktree —
+    # --force (already the audit-gate override) also supersedes a wedged
+    # lease holder. Sync runs hold the lease under this CLI process's own
+    # pid; background runs under the detached worker's.
+    claimed, claim_reason, holder_payload = worker_lease.claim(
+        wt, "master_of_coin", holder="coin-sync" if wait else "coin",
+        pid=os.getpid() if wait else 0,
+        pending=not wait,
+        force=coin_force,
+    )
+    if not claimed:
+        why = holder_payload or {}
+        print(
+            f"ERROR: worker lease held — a live master_of_coin worker already runs in this worktree "
+            f"({claim_reason}; holder {why.get('holder') or '?'}, pid {why.get('pid')}, "
+            f"session {why.get('session_id') or '-'}). Inspect: tail -40 {log_file} "
+            f"— or supersede with: court coin {quest.id} --force",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if wait:
         print(f"🪙 Running Master of Coin audit for {quest.id} synchronously (agent: master_of_coin, model: {qual_model})...")
         pre_existing = query_kilo_session_ids(wt)
-        res = subprocess.run(cmd, cwd=str(wt), env=_engine_spawn_env(wt))
+        try:
+            res = subprocess.run(cmd, cwd=str(wt), env=_engine_spawn_env(wt))
+        finally:
+            worker_lease.release(wt, "master_of_coin", pid=os.getpid())
         session_id = query_latest_kilo_session_id(wt, exclude_ids=pre_existing) or query_latest_kilo_session_id(wt)
         if session_id:
             quest.master_of_coin_session_id = session_id
@@ -3067,12 +3159,18 @@ def cmd_coin(args):
             )
         finally:
             log_out.close()
+        try:
+            coin_pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            coin_pgid = proc.pid
+        worker_lease.update(wt, "master_of_coin", pid=proc.pid, pgid=coin_pgid, pending=False, model=qual_model)
         _spawn_watchdog(
             wt, "master_of_coin", proc.pid, "",
             model=qual_model,
             quest_ids=quest.id,
             task_file="TASK_COIN.md",
             exclude_ids=pre_existing,
+            pgid=coin_pgid,
         )
         session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5, exclude_ids=pre_existing)
         # kilo-coin-36177 class (Q699): verify the detached process actually
@@ -3082,6 +3180,7 @@ def cmd_coin(args):
         # poll() (tests) is treated as alive.
         poll_res = proc.poll() if hasattr(proc, "poll") else None
         if session_id is None and isinstance(poll_res, int):
+            worker_lease.release(wt, "master_of_coin")
             print(
                 f"ERROR: Master of Coin process exited immediately (exit {poll_res}); no session was created. "
                 f"Log tail: tail -20 {log_file}",
@@ -3089,6 +3188,7 @@ def cmd_coin(args):
             )
             sys.exit(1)
         session_id = session_id or f"kilo-coin-{proc.pid}"
+        worker_lease.update(wt, "master_of_coin", session_id=session_id)
         quest.master_of_coin_session_id = session_id
         quest.master_of_coin_model = model
         store.save(quest, auto_commit=auto_commit, commit_msg=f"court: dispatch MoC {session_id} for {quest.id}")
@@ -3165,6 +3265,24 @@ def cmd_goad(args):
 
     auto_commit = not getattr(args, "no_commit", False)
     pre_existing = query_kilo_session_ids(wt)
+    # Worker lease (Q799 stack class): refuse to stack a goad on a live
+    # worker — a goad on a LIVE worker is the exact double-writer race this
+    # lease exists to prevent; the watchdog already owns continuation of a
+    # live worker's turn. --force supersedes a wedged holder.
+    claimed, claim_reason, holder_payload = worker_lease.claim(
+        wt, agent_role, holder="goad", pending=True, force=getattr(args, "force", False),
+    )
+    if not claimed:
+        why = holder_payload or {}
+        print(
+            f"ERROR: worker lease held — a live {role_label} worker already runs in this worktree "
+            f"({claim_reason}; holder {why.get('holder') or '?'}, pid {why.get('pid')}, "
+            f"session {why.get('session_id') or '-'}). A live worker is not stalled: the watchdog "
+            f"re-prompts it automatically when its turn ends. Inspect: tail -40 {log_file} "
+            f"— or supersede with: court goad {quest.id} --force",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(f"\n--- Goad {role_label}: {title} ({datetime.now().isoformat()}) ---\n")
     log_out = open(log_file, "a", encoding="utf-8")
@@ -3180,18 +3298,25 @@ def cmd_goad(args):
         )
     finally:
         log_out.close()
+    try:
+        worker_pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        worker_pgid = proc.pid
+    worker_lease.update(wt, agent_role, pid=proc.pid, pgid=worker_pgid, pending=False, model=qual_model)
     _spawn_watchdog(
         wt, agent_role, proc.pid, "",
         model=qual_model,
         quest_ids=quest.id,
         task_file="TASK_GOAD.md",
         exclude_ids=pre_existing,
+        pgid=worker_pgid,
     )
     session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5, exclude_ids=pre_existing)
     # Same instant-death verification as cmd_coin (Q699 class): refuse to
     # record a session id for a process that died on spawn.
     poll_res = proc.poll() if hasattr(proc, "poll") else None
     if session_id is None and isinstance(poll_res, int):
+        worker_lease.release(wt, agent_role)
         print(
             f"ERROR: Goaded {role_label} process exited immediately (exit {poll_res}); no session was created. "
             f"Log tail: tail -20 {log_file}",
@@ -3199,6 +3324,7 @@ def cmd_goad(args):
         )
         sys.exit(1)
     session_id = session_id or f"kilo-{agent_role}-{proc.pid}"
+    worker_lease.update(wt, agent_role, session_id=session_id)
     quest.serf_session_id = session_id
     store.save(quest, auto_commit=auto_commit, commit_msg=f"court: goad {role_label} session {session_id} for {quest.id}")
     print(f"⚡ Goaded {role_label} for {quest.id}:")
@@ -3265,6 +3391,7 @@ def _watch_write_state(worktree: Path, role: str, payload: dict) -> None:
     try:
         p = _watch_state_path(worktree, role)
         p.parent.mkdir(parents=True, exist_ok=True)
+        worker_lease.ensure_self_ignored(worktree)
         p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except OSError:
         pass
@@ -3339,13 +3466,51 @@ def _drain_owned_children(owned: set) -> None:
         owned.discard(op)
 
 
+def _worker_verdict_for_quest(q: Quest, worktree: Optional[str]) -> dict:
+    """Dashboard worker-liveness verdict for a quest's serf/scout worker
+    (lease state + log freshness; idle when no lease/no worktree)."""
+    role = "scout" if (getattr(q, "kind", "") == "scout" or getattr(q, "section", "") == "Investigation") else "serf"
+    if not worktree:
+        return {"state": "idle", "role": role, "lease": None, "log": {"verdict": "unknown", "age_seconds": None, "exists": False}}
+    try:
+        return worker_lease.worker_verdict(Path(worktree), role)
+    except Exception:
+        return {"state": "idle", "role": role, "lease": None, "log": {"verdict": "unknown", "age_seconds": None, "exists": False}}
+
+
+def _release_watch_lease(wt, role: str, pid: Optional[int]) -> None:
+    """Release the watched worker's lease on terminal watch exits — only when
+    we plausibly own it: pid-matched, or (manual poll mode, no pid) only when
+    the holder is not live (never dropping a live worker's lease)."""
+    if not wt:
+        return
+    if pid:
+        worker_lease.release(wt, role, pid=pid)
+        return
+    payload = worker_lease.read_lease(wt, role)
+    if payload:
+        live, _why = worker_lease.holder_is_live(payload)
+        if not live:
+            worker_lease.release(wt, role)
+
+
 def cmd_watch(args):
     """Detached continuation watchdog for an engine-spawned worker run.
 
     Waits for the kilo run process (pid) to exit; when the durable quest state
     says the run ended mid-task, re-prompts the SAME --session up to
     --max-attempts times. Never re-prompts human-blocked (HELD/PUNISHED) or
-    completed work. State lands in .kilo/watch/<role>.json."""
+    completed work. State lands in .kilo/watch/<role>.json.
+
+    Watchdog v2 (2026-10-06 Q799 stack class):
+    - holds the per-(worktree, role) worker lease; its continuations claim it
+      before spawning, and a live foreign holder refuses a duplicate
+      continuation instead of stacking a second concurrent writer
+    - stall referee: a worker whose stdout log has been silent past the
+      role's threshold is killed (SIGTERM -> SIGKILL its process group) and
+      then re-prompted through the normal continuation path — converting a
+      hung turn into a bounded retry. A missing log never triggers the
+      referee (no evidence, no kill)."""
     wt = Path(args.dir).resolve() if args.dir else None
     role = args.agent
     session_id = (args.session or "").strip()
@@ -3353,8 +3518,11 @@ def cmd_watch(args):
     max_attempts = max(1, int(args.max_attempts))
     deadline = time.time() + int(args.wall_cap)
     exclude = {x for x in (getattr(args, "exclude", "") or "").split(",") if x}
+    stall_override = int(getattr(args, "stall_seconds", 0) or 0)
+    stall_limit = stall_override if stall_override > 0 else worker_lease.stall_threshold(role)
 
     pid = args.pid
+    pgid = getattr(args, "pgid", None) or pid
     if pid and not _process_alive(pid):
         print(f"watch: worker pid {pid} already gone before watch started", file=sys.stderr)
         return
@@ -3362,12 +3530,24 @@ def cmd_watch(args):
     owned_pids: set = set()
     _drain_owned_children(owned_pids)
 
+    # Lease adoption: record watchdog ownership (watchdog_pid) on the lease
+    # the spawner claimed, or create it for a manual `court watch` on a live
+    # pid. Never clobbers a DIFFERENT live holder.
+    if wt and pid:
+        adopted, adopt_detail = worker_lease.adopt(
+            wt, role, pid=pid, pgid=pgid, session_id=session_id,
+            watchdog_pid=os.getpid(), holder="watch",
+        )
+        if not adopted:
+            _watch_log(wt, role, f"lease NOT adopted: {adopt_detail} — watching pid {pid} anyway")
+
     # A pid-fallback spawn has no resolvable session yet: poll for it briefly
     # so a crash-free spawn can still be continued on the right session.
     if wt and not session_id and exclude:
         for _ in range(int(args.session_resolve_seconds) // 2):
             session_id = query_latest_kilo_session_id(wt, timeout_seconds=2, exclude_ids=exclude) or ""
             if session_id:
+                worker_lease.update(wt, role, session_id=session_id)
                 break
             if pid and not _worker_running(pid, owned_pids):
                 break
@@ -3379,6 +3559,30 @@ def cmd_watch(args):
                 _drain_owned_children(owned_pids)
                 _watch_log(wt or Path.cwd(), role, f"wall cap reached; abandoning watch of {session_id or pid}")
                 return
+            # Stall referee: worker alive but stdout silent past the role's
+            # threshold = hung turn. Kill it (owned children directly;
+            # foreign pids only after the pid-reuse verification) and let the
+            # continuation decision below re-prompt — a bounded retry.
+            if wt or args.dir:
+                fresh = worker_lease.log_freshness(wt or Path.cwd(), role)
+            else:
+                fresh = None
+            if fresh and fresh["verdict"] == "silent":
+                age = fresh.get("age_seconds")
+                _watch_log(
+                    wt or Path.cwd(), role,
+                    f"stall referee: worker pid {pid} silent {age:.0f}s > {stall_limit}s — killing hung turn",
+                )
+                killed, kdetail = worker_lease.kill_worker_tree(
+                    pid, pgid=pgid, verify=(pid not in owned_pids),
+                )
+                _watch_log(wt or Path.cwd(), role, f"stall referee kill: {kdetail}")
+                _watch_write_state(wt or Path.cwd(), role, {
+                    "role": role, "session_id": session_id, "attempt": attempt,
+                    "max_attempts": max_attempts, "stall": True,
+                    "stall_age_seconds": age, "kill": kdetail, "ts": now_iso(),
+                })
+                break
             time.sleep(WATCH_POLL_SECONDS)
 
         quests = _load_watch_quests(getattr(args, "quest", "") or "", wt)
@@ -3398,6 +3602,7 @@ def cmd_watch(args):
         })
         if not cont:
             _drain_owned_children(owned_pids)
+            _release_watch_lease(wt, role, pid)
             return
         if attempt >= max_attempts:
             _drain_owned_children(owned_pids)
@@ -3427,6 +3632,7 @@ def cmd_watch(args):
         kilo_bin = find_kilo_binary()
         if not kilo_bin:
             _drain_owned_children(owned_pids)
+            _release_watch_lease(wt, role, pid)
             _watch_log(wt or Path.cwd(), role, "kilo binary not found — cannot re-prompt")
             return
         target_session = ""
@@ -3446,6 +3652,24 @@ def cmd_watch(args):
                 return
             fresh_fallback = True
             _watch_log(wt or Path.cwd(), role, "session id unresolvable — falling back to a fresh-session continuation in the same worktree")
+
+        # Lease arbitration for the continuation itself: claim BEFORE spawning
+        # so a raced-in goad/console-continue worker (live foreign holder)
+        # suppresses a duplicate continuation instead of stacking writers.
+        cont_claim_ok, cont_claim_reason, cont_holder = (True, "no-worktree", None)
+        if wt:
+            cont_claim_ok, cont_claim_reason, cont_holder = worker_lease.claim(
+                wt, role, holder="watch-continuation", pending=True,
+            )
+            if not cont_claim_ok:
+                _drain_owned_children(owned_pids)
+                _watch_log(
+                    wt, role,
+                    f"lease held by live worker ({cont_claim_reason}; holder "
+                    f"{(cont_holder or {}).get('holder')}, pid {(cont_holder or {}).get('pid')}) — "
+                    "not spawning a duplicate continuation",
+                )
+                return
         cmd = [
             str(kilo_bin), "run",
             "--agent", role,
@@ -3475,8 +3699,26 @@ def cmd_watch(args):
             )
         finally:
             log_out.close()
+        if isinstance(getattr(proc, "poll", lambda: None)(), int):
+            # Instant-death continuation: release the claim, stop watching.
+            if wt:
+                worker_lease.release(wt, role)
+            _drain_owned_children(owned_pids)
+            _watch_log(wt or Path.cwd(), role, "continuation process died on spawn — watch ending")
+            return
+        try:
+            cont_pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            cont_pgid = proc.pid
+        if wt:
+            worker_lease.update(
+                wt, role,
+                pid=proc.pid, pgid=cont_pgid, session_id=target_session,
+                holder="watch", watchdog_pid=os.getpid(), pending=False,
+            )
         attempt += 1
         pid = proc.pid
+        pgid = cont_pgid
         owned_pids.add(pid)
 
 
@@ -3490,6 +3732,7 @@ def _spawn_watchdog(
     task_file: str = "TASK.md",
     exclude_ids: Optional[set] = None,
     max_attempts: int = WATCH_MAX_ATTEMPTS,
+    pgid: Optional[int] = None,
 ) -> Optional[int]:
     """Launch the detached continuation watchdog for a freshly spawned worker.
     Returns the watchdog pid, or None when disabled (COURT_WATCH_DISABLE=1) or
@@ -3499,6 +3742,7 @@ def _spawn_watchdog(
     cmd = [
         sys.executable, "-m", "court.cli", "watch",
         "--pid", str(pid),
+        "--pgid", str(pgid if pgid else pid),
         "--dir", str(worktree_path),
         "--agent", role,
         "--model", model,
@@ -4535,7 +4779,7 @@ def cmd_collect(args):
                     wt = Path(solo.worktree)
                     setup_worktree_agent_config(wt, "gatekeeper")
                     prompt = f"Act as Gatekeeper for {solo.id} on {cogship_id}: merge castle in, run test suite, and on clean pass merge into castle."
-                    res = standup_kilo_session(wt, agent="gatekeeper", model=qual_gatekeeper, prompt=prompt, title=f"{cogship_id} Gatekeeper", kilo_bin=kilo_bin, run_now=True, watch_quest=solo.id)
+                    res = standup_kilo_session(wt, agent="gatekeeper", model=qual_gatekeeper, prompt=prompt, title=f"{cogship_id} Gatekeeper", kilo_bin=kilo_bin, run_now=True, watch_quest=solo.id, holder="collect")
                     sid = res.get("session_id")
                     if sid:
                         solo.gatekeeper_session_id = sid
@@ -4588,7 +4832,7 @@ def cmd_collect(args):
                     subprocess.run(["git", "-C", str(wt_path), "merge", base_branch, "--ff-only"], capture_output=True, timeout=120)
                     setup_worktree_agent_config(wt_path, "gatekeeper")
                     prompt = f"Act as Gatekeeper for {cogship_id}: integrate Quests {accepted_ids}, run integration suite, promote to castle."
-                    res = standup_kilo_session(wt_path, agent="gatekeeper", model=qual_gatekeeper, prompt=prompt, title=f"{cogship_id} Gatekeeper", kilo_bin=kilo_bin, run_now=True, watch_quest=accepted_ids)
+                    res = standup_kilo_session(wt_path, agent="gatekeeper", model=qual_gatekeeper, prompt=prompt, title=f"{cogship_id} Gatekeeper", kilo_bin=kilo_bin, run_now=True, watch_quest=accepted_ids, holder="collect")
                     sid = res.get("session_id")
                     if sid:
                         for q in accepted:
@@ -5741,7 +5985,11 @@ def cmd_studio(args):
             title=f"{slug} Combined Studio",
             kilo_bin=kilo_bin,
             provider_hint="artist",
+            holder="studio",
         )
+        if spawn.get("mode") == "lease-held":
+            print(f"ERROR: {spawn.get('message')}", file=sys.stderr)
+            sys.exit(1)
         session_id = spawn.get("session_id") or ""
         # Record only REAL sessions (api/cli); the config-mode placeholder id
         # ("kilo-artist", worktree merely pre-configured) is not a session.
@@ -6889,7 +7137,8 @@ def cmd_levy(args):
             ahead_str = f"↑{audit.git_status.get('ahead', 0)}" if audit.git_status.get("ahead") is not None else ""
             task_str = f"[Tasks: {audit.task_progress['summary']}] " if audit.task_progress.get("found") else ""
             phase_str = f" | Phase: {audit.task_progress['active_phase']}" if audit.task_progress.get("active_phase") else ""
-            print(f"  • {q.id:36} [{q.status:10}] {task_str}{ahead_str:5} ({tribute_str}){phase_str}")
+            worker_str = worker_lease.format_badge(_worker_verdict_for_quest(q, audit.worktree_path))
+            print(f"  • {q.id:36} [{q.status:10}] {task_str}{ahead_str:5} ({tribute_str}){phase_str} {worker_str}".rstrip())
             print(f"      {q.title}")
 
     if violations_list:
@@ -7283,7 +7532,7 @@ def build_parser():
     )
     p_coin.add_argument("quest_id", help="Quest ID to audit (must be in TRIBUTE_READY unless --force)")
     p_coin.add_argument("--model", default=None, help="Model for Master of Coin (default: manifest models.master_of_coin in .court/config.json)")
-    p_coin.add_argument("--force", action="store_true", help="Audit even if not currently in TRIBUTE_READY")
+    p_coin.add_argument("--force", action="store_true", help="Audit even if not currently in TRIBUTE_READY; also supersedes a live worker lease (kills the wedged holder)")
     p_coin.add_argument("--wait", action="store_true", help="Run synchronously and wait for completion instead of background")
     p_coin.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_coin.set_defaults(func=cmd_coin)
@@ -7295,6 +7544,7 @@ def build_parser():
     p_goad.add_argument("quest_id", help="Quest ID to goad")
     p_goad.add_argument("--model", default=None, help="Model override for goad")
     p_goad.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
+    p_goad.add_argument("--force", action="store_true", help="Supersede a live worker lease: kill the current worker's process group, then spawn the goad (default: refuse while a worker is live)")
     p_goad.set_defaults(func=cmd_goad)
 
     p_dispatch_complete = sub.add_parser(
@@ -7680,6 +7930,7 @@ def build_parser():
         help="Detached continuation watchdog: when a single-turn worker run ends mid-task, re-prompt the SAME session (generalized goad; spawned automatically beside every engine worker spawn)",
     )
     p_watch.add_argument("--pid", type=int, default=None, help="Worker process id to wait on (optional; no pid means poll the quest state once)")
+    p_watch.add_argument("--pgid", type=int, default=None, help="Worker process-group id (start_new_session spawns; defaults to --pid) — used by the stall referee to kill a hung worker tree")
     p_watch.add_argument("--dir", default=None, help="Worktree the worker runs in (watch state, logs, and ledger reads resolve here)")
     p_watch.add_argument("--agent", required=True, help="Worker role (serf | scout | gatekeeper | master_of_coin)")
     p_watch.add_argument("--model", default=None, help="Model for continuation turns (defaults to the worker's recorded model resolution)")
@@ -7691,6 +7942,7 @@ def build_parser():
     p_watch.add_argument("--exclude", default="", help="Comma-separated pre-existing session ids to exclude when resolving the worker session")
     p_watch.add_argument("--session-resolve-seconds", dest="session_resolve_seconds", type=int, default=6, help="How long to poll kilo.db for the worker session id when only a pid is known")
     p_watch.add_argument("--wall-cap", type=int, default=WATCH_WALL_CAP_SECONDS, help="Hard wall-clock cap for the whole watch (seconds)")
+    p_watch.add_argument("--stall-seconds", dest="stall_seconds", type=int, default=0, help="Stall referee threshold override in seconds (0 = role default: serf 20m, scout 30m, master_of_coin 30m, gatekeeper 45m of log silence)")
     p_watch.set_defaults(func=cmd_watch)
 
     p_monitor = sub.add_parser(

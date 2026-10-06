@@ -4307,6 +4307,24 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
     job["events"].append({"type": "status", "text": (
         f"spawning agent - {agent} - {mode} - "
         f"{directory.replace('/Users/scrummage/Python/', '')}")})
+    # Worker lease (Q799 stack class): the console was the third writer that
+    # stacked onto a live dispatch Serf. Claim the single-writer lease BEFORE
+    # spawning; a live holder (dispatch/goad/watchdog continuation) is
+    # reported into the console stream instead of double-spawning.
+    from court import lease as worker_lease
+    claimed, claim_reason, holder_payload = worker_lease.claim(
+        Path(directory), agent, holder="console", pending=True,
+    )
+    if not claimed:
+        why = holder_payload or {}
+        job["events"].append({"type": "error", "text": (
+            f"worker lease held — a live {agent} worker already runs in this "
+            f"worktree ({claim_reason}; holder {why.get('holder') or '?'}, "
+            f"pid {why.get('pid')}, session {(why.get('session_id') or '-')[:22]}). "
+            f"Inspect its .kilo/{agent}.log; supersede from the terminal with "
+            f"`court goad <quest> --force` if it is genuinely wedged.")})
+        job["done"] = True
+        return
     cmd = [_kilo_bin(), "run", "--dir", directory, "--agent", agent,
            "--format", "json", "--thinking", "--auto",
            "--title", prompt.strip()[:60] or "console turn"]
@@ -4328,9 +4346,19 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             start_new_session=True, env=_engine_spawn_env(Path(directory)))
     except Exception as exc:
+        worker_lease.release(Path(directory), agent)
         job["events"].append({"type": "error", "text": str(exc)})
         job["done"] = True
         return
+    try:
+        run_pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        run_pgid = proc.pid
+    worker_lease.update(
+        Path(directory), agent,
+        pid=proc.pid, pgid=run_pgid, session_id=session_id or "",
+        holder="console", pending=False,
+    )
     job["proc"] = proc
 
     def _reader():
@@ -4353,6 +4381,12 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
                                       "text": "agent connected - streaming"})
             if ev.get("sessionID") and not job.get("sid"):
                 job["sid"] = ev["sessionID"]
+                try:
+                    worker_lease.update(
+                        Path(directory), agent,
+                        session_id=ev["sessionID"], pending=False)
+                except Exception:
+                    pass
                 job["events"].append({"type": "status",
                                       "text": f"session {ev['sessionID'][:22]}..."})
             kind = ev.get("type")

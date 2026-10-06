@@ -161,3 +161,19 @@ Rules for every agent role (Steward, Serf, Gatekeeper, Master of Coin):
    resolves, falls back to a fresh-session continuation in the same worktree
    (same TASK.md, same charter, same attempt budget) instead of dying with
    "no resolvable session id".
+6. **Worker leases make the worktree single-writer (Watchdog v2, 2026-10-06
+   Q799 stack class).** Every engine worker spawn (dispatch, goad, coin,
+   collect, studio, console continue, watchdog continuations) claims a
+   per-(worktree, role) lease at `.kilo/watch/<role>.lease.json` BEFORE
+   spawning; a live holder refuses the new spawn, so a manual goad or a
+   console "continue" can never stack a second concurrent writer on a
+   worktree whose worker is still running. A genuinely wedged holder is
+   superseded with `--force` (`court goad <id> --force`), which kills the
+   holder's process group first. Liveness is observable without an in-agent
+   heartbeat: the worker's stdout log `.kilo/<role>.log` mtime is the
+   activity signal (`court status` renders LIVE/STALLED/exited badges, and
+   `court watch`'s stall referee kills a worker silent past its role's
+   threshold — serf 20m, scout 30m, master_of_coin 30m, gatekeeper 45m —
+   then re-prompts through the same attempt budget). Watch/lease state files
+   self-ignore in `.kilo/watch/.gitignore` so they never trip dirty-tree
+   compliance alarms.

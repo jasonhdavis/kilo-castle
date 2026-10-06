@@ -8,6 +8,7 @@ from __future__ import annotations
 import fcntl
 import json
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -1486,6 +1487,47 @@ def _detect_suite_command(worktree_path: Path) -> str:
     return "python3 -m pytest -q"
 
 
+def _primary_repo_root_for(worktree: Path) -> Optional[Path]:
+    """Resolve the PRIMARY checkout root for a linked worktree (the directory
+    holding the primary .git), or None when unresolvable."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=str(worktree), capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return Path(proc.stdout.strip()).parent
+
+
+def provision_env_file(worktree: Path) -> bool:
+    """Copy the gitignored root `.env` into a fresh worktree that lacks one.
+
+    cogship-281 hardening (2026-10-06): the studio flow already copied the
+    per-checkout `.env` before a runserver boot, but the gatehouse suite path
+    never did — a fresh convoy worktree ran the unified suite with env-only
+    settings unset (FERNET_KEYS was the outbreak: 311 failed + 468 errors
+    that read like regressions). Idempotent: only copies when the worktree
+    has no .env and the primary root does. Returns True when copied.
+    """
+    p = Path(worktree)
+    if (p / ".env").exists():
+        return False
+    root = _primary_repo_root_for(p)
+    if not root:
+        return False
+    root_env = root / ".env"
+    if not root_env.is_file():
+        return False
+    try:
+        shutil.copy2(root_env, p / ".env")
+        return True
+    except OSError:
+        return False
+
+
 def run_unified_suite(
     worktree_path: str | Path,
     command: Optional[str] = None,
@@ -1519,6 +1561,8 @@ def run_unified_suite(
     if not p.exists() or not p.is_dir():
         result["error"] = f"worktree path does not exist: {worktree_path}"
         return result
+
+    env_provisioned = provision_env_file(p)
 
     head_res = _run(["git", "rev-parse", "HEAD"], p)
     head_sha = head_res.get("stdout", "").strip()
@@ -1636,6 +1680,7 @@ def run_unified_suite(
         "ran_tests": ran_tests,
         "migration_graph_ok": result["migration_graph_ok"],
         "migration_graph_mode": graph.get("mode"),
+        "env_provisioned": env_provisioned,
         "test_db_recreated": test_db_recreated,
         "started": started,
         "finished": finished,

@@ -329,3 +329,51 @@ def test_runsuite_resume_stale_head_reruns(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert called["n"] == 1
     assert "re-running" in out
+
+
+# ---------------------------------------------------------------------------
+# Suite runner: .env provisioning for fresh worktrees (cogship-281 outbreak)
+# ---------------------------------------------------------------------------
+
+def test_run_unified_suite_copies_root_env_into_fresh_worktree(tmp_path, monkeypatch):
+    """A gatehouse worktree without .env gets the primary checkout's copy
+    before the suite runs; an existing .env is never overwritten."""
+    from court.git_ops import provision_env_file, run_unified_suite
+
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / ".env").write_text("FERNET_KEYS=abc\nQSTASH_URL=dummy_value\n", encoding="utf-8")
+    wt = tmp_path / "gatehouse"
+    wt.mkdir()
+
+    monkeypatch.setattr("court.git_ops._primary_repo_root_for", lambda p: root)
+    assert provision_env_file(wt) is True
+    assert (wt / ".env").read_text(encoding="utf-8").startswith("FERNET_KEYS=abc")
+    # Idempotent: second call does not touch the existing file.
+    (wt / ".env").write_text("FERNET_KEYS=kept\n", encoding="utf-8")
+    assert provision_env_file(wt) is False
+    assert (wt / ".env").read_text(encoding="utf-8") == "FERNET_KEYS=kept\n"
+
+    # And the suite runner provisions automatically.
+    (wt / ".env").unlink()
+    seen = {}
+    monkeypatch.setattr("court.git_ops.migration_graph.check_migration_graph",
+                        lambda p, extra_env=None: {"ok": True, "mode": "clean", "reason": ""})
+    monkeypatch.setattr("court.git_ops._suite_proof_path",
+                        lambda cwd=None, cogship_id="", quest_id="": tmp_path / "proof.json")
+    monkeypatch.setattr("court.git_ops.subprocess.run",
+                        lambda *a, **kw: MagicMock(returncode=0, stdout="5 passed", stderr=""))
+    monkeypatch.setattr("court.git_ops._detect_suite_command", lambda p: "")
+    run_unified_suite(wt, command="python -m pytest -q", cogship_id="cogship-envprov")
+    assert (wt / ".env").exists()
+
+
+def test_provision_env_noop_without_root_env(tmp_path, monkeypatch):
+    from court.git_ops import provision_env_file
+    root = tmp_path / "root"
+    root.mkdir()  # no .env in the primary root
+    wt = tmp_path / "gatehouse"
+    wt.mkdir()
+    monkeypatch.setattr("court.git_ops._primary_repo_root_for", lambda p: root)
+    assert provision_env_file(wt) is False
+    assert not (wt / ".env").exists()

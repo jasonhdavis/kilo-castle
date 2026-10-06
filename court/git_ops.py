@@ -1447,6 +1447,32 @@ def _suite_proof_path(cwd: Optional[Path | str] = None, cogship_id: str = "", qu
     return root / _SUITE_PROOF_DIRNAME / f"{name}.json"
 
 
+def _extract_env_prefix(cmd_str: str) -> dict[str, str]:
+    """Parse a leading ``env VAR=value [VAR2=value2 ...]`` prefix from a suite
+    command string into a plain dict. Stops at the first non-assignment token
+    (the actual program). Quoted values keep their quotes stripped. A command
+    without an env prefix yields {} — the graph check then inherits the
+    caller's environment exactly as before (backward compatible)."""
+    out: dict[str, str] = {}
+    if not cmd_str:
+        return out
+    tokens = cmd_str.split()
+    i = 0
+    if i < len(tokens) and tokens[i] == "env":
+        i += 1
+    while i < len(tokens):
+        tok = tokens[i]
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", tok)
+        if not m:
+            break
+        val = m.group(2)
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        out[m.group(1)] = val
+        i += 1
+    return out
+
+
 def _detect_suite_command(worktree_path: Path) -> str:
     # Q455: the canonical unified integration suite command lives in the
     # manifest (.court/config.json `suite.command` — the same value stamped
@@ -1499,11 +1525,20 @@ def run_unified_suite(
 
     started = datetime.now(timezone.utc).isoformat()
 
+    # The suite command (config manifest or override) resolves FIRST so both
+    # stages run under one environment: fresh gatehouse worktrees carry no
+    # .env, so a suite command that self-pins via a leading `env VAR=value`
+    # prefix must pin the migration-graph preflight too, or the preflight
+    # aborts with a settings/environment failure while the suite would have
+    # run fine (cogship-281, 2026-10-06).
+    cmd_str = command or _detect_suite_command(p)
+    pin_env = _extract_env_prefix(cmd_str)
+
     # Stage 1 — migration-graph integrity (DB-free, seconds). Only applies to
     # Django checkouts (manage.py present); a non-Django castle has no
     # migration graph to verify, so the stage is not applicable there.
     if (p / "manage.py").is_file():
-        graph = migration_graph.check_migration_graph(p)
+        graph = migration_graph.check_migration_graph(p, extra_env=pin_env)
         migration_graph_ok = bool(graph.get("ok"))
         result["migration_graph_ok"] = migration_graph_ok
 
@@ -1546,7 +1581,6 @@ def run_unified_suite(
     # Stage 2 — the test battery itself. When the suite keeps its test DB
     # (--keepdb / --reuse-db), a migration renumber since the DB was built
     # makes it fail with "column already exists"; rebuild it once instead.
-    cmd_str = command or _detect_suite_command(p)
     test_db_recreated = ""
     keepdb_mode = suite_keepdb_mode(cmd_str)
     fp_path = _keepdb_fingerprint_path(p)

@@ -3305,6 +3305,40 @@ def _process_alive(pid: Optional[int]) -> bool:
         return False
 
 
+def _worker_running(pid: Optional[int], owned: Optional[set] = None) -> bool:
+    """True while a watched worker is still alive.
+
+    2026-10-06 cogship-281 hardening: for children THIS process spawned, use
+    waitpid(WNOHANG) — os.kill(pid, 0) can never distinguish an exited-but-
+    unreaped child (zombie) from a live one, so a watchdog polling its own
+    continuation child wedged forever against the wall cap while the zombie
+    sat in the process table. Foreign pids (the original dispatch sibling)
+    keep the os.kill probe, since waitpid only works on our own children.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if owned is not None and pid in owned:
+        try:
+            wpid, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return False  # already reaped elsewhere
+        except OSError:
+            return False
+        return wpid == 0  # (0, 0) = still running; (pid, status) = exited & reaped
+    return _process_alive(pid)
+
+
+def _drain_owned_children(owned: set) -> None:
+    """Reap every child this process spawned so nothing outlives us as a
+    zombie in the process table (the pid-59680 defunct incident)."""
+    for op in list(owned):
+        try:
+            os.waitpid(op, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            pass
+        owned.discard(op)
+
+
 def cmd_watch(args):
     """Detached continuation watchdog for an engine-spawned worker run.
 
@@ -3325,6 +3359,9 @@ def cmd_watch(args):
         print(f"watch: worker pid {pid} already gone before watch started", file=sys.stderr)
         return
 
+    owned_pids: set = set()
+    _drain_owned_children(owned_pids)
+
     # A pid-fallback spawn has no resolvable session yet: poll for it briefly
     # so a crash-free spawn can still be continued on the right session.
     if wt and not session_id and exclude:
@@ -3332,13 +3369,14 @@ def cmd_watch(args):
             session_id = query_latest_kilo_session_id(wt, timeout_seconds=2, exclude_ids=exclude) or ""
             if session_id:
                 break
-            if pid and not _process_alive(pid):
+            if pid and not _worker_running(pid, owned_pids):
                 break
 
     while True:
         # Wait for the worker process to end its turn.
-        while pid and _process_alive(pid):
+        while pid and _worker_running(pid, owned_pids):
             if time.time() > deadline:
+                _drain_owned_children(owned_pids)
                 _watch_log(wt or Path.cwd(), role, f"wall cap reached; abandoning watch of {session_id or pid}")
                 return
             time.sleep(WATCH_POLL_SECONDS)
@@ -3359,13 +3397,12 @@ def cmd_watch(args):
             "ts": now_iso(),
         })
         if not cont:
+            _drain_owned_children(owned_pids)
             return
         if attempt >= max_attempts:
+            _drain_owned_children(owned_pids)
             _watch_log(wt or Path.cwd(), role, f"attempt {attempt}/{max_attempts} still incomplete — manual goad required")
             print(f"watch: attempt {attempt}/{max_attempts} ended mid-task ({why}); manual `court goad` required", file=sys.stderr)
-            return
-        if not (session_id or (wt and exclude)):
-            _watch_log(wt or Path.cwd(), role, "no resolvable session id — cannot re-prompt the same session")
             return
 
         # Re-prompt the SAME session with a continuation of the original task.
@@ -3389,26 +3426,42 @@ def cmd_watch(args):
         )
         kilo_bin = find_kilo_binary()
         if not kilo_bin:
+            _drain_owned_children(owned_pids)
             _watch_log(wt or Path.cwd(), role, "kilo binary not found — cannot re-prompt")
             return
-        target_session = session_id or query_latest_kilo_session_id(wt, timeout_seconds=5, exclude_ids=exclude) or ""
+        target_session = ""
+        if session_id or (wt and exclude):
+            target_session = session_id or query_latest_kilo_session_id(wt, timeout_seconds=5, exclude_ids=exclude) or ""
+        fresh_fallback = False
         if not target_session:
-            _watch_log(wt or Path.cwd(), role, "no resolvable session id — cannot re-prompt the same session")
-            return
+            # Fresh-worktree fallback (2026-10-06 cogship-281 hardening): a
+            # worker whose session id never resolved used to orphan its quest
+            # outright ("no resolvable session id — cannot re-prompt"). A
+            # fresh session in the SAME worktree reads the same .kilo/TASK.md
+            # and the charter, so continue there instead — still bounded by
+            # the same attempt budget and wall cap.
+            if not wt:
+                _drain_owned_children(owned_pids)
+                _watch_log(wt or Path.cwd(), role, "no resolvable session id and no worktree — cannot continue")
+                return
+            fresh_fallback = True
+            _watch_log(wt or Path.cwd(), role, "session id unresolvable — falling back to a fresh-session continuation in the same worktree")
         cmd = [
             str(kilo_bin), "run",
             "--agent", role,
             "--dir", str(wt or Path.cwd()),
-            "--session", target_session,
             "--auto",
             continuation,
         ]
+        if target_session and not fresh_fallback:
+            cmd += ["--session", target_session]
         if args.model:
             cmd += ["--model", args.model]
         log_file = (wt or Path.cwd()) / ".kilo" / f"{role}.log"
         (wt or Path.cwd()).mkdir(parents=True, exist_ok=True)
         with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"\n--- watch continuation {attempt + 1}/{max_attempts} for {role} ({datetime.now().isoformat()}) ---\n")
+            label = "fresh-session continuation" if fresh_fallback else "watch continuation"
+            f.write(f"\n--- watch {label} {attempt + 1}/{max_attempts} for {role} ({datetime.now().isoformat()}) ---\n")
         log_out = open(log_file, "a", encoding="utf-8")
         try:
             proc = subprocess.Popen(
@@ -3424,6 +3477,7 @@ def cmd_watch(args):
             log_out.close()
         attempt += 1
         pid = proc.pid
+        owned_pids.add(pid)
 
 
 def _spawn_watchdog(
@@ -4176,6 +4230,38 @@ def cmd_runsuite(args):
     else:
         print("ERROR: no worktree resolved — pass --dir <worktree> or a quest id", file=sys.stderr)
         sys.exit(1)
+
+    # --resume (2026-10-06 session-survival hardening): a successor session
+    # re-verifies a convoy without re-paying the suite when a GREEN durable
+    # proof already exists at the CURRENT head. A proof stamped for an older
+    # head is stale by definition — re-run. The READY_TO_RAZE gate keeps its
+    # independent proof re-verification either way.
+    if getattr(args, "resume", False):
+        existing_path = git_ops._suite_proof_path(
+            None,
+            cogship_id=cogship or "",
+            quest_id=(quests[0].id if len(quests) == 1 else ""),
+        )
+        if existing_path and existing_path.is_file():
+            try:
+                prior = json.loads(existing_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                prior = {}
+            head_now = (git_ops._run(["git", "rev-parse", "HEAD"], wt).get("stdout") or "").strip()
+            if prior.get("ok") and prior.get("exit_code") == 0 and head_now and prior.get("head_sha") == head_now:
+                label = cogship or (quests[0].id if quests else "suite")
+                print(
+                    f"♻️  --resume: GREEN proof already stamped for {label} "
+                    f"({prior.get('ran_tests')} tests, exit 0, head {head_now[:12]}) at {existing_path} — nothing to re-run"
+                )
+                if getattr(args, "json", False):
+                    print(json.dumps({**prior, "resumed": True}, indent=2))
+                return
+            if prior.get("ok") and prior.get("exit_code") == 0:
+                print(
+                    f"ℹ️  --resume: green proof exists for a different head "
+                    f"({str(prior.get('head_sha', ''))[:12]} vs current {head_now[:12]}) — re-running"
+                )
 
     res = git_ops.run_unified_suite(
         wt,
@@ -7586,6 +7672,7 @@ def build_parser():
     p_runsuite.add_argument("--command", default=None, help="Override suite command (default: manifest suite.command in .court/config.json, then pytest/Django auto-detect)")
     p_runsuite.add_argument("--timeout", type=int, default=1800, help="Engine timeout in seconds (default 1800 — an agent's 120s shell cap can never run a real suite)")
     p_runsuite.add_argument("--json", action="store_true", help="Output JSON format")
+    p_runsuite.add_argument("--resume", action="store_true", help="Skip the run when a GREEN durable proof already exists for this cogship/quest at the current head (successor-session re-verification)")
     p_runsuite.set_defaults(func=cmd_runsuite)
 
     p_watch = sub.add_parser(

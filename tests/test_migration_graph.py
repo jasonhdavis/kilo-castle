@@ -245,7 +245,8 @@ class CourtMigrationGraphPreflightTests(unittest.TestCase):
                    return_value=graph_fail) as mock_graph:
             ok, problems = cli._ship_preflight(main_wt, "main", "castle")
         self.assertFalse(ok)
-        mock_graph.assert_called_once_with(main_wt)
+        mock_graph.assert_called_once()
+        self.assertIsNone(mock_graph.call_args.kwargs.get("extra_env"))
         joined = "\n".join(problems)
         self.assertIn("migration graph preflight failed", joined)
         self.assertIn("common", joined)

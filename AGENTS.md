@@ -126,3 +126,38 @@ N parallel Quests branching from the same `castle` tip each independently autoge
 2. **Shape B — same filename (git add/add), or conflicting ops on one model**: trunk-side migration wins verbatim; the loser is rejected via `/reject_tribute` and its Serf runs the delete-and-regenerate procedure (`serf_remediation_prompt.md` → Migration Collision Remediation): schema migrations regenerate via `makemigrations` (next free number + deps are computed), data migrations rename + hand-repoint dependencies, semantically-overlapping deltas are dropped outright.
 3. **Shape C — quest-local `NNNN_merge_*` migrations**: contraband. `court collect` deterministically refuses to pack a candidate branch that ADDS a merge-shaped migration over the trunk (filename `NNNN_merge_*` or zero-op content with ≥2 same-app dependencies). Merge nodes are trunk-owned convoy artifacts, never Quest deliverables.
 4. **Prevention at dispatch time**: `court charter` prints a migration-lane advisory listing in-flight Quests adding migrations to shared `apps/<x>/migrations/` namespaces — sequence those lanes or consciously accept the convoy merge path. Most of this collision class dies at charter/dispatch time.
+
+## Long Pipeline Steps Must Outlive Their Session (2026-10-06 cogship-281 doctrine)
+
+The 2026-10-05/06 convoy cycle lost three gatehouse steps to the same disease:
+agents park multi-minute work (cron drivers, background suites, watchdog
+continuations) inside their own session's lifetime, and the harness reaps the
+process tree when the session or turn ends — the step dies silently and the
+pipeline stalls with no verdict stamped anywhere.
+
+Rules for every agent role (Steward, Serf, Gatekeeper, Master of Coin):
+
+1. **Integration suites run via `court runsuite` — never the session's
+   background tool.** `court runsuite --cogship <id> --dir <gatehouse-wt>`
+   executes inside the ENGINE with a long timeout and stamps durable proof to
+   `.court/suites/<id>.json`. A session-scoped background process dies with
+   the session (cogship-281 lost two suite runs this way) and leaves no
+   proof.
+2. **Fresh gatehouse worktrees have no `.env`.** The suite command self-pins
+   via its leading `env VAR=value` prefix; the engine now propagates that pin
+   to the migration-graph preflight, but an agent invoking any manage.py
+   command by hand must export the same pins or it aborts on settings.
+3. **A successor session resumes; it does not re-derive.** Before re-running
+   an expensive step, check for durable state: `court runsuite --resume
+   --cogship <id>` re-verifies an existing GREEN proof at the current head
+   and re-runs only when the proof is missing, failed, or stale.
+4. **Per-session cron tasks are handoffs, not owners.** A recurring driver
+   scheduled inside one session dies with it. Any agent taking over a
+   pipeline mid-flight must re-arm its own wakeup or drive fire-and-forget
+   steps to completion before ending its turn — and record the handoff in
+   `.court/LEDGER.md`.
+5. **The watchdog no longer orphans unresolvable sessions.** `court watch`
+   reaps its own children (no zombies) and, when a worker's session id never
+   resolves, falls back to a fresh-session continuation in the same worktree
+   (same TASK.md, same charter, same attempt budget) instead of dying with
+   "no resolvable session id".

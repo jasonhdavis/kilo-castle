@@ -90,7 +90,7 @@ def test_run_unified_suite_recreates_stale_keepdb(tmp_path, monkeypatch):
 
     monkeypatch.setattr("court.git_ops.subprocess.run", fake_run)
     monkeypatch.setattr("court.git_ops.migration_graph.check_migration_graph",
-                        lambda p: {"ok": True, "mode": "django", "reason": ""})
+                        lambda p, extra_env=None: {"ok": True, "mode": "django", "reason": ""})
     # No manage.py -> graph stage skipped; add it to prove no crash either way.
     res = cli_git_ops_run(wt, command="pytest -q --reuse-db", cogship_id="cogship-1")
     assert res["ok"] is True

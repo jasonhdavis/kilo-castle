@@ -102,7 +102,7 @@ def _find_parent_venv_python(worktree: Path) -> Optional[str]:
     return None
 
 
-def build_migration_graph_command(worktree: Path) -> tuple[list[str], dict]:
+def build_migration_graph_command(worktree: Path, extra_env: Optional[dict] = None) -> tuple[list[str], dict]:
     """Return (argv, env) for the graph check in `worktree`.
 
     * Checkout with its own venv -> the exact charter-specified shell form
@@ -111,11 +111,21 @@ def build_migration_graph_command(worktree: Path) -> tuple[list[str], dict]:
     * Checkout without a venv (quest/gatehouse worktrees) -> argv form using
       the parent checkout's venv python, falling back to the interpreter
       running the engine itself.
+
+    `extra_env` (2026-10-06 cogship-281 hardening): env vars parsed from the
+    suite command's leading ``env VAR=value`` prefix. Fresh worktrees carry no
+    .env, so the graph check inherits only the caller's os.environ and fails
+    closed with a settings/environment abort while the suite itself would
+    have run fine self-pinned. The suite runner therefore passes the same
+    pinned vars here so both stages run under one environment.
     """
     if (worktree / "venv" / "bin" / "activate").is_file():
-        return (["bash", "-c", MIGRATION_GRAPH_SHELL_COMMAND], dict(os.environ))
+        env = dict(os.environ)
+        env.update(extra_env or {})
+        return (["bash", "-c", MIGRATION_GRAPH_SHELL_COMMAND], env)
     python = _find_parent_venv_python(worktree) or sys.executable
     env = dict(os.environ)
+    env.update(extra_env or {})
     env["ROLE"] = "web"
     return ([python] + MIGRATION_GRAPH_ARGV_COMMAND, env)
 
@@ -176,7 +186,11 @@ def _describe_offenders(offenders: list[dict], mode: str) -> str:
     return "graph check failed for an unrecognized reason"
 
 
-def check_migration_graph(worktree: str | Path, timeout: int = DEFAULT_TIMEOUT) -> dict:
+def check_migration_graph(
+    worktree: str | Path,
+    timeout: int = DEFAULT_TIMEOUT,
+    extra_env: Optional[dict] = None,
+) -> dict:
     """Run the DB-free migration-graph build in `worktree` and return a plain
     verdict dict (engine stdlib-only):
 
@@ -208,7 +222,7 @@ def check_migration_graph(worktree: str | Path, timeout: int = DEFAULT_TIMEOUT) 
         result["reason"] = f"no manage.py in checkout: {p} — graph check cannot run"
         return result
 
-    argv, env = build_migration_graph_command(p)
+    argv, env = build_migration_graph_command(p, extra_env=extra_env)
     result["command"] = " ".join(argv) if argv[0] != "bash" else MIGRATION_GRAPH_SHELL_COMMAND
     try:
         proc = subprocess.run(

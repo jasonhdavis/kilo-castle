@@ -616,6 +616,7 @@ html[data-theme="light"] .iconbtn .bcount{color:#fff}
 <span onclick="closeModal()">CLOSE ✕</span></div><div class="bd" id="modal_bd"></div></div></div>
 <script>
 let S=null, selRepo=null, selWt=null, selSess=null, msgs=[], TURN=null, turns=[];
+let promptHist=[], histIdx=-1;
 let LANESEQ=0, curLane=null;
 const NAV_EXP={};
 const SECTION_ORDER=[
@@ -1350,11 +1351,46 @@ function autosizeTa(){
  ta.style.height='auto';
  ta.style.height=Math.min(140,Math.max(46,ta.scrollHeight))+'px';
 }
+function pushPromptHist(txt){
+ const t=(txt||'').trim();if(!t)return;
+ if(promptHist[promptHist.length-1]!==t)promptHist.push(t);
+ if(promptHist.length>50)promptHist.shift();
+ histIdx=-1;
+}
+function recallPrompt(dir){
+ if(!promptHist.length)return;
+ if(dir<0)histIdx=histIdx<0?promptHist.length-1:Math.max(0,histIdx-1);
+ else{if(histIdx<0)return;histIdx=Math.min(promptHist.length,histIdx+1);}
+ const ta=$('c_prompt');
+ ta.value=histIdx>=promptHist.length?'':promptHist[histIdx];
+ autosizeTa();renderCmdList();
+ try{ta.setSelectionRange(ta.value.length,ta.value.length);}catch(e){}
+}
+// Send-then-stop guard: hand an aborted/undelivered prompt back to the
+// composer so it can be edited and re-sent instead of vanishing.
+function revertToComposer(text){
+ const ta=$('c_prompt');
+ if(!text||ta.value.trim())return false;
+ ta.value=text;autosizeTa();renderCmdList();
+ pushPromptHist(text);
+ ta.focus();
+ try{ta.setSelectionRange(ta.value.length,ta.value.length);}catch(e){}
+ const c=$('c_cont');
+ if(c){
+  c.innerHTML='<span style="color:var(--amber)">prompt returned to the composer'+
+   ' — edit and press Enter to re-send</span>';
+  clearTimeout(window.revertTO);
+  window.revertTO=setTimeout(()=>{if(selSess)openSess(selSess);else poll();},9000);
+ }
+ return true;
+}
 async function dispatch(wt,sess,agent,model,prompt){
   const T={id:++TURNSEQ[0],wt,sess,sid:null,job:null,evs:0,ran:false,done:false,
    lane:sess||curLane,t0:Date.now(),blocks:[{cls:'user',text:prompt}],queue:null,
+   prompt:prompt,produced:false,
    histHTML:transcriptHTML(msgs),stopping:false,stopped:false,
    shown:0,spinEl:null};
+  pushPromptHist(prompt);
   TURN=T;turns.push(T);
   syncComposer();
   try{
@@ -1392,6 +1428,8 @@ async function dispatch(wt,sess,agent,model,prompt){
      else if(e.type==='error')T.blocks.push({cls:'error',text:e.text||'unknown error'});
     }
     if(lastSt.sid)T.sid=lastSt.sid;
+    if(T.sid||evs.some(e=>e.type==='text'||e.type==='reasoning'||e.type==='tool'))
+     T.produced=true;
     if(turnForView()===T)renderLive();
     if(lastSt.done)break;
     await new Promise(res=>setTimeout(res,700));
@@ -1426,7 +1464,13 @@ async function finishTurn(T,err,lastSt){
    }catch(e){}
   }
   window.addEventListener('focus',()=>{document.title='Castle';},{once:true});
-  const q=(T.ran&&T.queue)?T.queue:null;
+  // Revert-on-abort: a prompt that never reached the agent — send refused, a
+  // dispatch failure, or a stop pressed before the agent acted — is handed
+  // back to the composer (edit-and-resend) instead of being swallowed. A
+  // queued follow-up killed by a stop is likewise returned, not run.
+  const restore=T.queue&&T.stopped?T.queue.prompt
+   :(T.prompt&&(!T.ran||(T.stopped&&!T.produced))?T.prompt:null);
+  const q=(T.ran&&T.queue&&!T.stopped)?T.queue:null;
   if(wasViewing&&T.ran&&(T.sid||T.sess)){
    await openSess(T.sid||T.sess);
    const t=$('transcript');
@@ -1438,6 +1482,12 @@ async function finishTurn(T,err,lastSt){
    t.scrollTop=t.scrollHeight;
   }else{poll();}
   if(q){await dispatch(q.wt,T.sid||T.sess,q.agent,q.model,q.prompt);return;}
+  if(restore&&!revertToComposer(restore)){
+   // Composer already holds text — never silently swallow the aborted
+   // prompt: fall back to running the stopped queued follow-up.
+   if(T.queue&&T.stopped)
+    await dispatch(T.queue.wt,T.sid||T.sess,T.queue.agent,T.queue.model,T.queue.prompt);
+  }
 }
 async function stopTurn(){
   const T=turnForView();
@@ -1777,7 +1827,7 @@ async function bulkRun(op,btn){
   renderBoard();
   if(r&&!r.ok)alert('ship failed — '+r.error);
  }
- document.getElementById('c_prompt').addEventListener('input',()=>{cmdIdx=0;autosizeTa();renderCmdList();});
+ document.getElementById('c_prompt').addEventListener('input',()=>{cmdIdx=0;histIdx=-1;autosizeTa();renderCmdList();});
 document.getElementById('c_prompt').addEventListener('keydown',e=>{
  const list=$('cmdlist');
  const listOpen=list.style.display!=='none';
@@ -1790,6 +1840,10 @@ document.getElementById('c_prompt').addEventListener('keydown',e=>{
   const m=cmdMatches();if(!m.length)return;
   cmdIdx=(cmdIdx+m.length-1)%m.length;renderCmdList();return;}
  if(e.key==='Escape'&&listOpen){e.preventDefault();list.style.display='none';return;}
+ if(e.key==='ArrowUp'&&!listOpen&&(histIdx>=0||!$('c_prompt').value)){e.preventDefault();
+  recallPrompt(-1);return;}
+ if(e.key==='ArrowDown'&&!listOpen&&histIdx>=0){e.preventDefault();
+  recallPrompt(1);return;}
  if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){
   if(listOpen&&!$('c_prompt').value.includes(' ')){e.preventDefault();
    const m=cmdMatches();if(m.length)completeCmd(m[cmdIdx].name);return;}
@@ -3604,6 +3658,14 @@ def _mcp_toggle_write(file, name, enabled):
     return 200, {"ok": True}
 
 
+# Per-part transcript cap for the console reader. Long completions (research
+# reports, audits) routinely run 10k+ chars and MUST survive a session reload —
+# the live stream is uncapped, so a low cap here silently truncated messages on
+# re-open (2026-10-20 report cut at 4000). The cap is now a pathological-payload
+# guard only, and truncation is always marked.
+_TEXT_PART_CAP = 400_000
+
+
 def _session_messages(sid, limit=60):
     if not os.path.exists(KILO_DB) or not re.fullmatch(r"[\w-]+", sid):
         return []
@@ -3627,7 +3689,10 @@ def _session_messages(sid, limit=60):
                     continue
                 t = p.get("type")
                 if t in ("text", "reasoning") and p.get("text"):
-                    parts.setdefault(mid, []).append((t, p["text"]))
+                    txt = p["text"]
+                    if len(txt) > _TEXT_PART_CAP:
+                        txt = txt[:_TEXT_PART_CAP] + "\n\n…[truncated by court console]"
+                    parts.setdefault(mid, []).append((t, txt))
         db.close()
     except Exception:
         return []
@@ -3637,7 +3702,7 @@ def _session_messages(sid, limit=60):
             r = "reasoning" if ptype == "reasoning" else (role or "system")
             out.append({"role": r,
                         "time_created": tc,
-                        "text": text[:4000]})
+                        "text": text})
     return out
 
 

@@ -3,13 +3,99 @@ ps parsing, schedule-file parsing, session status boundaries, orphan and
 resurrection detection, and the snapshot builder. Nothing here touches the
 real kilo.db, the real schedule stores, or the live process table."""
 
+import io
 import json
 import os
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
+from court import lease as lease_mod
 from court import ui_server as u
+
+
+def _park_job():
+    return {"events": [], "done": False, "started": time.time(),
+            "dir": "/tmp/wt", "agent": "steward"}
+
+
+def _mock_popen(monkeypatch):
+    proc = MagicMock()
+    proc.pid = 999999  # not a real pid -> os.getpgid raises ProcessLookupError
+    proc.wait.return_value = 0
+    proc.stdout = io.StringIO("")
+    popen = MagicMock(return_value=proc)
+    monkeypatch.setattr(u.subprocess, "Popen", popen)
+    return popen
+
+
+def _stub_engine(monkeypatch):
+    monkeypatch.setattr(u, "_kilo_bin", lambda: "kilo")
+    monkeypatch.setattr(u, "_journal_append", lambda *a, **k: None)
+    monkeypatch.setattr(lease_mod, "update", lambda *a, **k: None)
+    monkeypatch.setattr(lease_mod, "release", lambda *a, **k: True)
+
+
+def test_start_run_queues_then_dispatches_when_lease_frees(monkeypatch):
+    """A held worker lease must park the console message and dispatch it once
+    the lease frees — never refuse it (the operator's prompt is unrecoverable
+    otherwise)."""
+    seq = {"n": 0}
+
+    def fake_claim(*a, **k):
+        seq["n"] += 1
+        if seq["n"] == 1:
+            return False, "refused-live (pid 42 live)", {
+                "holder": "console", "pid": 42, "session_id": "ses_other"}
+        return True, "claimed", None
+
+    _stub_engine(monkeypatch)
+    monkeypatch.setattr(lease_mod, "claim", fake_claim)
+    monkeypatch.setattr(u.time, "sleep", lambda *_: None)
+    popen = _mock_popen(monkeypatch)
+
+    job = _park_job()
+    u._start_run(job, "/tmp/wt", "steward", "hello", None, "test/model")
+
+    assert popen.called, "queued message must dispatch once the lease frees"
+    texts = [e.get("text", "") for e in job["events"]]
+    assert any("queued — a live" in t for t in texts)
+    assert any("dispatch" in t and "queued message" in t for t in texts)
+
+
+def test_start_run_cancel_while_parked_never_dispatches(monkeypatch):
+    _stub_engine(monkeypatch)
+    monkeypatch.setattr(
+        lease_mod, "claim",
+        lambda *a, **k: (False, "refused-live", {"holder": "console", "pid": 42}))
+    popen = _mock_popen(monkeypatch)
+
+    job = _park_job()
+    monkeypatch.setattr(u.time, "sleep", lambda *_: job.__setitem__("cancel", True))
+    u._start_run(job, "/tmp/wt", "steward", "hello", None, "test/model")
+
+    assert not popen.called, "a cancelled parked message must not dispatch"
+    assert job["done"] is True
+    assert any("cancelled before dispatch" in e.get("text", "") for e in job["events"])
+
+
+def test_start_run_gives_up_after_wait_cap(monkeypatch):
+    _stub_engine(monkeypatch)
+    monkeypatch.setattr(
+        lease_mod, "claim",
+        lambda *a, **k: (False, "refused-live", {"holder": "console", "pid": 42}))
+    monkeypatch.setattr(u, "CONSOLE_QUEUE_WAIT_SECONDS", 10)
+    monkeypatch.setattr(u, "CONSOLE_QUEUE_POLL_SECONDS", 5)
+    monkeypatch.setattr(u.time, "sleep", lambda *_: None)
+    popen = _mock_popen(monkeypatch)
+
+    job = _park_job()
+    u._start_run(job, "/tmp/wt", "steward", "hello", None, "test/model")
+
+    assert not popen.called
+    assert job["done"] is True
+    assert any("gave up after" in e.get("text", "") for e in job["events"])
 
 
 PS_FIXTURE = """\

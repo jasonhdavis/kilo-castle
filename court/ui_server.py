@@ -4105,6 +4105,14 @@ def _court_op(job, op, qid, status, note, ids=None, confirm=False):
 _JOBS = {}
 _JOB_SEQ = [0]
 
+# Console sends are queued, never refused, when the worktree's single-writer
+# worker lease is held by a live turn (Q799 stack class). Retyping a long
+# prompt because a *different* session's turn happened to be running was the
+# single most expensive failure mode for the operator; the message now parks
+# and dispatches the moment the lease frees. Stop cancels a parked message.
+CONSOLE_QUEUE_POLL_SECONDS = 5
+CONSOLE_QUEUE_WAIT_SECONDS = 30 * 60
+
 
 _MODEL_CACHE = {"t": 0.0, "list": []}
 
@@ -4393,14 +4401,34 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
     )
     if not claimed:
         why = holder_payload or {}
-        job["events"].append({"type": "error", "text": (
-            f"worker lease held — a live {agent} worker already runs in this "
-            f"worktree ({claim_reason}; holder {why.get('holder') or '?'}, "
+        job["events"].append({"type": "status", "text": (
+            f"queued — a live {agent} worker already runs in this worktree "
+            f"({claim_reason}; holder {why.get('holder') or '?'}, "
             f"pid {why.get('pid')}, session {(why.get('session_id') or '-')[:22]}). "
-            f"Inspect its .kilo/{agent}.log; supersede from the terminal with "
-            f"`court goad <quest> --force` if it is genuinely wedged.")})
-        job["done"] = True
-        return
+            f"This message dispatches automatically when that worker finishes; "
+            f"press Stop to cancel it instead.")})
+        waited = 0.0
+        while not claimed:
+            if job.get("cancel"):
+                job["events"].append({"type": "notice",
+                                      "text": "queued message cancelled before dispatch"})
+                job["done"] = True
+                return
+            time.sleep(CONSOLE_QUEUE_POLL_SECONDS)
+            waited += CONSOLE_QUEUE_POLL_SECONDS
+            if waited >= CONSOLE_QUEUE_WAIT_SECONDS:
+                job["events"].append({"type": "error", "text": (
+                    f"gave up after {int(CONSOLE_QUEUE_WAIT_SECONDS / 60)} min — the "
+                    f"{agent} worker in this worktree never released its lease. "
+                    f"Supersede it from the terminal with `court goad <quest> --force` "
+                    f"if it is genuinely wedged.")})
+                job["done"] = True
+                return
+            claimed, claim_reason, holder_payload = worker_lease.claim(
+                Path(directory), agent, holder="console", pending=True,
+            )
+        job["events"].append({"type": "status",
+                              "text": "lease free — dispatching queued message now"})
     cmd = [_kilo_bin(), "run", "--dir", directory, "--agent", agent,
            "--format", "json", "--thinking", "--auto",
            "--title", prompt.strip()[:60] or "console turn"]
@@ -5373,6 +5401,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         proc = job.get("proc")
         if not proc:
+            # No process yet: a message parked waiting for the worker lease.
+            # Flag it so the queue loop cancels before it ever dispatches.
+            if not job.get("done"):
+                job["cancel"] = True
+                self._json({"ok": True, "cancelled_queued": True})
+                return
             self._json({"error": "process gone"}, 409)
             return
         try:

@@ -495,6 +495,26 @@ def require_op_lock(name: str) -> None:
         sys.exit(1)
 
 
+# Worker identity: the pre-spawn lease record (worktree/role + pid/pgid) is
+# authoritative; a Kilo session id is an optional attribute of it. These bound
+# the optional scrape in query_latest_kilo_session_id — they are not a source
+# of truth.
+SESSION_RESOLVE_SECONDS = 12.0
+SESSION_SCAN_LIMIT = 25
+
+# Honest placeholder for "no resumable session id is known". A synthetic id
+# (`kilo-<agent>`, `kilo-<agent>-<pid>`, "native") cannot be resumed via
+# `kilo run --session <id>`: recording one renders a dead worker as
+# DISPATCHED/WORKING and strands it, because the watchdog's fresh-session
+# continuation only triggers on an empty/unresolvable id.
+UNRESOLVED_SESSION = ""
+
+
+def session_label(session_id: Optional[str]) -> str:
+    """Human-facing rendering of a worker's session identity."""
+    return (session_id or "").strip() or "unresolved"
+
+
 def query_kilo_session_ids(worktree_path: Path) -> set[str]:
     """Inspect local kilo.db and return all session IDs recorded for a worktree."""
     db_path = Path.home() / ".local" / "share" / "kilo" / "kilo.db"
@@ -517,28 +537,37 @@ def query_kilo_session_ids(worktree_path: Path) -> set[str]:
 
 def query_latest_kilo_session_id(
     worktree_path: Path,
-    timeout_seconds: float = 2.5,
+    timeout_seconds: Optional[float] = None,
     exclude_ids: Optional[set[str]] = None,
 ) -> Optional[str]:
-    """Inspect local kilo.db to find the session ID created for a worktree.
+    """Best-effort scrape of the local kilo.db for a worktree's newest session id.
 
-    When `exclude_ids` is provided (sessions that existed before dispatch),
-    prefer a newly created session over a resumed pre-existing one.
+    This is an *optional attribute*, never the worker's identity: the lease
+    record (pid/pgid + worktree/role) is authoritative, and a miss here simply
+    means "identity unresolved" — the caller must not invent a value.
+
+    The store is one shared sqlite file that grows without bound (observed at
+    ~14.8 GB), so the scan gets a real budget and a bounded result set. The old
+    2.5 s / unbounded-fetch version missed almost always at that size, which is
+    what drove callers to fabricate ids.
     """
+    if timeout_seconds is None:
+        timeout_seconds = SESSION_RESOLVE_SECONDS
     db_path = Path.home() / ".local" / "share" / "kilo" / "kilo.db"
     wt_str = str(worktree_path.resolve())
     deadline = time.time() + timeout_seconds
     while time.time() <= deadline:
         if db_path.is_file():
+            conn = None
             try:
                 conn = sqlite3.connect(str(db_path), timeout=1.0)
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT id FROM session WHERE directory = ? ORDER BY time_created DESC",
-                    (wt_str,)
+                    "SELECT id FROM session WHERE directory = ? "
+                    "ORDER BY time_created DESC LIMIT ?",
+                    (wt_str, SESSION_SCAN_LIMIT),
                 )
                 rows = cur.fetchall()
-                conn.close()
                 excluded = exclude_ids or set()
                 new_ids = [r[0] for r in rows if r and r[0] and r[0] not in excluded]
                 if new_ids:
@@ -548,6 +577,12 @@ def query_latest_kilo_session_id(
                         return rows[0][0]
             except Exception:
                 pass
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
         time.sleep(0.2)
     return None
 
@@ -621,6 +656,7 @@ def standup_kilo_session(
                         "ok": True,
                         "mode": "api",
                         "session_id": session_id,
+                        "identity": "resolved",
                         "message": f"Stood up session {session_id} on Kilo Server API",
                     }
         except Exception:
@@ -702,7 +738,7 @@ def standup_kilo_session(
                 holder=holder, model=qual_model,
             )
 
-            session_id = query_latest_kilo_session_id(worktree_path, timeout_seconds=2.5, exclude_ids=pre_existing)
+            session_id = query_latest_kilo_session_id(worktree_path, exclude_ids=pre_existing)
             if session_id:
                 worker_lease.update(worktree_path, agent, session_id=session_id)
                 watch_pid = _spawn_watchdog(
@@ -717,6 +753,7 @@ def standup_kilo_session(
                     "ok": True,
                     "mode": "cli",
                     "session_id": session_id,
+                    "identity": "resolved",
                     "pid": proc.pid,
                     "watchdog_pid": watch_pid,
                     "message": f"Stood up session {session_id} (pid {proc.pid}) via Kilo CLI",
@@ -738,6 +775,7 @@ def standup_kilo_session(
                     "ok": False,
                     "mode": "dead-spawn",
                     "session_id": "",
+                    "identity": "dead-spawn",
                     "pid": proc.pid,
                     "message": (
                         f"{agent} process exited immediately (exit {poll_res}); no session was created. "
@@ -745,7 +783,12 @@ def standup_kilo_session(
                     ),
                     "log": str(log_file),
                 }
-            session_id = f"kilo-{agent}-{proc.pid}"
+            # Identity is honestly unresolved: the store scan did not reveal a
+            # session id. Do NOT invent `kilo-<agent>-<pid>` — that id cannot be
+            # resumed, so it both strands the worker and renders it live. The
+            # lease + pid remain the worker's address, and the watchdog re-prompts
+            # the same worktree/TASK.md via the fresh-session continuation.
+            session_id = session_id or UNRESOLVED_SESSION
             watch_pid = _spawn_watchdog(
                 worktree_path, agent, proc.pid, "",
                 model=qual_model,
@@ -758,10 +801,14 @@ def standup_kilo_session(
                 "ok": True,
                 "mode": "cli",
                 "session_id": session_id,
+                "identity": "resolved" if session_id else "unresolved",
                 "pid": proc.pid,
                 "watchdog_pid": watch_pid,
                 "log": str(log_file),
-                "message": f"Spawned background Kilo CLI {agent} session {session_id} (PID {proc.pid})",
+                "message": (
+                    f"Spawned background Kilo CLI {agent} worker "
+                    f"(PID {proc.pid}, session {session_label(session_id)})"
+                ),
             }
         except Exception as e:
             pass
@@ -769,7 +816,8 @@ def standup_kilo_session(
     return {
         "ok": True,
         "mode": "config",
-        "session_id": f"kilo-{agent}",
+        "session_id": UNRESOLVED_SESSION,
+        "identity": "unresolved",
         "message": f"Worktree configured with agent '{agent}' and task written to .kilo/TASK.md",
     }
 
@@ -2701,7 +2749,7 @@ def _print_dispatch_next_steps(quest: Quest, standup_res: Optional[dict] = None)
     role_name = "Scout" if is_scout else "Serf"
     role_mode = "scout" if is_scout else "serf"
     steps = [
-        f"- {role_name} session {quest.serf_session_id or '-'} ({quest.serf_model or '-'}) is toiling in",
+        f"- {role_name} session {session_label(quest.serf_session_id)} ({quest.serf_model or '-'}) is toiling in",
         f"  {quest.worktree or '-'} on branch {quest.branch or '-'}.",
         f"- Initialized under agent mode '{role_mode}' with pure charter task instructions via Kilo CLI.",
         f"- Nothing to do right now: this is normal {role_name} toil time.",
@@ -2831,10 +2879,10 @@ def cmd_dispatch(args):
         print(f"ERROR: {standup_res.get('message')}", file=sys.stderr)
         sys.exit(1)
     if not session_id:
-        if getattr(args, "create_worktree", False) or getattr(args, "native", False):
-            session_id = "native"
-        else:
-            session_id = standup_res.get("session_id") or f"kilo-{agent_role}"
+        # Record what the standup actually produced — never a sentinel. The old
+        # `"native"` / `f"kilo-{agent_role}"` fallbacks wrote ids that no resume
+        # path understands, so a stranded worker still rendered as DISPATCHED.
+        session_id = standup_res.get("session_id") or UNRESOLVED_SESSION
 
     quest.branch = branch
     quest.worktree = str(worktree_path)
@@ -3217,7 +3265,7 @@ def cmd_coin(args):
             exclude_ids=pre_existing,
             pgid=coin_pgid,
         )
-        session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5, exclude_ids=pre_existing)
+        session_id = query_latest_kilo_session_id(wt, exclude_ids=pre_existing)
         # kilo-coin-36177 class (Q699): verify the detached process actually
         # survived spawn before recording a session id. A PID-fallback id for
         # an instantly-dead process is a session that never existed — the
@@ -3232,13 +3280,13 @@ def cmd_coin(args):
                 file=sys.stderr,
             )
             sys.exit(1)
-        session_id = session_id or f"kilo-coin-{proc.pid}"
+        session_id = session_id or UNRESOLVED_SESSION
         worker_lease.update(wt, "master_of_coin", session_id=session_id)
         quest.master_of_coin_session_id = session_id
         quest.master_of_coin_model = model
-        store.save(quest, auto_commit=auto_commit, commit_msg=f"court: dispatch MoC {session_id} for {quest.id}")
+        store.save(quest, auto_commit=auto_commit, commit_msg=f"court: dispatch MoC {session_label(session_id)} for {quest.id}")
         print(f"🪙 Dispatched Master of Coin for {quest.id}:")
-        print(f"   Session:  {session_id} (PID {proc.pid})")
+        print(f"   Session:  {session_label(session_id)} (PID {proc.pid})")
         print(f"   Agent:    master_of_coin")
         print(f"   Model:    {qual_model}")
         print(f"   Worktree: {wt}")
@@ -3356,7 +3404,7 @@ def cmd_goad(args):
         exclude_ids=pre_existing,
         pgid=worker_pgid,
     )
-    session_id = query_latest_kilo_session_id(wt, timeout_seconds=2.5, exclude_ids=pre_existing)
+    session_id = query_latest_kilo_session_id(wt, exclude_ids=pre_existing)
     # Same instant-death verification as cmd_coin (Q699 class): refuse to
     # record a session id for a process that died on spawn.
     poll_res = proc.poll() if hasattr(proc, "poll") else None
@@ -3368,12 +3416,12 @@ def cmd_goad(args):
             file=sys.stderr,
         )
         sys.exit(1)
-    session_id = session_id or f"kilo-{agent_role}-{proc.pid}"
+    session_id = session_id or UNRESOLVED_SESSION
     worker_lease.update(wt, agent_role, session_id=session_id)
     quest.serf_session_id = session_id
-    store.save(quest, auto_commit=auto_commit, commit_msg=f"court: goad {role_label} session {session_id} for {quest.id}")
+    store.save(quest, auto_commit=auto_commit, commit_msg=f"court: goad {role_label} session {session_label(session_id)} for {quest.id}")
     print(f"⚡ Goaded {role_label} for {quest.id}:")
-    print(f"   Session:  {session_id} (PID {proc.pid})")
+    print(f"   Session:  {session_label(session_id)} (PID {proc.pid})")
     print(f"   Agent:    {agent_role}")
     print(f"   Model:    {qual_model}")
     print(f"   Worktree: {wt}")
@@ -7631,7 +7679,7 @@ def build_parser():
     p_dispatch.add_argument("--agent", default=None, help="Agent to use (default: serf, or scout for investigations)")
     p_dispatch.add_argument("--prompt", default=None, help="Custom prompt override (defaults to pure charter task instructions)")
     p_dispatch.add_argument("--base", default="castle", help="Base branch for new worktrees (default: castle)")
-    p_dispatch.add_argument("--session-id", default=None, dest="session_id", help="Agent session ID (defaults to 'native')")
+    p_dispatch.add_argument("--session-id", default=None, dest="session_id", help="Pre-resolved agent session ID (default: whatever the spawn resolves; unresolved when none)")
     p_dispatch.add_argument(
         "--model", "--serf-model",
         dest="serf_model",

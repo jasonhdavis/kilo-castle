@@ -32,13 +32,15 @@ class TestDispatchNative(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
+    @patch("court.cli.standup_kilo_session")
     @patch("court.git_ops.create_git_worktree")
     @patch("court.git_ops.get_repo_root")
     @patch("court.store.get_court_root")
-    def test_dispatch_create_worktree(self, mock_court_root, mock_repo_root, mock_create_wt):
+    def test_dispatch_create_worktree(self, mock_court_root, mock_repo_root, mock_create_wt, mock_standup):
         mock_court_root.return_value = self.court_dir
         mock_repo_root.return_value = self.tmp_path
         mock_create_wt.return_value = {"ok": True, "path": str(self.tmp_path / "wt"), "branch": "quest/q101-core-auth"}
+        mock_standup.return_value = {"ok": True, "mode": "cli", "session_id": "ses_resolved_1", "identity": "resolved"}
 
         with patch("court.store.find_path") as mock_find:
             mock_find.return_value = self.quests_dir / "Q101-Core-Auth.md"
@@ -47,8 +49,29 @@ class TestDispatchNative(unittest.TestCase):
         self.assertIn(rc, (0, None))
         q = store.load("Q101-Core-Auth", court_root=self.court_dir)
         self.assertEqual(q.status, "WORKING")
-        self.assertEqual(q.serf_session_id, "native")
+        # The actually-resolved session is recorded — never the old "native" sentinel.
+        self.assertEqual(q.serf_session_id, "ses_resolved_1")
         self.assertTrue(mock_create_wt.called)
+
+    @patch("court.cli.standup_kilo_session")
+    @patch("court.git_ops.create_git_worktree")
+    @patch("court.git_ops.get_repo_root")
+    @patch("court.store.get_court_root")
+    def test_dispatch_unresolved_identity_not_fabricated(self, mock_court_root, mock_repo_root, mock_create_wt, mock_standup):
+        """A standup that resolves no session must leave the ledger identity
+        empty, not fabricate "native"/`kilo-<agent>` (which strand the worker)."""
+        mock_court_root.return_value = self.court_dir
+        mock_repo_root.return_value = self.tmp_path
+        mock_create_wt.return_value = {"ok": True, "path": str(self.tmp_path / "wt"), "branch": "quest/q101-core-auth"}
+        mock_standup.return_value = {"ok": True, "mode": "cli", "session_id": "", "identity": "unresolved"}
+
+        with patch("court.store.find_path") as mock_find:
+            mock_find.return_value = self.quests_dir / "Q101-Core-Auth.md"
+            rc = main(["dispatch", "Q101-Core-Auth", "--create-worktree", "--no-commit"])
+
+        self.assertIn(rc, (0, None))
+        q = store.load("Q101-Core-Auth", court_root=self.court_dir)
+        self.assertEqual(q.serf_session_id, "")
 
     def test_config_defaults_and_override(self):
         # Q455: DEFAULT_CONFIG is structural only — role models live solely in

@@ -14,6 +14,7 @@ from court.cli import (
     cmd_dispatch,
     find_kilo_binary,
     main,
+    session_label,
     setup_worktree_agent_config,
     standup_kilo_session,
 )
@@ -141,9 +142,52 @@ class TestCliStandup(unittest.TestCase):
             run_now=False,
         )
         self.assertTrue(res["ok"])
-        self.assertEqual(res["session_id"], "kilo-serf")
+        # Identity is honestly unresolved in config mode — no fabricated
+        # `kilo-serf` id is ever returned.
+        self.assertEqual(res["session_id"], "")
+        self.assertEqual(res["identity"], "unresolved")
         self.assertTrue((wt_dir / ".kilo" / "TASK.md").is_file())
         self.assertEqual((wt_dir / ".kilo" / "TASK.md").read_text(encoding="utf-8"), "Do task")
+
+    @patch("court.cli.subprocess.Popen")
+    def test_standup_missed_scrape_does_not_fabricate_session_id(self, mock_popen):
+        """When the session store scrape misses, the worker identity must be
+        reported unresolved — never a synthetic `kilo-<agent>-<pid>` id that
+        `court goad` would then try (and fail) to resume."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 4242
+        mock_proc.poll.return_value = None  # alive
+        mock_popen.return_value = mock_proc
+
+        wt_dir = self.tmp_path / "worktree_miss"
+        wt_dir.mkdir(parents=True)
+        fake_bin = self.tmp_path / "kilo"
+        fake_bin.write_text("#!/bin/sh\nexit 0", encoding="utf-8")
+        fake_bin.chmod(0o755)
+
+        with patch("court.cli.query_latest_kilo_session_id", return_value=None), \
+             patch("court.cli._spawn_watchdog", return_value=None):
+            res = standup_kilo_session(
+                worktree_path=wt_dir,
+                agent="serf",
+                model="GLM-5.3-Flash",
+                prompt="Do work",
+                title="Q123 Serf Worker",
+                kilo_bin=fake_bin,
+                run_now=True,
+            )
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["session_id"], "")
+        self.assertEqual(res["identity"], "unresolved")
+        self.assertNotIn("kilo-serf", res.get("session_id") or "")
+
+    @patch("court.cli.query_latest_kilo_session_id", return_value="ses_api")
+    def test_standup_resolved_identity_reported(self, _mock_query):
+        """A resolved session id is reported with identity=resolved."""
+        self.assertEqual(session_label("ses_api"), "ses_api")
+        self.assertEqual(session_label(""), "unresolved")
+        self.assertEqual(session_label(None), "unresolved")
 
     @patch("court.cli.subprocess.Popen")
     def test_standup_kilo_session_cli_mode(self, mock_popen):
@@ -288,7 +332,7 @@ class TestCliStandup(unittest.TestCase):
         self.assertIn(rc, (0, None))
         self.assertTrue(mock_popen.called)
         self.assertTrue(mock_query_ids.called)
-        mock_query_latest.assert_called_once_with(wt_path.resolve(), timeout_seconds=2.5, exclude_ids={"ses_old_1"})
+        mock_query_latest.assert_called_once_with(wt_path.resolve(), exclude_ids={"ses_old_1"})
         cmd_called = mock_popen.call_args[0][0]
         self.assertIn("--agent", cmd_called)
         self.assertIn("serf", cmd_called)
@@ -323,7 +367,7 @@ class TestCliStandup(unittest.TestCase):
         self.assertTrue(res["ok"])
         self.assertEqual(res["session_id"], "ses_gatekeeper_new")
         self.assertTrue(mock_query_ids.called)
-        mock_query_latest.assert_called_once_with(wt_dir, timeout_seconds=2.5, exclude_ids={"ses_moc_prev"})
+        mock_query_latest.assert_called_once_with(wt_dir, exclude_ids={"ses_moc_prev"})
 
     @patch("court.cli.standup_kilo_session")
     @patch("court.store.get_court_root")

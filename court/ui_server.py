@@ -1387,7 +1387,7 @@ function revertToComposer(text){
 async function dispatch(wt,sess,agent,model,prompt){
   const T={id:++TURNSEQ[0],wt,sess,sid:null,job:null,evs:0,ran:false,done:false,
    lane:sess||curLane,t0:Date.now(),blocks:[{cls:'user',text:prompt}],queue:null,
-   prompt:prompt,produced:false,
+   prompt:prompt,produced:false,errored:false,
    histHTML:transcriptHTML(msgs),stopping:false,stopped:false,
    shown:0,spinEl:null};
   pushPromptHist(prompt);
@@ -1414,7 +1414,7 @@ async function dispatch(wt,sess,agent,model,prompt){
     try{lastSt=await (await fetch('/api/send/'+T.job)).json();}
     catch(e){err=e;break;}
     if(lastSt.error){
-     T.blocks.push({cls:'error',text:lastSt.error});lastSt=null;break;}
+     T.blocks.push({cls:'error',text:lastSt.error});T.errored=true;lastSt=null;break;}
     const evs=(lastSt.events||[]).slice(T.evs);
     T.evs=(lastSt.events||[]).length;
     for(const e of evs){
@@ -1425,7 +1425,8 @@ async function dispatch(wt,sess,agent,model,prompt){
      else if(e.type==='step_finish')T.blocks.push({cls:'notice',text:e.text||'step done'});
      else if(e.type==='tool')T.blocks.push({cls:'tool',
       text:'tool · '+e.tool+' '+(e.brief||'')});
-     else if(e.type==='error')T.blocks.push({cls:'error',text:e.text||'unknown error'});
+     else if(e.type==='error'){T.blocks.push({cls:'error',text:e.text||'unknown error'});
+      if(!T.produced)T.errored=true;}
     }
     if(lastSt.sid)T.sid=lastSt.sid;
     if(T.sid||evs.some(e=>e.type==='text'||e.type==='reasoning'||e.type==='tool'))
@@ -1469,13 +1470,14 @@ async function finishTurn(T,err,lastSt){
   // back to the composer (edit-and-resend) instead of being swallowed. A
   // queued follow-up killed by a stop is likewise returned, not run.
   const restore=T.queue&&T.stopped?T.queue.prompt
-   :(T.prompt&&(!T.ran||(T.stopped&&!T.produced))?T.prompt:null);
+   :(T.prompt&&(!T.ran||T.stopped&&!T.produced||(T.errored&&!T.produced))?T.prompt:null);
   const q=(T.ran&&T.queue&&!T.stopped)?T.queue:null;
   if(wasViewing&&T.ran&&(T.sid||T.sess)){
    await openSess(T.sid||T.sess);
    const t=$('transcript');
    const secs=((Date.now()-T.t0)/1000)|0;
    const msg=err?'stream failed · '+secs+'s'
+    :(T.errored&&!T.produced)?'turn refused — prompt returned to the composer'
     :(exit&&exit!==0&&!T.stopped)?'turn failed (exit '+exit+') · '+secs+'s'
     :(T.stopped?'stopped':'turn complete')+' · '+secs+'s';
    t.insertAdjacentHTML('beforeend','<div class="msg notice">'+esc(msg)+'</div>');

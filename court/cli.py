@@ -72,6 +72,53 @@ _CHARTER_PIPELINE_ORDER = (
 )
 
 
+_KILO_EXT_DIR_RE = re.compile(r"kilocode\.kilo-code-(\d+(?:\.\d+)*)", re.IGNORECASE)
+
+
+def _kilo_version_key(kilo_path: Path) -> tuple:
+    """Numeric sort key for a VS Code extension ``kilo`` binary.
+
+    Extension dirs are named ``kilocode.kilo-code-<major>.<minor>.<patch>[-<platform>]``.
+    Comparing those directory strings lexicographically ranks ``7.8.8`` above
+    ``7.8.12`` (``"8" > "1"`` at the third segment), so Court spawned every role
+    from a stale binary the running VS Code window could not see (2026-10-17
+    studio incident). Parse the version into an int tuple so 7.8.12 outranks
+    7.8.8. Unrecognised directory names rank lowest.
+    """
+    name = Path(kilo_path).parent.parent.name
+    m = _KILO_EXT_DIR_RE.search(name)
+    if not m:
+        return (0,)
+    return tuple(int(part) for part in m.group(1).split("."))
+
+
+def newest_kilo_extension_binary() -> Optional[Path]:
+    """Newest *installed* VS Code extension ``bin/kilo``, version-aware.
+
+    Returns None when no extension ships a runnable binary. Numeric versions
+    decide; file mtime breaks ties between identically-numbered reinstalls
+    (auto-update proof).
+    """
+    vscode_ext = Path.home() / ".vscode" / "extensions"
+    if not vscode_ext.is_dir():
+        return None
+    candidates = [
+        m for m in vscode_ext.glob("kilocode.kilo-code-*/bin/kilo")
+        if m.is_file() and os.access(m, os.X_OK)
+    ]
+    if not candidates:
+        return None
+
+    def _rank(p: Path) -> tuple:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (_kilo_version_key(p), mtime)
+
+    return max(candidates, key=_rank)
+
+
 def find_kilo_binary() -> Optional[Path]:
     """Find the kilo CLI binary on the system.
 
@@ -79,6 +126,7 @@ def find_kilo_binary() -> Optional[Path]:
     1. KILO_BIN environment variable
     2. shutil.which("kilo")
     3. VS Code extensions directory: ~/.vscode/extensions/kilocode.kilo-code-*/bin/kilo
+       (newest installed version wins — NOT lexicographic)
     4. Common local paths: ~/.local/bin/kilo, /usr/local/bin/kilo
     """
     env_bin = os.environ.get("KILO_BIN")
@@ -89,13 +137,10 @@ def find_kilo_binary() -> Optional[Path]:
     if which_bin:
         return Path(which_bin)
 
-    # Check VS Code extension installs
-    vscode_ext = Path.home() / ".vscode" / "extensions"
-    if vscode_ext.is_dir():
-        matches = sorted(vscode_ext.glob("kilocode.kilo-code-*/bin/kilo"), reverse=True)
-        for m in matches:
-            if m.is_file() and os.access(m, os.X_OK):
-                return m
+    # Check VS Code extension installs (newest version, not lexicographic).
+    ext_bin = newest_kilo_extension_binary()
+    if ext_bin:
+        return ext_bin
 
     for fallback in [Path.home() / ".local" / "bin" / "kilo", Path("/usr/local/bin/kilo")]:
         if fallback.is_file() and os.access(fallback, os.X_OK):
@@ -3860,6 +3905,29 @@ def _extract_target_routes(quest: Quest, worktree: Optional[Path] = None) -> lis
     return routes
 
 
+def _probe_runserver(port: int, attempts: int = 3, delay: float = 0.5) -> bool:
+    """True when an HTTP server answers on 127.0.0.1:port.
+
+    Any HTTP status (including 4xx/5xx) counts as up; connection errors do not.
+    Retries absorb the manage_servers.sh start race so the reported port is the
+    one actually serving, not a stale/default guess.
+    """
+    import urllib.error
+    import urllib.request
+
+    url = f"http://127.0.0.1:{int(port)}/"
+    for i in range(max(1, attempts)):
+        try:
+            with urllib.request.urlopen(url, timeout=1.5):
+                return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            if i + 1 < attempts:
+                time.sleep(delay)
+    return False
+
+
 def _ensure_worktree_server(
     worktree: Path,
     port_override: Optional[int] = None,
@@ -3867,6 +3935,12 @@ def _ensure_worktree_server(
 ) -> tuple[int, str, str]:
     """Ensure a development server is running for a worktree.
     Returns (port, runserver_url, status_description).
+
+    The returned port is verified against a live probe before it is reported, and
+    a verified port is persisted to `.worktree-port` so the Court Console, the
+    artist brief, and `studio --close` all agree on the same port (2026-10-17
+    "UI shows the wrong port" studio incident: the old code returned a default
+    without ever confirming a server answered there).
     """
     if port_override:
         return port_override, f"http://localhost:{port_override}", "Manual port override"
@@ -3909,8 +3983,19 @@ def _ensure_worktree_server(
     if not port:
         port = 8000
 
-    status = "Active" if not no_server else "Server startup skipped (--no-server)"
-    return port, f"http://localhost:{port}", status
+    if no_server:
+        return port, f"http://localhost:{port}", "Server startup skipped (--no-server)"
+
+    up = _probe_runserver(port)
+    if up:
+        # Persist the verified port so every downstream reader agrees.
+        try:
+            port_file.write_text(f"{port}\n", encoding="utf-8")
+        except Exception:
+            pass
+        return port, f"http://localhost:{port}", "Active (runserver verified up)"
+
+    return port, f"http://localhost:{port}", f"runserver NOT reachable on port {port}"
 
 
 def cmd_artist(args):
@@ -5831,6 +5916,27 @@ def cmd_studio(args):
             browser_wired_mcp = ensure_worktree_browser_mcp(wt_path, int(browser_info.get("port") or 0))
     browser_mcp_line = render_browser_note(wt_path, browser_info, browser_wired_mcp)
 
+    # Loud standup verification (2026-10-17): a silent best-effort studio is how
+    # Stewards end up reviewing a dead runserver or an annotation overlay still
+    # pinned to the previous studio. Every mechanical dependency is probed and
+    # reported, and any FAIL is called out so the review does not start blind.
+    no_browser_flag = bool(getattr(args, "no_browser", False))
+    runserver_up = False if no_server else _probe_runserver(port, attempts=1)
+    browser_up = bool(browser_info and browser_info.get("port"))
+    annotator_alive = bool(
+        studio_browser.browser_status().get("annotator_alive")) if browser_info else False
+
+    def _standup_verdict(ok: bool, skipped: bool) -> str:
+        return "skipped" if skipped else ("OK" if ok else "FAIL")
+
+    standup_verify = {
+        "runserver": _standup_verdict(runserver_up, no_server),
+        "browser": _standup_verdict(browser_up, no_browser_flag),
+        "annotator": _standup_verdict(annotator_alive, no_browser_flag),
+        "mcp": "skipped" if no_browser_flag else ("OK" if browser_wired_mcp else "WARN"),
+    }
+    standup_failures = [k for k, v in standup_verify.items() if v == "FAIL"]
+
     quest_blocks: list[str] = []
     routes_by_id: dict[str, list[str]] = {}
     for quest in merged_quests:
@@ -5954,6 +6060,7 @@ def cmd_studio(args):
             "base": base_branch,
             "port": port,
             "runserver_url": runserver_url,
+            "standup": standup_verify,
             "freshness": {"verdict": fresh_verdict, "age_hours": freshness.get("age_hours"),
                           "command": freshness.get("command"), "detail": freshness.get("detail")},
             "model": model,
@@ -6018,6 +6125,14 @@ def cmd_studio(args):
     print(f"Browser:     {_browser_lines[0].lstrip('- ')}")
     for _bline in _browser_lines[1:]:
         print(f"             {_bline.lstrip('- ')}")
+    print("Standup:     " + " · ".join(f"{k}: {v}" for k, v in standup_verify.items()))
+    if standup_failures:
+        print(
+            f"  ⚠️  STANDUP INCOMPLETE — did not come up: {', '.join(standup_failures)}. "
+            "Do NOT begin the royal review until these are green: "
+            f"re-run `python3 -m court.cli browser start --annotate {wt_path}` and check the "
+            f"runserver log at {wt_path / '.kilo' / 'runserver.log'} (or drop --no-browser/--no-server)."
+        )
     if env_note:
         print(f"Env:         {env_note}")
     print()

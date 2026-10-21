@@ -155,6 +155,45 @@ def _spawn_detached(cmd: list[str], cwd: Optional[Path] = None) -> int:
     return proc.pid
 
 
+def _spawn_injector(worktree: Path) -> int:
+    """Start the CDP annotation injector pinned to ``worktree`` (detached)."""
+    repo_root = Path(__file__).resolve().parent.parent
+    return _spawn_detached(
+        [sys.executable, "-m", "court.cli", "browser", "_inject_worker", str(worktree)],
+        cwd=repo_root,
+    )
+
+
+def _relink_annotator(state: dict[str, Any], annotate_worktree: Optional[Path]) -> None:
+    """Pin the annotation overlay to ``annotate_worktree`` on an ADOPTED browser.
+
+    A reused shared Chromium keeps whatever worktree its injector was pinned to,
+    so a second studio would silently append notes into the PREVIOUS studio's
+    JSONL ("annotation layer is not reset"). Whenever the requested worktree
+    differs from the recorded one — or the recorded injector has died — stop the
+    stale injector and spawn a fresh one pinned to the request. The fresh
+    injector re-injects every open page target, and annotator.js swaps a
+    mismatched overlay in place (see its worktree-aware install guard).
+    """
+    if not annotate_worktree:
+        return
+    want = str(Path(annotate_worktree).resolve())
+    have = state.get("annotate_worktree")
+    pid = state.get("annotator_pid")
+    alive = _pid_alive(pid) if pid else False
+    if want == have and alive:
+        return
+    if pid and alive:
+        _terminate_pid(int(pid))
+    try:
+        state["annotator_pid"] = _spawn_injector(Path(annotate_worktree))
+    except Exception as e:
+        state["annotator_pid"] = None
+        print(f"warning: annotation injector did not start ({e})", file=sys.stderr)
+    state["annotate_worktree"] = want
+    _write_state(state)
+
+
 # ---------------------------------------------------------------------------
 # start / status / stop
 # ---------------------------------------------------------------------------
@@ -174,16 +213,7 @@ def start_browser(
     """
     existing = _load_state()
     if existing and _pid_alive(existing.get("pid")) and cdp_responsive(int(existing.get("port") or 0)):
-        if annotate_worktree and not existing.get("annotator_pid"):
-            repo_root = Path(__file__).resolve().parent.parent
-            try:
-                existing["annotator_pid"] = _spawn_detached(
-                    [sys.executable, "-m", "court.cli", "browser", "_inject_worker", str(annotate_worktree)],
-                    cwd=repo_root,
-                )
-                _write_state(existing)
-            except Exception:
-                pass
+        _relink_annotator(existing, annotate_worktree)
         return dict(existing)
 
     chrome = find_chrome_binary()
@@ -251,15 +281,19 @@ def start_browser(
         "headless": bool(headless),
         "started_ts": datetime.now().isoformat(),
         "annotator_pid": None,
+        "annotate_worktree": None,
     }
 
     if annotate_worktree:
-        repo_root = Path(__file__).resolve().parent.parent
+        # A previous browser may have died while its injector kept polling: kill
+        # that stale injector before spawning a fresh one so two injectors never
+        # race on the same targets.
+        prev = (existing or {}).get("annotator_pid")
+        if prev and _pid_alive(prev):
+            _terminate_pid(int(prev))
         try:
-            state["annotator_pid"] = _spawn_detached(
-                [sys.executable, "-m", "court.cli", "browser", "_inject_worker", str(annotate_worktree)],
-                cwd=repo_root,
-            )
+            state["annotator_pid"] = _spawn_injector(Path(annotate_worktree))
+            state["annotate_worktree"] = str(Path(annotate_worktree).resolve())
         except Exception as e:
             print(f"warning: annotation injector did not start ({e})", file=sys.stderr)
 
@@ -287,6 +321,7 @@ def browser_status() -> dict[str, Any]:
     }
     annotator_pid = state.get("annotator_pid")
     out["annotator_alive"] = _pid_alive(annotator_pid) if annotator_pid else False
+    out["annotator_worktree"] = state.get("annotate_worktree")
     return out
 
 
@@ -527,10 +562,12 @@ def _inject_target(ws_url: str, script: str) -> WebSocketClient:
 def _inject_worker(worktree: str) -> None:
     """Long-running overlay pinning loop.
 
-    Runs until the state file is gone, /json/version stops answering, the
-    stop-file appears, or the process is killed. Every poll cycle it
-    re-lists page targets, injects new ones, re-injects dead WS sessions,
-    and drains open sessions (ping/pong keep-alive).
+    Runs until the recorded state file is removed (``browser stop``) or the
+    stop-file appears. A transient browser crash, restart, or port change does
+    NOT end the loop: the injector releases its targets and keeps polling so it
+    adopts the browser again once it returns (studio connection survives a
+    restart). Every poll cycle it re-lists page targets, injects new ones,
+    re-injects dead WS sessions, and drains open sessions (ping/pong keep-alive).
     """
     endpoint = f"http://127.0.0.1:{_console_port()}/api/annotation"
     try:
@@ -547,6 +584,10 @@ def _inject_worker(worktree: str) -> None:
         if ws:
             ws.close()
 
+    def _drop_all() -> None:
+        for tid in list(injected):
+            _drop(tid)
+
     try:
         while True:
             try:
@@ -554,21 +595,25 @@ def _inject_worker(worktree: str) -> None:
                     break
                 state = _load_state()
                 if not state:
+                    # State file removed (explicit `browser stop`) — the only
+                    # clean exit. A crash leaves the file in place, so the
+                    # injector waits rather than dying with the browser.
                     break
                 new_port = int(state.get("port") or 0)
                 if new_port and new_port != port:
-                    # Browser restarted on a different port: start fresh.
-                    for tid in list(injected):
-                        _drop(tid)
+                    # Browser (re)started on a different port: start fresh.
+                    _drop_all()
                     port = new_port
-                if not port or not _pid_alive(state.get("pid")):
-                    break
-                if not cdp_responsive(port):
-                    break
+                if not port or not cdp_responsive(port):
+                    # Browser down or restarting: release targets, wait, retry.
+                    _drop_all()
+                    time.sleep(POLL_SECONDS)
+                    continue
 
                 targets = _http_get_json(f"http://127.0.0.1:{port}/json/list", timeout=3.0)
                 if not isinstance(targets, list):
-                    break
+                    time.sleep(POLL_SECONDS)
+                    continue
                 live_ids: set[str] = set()
                 for target in targets:
                     if target.get("type") != "page":
@@ -599,5 +644,4 @@ def _inject_worker(worktree: str) -> None:
                 # Never crash the injector on one bad cycle; retry next poll.
                 time.sleep(POLL_SECONDS)
     finally:
-        for tid in list(injected):
-            _drop(tid)
+        _drop_all()

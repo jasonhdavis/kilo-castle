@@ -71,6 +71,53 @@ _CHARTER_PIPELINE_ORDER = (
 )
 
 
+_KILO_EXT_DIR_RE = re.compile(r"kilocode\.kilo-code-(\d+(?:\.\d+)*)", re.IGNORECASE)
+
+
+def _kilo_version_key(kilo_path: Path) -> tuple:
+    """Numeric sort key for a VS Code extension ``kilo`` binary.
+
+    Extension dirs are named ``kilocode.kilo-code-<major>.<minor>.<patch>[-<platform>]``.
+    Comparing those directory strings lexicographically ranks ``7.8.8`` above
+    ``7.8.12`` (``"8" > "1"`` at the third segment), so Court spawned every role
+    from a stale binary the running VS Code window could not see (2026-10-17
+    studio incident). Parse the version into an int tuple so 7.8.12 outranks
+    7.8.8. Unrecognised directory names rank lowest.
+    """
+    name = Path(kilo_path).parent.parent.name
+    m = _KILO_EXT_DIR_RE.search(name)
+    if not m:
+        return (0,)
+    return tuple(int(part) for part in m.group(1).split("."))
+
+
+def newest_kilo_extension_binary() -> Optional[Path]:
+    """Newest *installed* VS Code extension ``bin/kilo``, version-aware.
+
+    Returns None when no extension ships a runnable binary. Numeric versions
+    decide; file mtime breaks ties between identically-numbered reinstalls
+    (auto-update proof).
+    """
+    vscode_ext = Path.home() / ".vscode" / "extensions"
+    if not vscode_ext.is_dir():
+        return None
+    candidates = [
+        m for m in vscode_ext.glob("kilocode.kilo-code-*/bin/kilo")
+        if m.is_file() and os.access(m, os.X_OK)
+    ]
+    if not candidates:
+        return None
+
+    def _rank(p: Path) -> tuple:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (_kilo_version_key(p), mtime)
+
+    return max(candidates, key=_rank)
+
+
 def find_kilo_binary() -> Optional[Path]:
     """Find the kilo CLI binary on the system.
 
@@ -78,6 +125,7 @@ def find_kilo_binary() -> Optional[Path]:
     1. KILO_BIN environment variable
     2. shutil.which("kilo")
     3. VS Code extensions directory: ~/.vscode/extensions/kilocode.kilo-code-*/bin/kilo
+       (newest installed version wins — NOT lexicographic)
     4. Common local paths: ~/.local/bin/kilo, /usr/local/bin/kilo
     """
     env_bin = os.environ.get("KILO_BIN")
@@ -88,13 +136,10 @@ def find_kilo_binary() -> Optional[Path]:
     if which_bin:
         return Path(which_bin)
 
-    # Check VS Code extension installs
-    vscode_ext = Path.home() / ".vscode" / "extensions"
-    if vscode_ext.is_dir():
-        matches = sorted(vscode_ext.glob("kilocode.kilo-code-*/bin/kilo"), reverse=True)
-        for m in matches:
-            if m.is_file() and os.access(m, os.X_OK):
-                return m
+    # Check VS Code extension installs (newest version, not lexicographic).
+    ext_bin = newest_kilo_extension_binary()
+    if ext_bin:
+        return ext_bin
 
     for fallback in [Path.home() / ".local" / "bin" / "kilo", Path("/usr/local/bin/kilo")]:
         if fallback.is_file() and os.access(fallback, os.X_OK):

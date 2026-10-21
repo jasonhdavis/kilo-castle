@@ -293,6 +293,14 @@ class TestStudioCommand(unittest.TestCase):
             patch("court.cli.find_kilo_binary", return_value=None),
             patch("court.cli.migration_guard.scan_branch_contraband", return_value=[]),
             patch("court.cli._ensure_worktree_server", return_value=(port, f"http://localhost:{port}", "test server")),
+            # Standup verification probes the runserver and browser liveness; pin
+            # both so tests stay hermetic and never touch a real shared browser.
+            patch("court.cli._probe_runserver", return_value=True),
+            patch("court.cli.studio_browser.start_browser", return_value={
+                "pid": 4242, "port": 9335, "cdp_url": "http://127.0.0.1:9335",
+                "profile": "/tmp/studio-profile", "annotator_pid": 4243,
+            }),
+            patch("court.cli.studio_browser.browser_status", return_value={"annotator_alive": True}),
             patch("court.cli._run_freshness_gate", return_value={
                 "configured": True, "command": "python3 scripts/db/local_db.py --age",
                 "max_age_hours": 24, "age_hours": 0.36, "fresh": True, "detail": "Freshness: FRESH (<24h)",
@@ -423,6 +431,10 @@ class TestStudioCommand(unittest.TestCase):
         self.assertIn("prompt", data)
         self.assertEqual(data["freshness"]["age_hours"], 0.36)
         self.assertIn("conflict_policy", data)
+        # Loud standup verification travels with the payload.
+        self.assertEqual(data["standup"]["runserver"], "OK")
+        self.assertEqual(data["standup"]["browser"], "OK")
+        self.assertEqual(data["standup"]["annotator"], "OK")
 
     def test_standup_records_session_on_all_merged_quests(self):
         q1 = _make_ui_quest("Q731-Web-Ui")

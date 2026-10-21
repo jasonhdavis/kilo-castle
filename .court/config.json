@@ -1,15 +1,15 @@
 {
   "_manifest_note": "Single source of truth for court-engine role configuration (Q455). models.<role> is the per-role model; models.<role>_provider is the Kilo CLI provider; model_aliases maps human/display model names to qualified provider/model IDs; suite.command is the canonical unified integration suite invocation used by git_ops suite detection (heuristics are fallback only).",
   "models": {
-    "serf": "openrouter/z-ai/glm-5.3-flash",
+    "serf": "openrouter/deepseek/deepseek-v4.1-flash",
     "serf_provider": "openrouter",
-    "master_of_coin": "openrouter/deepseek/deepseek-pro-latest",
-    "gatekeeper": "openrouter/deepseek/deepseek-pro-latest",
-    "steward": "openrouter/z-ai/glm-5.3-flash",
-    "artist": "openrouter/z-ai/glm-5.3-flash",
+    "master_of_coin": "openrouter/z-ai/glm-5.3-flash",
+    "gatekeeper": "openrouter/z-ai/glm-5.3-flash",
+    "steward": "openrouter/deepseek/deepseek-v4.1-flash",
+    "artist": "openrouter/deepseek/deepseek-v4.1-flash",
     "artist_provider": "openrouter",
     "artist_vision": "openrouter/google/gemini-3.7-flash",
-    "scout": "openrouter/z-ai/glm-5.3-flash",
+    "scout": "openrouter/deepseek/deepseek-v4.1-flash",
     "master_of_coin_provider": "openrouter",
     "gatekeeper_provider": "openrouter",
     "steward_provider": "openrouter",
@@ -35,7 +35,9 @@
     "openrouter/anthropic/claude-sonnet-4.6",
     "openrouter/openai/gpt-5.2",
     "openrouter/google/gemini-3.8-flash",
-    "openrouter/stealth/space-bunny-alpha"
+    "openrouter/stealth/space-bunny-alpha",
+    "deepseek/deepseek-v4.1-flash",
+    "openrouter/deepseek/deepseek-v4.1-flash"
   ],
   "studio": {
     "freshness_max_age_hours": 24.0

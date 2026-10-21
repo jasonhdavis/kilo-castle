@@ -3797,8 +3797,17 @@ def _session_meta(sid):
 
 
 def _kilo_bin():
-    """Latest kilo binary across installed extension versions (auto-update
-    proof), falling back to PATH."""
+    """Newest kilo binary across installed extension versions (auto-update
+    proof), falling back to PATH. Version-aware so 7.8.12 outranks 7.8.8 — a
+    lexicographic sort picked the stale binary and spawned Court roles the
+    running VS Code window could not see (2026-10-17 studio incident)."""
+    try:
+        from court.cli import newest_kilo_extension_binary
+        found = newest_kilo_extension_binary()
+        if found:
+            return str(found)
+    except Exception:
+        pass
     cands = glob.glob(os.path.expanduser(
         "~/.vscode/extensions/kilocode.kilo-code-*/bin/kilo"))
     if cands:

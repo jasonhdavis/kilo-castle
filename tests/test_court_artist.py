@@ -122,6 +122,43 @@ class TestCourtArtist(unittest.TestCase):
             self.assertEqual(port, 8123)
             self.assertEqual(url, "http://localhost:8123")
 
+    def test_ensure_worktree_server_persists_verified_port(self):
+        """A live probe persists the verified port (truthful port reporting)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("court.cli._probe_runserver", return_value=True):
+                port, url, desc = cli._ensure_worktree_server(tmp_path)
+            self.assertEqual(port, 8000)
+            self.assertIn("verified", desc)
+            self.assertEqual((tmp_path / ".worktree-port").read_text().strip(), "8000")
+
+    def test_ensure_worktree_server_reports_unreachable(self):
+        """A dead runserver is reported loudly and does not fabricate a port file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("court.cli._probe_runserver", return_value=False):
+                port, url, desc = cli._ensure_worktree_server(tmp_path)
+            self.assertEqual(port, 8000)
+            self.assertIn("NOT reachable", desc)
+            self.assertFalse((tmp_path / ".worktree-port").exists())
+
+    def test_probe_runserver_detects_live_and_dead(self):
+        import http.server
+        import socketserver
+        import threading
+
+        handler = http.server.SimpleHTTPRequestHandler
+        with socketserver.TCPServer(("127.0.0.1", 0), handler) as srv:
+            live_port = srv.server_address[1]
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            try:
+                self.assertTrue(cli._probe_runserver(live_port, attempts=1))
+            finally:
+                srv.shutdown()
+        # A port with nothing bound refuses the connection.
+        self.assertFalse(cli._probe_runserver(live_port, attempts=1, delay=0.01))
+
     @patch("court.git_ops.find_worktree_for_quest")
     @patch("court.store.load")
     @patch("court.store.save")

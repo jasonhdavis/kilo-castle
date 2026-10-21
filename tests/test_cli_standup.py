@@ -106,6 +106,27 @@ class TestCliStandup(unittest.TestCase):
             found = find_kilo_binary()
             self.assertEqual(found, fake_bin)
 
+    def test_find_kilo_binary_prefers_numerically_newest_extension(self):
+        """7.8.12 must outrank 7.8.8 — a lexicographic sort picked the stale
+        binary and spawned Court roles the running VS Code window could not see
+        (2026-10-17 studio sidebar incident)."""
+        home = self.tmp_path / "home"
+        ext = home / ".vscode" / "extensions"
+        for ver in ("7.8.8", "7.8.12"):
+            bin_dir = ext / f"kilocode.kilo-code-{ver}-darwin-arm64" / "bin"
+            bin_dir.mkdir(parents=True)
+            kilo = bin_dir / "kilo"
+            kilo.write_text("#!/bin/sh\n", encoding="utf-8")
+            kilo.chmod(0o755)
+
+        with patch.dict(os.environ, {"KILO_BIN": ""}), \
+             patch("pathlib.Path.home", return_value=home), \
+             patch("court.cli.shutil.which", return_value=None):
+            found = find_kilo_binary()
+
+        self.assertIsNotNone(found)
+        self.assertIn("7.8.12", str(found))
+
     def test_standup_kilo_session_config_mode(self):
         """Verify standup_kilo_session writes .kilo/TASK.md and configures worktree when run_now=False."""
         wt_dir = self.tmp_path / "worktree_session"

@@ -13,17 +13,25 @@
     if (window !== window.top) {
       return;
     }
+    var ENDPOINT = "{{ANNOTATE_ENDPOINT}}";
+    var WORKTREE = "{{WORKTREE}}";
+
     // A `window` object survives navigation, so the double-install guard must
-    // be DOM-based: if this document already hosts the overlay, do nothing.
-    // addScriptToEvaluateOnNewDocument re-runs this script in every new
-    // document, and the fresh document has no overlay root yet.
-    if (document.querySelector('[data-studio-annotator="root"]')) {
-      return;
+    // be DOM-based. addScriptToEvaluateOnNewDocument re-runs this script in
+    // every new document, and older pinned scripts run before newer ones. When
+    // a studio re-pins this browser to a DIFFERENT worktree, the previously
+    // injected overlay is still mounted with the stale binding: tear it down
+    // and re-mount with the current worktree instead of silently keeping it
+    // (annotation-layer reset on studio relink).
+    var existingRoot = document.querySelector('[data-studio-annotator="root"]');
+    if (existingRoot) {
+      if (existingRoot.getAttribute("data-studio-worktree") === WORKTREE) {
+        return;
+      }
+      try { existingRoot.remove(); } catch (e) { /* ignore */ }
     }
     window.__studioAnnotator = true;
 
-    var ENDPOINT = "{{ANNOTATE_ENDPOINT}}";
-    var WORKTREE = "{{WORKTREE}}";
     var MAX_TEXT = 140;
     var MAX_SELECTOR = 200;
 
@@ -74,6 +82,7 @@
         }
         var root = document.createElement("div");
         root.setAttribute("data-studio-annotator", "root");
+        root.setAttribute("data-studio-worktree", WORKTREE);
         root.style.cssText = "all:initial; position:fixed; left:0; top:0; width:0; height:0; z-index:2147483647;";
         host.appendChild(root);
         var shadow = root.attachShadow({ mode: "closed" });

@@ -4391,20 +4391,40 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
     job["events"].append({"type": "status", "text": (
         f"spawning agent - {agent} - {mode} - "
         f"{directory.replace('/Users/scrummage/Python/', '')}")})
-    # Worker lease (Q799 stack class): the console was the third writer that
-    # stacked onto a live dispatch Serf. Claim the single-writer lease BEFORE
-    # spawning; a live holder (dispatch/goad/watchdog continuation) is
-    # reported into the console stream instead of double-spawning.
+    # Worker lease (Q799 stack class): the console must never stack a second
+    # writer onto a DISPATCHED worker's worktree (dispatch / goad / watchdog
+    # continuation). It must NOT, however, serialize console conversations —
+    # several steward chats in one repo are independent sessions and the
+    # operator is entitled to run them at the same time. So:
+    #   - the lease key is session-scoped, so console turns never collide with
+    #     each other (the same session still serializes, as it must);
+    #   - a live NON-console holder of the role-level lease still parks us.
     from court import lease as worker_lease
-    claimed, claim_reason, holder_payload = worker_lease.claim(
-        Path(directory), agent, holder="console", pending=True,
-    )
+
+    def _dispatched_blocker():
+        """Why a dispatched worker blocks this send, or None."""
+        held = worker_lease.read_lease(Path(directory), agent)
+        if not held:
+            return None
+        live, why = worker_lease.holder_is_live(held)
+        if live and (held.get("holder") or "") != "console":
+            return why
+        return None
+
+    lease_role = (f"{agent}@{session_id}" if session_id
+                  else f"{agent}#{job.get('jid') or 'adhoc'}")
+    blocker = _dispatched_blocker()
+    claimed, claim_reason, holder_payload = (False, "", None)
+    if blocker is None:
+        claimed, claim_reason, holder_payload = worker_lease.claim(
+            Path(directory), lease_role, holder="console", pending=True,
+        )
     if not claimed:
         why = holder_payload or {}
         job["events"].append({"type": "status", "text": (
-            f"queued — a live {agent} worker already runs in this worktree "
-            f"({claim_reason}; holder {why.get('holder') or '?'}, "
-            f"pid {why.get('pid')}, session {(why.get('session_id') or '-')[:22]}). "
+            f"queued — a dispatched {agent} worker already runs in this worktree "
+            f"({blocker or claim_reason}; holder {why.get('holder') or 'dispatched'}, "
+            f"pid {why.get('pid') or '?'}, session {(why.get('session_id') or '-')[:22]}). "
             f"This message dispatches automatically when that worker finishes; "
             f"press Stop to cancel it instead.")})
         waited = 0.0
@@ -4424,9 +4444,11 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
                     f"if it is genuinely wedged.")})
                 job["done"] = True
                 return
-            claimed, claim_reason, holder_payload = worker_lease.claim(
-                Path(directory), agent, holder="console", pending=True,
-            )
+            blocker = _dispatched_blocker()
+            if blocker is None:
+                claimed, claim_reason, holder_payload = worker_lease.claim(
+                    Path(directory), lease_role, holder="console", pending=True,
+                )
         job["events"].append({"type": "status",
                               "text": "lease free — dispatching queued message now"})
     cmd = [_kilo_bin(), "run", "--dir", directory, "--agent", agent,
@@ -4450,7 +4472,7 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             start_new_session=True, env=_engine_spawn_env(Path(directory)))
     except Exception as exc:
-        worker_lease.release(Path(directory), agent)
+        worker_lease.release(Path(directory), lease_role)
         job["events"].append({"type": "error", "text": str(exc)})
         job["done"] = True
         return
@@ -4459,7 +4481,7 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
     except (ProcessLookupError, OSError):
         run_pgid = proc.pid
     worker_lease.update(
-        Path(directory), agent,
+        Path(directory), lease_role,
         pid=proc.pid, pgid=run_pgid, session_id=session_id or "",
         holder="console", pending=False,
     )
@@ -4487,7 +4509,7 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
                 job["sid"] = ev["sessionID"]
                 try:
                     worker_lease.update(
-                        Path(directory), agent,
+                        Path(directory), lease_role,
                         session_id=ev["sessionID"], pending=False)
                 except Exception:
                     pass
@@ -5483,7 +5505,7 @@ class Handler(BaseHTTPRequestHandler):
         _JOB_SEQ[0] += 1
         jid = _JOB_SEQ[0]
         job = {"events": [], "done": False, "started": time.time(),
-               "dir": directory, "agent": agent}
+               "dir": directory, "agent": agent, "jid": str(jid)}
         _JOBS[str(jid)] = job
         threading.Thread(
             target=_start_run,

@@ -60,7 +60,7 @@ def test_start_run_queues_then_dispatches_when_lease_frees(monkeypatch):
 
     assert popen.called, "queued message must dispatch once the lease frees"
     texts = [e.get("text", "") for e in job["events"]]
-    assert any("queued — a live" in t for t in texts)
+    assert any(t.startswith("queued —") for t in texts)
     assert any("dispatch" in t and "queued message" in t for t in texts)
 
 
@@ -96,6 +96,47 @@ def test_start_run_gives_up_after_wait_cap(monkeypatch):
     assert not popen.called
     assert job["done"] is True
     assert any("gave up after" in e.get("text", "") for e in job["events"])
+
+
+def test_console_turns_are_session_scoped_not_serialized(monkeypatch):
+    """Two steward conversations in one repo must not block each other."""
+    seen = []
+
+    def fake_claim(wt, role, **k):
+        seen.append(role)
+        return True, "claimed", None
+
+    _stub_engine(monkeypatch)
+    monkeypatch.setattr(lease_mod, "read_lease", lambda *a, **k: None)
+    monkeypatch.setattr(lease_mod, "claim", fake_claim)
+    _mock_popen(monkeypatch)
+
+    u._start_run(_park_job(), "/tmp/wt", "steward", "a", "ses_one", "m")
+    u._start_run(_park_job(), "/tmp/wt", "steward", "b", "ses_two", "m")
+
+    assert "steward@ses_one" in seen
+    assert "steward@ses_two" in seen
+    assert "steward" not in seen, "console turns must not share one role-level lease"
+
+
+def test_dispatched_holder_still_parks_a_console_send(monkeypatch):
+    """Q799 is preserved: a live non-console holder parks the console."""
+    held = {"holder": "dispatch", "pid": 42, "session_id": "ses_x"}
+    _stub_engine(monkeypatch)
+    monkeypatch.setattr(lease_mod, "read_lease", lambda *a, **k: held)
+    monkeypatch.setattr(lease_mod, "holder_is_live", lambda *a, **k: (True, "pid 42 live"))
+    monkeypatch.setattr(lease_mod, "claim", lambda *a, **k: (False, "refused-live", held))
+    monkeypatch.setattr(u, "CONSOLE_QUEUE_WAIT_SECONDS", 10)
+    monkeypatch.setattr(u, "CONSOLE_QUEUE_POLL_SECONDS", 5)
+    monkeypatch.setattr(u.time, "sleep", lambda *_: None)
+    popen = _mock_popen(monkeypatch)
+
+    job = _park_job()
+    u._start_run(job, "/tmp/wt", "steward", "hello", "ses_target", "m")
+
+    assert not popen.called, "must not stack onto a dispatched worker"
+    assert any("queued — a dispatched steward worker" in e.get("text", "")
+               for e in job["events"])
 
 
 PS_FIXTURE = """\

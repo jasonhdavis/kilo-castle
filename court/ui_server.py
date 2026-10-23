@@ -12,6 +12,9 @@ managed studio browser), and the /monitor actions (/api/monitor/kill —
 SIGTERM->SIGKILL one target PID via a detached child, never the server's own
 ancestry; /api/monitor/schedule/delete — removes one schedule JSON file under
 the kilo cron/wakeup stores and logs it so reappearance is flagged).
+Background mutation: when the manifest sets `sync.auto_interval_minutes`, the
+server also runs the classified `court sync --all` fold on a timer so the
+board's ledger cannot silently lag the branch tips (see `start_auto_sync`).
 """
 
 import glob
@@ -33,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
+from court import config as court_config
 from court import git_ops
 
 COURT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -548,6 +552,7 @@ html[data-theme="light"] #modal .box{box-shadow:var(--sh-2)}
 html[data-theme="light"] .qbadge.app-common,html[data-theme="light"] .qbadge.app-intelligence{
  background:rgba(123,83,194,.08);border-color:rgba(123,83,194,.4);color:#7b53c2}
 html[data-theme="light"] .iconbtn .bcount{color:#fff}
+.iconbtn.auto{color:var(--green)}
 </style></head><body>
 <header><div class="brand"><span class="glyph"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><path fill="currentColor" d="M32 192L32 48c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 40c0 4.4 3.6 8 8 8l32 0c4.4 0 8-3.6 8-8l0-40c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 40c0 4.4 3.6 8 8 8l32 0c4.4 0 8-3.6 8-8l0-40c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16l0 144c0 10.1-4.7 19.6-12.8 25.6L352 256l16 144L80 400 96 256 44.8 217.6C36.7 211.6 32 202.1 32 192zm176 96l32 0c8.8 0 16-7.2 16-16l0-48c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 48c0 8.8 7.2 16 16 16zM22.6 473.4L64 432l320 0 41.4 41.4c4.2 4.2 6.6 10 6.6 16c0 12.5-10.1 22.6-22.6 22.6L38.6 512C26.1 512 16 501.9 16 489.4c0-6 2.4-11.8 6.6-16z"/></svg></span><em>CASTLE</em></div>
 <div class="vtabs"><div class="app on" id="v_chat" onclick="setView('chat')">chat</div>
@@ -773,6 +778,7 @@ window.addEventListener('popstate',()=>{
 
  async function poll(){
  try{S=await (await fetch('/api/state')).json();DS_CACHE=null;}catch(e){return;}
+ syncAutoBadge();
  if(!selRepo&&S.repos.length){
   selRepo=(S.repos.find(r=>r.key==='app')||S.repos[0]).key;
   applyHash();renderNav();
@@ -2111,6 +2117,17 @@ function syncEaselChip(){
 $('chatbar').addEventListener('click',e=>{
   if(e.target.closest('[data-easel]'))openEaselNotes();});
 let GSYNC_BUSY=false;
+function syncAutoBadge(){
+ const b=$('gsync_btn');if(!b||GSYNC_BUSY)return;
+ const a=(S&&S.auto_sync)||{},on=!!a.enabled;
+ b.classList.toggle('auto',on);
+ b.textContent='⇅';
+ b.title=on
+  ?('global sync — court sync --all; auto every '+a.interval_minutes+'m'+
+    (a.last_run_ago?', last ran '+a.last_run_ago+' ago':' (first run pending)')+
+    '. Click to run now.')
+  :'global sync — court sync --all (manual; set sync.auto_interval_minutes in .court/config.json to auto-reconcile)';
+}
 async function globalSync(btn){
  if(GSYNC_BUSY)return;
  if(!confirm('GLOBAL SYNC — court sync --all?\n\nFolds branch-tip quest paperwork onto the main checkout for every quest (branch-wins union; true edit wars report and refuse to run).'))return;
@@ -2366,7 +2383,7 @@ def _tribute_counts(text):
     return done, total
 
 
-def _quests(root, ttl=20):
+def _quests(root, ttl=120):
     """Read <root>/.court/{quests,epics}/*.md frontmatter into card dicts."""
     now = time.time()
     hit = _QUESTS_CACHE.get(root)
@@ -2420,7 +2437,11 @@ def _quests(root, ttl=20):
                 "epic": fm.get("parent_epic", ""),
                 "section": fm.get("section", ""), "concern": fm.get("concern", ""),
                 "kind": fm.get("kind", ""),
-                "dirty": _wt_dirty(wt), "path": path,
+                # `dirty` is filled by the parallel pass below; calling
+                # _wt_dirty() here would run one serial `git status` per
+                # worktree on the request thread (the dominant cost of this
+                # endpoint — 100+ worktrees at ~0.3s each).
+                "dirty": False, "path": path,
                 "wt_status": wt_status,
                 "cogship_id": fm.get("cogship_id", ""),
                 "cogship_promoted_commit": fm.get("cogship_promoted_commit", ""),
@@ -2430,7 +2451,7 @@ def _quests(root, ttl=20):
     quests.sort(key=lambda q: (
         STATUS_ORDER.index(q["status"]) if q["status"] in STATUS_ORDER else 99,
         q["id"]))
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=16) as ex:
         for q, d in zip(quests, ex.map(_wt_dirty, [q["worktree"]
                                                    for q in quests])):
             q["dirty"] = d
@@ -2594,6 +2615,122 @@ def _repos():
     return out
 
 
+# --- Dashboard ledger auto-reconcile (the systemic "ledger lag" class) -------
+#
+# A worktree-side `court advance` writes only that branch's own quest copy:
+# the main checkout's ledger keeps reading WORKING/TRIBUTE_READY while the
+# branch tip already sits at GATE, so the board overstated "in progress"
+# (and understated the gate-ready/collectable set) until someone ran the
+# classified, branch-wins `court sync --all` by hand. The long-lived
+# dashboard server now runs that same fold on a timer
+# (`sync.auto_interval_minutes` in .court/config.json; absent/0 disables),
+# so the view self-heals without a click.
+AUTO_SYNC = {
+    "thread": None,
+    "last_run": 0.0,
+    "running": False,
+    "results": [],
+}
+_AUTO_SYNC_GUARD = threading.Lock()
+
+
+def _ledger_repo_roots():
+    """Every known repo whose checkout owns a .court/quests ledger, deduped
+    (the same root can appear twice under two keys)."""
+    seen, roots = set(), []
+    for r in _repos():
+        root = r["root"]
+        if root in seen:
+            continue
+        seen.add(root)
+        if os.path.isdir(os.path.join(root, ".court", "quests")):
+            roots.append(root)
+    return roots
+
+
+def _auto_sync_status():
+    cfg = court_config.get_auto_sync(Path(COURT_DIR) / ".court")
+    last = AUTO_SYNC["last_run"]
+    return {
+        "enabled": cfg["enabled"],
+        "interval_minutes": cfg["interval_minutes"],
+        "running": AUTO_SYNC["running"],
+        "last_run": last,
+        "last_run_ago": (f"{int((time.time() - last) // 60)}m" if last else ""),
+        "results": AUTO_SYNC["results"],
+    }
+
+
+def _invalidate_state_caches():
+    """Drop every /api/state aggregation cache so the next poll re-reads the
+    freshly folded ledger (mirrors the post-op invalidation in _court_op)."""
+    for cache in (_QUESTS_CACHE, _WT_CACHE, _DIRTY_CACHE, _BR_CACHE,
+                  _AUDIT_CACHE):
+        cache.clear()
+
+
+def _auto_sync_cycle():
+    """One classified `court sync --all` sweep across every ledger checkout."""
+    results = []
+    for root in _ledger_repo_roots():
+        try:
+            r = subprocess.run(
+                [sys.executable, "-m", "court.cli", "sync", "--all"],
+                capture_output=True, text=True, timeout=1800, cwd=root)
+            out = (r.stdout or "").strip()
+            summary = out.splitlines()[-1].strip() if out else "(no output)"
+            if r.returncode != 0:
+                summary = "exit %d: %s" % (
+                    r.returncode, ((r.stderr or "").strip() or summary)[:300])
+            results.append({"root": root, "ok": r.returncode == 0,
+                            "summary": summary[:300]})
+        except subprocess.TimeoutExpired:
+            results.append({"root": root, "ok": False,
+                            "summary": "timed out after 1800s"})
+        except Exception as exc:
+            results.append({"root": root, "ok": False,
+                            "summary": f"failed: {exc}"[:300]})
+    _invalidate_state_caches()
+    return results
+
+
+def _auto_sync_loop():
+    """Cadence thread: re-read the manifest each cycle so a settings change
+    (or a disable) takes effect without a server restart."""
+    while True:
+        try:
+            cfg = court_config.get_auto_sync(Path(COURT_DIR) / ".court")
+        except Exception:
+            cfg = {"enabled": False, "interval_minutes": 0.0}
+        if not cfg["enabled"]:
+            time.sleep(60)
+            continue
+        # First fold lands one interval after boot, never in a startup storm.
+        time.sleep(max(60.0, cfg["interval_minutes"] * 60.0))
+        with _AUTO_SYNC_GUARD:
+            if AUTO_SYNC["running"]:
+                continue
+            AUTO_SYNC["running"] = True
+        try:
+            AUTO_SYNC["results"] = _auto_sync_cycle()
+            AUTO_SYNC["last_run"] = time.time()
+        except Exception:
+            pass
+        finally:
+            AUTO_SYNC["running"] = False
+
+
+def start_auto_sync():
+    """Idempotent: arm the dashboard's periodic ledger-reconcile thread."""
+    if AUTO_SYNC.get("thread"):
+        return AUTO_SYNC["thread"]
+    t = threading.Thread(target=_auto_sync_loop, name="court-auto-sync",
+                         daemon=True)
+    t.start()
+    AUTO_SYNC["thread"] = t
+    return t
+
+
 _WT_CACHE = {}
 _WT_LOCKS = {}
 _BR_CACHE = {}
@@ -2615,7 +2752,7 @@ def _branches(repo, ttl=30):
     return out
 
 
-def _worktrees(repo=None, ttl=60):
+def _worktrees(repo=None, ttl=120):
     repo = repo or COURT_DIR
     now = time.time()
     hit = _WT_CACHE.get(repo)
@@ -2660,6 +2797,10 @@ def _compute_worktrees(repo):
             w["dirty"] = bool(r2.stdout.strip())
         except Exception:
             w["dirty"] = False
+        # Share with _wt_dirty()'s cache so the quest aggregation reuses this
+        # sweep instead of running a second git-status pass over the same
+        # worktrees (they are the two dominant costs of /api/state).
+        _DIRTY_CACHE[w["path"]] = (time.time(), w["dirty"])
         return w
 
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -5175,6 +5316,7 @@ class Handler(BaseHTTPRequestHandler):
                                  key=lambda a: a.get("started") or 0),
                 "mcp": _mcp_inventory(procs),
                 "browser": _browser_runtime().browser_status(),
+                "auto_sync": _auto_sync_status(),
                 "processes": [
                     {k: p[k] for k in ("pid", "ppid", "rss", "etime", "args")}
                     for p in flagged],
@@ -5688,6 +5830,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(port=8300):
+    start_auto_sync()
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"court ui: http://127.0.0.1:{port}  (Ctrl-C to stop)")
     try:

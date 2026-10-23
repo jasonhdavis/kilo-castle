@@ -12,6 +12,9 @@ role configuration:
 - `suite.command`            — the canonical unified integration suite
                               invocation (git_ops suite detection reads this
                               first; the manage.py/pytest probe is fallback).
+- `sync.auto_interval_minutes`— dashboard (`court ui`) auto-reconcile cadence
+                              for the classified `court sync --all` fold
+                              (absent/0 disables; see `get_auto_sync`).
 
 No model-ID constants live in engine code: every role model resolves through
 `get_model()` / `get_provider()` against the manifest. A missing role is a
@@ -123,6 +126,30 @@ def get_harness_command(court_dir: Optional[Path] = None) -> str:
         if cmd:
             return cmd
     return ""
+
+
+def get_auto_sync(court_dir: Optional[Path] = None) -> dict:
+    """Dashboard ledger auto-reconcile from the manifest (sync.*).
+
+    The recurring "ledger lag" class: a worktree-side ``court advance`` writes
+    only that branch's own quest copy, so the main checkout's ledger keeps
+    reading WORKING/TRIBUTE_READY while the branch tip already sits at GATE.
+    Nothing folded that automatically, so the board overstated "in progress"
+    and the gate-ready/collectable set understated, until someone ran the
+    classified, branch-wins ``court sync --all`` by hand.
+
+    ``sync.auto_interval_minutes`` lets the long-lived dashboard server
+    (``court ui``) run that same classified fold on a fixed cadence. Absent or
+    0 disables it; a positive value enables it and sets the period in minutes.
+    Returns ``{"enabled": bool, "interval_minutes": float}``.
+    """
+    cfg = load_config(court_dir)
+    sync = cfg.get("sync") if isinstance(cfg.get("sync"), dict) else {}
+    try:
+        interval = float(sync.get("auto_interval_minutes", 0) or 0)
+    except (TypeError, ValueError):
+        interval = 0.0
+    return {"enabled": interval > 0, "interval_minutes": interval}
 
 
 def get_studio_freshness(court_dir: Optional[Path] = None) -> dict:

@@ -14,7 +14,7 @@ work (that's `/quest`). Follow `.court/templates/vassal_dispatch_prompt.md`:
    ```
    Immediately commit the new Epic file to `castle` (e.g. `git add .court/epics/<epic_id>.md && git commit -m "court: create <epic_id> (<title>)"`).
 2. Dispatch a Vassal via the Kilo CLI in the main checkout (it coordinates,
-   it doesn't need its own worktree): `kilo run --agent vassal --dir <checkout> --model "openrouter/google/gemini-3.7-flash" "<filled vassal_dispatch_prompt.md>"` — model Gemini 3.7 Flash by default
+   it doesn't need its own worktree): `kilo run --auto --agent vassal --dir <checkout> --model "openrouter/google/gemini-3.7-flash" "<filled vassal_dispatch_prompt.md>"` — model Gemini 3.7 Flash by default
    unless the decomposition itself looks hard. NEVER call `agent_manager` — the tool is
    permission-denied in `kilo.json` for every agent in this project.
 3. Record the Vassal's session ID on the Epic via

@@ -18,7 +18,7 @@ Decrees, and the Steward charters a brand-new Quest+worktree from those Decrees.
 1. Read `branch`/`worktree` from the Quest's frontmatter (`court show {{ quest_id }}`).
 2. Dispatch via Court CLI:
    `python3 -m court.cli coin {{ quest_id }}`
-   (or via Kilo CLI: `kilo run --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir {{ worktree }} "<prompt>"`).
+   (or via Kilo CLI: `kilo run --auto --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir {{ worktree }} "<prompt>"`).
    This evaluates directly in the Quest's existing worktree under `agent: master_of_coin` with the configured `models.master_of_coin`, bypassing Agent Manager's agent-mode inheritance bug.
 3. The session assumes the Master of Coin persona inside the worktree, renders its one audit
    into `.court/quests/{{ quest_id }}.md` under `## Master of Coin's Audit`, and either

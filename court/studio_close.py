@@ -738,7 +738,7 @@ def run_close(args) -> int:
     elif union_quests:
         artist_spawn["hint"] = (
             "union-pending quests route to the artist: re-run with --artist-session, or run "
-            f"`kilo run --agent artist --dir {wt_path or '<studio worktree>'} \"<brief>\"`"
+            f"`kilo run --auto --agent artist --dir {wt_path or '<studio worktree>'} \"<brief>\"`"
         )
 
     _print_close(slug, studio_branch, rows, meta, manifest, teardown_info, artist_spawn, as_json)

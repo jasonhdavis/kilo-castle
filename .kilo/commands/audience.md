@@ -37,7 +37,7 @@ interrogation, logged as a dated entry in that Quest's own `## Audience Log`.
    NEVER call `agent_manager` — the tool is permission-denied in `kilo.json` for every agent in this project (headless runs hang on it until timeout, and Agent Manager cannot see CLI-spawned sessions).
 3. **Otherwise spawn a fresh, dedicated session** bound to the Quest's exact existing
    worktree via the Kilo CLI:
-   `kilo run --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir <wt> "<filled .court/templates/master_of_coin_interrogate_prompt.md>"`.
+   `kilo run --auto --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir <wt> "<filled .court/templates/master_of_coin_interrogate_prompt.md>"`.
    **Never** hijack the Serf's own `serf_session_id`, and **never** run this as a
    `task` subagent on `castle`. Record the new session so future interrogations (and
    `/levy`) can reuse it:

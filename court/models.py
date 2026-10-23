@@ -231,6 +231,47 @@ _TRIBUTE_PART_ALIASES = {
 # Canonical display order for reassembling a tribute from its parts.
 _TRIBUTE_PART_ORDER = ("Ballad", "Tribute", "Tally", "Penance", "Audience", "Opinion", "Survey", "Map", "Dangers", "Plot")
 
+# Sections whose body is free text and may legitimately contain `## ` sub-headings
+# of its own (charter goal prose with `## Purpose`/`## Scope`, checklist groups,
+# tribute reports, audit verdicts, Decrees). A `## ` heading inside one of these
+# that is not itself a known section name is CONTENT, never a new section. Without
+# this rule a Steward-authored charter whose `--goal`/`--notes` body carried
+# sub-headings split The Kingdom Requires into `## Purpose`/`## Scope`/... top-level
+# sections; the next load→save (e.g. `court dispatch`) then re-parsed the rendered
+# file, saw an empty The Kingdom Requires, and blanked the canonical section in the
+# markdown — silently deleting the goal body and M'Lord's notes (2026-10-22 pb-app
+# Q877/Q878/Q879/Q888 incident).
+_FREETEXT_SECTION_NAMES = frozenset({
+    "The Kingdom Requires",
+    "Goal & Scope",  # legacy alias, same body
+    "Expected Tribute",
+    "Tribute Rendered",
+    "Master of Coin's Audit",
+    "Master of Coin Review",  # legacy alias, same body
+    "Judgement of the Condemned",
+})
+
+# Hard ceiling on a custom (non-canonical) section name accepted by the parser,
+# serializer, writer, and `set_section` — mirrors fold_events' key sanity bound so
+# a name that can be written is always a name that can be folded back.
+_MAX_SECTION_NAME_LEN = 120
+
+
+def is_valid_section_name(name: str) -> bool:
+    """True when `name` may be a top-level body section key.
+
+    Canonical/legacy names are always valid. Any other non-empty single-line name
+    is accepted as a custom section (Royal Addendum, Context, ...) EXCEPT tribute
+    sub-part aliases: those are content headers, and re-keying them as sections is
+    the poison class behind the cogship-253/Q661/Q688 fold-blinding incident.
+    """
+    candidate = (name or "").strip()
+    if not candidate or "\n" in candidate or len(candidate) > _MAX_SECTION_NAME_LEN:
+        return False
+    if candidate in _KNOWN_SECTION_NAMES:
+        return True
+    return candidate.lower() not in _TRIBUTE_PART_ALIASES
+
 
 class _DirtyTrackingSections(dict):
     """Body-sections dict that records every key written to it, so
@@ -362,10 +403,27 @@ class Quest:
         frontmatter = "---\n" + "\n".join(fm_lines) + "\n---\n"
         title_line = f"# {self.id} — {self.title}\n"
         body_parts = []
-        ordered = list(DEFAULT_BODY_SECTIONS) + [
-            s for s in self.body_sections
-            if s not in DEFAULT_BODY_SECTIONS and s.lower() not in _TRIBUTE_PART_ALIASES
-        ]
+        # Preserve section order: canonical for a freshly built Quest, on-disk
+        # order for a parsed one, so a load→save cycle is order-stable and a
+        # nested free-text/heading section is never relocated. Any canonical
+        # section still missing from body_sections is appended so every Quest
+        # keeps the full default skeleton. Tribute sub-part keys (and any other
+        # invalid section name) are never rendered as top-level sections — they
+        # are content inside `Tribute Rendered`, and a mis-keyed duplicate must
+        # not be emitted twice.
+        ordered = []
+        seen = set()
+        for section in self.body_sections:
+            if section in seen:
+                continue
+            if section not in DEFAULT_BODY_SECTIONS and not is_valid_section_name(section):
+                continue
+            seen.add(section)
+            ordered.append(section)
+        for section in DEFAULT_BODY_SECTIONS:
+            if section not in seen:
+                seen.add(section)
+                ordered.append(section)
         for section in ordered:
             content = self.body_sections.get(section, "").rstrip()
             if not content and section not in DEFAULT_BODY_SECTIONS:
@@ -396,32 +454,33 @@ class Quest:
         sections = {}
         current = None
         buf = []
-        in_tribute_rendered = False
         for line in body_text.splitlines():
             header_m = header_re.match(line)
             header_name = header_m.group(1).strip() if header_m else ""
-            # Tribute part headers (## Ballad, ## Tally, ...) are content inside
-            # `## Tribute Rendered`, never section boundaries while the parser
-            # sits inside that section — parsing them as boundaries re-keyed
-            # whole tributes into spurious body_sections keys and emptied
-            # Tribute Rendered, blinding the event-fold
-            # (cogship-253/Q661/Q688 incident). Outside Tribute Rendered,
-            # new-shape part-named headers keep their historical boundary
-            # behavior (e.g. a custom section followed by "## Penance").
+            # A header opens a NEW top-level section when its name is a known
+            # canonical/legacy section, or — in new-shape files, and only while
+            # the parser is NOT inside a free-text section — any other genuine
+            # custom section name (Royal Addendum, Context, ...). Tribute
+            # sub-part headers (## Ballad, ## Tally, ## Penance, ...) are never
+            # boundaries; nor is any `## ` heading nested inside a free-text
+            # section (charter goal prose with `## Purpose`/`## Scope` must stay
+            # byte-identical inside The Kingdom Requires — the 2026-10-22
+            # body-stripping defect, see _FREETEXT_SECTION_NAMES).
             if header_name in _KNOWN_SECTION_NAMES:
                 is_section_boundary = True
-            elif is_new_shape:
-                is_section_boundary = not (
-                    in_tribute_rendered and header_name.lower() in _TRIBUTE_PART_ALIASES
-                )
-            else:
+            elif not is_new_shape or not header_name:
                 is_section_boundary = False
+            elif header_name.lower() in _TRIBUTE_PART_ALIASES:
+                is_section_boundary = False
+            elif current in _FREETEXT_SECTION_NAMES:
+                is_section_boundary = False
+            else:
+                is_section_boundary = True
             if header_m and is_section_boundary:
                 if current is not None:
                     sections[current] = "\n".join(buf).strip("\n")
                 current = header_name
                 buf = []
-                in_tribute_rendered = current == "Tribute Rendered"
             else:
                 buf.append(line)
         if current is not None:
@@ -465,8 +524,14 @@ class Quest:
         self.log_ledger(old, new_status, note)
 
     def set_section(self, section_name: str, content: str, mode: str = "replace") -> None:
-        if section_name not in DEFAULT_BODY_SECTIONS:
-            raise ValueError(f"Unknown section {section_name!r}")
+        name = (section_name or "").strip()
+        if not is_valid_section_name(name):
+            raise ValueError(
+                f"Invalid section name {section_name!r}: must be a canonical section, or a "
+                f"single-line custom section name (<= {_MAX_SECTION_NAME_LEN} chars) that is not "
+                f"a tribute sub-part alias (those are content inside 'Tribute Rendered')."
+            )
+        section_name = name
         if mode == "append":
             existing = self.body_sections.get(section_name, "")
             self.body_sections[section_name] = (existing.rstrip() + "\n\n" + content).strip()

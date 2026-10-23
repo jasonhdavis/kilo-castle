@@ -16,13 +16,12 @@ from dataclasses import fields as dc_fields
 from pathlib import Path
 from typing import Optional
 
-from .models import Quest, DEFAULT_BODY_SECTIONS, FRONTMATTER_FIELDS
+from .models import Quest, DEFAULT_BODY_SECTIONS, FRONTMATTER_FIELDS, is_valid_section_name
 
 FIELD_PREFIX = "field:"
 SECTION_PREFIX = "section:"
 
 _KNOWN_FIELD_NAMES = frozenset(FRONTMATTER_FIELDS)
-_KNOWN_SECTION_TARGETS = frozenset(DEFAULT_BODY_SECTIONS)
 
 
 def events_path_for(md_path: Path) -> Path:
@@ -108,19 +107,29 @@ def build_events_for_save(quest: Quest, prior: Optional[Quest], ts: str) -> list
         if new_val != old_val:
             events.append({"ts": ts, "target": f"{FIELD_PREFIX}{f}", "value": new_val})
 
-    # Canonical targets only. Non-canonical body_sections keys (tribute parts
-    # mis-keyed by a bad parse, custom sections) are dropped by fold_events on
-    # read, so emitting them only poisons union-merged stores while never
-    # surviving a fold — cogship-253/Q661/Q688 fold-blinding incident.
-    for section in DEFAULT_BODY_SECTIONS:
+    # Canonical sections in canonical order, then any genuine custom section
+    # (Royal Addendum, Context, ...) in insertion order. Tribute sub-part keys
+    # are never emitted: they are content inside `Tribute Rendered`, and
+    # re-keying them as sections was the cogship-253/Q661/Q688 fold-blinding
+    # poison. Custom sections ARE emitted so a load→save cycle round-trips them
+    # (fold_events already folds any valid section name) — dropping them was
+    # itself a silent charter-body-stripping defect.
+    section_names = [s for s in DEFAULT_BODY_SECTIONS if s in quest.body_sections]
+    section_names += [
+        s for s in quest.body_sections
+        if s not in DEFAULT_BODY_SECTIONS
+        and s not in section_names
+        and is_valid_section_name(s)
+    ]
+    for section in section_names:
         new_val = quest.body_sections.get(section, "") or ""
         old_val = ((prior.body_sections.get(section, "") if prior is not None else "") or "")
         if new_val != old_val:
             # Fold-blinding guard: never emit a section wipe from a partial or
-            # mangled in-memory view. Emptying a previously non-empty canonical
-            # section requires explicit intent (set_section("") marks
-            # quest._explicit_wipes); anything else is skipped so the fold
-            # keeps the last good value.
+            # mangled in-memory view. Emptying a previously non-empty section
+            # requires explicit intent (set_section("") marks
+            # quest._explicit_wipes); anything else is skipped so the fold keeps
+            # the last good value.
             if new_val == "" and old_val != "" and section not in getattr(quest, "_explicit_wipes", ()):
                 continue
             events.append({"ts": ts, "target": f"{SECTION_PREFIX}{section}", "value": new_val})

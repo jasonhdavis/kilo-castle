@@ -180,7 +180,7 @@ Stand up the Serf worktree and session directly via Court CLI:
 ```bash
 python3 -m court.cli dispatch <id> --standup
 ```
-This directly invokes Kilo's CLI standup (`kilo worktree create` + `kilo run --agent serf` / API), initializing the session with `agent = serf`, setting worktree config `default_agent: "serf"`, enforcing `task: deny` permissions, and passing pure charter task instructions without persona boilerplate.
+This directly invokes Kilo's CLI standup (`kilo worktree create` + `kilo run --auto --agent serf` / API), initializing the session with `agent = serf`, setting worktree config `default_agent: "serf"`, enforcing `task: deny` permissions, and passing pure charter task instructions without persona boilerplate.
 
 Alternatively, record manual session IDs:
 ```bash

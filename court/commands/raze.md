@@ -41,7 +41,7 @@ Follow the Raze Protocol:
      what to clean up, never deletes anything itself.
    - **HOLD entries** (verdict not yet synced back): do not touch the worktree. If a live session
      is listed, deliver the printed re-prompt verbatim into that worktree via Kilo CLI
-     (`kilo run --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir <wt>`)
+     (`kilo run --auto --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir <wt>`)
      so the stalled MoC/Gatekeeper session pushes its sync-back itself. If no session remains, the audit stalled
      without ever finishing — leave that fork alone and re-dispatch a fresh session per
      `master_of_coin_review_prompt.md` / `gatekeeper_review_prompt.md` instead of resurrecting it.

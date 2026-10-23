@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import store
-from .models import Quest, STATUSES, SECTIONS, KINDS, now_iso, validate_branch_name, status_label
+from .models import Quest, STATUSES, SECTIONS, KINDS, now_iso, validate_branch_name, status_label, DEFAULT_BODY_SECTIONS, is_valid_section_name
 from . import git_ops
 from . import ward
 from . import branch_ops
@@ -247,19 +247,48 @@ def build_serf_task_prompt(quest: Quest) -> str:
 
     Zero persona boilerplate; zero prompt corruption. The Serf persona and
     behavioral constraints live in Kilo's system prompt (.kilo/agent/serf.md or kilo.json).
+
+    Every charter section the worker must act on is included verbatim — not just
+    the two canonical headings. A Steward-authored goal whose body carries
+    `## ` sub-headings keeps them inside `The Kingdom Requires` (the parser no
+    longer re-keys them), and any genuine custom section (e.g. an inherited
+    `Royal Addendum`, a `Context` block) is passed through too. Internal
+    bookkeeping sections (ledger, tribute, audits, cogship log, audience log)
+    are omitted: they are not task instructions.
     """
     branch = quest.branch or quest.tree_branch
+    internal = {
+        "Castle Ledger", "Tribute Rendered", "Master of Coin's Audit",
+        "Judgement of the Condemned", "Cogship Log", "Audience Log",
+    }
+    goal = quest.body_sections.get("The Kingdom Requires") or quest.body_sections.get("Goal & Scope") or ""
+    expected = quest.body_sections.get("Expected Tribute") or ""
     lines = [
         f"# Quest {quest.id}: {quest.title}",
         f"Branch: {branch}",
         f"Section: {quest.section or '-'}",
         "",
         "## The Kingdom Requires",
-        quest.body_sections.get("The Kingdom Requires") or quest.body_sections.get("Goal & Scope") or "",
+        goal,
         "",
         "## Expected Tribute",
-        quest.body_sections.get("Expected Tribute") or "",
+        expected,
     ]
+
+    # Any further charter content (custom sections, or canonical sections that
+    # are neither goal nor tribute) travels with the task instructions in
+    # on-disk order. Tribute-part keys and internal sections are never included.
+    for name, content in quest.body_sections.items():
+        body = (content or "").strip()
+        if not body:
+            continue
+        if name in ("The Kingdom Requires", "Goal & Scope", "Expected Tribute"):
+            continue
+        if name in internal:
+            continue
+        if not (name in DEFAULT_BODY_SECTIONS or is_valid_section_name(name)):
+            continue
+        lines.extend(["", f"## {name}", body])
 
     scout_of = getattr(quest, "scout_of", "") or ""
     if scout_of:
@@ -386,15 +415,40 @@ def session_is_fresh(worktree_path: Path, max_age_ms: int = SESSION_FRESH_MS) ->
     return (time.time() * 1000 - act) <= max_age_ms
 
 
-def gatehouse_convoy_is_live(cogship_id: str, repo_root: Optional[Path] = None) -> tuple[bool, str]:
-    """Mechanical version of the 'grep cogship_id before standing up a
-    Gatekeeper' ritual (2026-09-09 lesson): a convoy is live when its ephemeral
-    gatehouse worktree exists AND has a freshly-updated kilo session (an active
-    Gatekeeper), or when the convoy branch exists ahead of castle."""
+def convoy_branch_promoted(cogship_id: str, repo_root: Optional[Path] = None) -> tuple[bool, str]:
+    """True when a convoy branch exists and is fully contained in `castle`.
+
+    A promoted convoy is DONE: it can never be "live", no matter how recently
+    its Gatekeeper session wrote. Treating a fresh session in a promoted
+    convoy's gatehouse worktree as "live" is what blocked re-minting/handing a
+    convoy back to a Gatekeeper (2026-10-23 pb-app defect report)."""
     norm = store.normalize_cogship_id(cogship_id)
     if not norm:
         return False, "unnormalized cogship id"
     root = repo_root or git_ops.get_repo_root()
+    branch = f"the-gatehouse/{norm}"
+    exists = git_ops._run(["git", "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}"], root)
+    if not (exists.get("ok") and (exists.get("stdout") or "").strip()):
+        return False, f"{branch} not found"
+    merged = git_ops._run(["git", "merge-base", "--is-ancestor", branch, "castle"], root)
+    if merged.get("ok"):
+        return True, f"{branch} is already merged into castle (promoted convoy)"
+    return False, f"{branch} not yet merged into castle"
+
+
+def gatehouse_convoy_is_live(cogship_id: str, repo_root: Optional[Path] = None) -> tuple[bool, str]:
+    """Mechanical version of the 'grep cogship_id before standing up a
+    Gatekeeper' ritual (2026-09-09 lesson): a convoy is live when its ephemeral
+    gatehouse worktree exists AND has a freshly-updated kilo session (an active
+    Gatekeeper), or when the convoy branch exists ahead of castle. A convoy
+    whose branch is already merged into castle is finished, never live."""
+    norm = store.normalize_cogship_id(cogship_id)
+    if not norm:
+        return False, "unnormalized cogship id"
+    root = repo_root or git_ops.get_repo_root()
+    promoted, why = convoy_branch_promoted(norm, repo_root=root)
+    if promoted:
+        return False, why
     wt = root / ".kilo" / "worktrees" / f"the-gatehouse-{norm}"
     if wt.is_dir():
         if session_is_fresh(wt):
@@ -2599,7 +2653,7 @@ def _print_charter_next_steps(quest: Quest, am_section: str) -> None:
             f'   kilo --worktree {wt_name} --agent serf --model "{config.get_model("serf")}" --provider "{config.get_provider("serf")}"',
             f'   or:',
             f'   kilo worktree create {wt_name}',
-            f'   kilo run --agent serf --model "{config.get_model("serf")}" --provider "{config.get_provider("serf")}" --dir <WORKTREE_PATH> "<TASK_PROMPT>"',
+            f'   kilo run --auto --agent serf --model "{config.get_model("serf")}" --provider "{config.get_provider("serf")}" --dir <WORKTREE_PATH> "<TASK_PROMPT>"',
             f"",
             f"2. Or if manually spawning a session in any UI in section \"{section_display}\":",
             f"   python3 -m court.cli dispatch-complete {quest.id} \\",
@@ -4165,9 +4219,9 @@ def cmd_artist(args):
     print("     Agent Manager prompting is retired; it defaults to steward mode and lacks")
     print("     agent parameterization):")
     if brief_file:
-        print(f"     kilo run --agent artist --model \"{model}\" --dir {wt} \"$(cat {brief_file})\"")
+        print(f"     kilo run --auto --agent artist --model \"{model}\" --dir {wt} \"$(cat {brief_file})\"")
     else:
-        print(f"     kilo run --agent artist --model \"{model}\" --dir {wt} \"<the brief>\"")
+        print(f"     kilo run --auto --agent artist --model \"{model}\" --dir {wt} \"<the brief>\"")
     print(f"     (or interactive: cd {wt} && kilo — default_agent already set to artist).")
     print(f"     (Slash command: `/artist {quest.id}` drives this flow.)")
     print(f"  2. Open the live preview in your browser: {runserver_url}")
@@ -4687,7 +4741,13 @@ def cmd_collect(args):
     a size>1 convoy gets a brand-new ephemeral worktree scoped to that one
     convoy only (`the-gatehouse/<cogship_id>`), torn down after promotion.
     """
-    candidates = resolve_quest_selection(args, batchable=True, required=True, default_status="TRIBUTE_READY")
+    regate = bool(getattr(args, "regate", False))
+    candidates = resolve_quest_selection(
+        args,
+        batchable=True,
+        required=True,
+        default_status="READY_TO_RAZE" if regate else "TRIBUTE_READY",
+    )
     base_branch = getattr(args, "base", "castle") or "castle"
     auto_commit = not getattr(args, "no_commit", False)
 
@@ -4699,8 +4759,16 @@ def cmd_collect(args):
         if quest.status == "PUNISHED":
             skipped.append((quest.id, "PUNISHED (side-state, frozen pending its pillory successor)"))
             continue
-        if quest.status not in ("TRIBUTE_READY", "GATE"):
-            skipped.append((quest.id, f"status is [{quest.status}], not TRIBUTE_READY or GATE"))
+        packable_statuses = ("TRIBUTE_READY", "GATE") + (("READY_TO_RAZE",) if regate else ())
+        if quest.status not in packable_statuses:
+            if quest.status == "READY_TO_RAZE":
+                skipped.append((
+                    quest.id,
+                    "status is [READY_TO_RAZE] (already promoted) — re-open it to WORKING, or "
+                    "pass --regate to hand a promoted convoy back to a Gatekeeper in a fresh convoy",
+                ))
+            else:
+                skipped.append((quest.id, f"status is [{quest.status}], not TRIBUTE_READY or GATE"))
             continue
         # Gates read the worktree charter first (freshest: coin verdicts and
         # UI-review approvals commit on the branch before any convoy promotes),
@@ -4744,9 +4812,25 @@ def cmd_collect(args):
         if audit.git_status.get("dirty"):
             skipped.append((quest.id, "dirty working tree"))
             continue
-        if audit.violations:
-            skipped.append((quest.id, f"{len(audit.violations)} compliance violation(s): {'; '.join(audit.violations)}"))
+        violations = list(audit.violations)
+        if regate:
+            # A re-gated Quest's branch tip is typically already an ancestor of
+            # castle (its code shipped in the prior convoy); zero ahead is the
+            # expected shape, not a delivery failure.
+            violations = [v for v in violations if "Zero commits delivered on branch" not in str(v)]
+        force = bool(getattr(args, "force", False))
+        tampering = [v for v in violations if "Charter tampering" in str(v)]
+        non_tampering = [v for v in violations if "Charter tampering" not in str(v)]
+        if tampering:
+            # Charter tampering is never waived, not even with --force.
+            skipped.append((quest.id, f"{len(tampering)} compliance violation(s): {'; '.join(str(v) for v in tampering)}"))
             continue
+        if non_tampering:
+            if force:
+                print(f"⚠️  {quest.id}: packing despite {len(non_tampering)} violation(s) (--force): {'; '.join(str(v) for v in non_tampering)}")
+            else:
+                skipped.append((quest.id, f"{len(non_tampering)} compliance violation(s): {'; '.join(str(v) for v in non_tampering)}"))
+                continue
         # Shape C gate (2026-09-15 migration-fork class): refuse to pack quest-local
         # merge migrations. Differential scan - only files the branch ADDS over the
         # trunk, so castle's own pre-existing merge nodes never flag innocent branches.
@@ -4789,6 +4873,10 @@ def cmd_collect(args):
         m = re.match(r"the-gatehouse-(cogship-\d+)$", wt_dir.name)
         if not m or not session_is_fresh(wt_dir):
             continue
+        # A promoted convoy is finished — a fresh session in its worktree is the
+        # tail of the completed integration, not a race this collect can lose.
+        if convoy_branch_promoted(m.group(1), repo_root=repo_root)[0]:
+            continue
         live_convoy = (m.group(1), str(wt_dir))
         break
     if live_convoy is not None:
@@ -4806,14 +4894,30 @@ def cmd_collect(args):
     # live prior convoy (fresh Gatekeeper session in its gatehouse worktree)
     # means another operator's integration is in flight — skip, don't race it.
     requested_cogship = getattr(args, "cogship", None)
+    # `--cogship new` (documented) means "allocate the next id", not a literal id.
+    if isinstance(requested_cogship, str) and requested_cogship.strip().lower() in ("new", "next", "auto"):
+        requested_cogship = None
+    if regate and requested_cogship:
+        # Handing a promoted convoy back must mint a FRESH convoy: reusing the
+        # promoted id would resurrect a branch that is already in castle.
+        prior_ids = {store.normalize_cogship_id(q.cogship_id or "") for q in accepted if q.cogship_id}
+        if store.normalize_cogship_id(requested_cogship) in prior_ids:
+            print(
+                f"ERROR: --regate refuses to reuse promoted convoy {requested_cogship}: it is "
+                f"already merged into castle. Omit --cogship (or pass 'new') to mint a fresh convoy.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     live_skipped: list[tuple[str, str]] = []
     repackable: list = []
+    prior_stamps: dict[str, str] = {}
     for q in accepted:
         prior = store.normalize_cogship_id(q.cogship_id or "")
+        prior_stamps[q.id] = prior or ""
         if not prior or prior == store.normalize_cogship_id(requested_cogship or ""):
             repackable.append(q)
             continue
-        is_live, why = gatehouse_convoy_is_live(prior, repo_root=git_ops.get_repo_root())
+        is_live, why = gatehouse_convoy_is_live(prior, repo_root=repo_root)
         if is_live:
             live_skipped.append((q.id, why))
         else:
@@ -4839,6 +4943,16 @@ def cmd_collect(args):
     accepted = repackable
     print(f"🚢 Stamped {len(accepted)} Quest(s) onto {cogship_id}.")
 
+    # A re-minted convoy is a FRESH integration: prior promotion/session stamps
+    # describe the old convoy and would make `collect --standup` skip the
+    # Gatekeeper ("already records session") or the promote-gate compare against
+    # a stale commit. Clear them for every Quest moving to a new cogship id.
+    for quest in accepted:
+        prior = prior_stamps.get(quest.id, "")
+        if prior and prior != store.normalize_cogship_id(cogship_id):
+            quest.cogship_promoted_commit = ""
+            quest.gatekeeper_session_id = ""
+            quest.gatekeeper_model = ""
     for quest in accepted:
         quest.set_status("GATE", f"Packed in {cogship_id}; dispatched to Gatekeeper")
     # One batched commit for the whole GATE advance (was: one commit per quest).
@@ -4859,7 +4973,7 @@ def cmd_collect(args):
             "so run the Gatekeeper role directly inside this Quest's own existing",
             "worktree via Kilo CLI:",
             "",
-            f"   kilo run --agent gatekeeper --model {qual_gatekeeper} --dir {solo_quest.worktree or '<worktree>'} \"Act as Gatekeeper for {solo_id}: merge castle in, run test suite, and on a clean pass merge straight into castle.\"",
+            f"   kilo run --auto --agent gatekeeper --model {qual_gatekeeper} --dir {solo_quest.worktree or '<worktree>'} \"Act as Gatekeeper for {solo_id}: merge castle in, run test suite, and on a clean pass merge straight into castle.\"",
             "",
             "1. Record the session:",
             f"   python3 -m court.cli set-field {solo_id} gatekeeper_session_id <session_id>",
@@ -4883,7 +4997,7 @@ def cmd_collect(args):
             f"1. Stand up the convoy worktree and Gatekeeper session via Kilo CLI:",
             f"   kilo worktree create {wt_name}",
             f"   git -C .kilo/worktrees/{wt_name} branch -m {branch_name}",
-            f"   kilo run --agent gatekeeper --model {qual_gatekeeper} --dir .kilo/worktrees/{wt_name} \"Act as Gatekeeper for {cogship_id}: merge in branches for {accepted_ids}, run unified suite once, promote clean remainder directly into castle.\"",
+            f"   kilo run --auto --agent gatekeeper --model {qual_gatekeeper} --dir .kilo/worktrees/{wt_name} \"Act as Gatekeeper for {cogship_id}: merge in branches for {accepted_ids}, run unified suite once, promote clean remainder directly into castle.\"",
             "",
             "2. Run the unified suite via the ENGINE in the convoy worktree (stamps the",
             "   proof the READY_TO_RAZE gate requires; never run suites through an",
@@ -5677,9 +5791,9 @@ def cmd_atelier(args):
     print("     as the sole writer there) via Kilo CLI — the single unified path; Agent")
     print("     Manager prompting is retired:")
     if atelier_brief_path:
-        print(f"     kilo run --agent artist --model \"{model}\" --dir {wt_path} \"$(cat {atelier_brief_path})\"")
+        print(f"     kilo run --auto --agent artist --model \"{model}\" --dir {wt_path} \"$(cat {atelier_brief_path})\"")
     else:
-        print(f"     kilo run --agent artist --model \"{model}\" --dir {wt_path} \"<the brief>\"")
+        print(f"     kilo run --auto --agent artist --model \"{model}\" --dir {wt_path} \"<the brief>\"")
     print(f"     (or interactive: cd {wt_path} && kilo — default_agent already set to artist).")
     print(f"     (Slash command: `/atelier {merged_ids}` drives this whole flow.)")
     print(f"  2. Record the session on each packed Quest: python3 -m court.cli set-field <id> artist_session_id <session_id>")
@@ -5691,7 +5805,7 @@ def cmd_atelier(args):
     print(f"  5. Run the unified integration suite via the ENGINE in the convoy worktree:")
     print(f"     python3 -m court.cli runsuite --cogship {cogship_id} --dir {wt_path}")
     print(f"  6. Hand the worktree to the Gatekeeper (candidate branches are already merged):")
-    print(f"     kilo run --agent gatekeeper --model \"$(python3 -m court.cli model gatekeeper)\" --dir {wt_path}")
+    print(f"     kilo run --auto --agent gatekeeper --model \"$(python3 -m court.cli model gatekeeper)\" --dir {wt_path}")
     print(f"     \"Act as Gatekeeper for {cogship_id}: candidate branches already merged; run the unified")
     print(f"     suite via court runsuite, promote the clean convoy into castle, advance passing Quests")
     print(f"     to READY_TO_RAZE, and pack the manifest with court ship.\"")
@@ -6192,7 +6306,7 @@ def cmd_studio(args):
     print("Next Steps for M'Lord & Steward (single unified spawn path — prompting):")
     print("  Spawn the Court Artist session via Kilo CLI (Agent Manager prompting is")
     print("  retired: it defaults sessions to steward mode and lacks agent parameterization):")
-    print(f"    kilo run --agent artist --model \"$(python3 -m court.cli model artist)\" --dir {wt_path} \"$(cat {brief_path})\"")
+    print(f"    kilo run --auto --agent artist --model \"$(python3 -m court.cli model artist)\" --dir {wt_path} \"$(cat {brief_path})\"")
     print("    (or `--standup` next time to let this command spawn and record it), or interactive:")
     print(f"    cd {wt_path} && kilo   # default_agent already set to artist")
     print("    then record the session: python3 -m court.cli set-field <id> artist_session_id <session_id>")
@@ -6662,7 +6776,7 @@ def cmd_fork_teardown_list(args):
             print(f"   * {q.id} [{q.status}] — {e['branch']}")
             print(f"     {e['reason']}")
             if e["session_id"] and e["session_name"]:
-                print(f"     👉 kilo run --agent master_of_coin --dir <this fork worktree> --model \"$(python3 -m court.cli model master_of_coin)\": \"Confirm your verdict is written under "
+                print(f"     👉 kilo run --auto --agent master_of_coin --dir <this fork worktree> --model \"$(python3 -m court.cli model master_of_coin)\": \"Confirm your verdict is written under "
                       f"## Master of Coin's Audit in .court/quests/{q.id}*.md, then run `git push . HEAD:{q.branch}` "
                       f"from this fork worktree and report back the exact push result. Do not stop "
                       f"your own session.\"")
@@ -7915,6 +8029,7 @@ def build_parser():
     p_collect.add_argument("--base", default="castle", help="Base branch for the compliance audit (default: castle)")
     p_collect.add_argument("--skip-ui-review", action="store_true", help="Bypass pending UI review check when packing into Cog Ship")
     p_collect.add_argument("--hotfix", action="store_true", help="Allow hotfix fast-track inline audit and pack")
+    p_collect.add_argument("--regate", action="store_true", help="Hand previously promoted Quests (READY_TO_RAZE) back to a Gatekeeper: mint a FRESH convoy, rewind them to GATE, clear stale promotion/session stamps, and stand up a new Gatekeeper")
     p_collect.add_argument("--standup", action="store_true", help="Automatically stand up the Gatekeeper worktree and session via Kilo CLI")
     p_collect.add_argument("--force", action="store_true", help="Force packing even if checks warn/fail")
     p_collect.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
@@ -8009,7 +8124,7 @@ def build_parser():
 
     p_artist_say = sub.add_parser(
         "artist-say",
-        help="Deliver M'Lord's instruction to an existing Court Artist session (kilo run --agent artist --session <artist_session_id>)",
+        help="Deliver M'Lord's instruction to an existing Court Artist session (kilo run --auto --agent artist --session <artist_session_id>)",
     )
     p_artist_say.add_argument("quest_id", help="Quest ID with a recorded artist_session_id (e.g. Q196)")
     p_artist_say.add_argument("instruction", help="The instruction to deliver to the artist session")

@@ -74,6 +74,25 @@ class TestCliStandup(unittest.TestCase):
         self.assertIn("## Scout Predecessor", prompt)
         self.assertIn("Q120-Core-Scout-Spike", prompt)
 
+    def test_build_serf_task_prompt_includes_custom_charter_sections(self):
+        """Custom charter sections travel with the task instructions.
+
+        Regression guard for the 2026-10-22 body-stripping defect: a goal whose
+        body carried sub-headings split into custom sections, and `court
+        dispatch` only forwarded two hard-coded headings, so the worker never
+        saw the rest of the charter."""
+        self.quest.set_section("Acceptance Criteria", "- [ ] custom criterion")
+        self.quest.set_section("Context", "Background the worker needs.")
+        # Internal bookkeeping sections are never task instructions.
+        self.quest.set_section("Master of Coin's Audit", "Verdict: PASS")
+        prompt = build_serf_task_prompt(self.quest)
+
+        self.assertIn("## Acceptance Criteria", prompt)
+        self.assertIn("- [ ] custom criterion", prompt)
+        self.assertIn("## Context", prompt)
+        self.assertIn("Background the worker needs.", prompt)
+        self.assertNotIn("Verdict: PASS", prompt)
+
     def test_setup_worktree_agent_config(self):
         """Verify .kilo/kilo.json is written with default_agent: serf."""
         wt_dir = self.tmp_path / "worktree_test"

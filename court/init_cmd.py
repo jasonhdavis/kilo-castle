@@ -203,6 +203,7 @@ DEFAULT_KILO_CONFIG = {
                 "Strict Constraints:\n"
                 "- ZERO ROLEPLAY LEAKAGE: Internal Court terms are strictly internal orchestration and bookkeeping vocabulary. NEVER use Court or Castle roleplay jargon in production code, templates, UI text, table headers, buttons, badge text, model names, service classes, API endpoints, or user-facing copy.\n"
                 "- STRICT CHARTER IMMUTABILITY: You are strictly forbidden from modifying, editing, or rephrasing # The Kingdom Requires or altering the text of items in # Expected Tribute. Permitted ONLY to toggle checkbox status (- [ ] -> - [x]) and render your report under ## Tribute Rendered.\n"
+                "- CHUNKED LARGE-FILE WRITES (mandatory): never emit one enormous file write. For any new file that will exceed roughly 200 lines — or any full rewrite of an existing large file — write a small skeleton first, then extend it with successive edits/appends of ~100-150 lines each. One giant single write aborts mid-stream on this worker and loses the work; chunking is a hard requirement, not a style preference.\n"
                 "- Follow AGENTS.md branch, worktree, and testing rules.\n"
                 "- Clean tree & base alignment: verify git status --porcelain is clean, and merge castle (behind: 0) before declaring done.\n"
                 "- REAL-DATA DRY-RUN EVIDENCE: if the charter mandates a dry-run gate for data-mutating work (backfills, bulk updates, batch jobs, syncs), "
@@ -235,7 +236,8 @@ DEFAULT_KILO_CONFIG = {
                 "- NO Production Migrations.\n"
                 "- Put all experimental code in tasks/artifacts/ or scratch commands.\n"
                 "- Read-only inspection / mock data.\n"
-                "- Non-merging branch.\n\n"
+                "- Non-merging branch.\n"
+                "- CHUNKED LARGE-FILE WRITES (mandatory): never emit one enormous file write. For any new file that will exceed roughly 200 lines — or any full rewrite of an existing large file — write a small skeleton first, then extend it with successive edits/appends of ~100-150 lines each. One giant single write aborts mid-stream on this worker and loses the work; chunking is a hard requirement, not a style preference.\n\n"
                 "Mandatory 5-Part Scout Report: 1. Survey (viability, findings, 0-10 confidence); 2. Map (architecture, endpoints, schemas); 3. Dangers (gotchas, edge cases, costs); 4. Tribute (artifacts delivered); 5. Plot (production architecture proposal, candidate Quests).\n"
                 "Write complete report into durable state via court set-section."
             ),
@@ -257,7 +259,8 @@ DEFAULT_KILO_CONFIG = {
                 "- Direct promotion to castle, compile deployment manifest (court ship), and advance passing Quests to READY_TO_RAZE.\n"
                 "- No push authority: never run `git push` against any remote. Promotion into castle is local-only "
                 "(git merge the-gatehouse/<cogship_id> --ff-only); remote synchronization and deployment belong to the Steward and the human operator.\n"
-                "- No pillory duty."
+                "- No pillory duty.\n"
+                "- Hand-back / re-gate convoys: a previously promoted convoy can be handed back via `court collect <ids> --regate`. Quests arrive at GATE on a BRAND-NEW cogship id with promotion/session stamps cleared; integrate post-promotion commits into a fresh the-gatehouse/<new-id> worktree cut from castle, run the unified suite, and promote. Never reuse a promoted convoy id or branch — it is already in castle."
             ),
         },
         "master_of_coin": {

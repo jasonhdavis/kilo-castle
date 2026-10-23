@@ -25,7 +25,7 @@ Follow the Charter Protocol in `.kilo/prompts/steward.md` §"Charter":
      python3 -m court.cli dispatch <id> --standup
      ```
      (or combine both steps with `python3 -m court.cli charter <id> --dispatch`).
-   - This directly invokes Kilo's CLI standup (`kilo worktree create` + `kilo run --agent serf` / API), creating the worktree under `.kilo/worktrees/`, configuring `.kilo/kilo.json` with `"default_agent": "serf"`, enforcing `task: deny` permissions, and passing pure charter task instructions without persona prompt corruption.
+   - This directly invokes Kilo's CLI standup (`kilo worktree create` + `kilo run --auto --agent serf` / API), creating the worktree under `.kilo/worktrees/`, configuring `.kilo/kilo.json` with `"default_agent": "serf"`, enforcing `task: deny` permissions, and passing pure charter task instructions without persona prompt corruption.
    - Alternatively, if M'Lord manually creates a session in the Agent Manager UI (section `Bug fix`/`Feature`/`Optimization` — a human action, not an agent tool call), record its IDs via `python3 -m court.cli dispatch-complete <id> --session-id <SESSION_ID> --branch <branch> --worktree <worktree_path>`.
 
 4. **Record Metadata and Land at Working in One Command**:

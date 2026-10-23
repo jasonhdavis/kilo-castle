@@ -612,7 +612,7 @@ class TestStudioDocsAndSpawnPaths(unittest.TestCase):
             text = p.read_text()
             # 2026-09-28: spawn unified through prompting — Kilo CLI is the
             # single documented path; Agent Manager prompting is retired.
-            self.assertIn("kilo run --agent artist", text)
+            self.assertIn("kilo run --auto --agent artist", text)
             self.assertIn("--standup", text)
             self.assertIn("Agent Manager prompting is RETIRED", text)
             self.assertNotIn("agent_manager", text)

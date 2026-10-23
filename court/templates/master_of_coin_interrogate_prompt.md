@@ -14,9 +14,9 @@ This interrogation:
 ## Dispatch Pattern: Reuse the Existing Master of Coin Session, or Spawn a Fresh One
 
 1. Read `branch`/`worktree`/`master_of_coin_session_id` from `court show {{ quest_id }}`.
-2. **Reuse first:** if `master_of_coin_session_id` is set AND `kilo session list` still shows that session live, deliver this prompt into its worktree via Kilo CLI: `kilo run --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir <wt>`.
+2. **Reuse first:** if `master_of_coin_session_id` is set AND `kilo session list` still shows that session live, deliver this prompt into its worktree via Kilo CLI: `kilo run --auto --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir <wt>`.
 3. **Spawn fresh only if reuse isn't possible:** start a **brand-new, dedicated** session bound to the Quest's branch:
-   `kilo run --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --provider openrouter --dir <wt>` in the Quest's existing worktree (`model` resolved from `.court/config.json`). Record it:
+   `kilo run --auto --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --provider openrouter --dir <wt>` in the Quest's existing worktree (`model` resolved from `.court/config.json`). Record it:
    ```bash
    python3 -m court.cli set-field {{ quest_id }} master_of_coin_session_id <session_id>
    python3 -m court.cli set-field {{ quest_id }} master_of_coin_model "$(python3 -m court.cli model master_of_coin)"

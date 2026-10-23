@@ -38,23 +38,38 @@ Follow the Collect Protocol (absorbing gate progression):
      queue. Only a *dirty* working tree or a genuine merge conflict blocks packing. To
      reconverge a Quest before packing it, run `python3 -m court.cli rebase <id>`
      — mechanical, zero agent turns.
+   - **Hand-back / re-gate an already-promoted convoy (`--regate`)**: a convoy that
+     has been merged into `castle` can still be handed back to a Gatekeeper when a
+     post-promotion fix or a missed integration must be re-verified. `--regate`
+     accepts Quests at `READY_TO_RAZE`, mints a BRAND-NEW cogship id (it refuses to
+     reuse the promoted id), rewinds the Quests to `GATE`, clears their stale
+     `cogship_promoted_commit`/`gatekeeper_session_id`, and treats the promoted
+     convoy as dead (its still-fresh Gatekeeper session no longer blocks a new
+     pack):
+     ```bash
+     python3 -m court.cli collect <quest_id_1>,<quest_id_2> --regate [--standup]
+     ```
+     The fresh convoy is cut from the current `castle` tip, so it integrates only
+     the post-promotion commits the Quest branches still carry.
    - This one command replaces the old manual `audit` → `stamp` → per-Quest `advance ...
      GATE` sequence and prints the exact Gatekeeper dispatch NEXT STEPS for step 3 below.
 
 3. **Summon the Gatekeeper & Execute Unified Integration**:
-- **Gatehouse routing is by convoy size (2026-09-05 re-architecture — the persistent
-      `the-gatehouse/north|south|east|west` named stations are retired).** NEVER use the
-      `agent_manager` tool — it is permission-denied in `kilo.json` for every agent in this
-      project (headless runs hang on it until timeout, and it cannot see CLI-spawned sessions).
-      - **Convoy of 1 Quest**: skip a separate Gatehouse worktree entirely. Run the Gatekeeper
-        directly in that Quest's own existing worktree via Kilo CLI:
-        `kilo run --agent gatekeeper --model "$(python3 -m court.cli model gatekeeper)" --dir <wt> "<gatekeeper review prompt>"` — merge castle in, run the full suite, promote on a
-        clean pass. Nothing to batch, so no reason for a separate integration point.
-      - **Convoy of >1 Quest** (the common case): spawn ONE brand-new ephemeral convoy worktree on
-        branch `the-gatehouse/<cogship_id>` cut from castle's current tip — never an old/idle named
-        station — via Court CLI: `python3 -m court.cli collect <ids> --standup` (cuts the convoy
-        worktree and stands up the Gatekeeper session there via Kilo CLI). Tear the worktree down
-        (Ashes/stop) once promoted; it is scoped to this one convoy only, not meant to persist for reuse.
+   - **Gatehouse routing is by convoy size (2026-09-05 re-architecture — the persistent
+     `the-gatehouse/north|south|east|west` named stations are retired):** all Gatekeeper
+     sessions spawn headless via the Kilo CLI — never via the `agent_manager` tool (retired
+     for orchestration; calls hang and time out).
+     - **Convoy of 1 Quest**: skip a separate Gatehouse worktree entirely. Run the
+       Gatekeeper directly in that Quest's own EXISTING worktree via Kilo CLI:
+       `kilo run --auto --agent gatekeeper --model "$(python3 -m court.cli model gatekeeper)" --dir <wt>`
+       — merge castle in, run the full suite, promote on a clean pass. Nothing to batch, so
+       no reason for a separate integration point.
+     - **Convoy of >1 Quest** (the common case): spawn ONE brand-new ephemeral worktree via
+       `kilo worktree create` on branch `the-gatehouse/<cogship_id>` off castle's current
+       tip — never an old/idle named station — then
+       `kilo run --auto --agent gatekeeper --model "$(python3 -m court.cli model gatekeeper)" --dir <gatehouse_wt>`.
+       Tear the worktree down once promoted; it is scoped to this one convoy only, not meant
+       to persist for reuse.
      - **NEVER** run Gatekeeper as a background task, background process, or on castle.
      - Gatekeeper is a model pinned in `.court/config.json` (`models.gatekeeper`).
      - Allowed to spawn sequential non-background tasks (`background: false`) for integration verification.
@@ -74,16 +89,13 @@ Follow the Collect Protocol (absorbing gate progression):
      status to `READY_TO_RAZE` ("Ready to Raze"), and queues worktrees for **Ashes** (including the
      ephemeral Gatehouse worktree itself, for a size->1 convoy — it does not persist between convoys).
    - Generate the full deployment manifest via `python3 -m court.cli ship --cogship <id>` (or default rollup pillars: Bard, Coffers, Tally, Atone, Murmur).
-- **Teardown is the Steward's job, not the Gatekeeper's own.** The Gatekeeper never stops
-      its own session (same self-stop timing risk as Master of Coin —
-      see `AGENTS.md`). It reports the promoted commit hash(es) back; the Steward runs
-      `python3 -m court.cli fork-teardown-list` to confirm the promotion actually landed
-      on `castle` and get the exact next commands. For an ELIGIBLE convoy, pass the printed
-      `agent_manager` `move` (session into **Ashes**, while it's still alive) then
-      `agent_manager` `stop` sequences to M'Lord verbatim for manual execution in the
-      Agent Manager UI — never the reverse, and never `git worktree remove` (M'Lord prunes
-      the directory by hand). NEVER call the `agent_manager` tool yourself (permission-denied
-      in `kilo.json` for every agent in this project).
+   - **Teardown is the Steward's job, not the Gatekeeper's own.** The Gatekeeper never stops
+     its own session (same self-stop timing risk as Master of Coin — see `AGENTS.md`). It
+     reports the promoted commit hash(es) back; the Steward runs
+     `python3 -m court.cli fork-teardown-list` to confirm the promotion actually landed
+     on `castle` and get the cleanup steps. Session teardown is via Kilo CLI
+     (`kilo session delete <sessionID>`); never `git worktree remove` (M'Lord prunes the
+     directory by hand).
 
 5. **Report to M'Lord (Cog Ship Voyage Report)**:
    - Present the synthesized deployment summary using `status_label()` names:

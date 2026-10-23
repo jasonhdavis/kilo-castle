@@ -23,7 +23,7 @@ Reconstruct Ward state using single-shot deterministic Court status:
 To start a fresh hunting-grounds patrol (rather than just reading the last one):
 1. Cut a patrol worktree on a dedicated branch: `ward/hunting-grounds` or
    `ward/<date>-patrol` (`git worktree add <path> -b <branch>`), then spawn the Warden via
-   the Kilo CLI: `kilo run --agent warden --dir <patrol_wt> "<dispatch prompt>"` — never via
+   the Kilo CLI: `kilo run --auto --agent warden --dir <patrol_wt> "<dispatch prompt>"` — never via
    `agent_manager` (the tool is permission-denied in `kilo.json` for every agent in this project).
 2. Use `.court/templates/warden_dispatch_prompt.md` as the initial prompt, filling in the
    patrol scope.

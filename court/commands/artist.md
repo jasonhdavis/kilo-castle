@@ -25,10 +25,10 @@ Follow the Court Artist Protocol:
 3. **Check or Spawn Dedicated Court Artist Session (single unified path — prompting)**:
    - Agent Manager prompting is RETIRED (2026-09-28): it defaults sessions to `steward` mode, lacks agent parameterization, and its launcher times out (the Q602 studio confusion). Spawn via Kilo CLI:
      ```bash
-     kilo run --agent artist --model "<model>" --dir <worktree> "$(cat <worktree>/.kilo/TASK_ARTIST.md)"
+     kilo run --auto --agent artist --model "<model>" --dir <worktree> "$(cat <worktree>/.kilo/TASK_ARTIST.md)"
      ```
      (the `court artist` command writes the rendered brief to `<worktree>/.kilo/TASK_ARTIST.md` and its `--json` output carries the same argv list under `spawn`), or interactive: `cd <worktree> && kilo` (default_agent already `artist`).
-   - Reuse first: if `artist_session_id` is already recorded on the Quest, resume that session (e.g. `kilo run --agent artist --session <artist_session_id> --dir <worktree> "<directive>"` if supported, or work interactively in the same worktree session) instead of spawning a duplicate.
+   - Reuse first: if `artist_session_id` is already recorded on the Quest, resume that session (e.g. `kilo run --auto --agent artist --session <artist_session_id> --dir <worktree> "<directive>"` if supported, or work interactively in the same worktree session) instead of spawning a duplicate.
    - Record the session ID on the Quest:
      ```bash
      python3 -m court.cli set-field <quest_id> artist_session_id <session_id>

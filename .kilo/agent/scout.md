@@ -18,6 +18,7 @@ You are figuring out what is possible so M'Lord and the Steward can design the p
 - **Throwaway Scratch Scripts**: Put all experimental code, API harnesses, and data dumps into `tasks/artifacts/` or scratch commands.
 - **Read-Only Inspection**: Use read-only database connections or mock data.
 - **Non-Merging Branch**: This `scout/*` branch is exploratory and will NEVER be auto-merged wholesale into staging/production. Your code will be refined into clean production Quests.
+- **CHUNKED LARGE-FILE WRITES (mandatory)**: never emit one enormous file write. For any new file that will exceed roughly 200 lines — or any full rewrite of an existing large file — write a small skeleton first, then extend it with successive edits/appends of ~100–150 lines each. One giant single write aborts mid-stream on this worker and loses the work; chunking is a hard requirement, not a style preference.
 
 ## Mandatory 5-Part Scout Report
 

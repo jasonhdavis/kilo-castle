@@ -11,7 +11,7 @@ Arguments: $ARGUMENTS
      ```bash
      python3 -m court.cli goad <id>
      ```
-   - This directly invokes Kilo CLI (`kilo run --agent serf --dir <wt>`) with `.court/templates/goad_prompt.md`, pinning `--agent serf` with GLM 5.3 Flash, logging to `.kilo/serf.log`, and updating the Quest's `serf_session_id`.
+   - This directly invokes Kilo CLI (`kilo run --auto --agent serf --dir <wt>`) with `.court/templates/goad_prompt.md`, pinning `--agent serf` with GLM 5.3 Flash, logging to `.kilo/serf.log`, and updating the Quest's `serf_session_id`.
    - Bypasses Agent Manager UI to prevent the server-context `steward` inheritance bug.
    - To continue an existing live session by its ID, use the Kilo CLI continuation:
       `kilo run --session <ses_id> --dir <wt> --agent serf "<prompt>"`. Otherwise, `court goad <id>` is the canonical path.

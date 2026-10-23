@@ -31,7 +31,7 @@ Follow the Combined Studio Protocol (Q-2 — the deterministic formalization of 
 3. **Spawn the Court Artist Session (single unified path — prompting)**:
    - Agent Manager prompting is RETIRED (2026-09-28): it defaults sessions to `steward` mode, lacks agent parameterization, and its launcher times out. Spawn via Kilo CLI instead:
      ```bash
-     kilo run --agent artist --model "$(python3 -m court.cli model artist)" --dir .kilo/worktrees/artist-studio-<ids> "$(cat .kilo/worktrees/artist-studio-<ids>/.kilo/TASK_ARTIST.md)"
+     kilo run --auto --agent artist --model "$(python3 -m court.cli model artist)" --dir .kilo/worktrees/artist-studio-<ids> "$(cat .kilo/worktrees/artist-studio-<ids>/.kilo/TASK_ARTIST.md)"
      ```
      or pass `--standup` to the studio command to spawn + record in one shot, or `cd .kilo/worktrees/artist-studio-<ids> && kilo` (default_agent already `artist`).
    - Record the session on every studio Quest:

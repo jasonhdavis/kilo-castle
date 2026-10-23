@@ -24,7 +24,7 @@ Follow the Royal UI Atelier Protocol:
 3. **Spawn the Court Artist Session in the Convoy Worktree (single unified path — prompting)**:
    - Agent Manager prompting is RETIRED (2026-09-28). Spawn via Kilo CLI bound to the convoy branch `the-gatehouse/<cogship_id>` (the command writes the rendered brief to `.kilo/worktrees/the-gatehouse-<cogship_id>/.kilo/TASK_ARTIST.md`; its `--json` output carries the same argv list under `spawn`):
      ```bash
-     kilo run --agent artist --model "$(python3 -m court.cli model artist)" --dir .kilo/worktrees/the-gatehouse-<cogship_id> "$(cat .kilo/worktrees/the-gatehouse-<cogship_id>/.kilo/TASK_ARTIST.md)"
+     kilo run --auto --agent artist --model "$(python3 -m court.cli model artist)" --dir .kilo/worktrees/the-gatehouse-<cogship_id> "$(cat .kilo/worktrees/the-gatehouse-<cogship_id>/.kilo/TASK_ARTIST.md)"
      ```
      or `cd .kilo/worktrees/the-gatehouse-<cogship_id> && kilo`, where `default_agent` is already `artist`.
    - Record the session on each packed quest:

@@ -34,7 +34,7 @@ size > 1) — see `gatekeeper_review_prompt.md`.)
    ```
 
 3. **Dispatch a Fresh Serf Session in the SAME Worktree**:
-   - Via Kilo CLI — `court goad <id>` for an idle session, or `kilo run --agent serf --model "$(python3 -m court.cli model serf)" --dir <wt>` for a fresh one —
+   - Via Kilo CLI — `court goad <id>` for an idle session, or `kilo run --auto --agent serf --model "$(python3 -m court.cli model serf)" --dir <wt>` for a fresh one —
      with `.court/templates/serf_remediation_prompt.md`,
      filled with the exact failing command, traceback, and required fixes.
    - Model: the standard Serf model (`z-ai/glm-5.3-flash`); this is mechanical repair work.

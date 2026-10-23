@@ -99,7 +99,7 @@ of current state), reconstruct reality from disk + live tool state:
 - Never run test suites yourself as the Steward. All test suite execution belongs to the
   `gatehouse` layer (ephemeral Gatekeeper convoy sessions) and worktree Serfs.
 - Never run Gatekeeper as a background task or subagent on `castle`.
-- Use `court dispatch <id> --standup` (or `kilo worktree create` + `kilo run --agent serf`) to stand up Serf sessions with pure task instructions.
+- Use `court dispatch <id> --standup` (or `kilo worktree create` + `kilo run --auto --agent serf`) to stand up Serf sessions with pure task instructions.
 - Do not poll on a timer. State is pulled on-demand.
 
 ## The Quest Lifecycle

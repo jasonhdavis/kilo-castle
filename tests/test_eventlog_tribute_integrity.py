@@ -12,7 +12,7 @@ import pytest
 
 from court import eventlog, store
 from court.cli import main
-from court.models import Quest, DEFAULT_BODY_SECTIONS
+from court.models import Quest
 
 
 TRIBUTE_MD = """---
@@ -59,16 +59,47 @@ def test_from_markdown_keeps_tribute_parts_inline():
 
 
 def test_from_markdown_still_preserves_custom_sections():
-    md = TRIBUTE_MD.replace(
-        "## Penance\n\nConfidence 9/10.",
-        "## Royal Addendum\n\nExtra royal ruling.\n\n## Penance\n\nConfidence 9/10.",
+    # A genuine top-level custom section (Royal Addendum lives after the last
+    # canonical section in real charters) survives as its own section.
+    md = TRIBUTE_MD + "\n## Cogship Log\n\n## Royal Addendum\n\nExtra royal ruling.\n"
+    quest = Quest.from_markdown(md)
+    assert "Extra royal ruling." in quest.body_sections["Royal Addendum"]
+    assert "## Ballad" in quest.body_sections["Tribute Rendered"]
+    # Nothing is lost across a load→save cycle.
+    reparsed = Quest.from_markdown(quest.to_markdown())
+    assert reparsed.body_sections["Royal Addendum"].strip() == "Extra royal ruling."
+
+
+def test_custom_heading_inside_freetext_section_is_content():
+    """A `## ` heading nested inside a free-text canonical section is CONTENT.
+
+    This is the 2026-10-22 `court dispatch` body-stripping defect: a charter
+    goal (`--goal`/`--notes`) whose body carried `## Purpose`/`## Scope`
+    sub-headings was split into separate top-level sections; the next
+    load→save re-parsed the rendered file, saw The Kingdom Requires as empty,
+    and blanked the canonical section on disk — silently deleting the goal and
+    M'Lord's notes (pb-app Q877/Q878/Q879/Q888).
+    """
+    md = (
+        "---\nid: Q001-Core-Freetext\ntitle: Free Text\nstatus: PLANNED\n---\n\n"
+        "# Q001-Core-Freetext — Free Text\n\n"
+        "## The Kingdom Requires\n\n"
+        "Goal paragraph.\n\n"
+        "## Purpose\n\n"
+        "Why this exists.\n\n"
+        "## Scope\n\n"
+        "- in scope\n\n"
+        "M'Lord's Charter Notes: keep this line.\n\n"
+        "## Expected Tribute\n\n- [ ] item\n"
     )
     quest = Quest.from_markdown(md)
-    assert quest.body_sections.get("Royal Addendum", "").strip() == "Extra royal ruling."
-    # Outside Tribute Rendered, a part-named header keeps its historical
-    # boundary behavior: "## Penance" becomes its own section again.
-    assert quest.body_sections.get("Penance", "").strip() == "Confidence 9/10."
-    assert "## Ballad" in quest.body_sections["Tribute Rendered"]
+    goal = quest.body_sections["The Kingdom Requires"]
+    assert "## Purpose" in goal and "## Scope" in goal
+    assert "M'Lord's Charter Notes: keep this line." in goal
+    assert "Purpose" not in quest.body_sections and "Scope" not in quest.body_sections
+    # Byte-identical through a load→save→load cycle.
+    reparsed = Quest.from_markdown(quest.to_markdown())
+    assert reparsed.body_sections["The Kingdom Requires"] == goal
 
 
 def test_to_markdown_never_renders_tribute_part_keys():
@@ -81,13 +112,29 @@ def test_to_markdown_never_renders_tribute_part_keys():
     assert "misfiled content" not in rendered
 
 
-def test_build_events_never_emits_noncanonical_sections():
+def test_build_events_never_emits_tribute_part_keys():
     quest = _make_quest()
     quest.body_sections["Ballad"] = "misfiled content"
     events = eventlog.build_events_for_save(quest, None, "2026-09-30T01:10:00Z")
-    for ev in events:
-        if ev["target"].startswith("section:"):
-            assert ev["target"].removeprefix("section:") in DEFAULT_BODY_SECTIONS
+    targets = {ev["target"].removeprefix("section:") for ev in events if ev["target"].startswith("section:")}
+    assert "Ballad" not in targets
+    assert {"Tribute Rendered", "The Kingdom Requires"} <= targets
+
+
+def test_build_events_persists_custom_sections():
+    """Genuine custom sections (Royal Addendum, Context) must survive the fold.
+
+    Dropping them was itself a silent charter-body-stripping defect: a Steward
+    addendum written with `set-section "Royal Addendum"` was never re-emitted,
+    so the next load lost it.
+    """
+    quest = _make_quest()
+    quest.set_section("Royal Addendum", "Extra royal ruling.")
+    events = eventlog.build_events_for_save(quest, None, "2026-10-22T01:10:00Z")
+    assert any(
+        ev["target"] == "section:Royal Addendum" and ev["value"] == "Extra royal ruling."
+        for ev in events
+    )
 
 
 def test_build_events_refuses_accidental_section_wipe():
@@ -133,6 +180,46 @@ def _poison_events(quest_id, court_dir, quest_title="Blind Fixture"):
         fh.write(json.dumps({"ts": "2026-09-30T00:41:50Z", "target": "section:Ballad", "value": "Ballad body"}) + "\n")
         fh.write(json.dumps({"ts": "2026-09-30T00:41:50Z", "target": "section:Tribute", "value": "Tribute body"}) + "\n")
         fh.write(json.dumps({"ts": "2026-09-30T00:41:50Z", "target": "section:Penance", "value": "Penance body"}) + "\n")
+
+
+def test_charter_goal_with_subheadings_survives_dispatch_save_cycle(tmp_path, monkeypatch, capsys):
+    """court new --goal (body carrying `## Purpose`/`## Scope`) → a dispatch-style
+    load→mutate→save must NOT blank The Kingdom Requires.
+
+    Reproduces the 2026-10-22 pb-app body-stripping defect: the goal was split
+    into top-level sections by the parser, then the next save re-parsed the
+    rendered file, saw The Kingdom Requires as empty, and deleted the goal body
+    and M'Lord's notes from disk (Q877/Q878/Q879/Q888)."""
+    _init_git_repo(tmp_path, branch="castle")
+    monkeypatch.setenv("COURT_DIR", str(tmp_path / ".court"))
+    monkeypatch.chdir(tmp_path)
+    main(["init"])
+    capsys.readouterr()
+
+    goal = (
+        "Goal paragraph.\n\n"
+        "## Purpose\n\nWhy this exists.\n\n"
+        "## Scope\n\n- in scope\n\n"
+        "M'Lord's Charter Notes: keep this line."
+    )
+    main(["new", "--app", "core", "--concern", "freetext", "--title", "Free Text", "--goal", goal])
+    capsys.readouterr()
+
+    quest = store.load("Q001-Core-Freetext")
+    body = quest.body_sections["The Kingdom Requires"]
+    assert "## Purpose" in body and "## Scope" in body
+    assert "M'Lord's Charter Notes: keep this line." in body
+    assert "Purpose" not in quest.body_sections and "Scope" not in quest.body_sections
+
+    # A dispatch-style cycle: load, mutate frontmatter, save.
+    quest.branch = "quest/q001-core-freetext"
+    store.save(quest, commit_msg="dispatch sim")
+    reloaded = store.load("Q001-Core-Freetext")
+    assert reloaded.body_sections["The Kingdom Requires"] == body
+
+    rendered = (tmp_path / ".court" / "quests" / "Q001-Core-Freetext.md").read_text(encoding="utf-8")
+    assert "## Purpose" in rendered
+    assert "M'Lord's Charter Notes: keep this line." in rendered
 
 
 def test_events_repair_restores_blind_tribute(tmp_path, monkeypatch, capsys):

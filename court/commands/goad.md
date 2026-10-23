@@ -11,7 +11,7 @@ Arguments: $ARGUMENTS
      ```bash
      python3 -m court.cli goad <id>
      ```
-   - This directly invokes Kilo CLI (`kilo run --agent serf --dir <wt>`) with `.court/templates/goad_prompt.md`, pinning `--agent serf` with GLM 5.3 Flash, logging to `.kilo/serf.log`, and updating the Quest's `serf_session_id`.
+   - This directly invokes Kilo CLI (`kilo run --auto --agent serf --dir <wt>`) with `.court/templates/goad_prompt.md`, pinning `--agent serf` with GLM 5.3 Flash, logging to `.kilo/serf.log`, and updating the Quest's `serf_session_id`.
    - Runs headless via the Kilo CLI — no Agent Manager involved.
    - `court goad <id>` is the ONLY path. Do not attempt to prompt existing sessions through the `agent_manager` tool.
 4. **Verify the goad actually landed** before reporting anything to M'Lord: re-run `kilo session list` and confirm a live session exists for the Quest's worktree, or re-run `court show <id>` after the session responds and confirm either `# Tribute Rendered` is now filled in + `status: TRIBUTE_READY`, or the task checklist moved forward. A goad that produced no visible session and no ledger change did not happen — do not log success for it.

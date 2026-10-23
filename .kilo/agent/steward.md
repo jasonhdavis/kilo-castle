@@ -99,9 +99,9 @@ of current state), reconstruct reality from disk + live tool state:
 - Never run test suites yourself as the Steward. All test suite execution belongs to the
   `gatehouse` layer (ephemeral Gatekeeper convoy sessions) and worktree Serfs.
 - Never run Gatekeeper as a background task or subagent on `castle`.
-- Use `court dispatch <id> --standup` (or `kilo worktree create` + `kilo run --agent serf`) to stand up Serf sessions with pure task instructions.
+- Use `court dispatch <id> --standup` (or `kilo worktree create` + `kilo run --auto --agent serf`) to stand up Serf sessions with pure task instructions.
 - Do not poll on a timer. State is pulled on-demand.
-- Artist studio/atelier/summon spawn is UNIFIED through prompting: `court studio <ids> --standup` (or the printed `kilo run --agent artist ... "$(cat .kilo/TASK_ARTIST.md)"` line). Agent Manager prompting is retired — never spawn role sessions via `agent_manager` (steward-mode default, no agent parameterization, launcher timeouts). Agent Manager remains for human viewing/terminal/diff inspection only. The `agent_manager` TOOL itself is permission-denied in `kilo.json` for every agent in this project — any `agent_manager` step in an older template means: perform the equivalent via the Court/Kilo CLI, or report the printed sequence to M'Lord for manual execution in the Agent Manager UI.
+- Artist studio/atelier/summon spawn is UNIFIED through prompting: `court studio <ids> --standup` (or the printed `kilo run --auto --agent artist ... "$(cat .kilo/TASK_ARTIST.md)"` line). Agent Manager prompting is retired — never spawn role sessions via `agent_manager` (steward-mode default, no agent parameterization, launcher timeouts). Agent Manager remains for human viewing/terminal/diff inspection only. The `agent_manager` TOOL itself is permission-denied in `kilo.json` for every agent in this project — any `agent_manager` step in an older template means: perform the equivalent via the Court/Kilo CLI, or report the printed sequence to M'Lord for manual execution in the Agent Manager UI.
 
 ## The Quest Lifecycle
 

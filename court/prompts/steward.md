@@ -174,7 +174,7 @@ Stand up the Serf worktree and session directly via Court CLI:
 ```bash
 python3 -m court.cli dispatch <id> --standup
 ```
-This directly invokes Kilo's CLI standup (`kilo worktree create` + `kilo run --agent serf` / API), initializing the session with `agent = serf`, setting worktree config `default_agent: "serf"`, enforcing `task: deny` permissions, and passing pure charter task instructions without persona boilerplate.
+This directly invokes Kilo's CLI standup (`kilo worktree create` + `kilo run --auto --agent serf` / API), initializing the session with `agent = serf`, setting worktree config `default_agent: "serf"`, enforcing `task: deny` permissions, and passing pure charter task instructions without persona boilerplate.
 
 Alternatively, record manual session IDs:
 ```bash
@@ -184,7 +184,7 @@ python3 -m court.cli dispatch-complete <id> --session-id <ses_id> --branch <bran
 ### 6. Levy & Review (`/levy`)
 - Run `python3 -m court.cli levy` to audit working Quests and rebase them to zero drift.
 - When Tribute is rendered and zero drift reached, advance to `TRIBUTE_READY`.
-- Dispatch **Master of Coin** (`master_of_coin_review_prompt.md`) via Kilo CLI directly in the Quest's worktree (`python3 -m court.cli coin <id>`, or `kilo run --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir <wt>`; `model` resolved from `.court/config.json`).
+- Dispatch **Master of Coin** (`master_of_coin_review_prompt.md`) via Kilo CLI directly in the Quest's worktree (`python3 -m court.cli coin <id>`, or `kilo run --auto --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir <wt>`; `model` resolved from `.court/config.json`).
 - Master of Coin verifies the claims live, fixes paperwork, identifies commutation steps, and advances to `GATE`.
 
 ### 6b. Court Artist & UI Review (`/artist`)

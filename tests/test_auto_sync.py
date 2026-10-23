@@ -55,6 +55,7 @@ def _fake_run(returncode=0, stdout="Ledger sync: 3 synced, 0 united", stderr="")
 
 def test_auto_sync_cycle_sweeps_every_ledger_root(monkeypatch):
     monkeypatch.setattr(u, "_ledger_repo_roots", lambda: ["/r/a", "/r/b"])
+    monkeypatch.setattr(u, "_auto_sync_base_ok", lambda root, base="castle": True)
     fake = _fake_run()
     monkeypatch.setattr(u.subprocess, "run", fake)
 
@@ -68,8 +69,23 @@ def test_auto_sync_cycle_sweeps_every_ledger_root(monkeypatch):
     assert [c["cwd"] for c in fake.calls] == ["/r/a", "/r/b"]
 
 
+def test_auto_sync_cycle_skips_root_without_base_branch(monkeypatch):
+    monkeypatch.setattr(u, "_ledger_repo_roots", lambda: ["/r/a", "/r/b"])
+    monkeypatch.setattr(u, "_auto_sync_base_ok",
+                        lambda root, base="castle": root != "/r/b")
+    fake = _fake_run()
+    monkeypatch.setattr(u.subprocess, "run", fake)
+
+    results = u._auto_sync_cycle()
+
+    assert [r["ok"] for r in results] == [True, True]
+    assert "skipped" in results[1]["summary"]
+    assert [c["cwd"] for c in fake.calls] == ["/r/a"]  # /r/b never synced
+
+
 def test_auto_sync_cycle_reports_failure_without_raising(monkeypatch):
     monkeypatch.setattr(u, "_ledger_repo_roots", lambda: ["/r/a"])
+    monkeypatch.setattr(u, "_auto_sync_base_ok", lambda root, base="castle": True)
     monkeypatch.setattr(u.subprocess, "run",
                         _fake_run(returncode=1, stdout="", stderr="boom"))
     results = u._auto_sync_cycle()
@@ -78,6 +94,7 @@ def test_auto_sync_cycle_reports_failure_without_raising(monkeypatch):
 
 def test_auto_sync_cycle_clears_state_caches(monkeypatch):
     monkeypatch.setattr(u, "_ledger_repo_roots", lambda: [])
+    monkeypatch.setattr(u, "_auto_sync_base_ok", lambda root, base="castle": True)
     monkeypatch.setattr(u.subprocess, "run", _fake_run())
     u._QUESTS_CACHE["/r/a"] = (1.0, [])
     u._WT_CACHE["/r/a"] = (1.0, [])

@@ -2669,10 +2669,28 @@ def _invalidate_state_caches():
         cache.clear()
 
 
+def _auto_sync_base_ok(root, base="castle"):
+    """`court sync --all` is only meaningful where its base branch exists: with
+    a missing base the merge-base is unknowable and every quest degrades to
+    the union-merge path. Guard the sweep so a repo on a different trunk
+    (e.g. kilo-castle's `main`) is left alone."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--verify", "--quiet", base],
+            capture_output=True, text=True, timeout=15)
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except Exception:
+        return False
+
+
 def _auto_sync_cycle():
     """One classified `court sync --all` sweep across every ledger checkout."""
     results = []
     for root in _ledger_repo_roots():
+        if not _auto_sync_base_ok(root):
+            results.append({"root": root, "ok": True,
+                            "summary": "skipped: no `castle` base branch"})
+            continue
         try:
             r = subprocess.run(
                 [sys.executable, "-m", "court.cli", "sync", "--all"],

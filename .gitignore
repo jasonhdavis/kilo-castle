@@ -49,3 +49,7 @@ htmlcov/
 # durable paperwork lives in .court/quests/.
 .kilo/TASK*.md
 .court/archive/
+
+# Local runtime logs and config backups (machine-local, never publish)
+.kilo/*.log
+.court/*.bak

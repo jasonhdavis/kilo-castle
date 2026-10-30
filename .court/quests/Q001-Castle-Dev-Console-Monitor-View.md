@@ -16,7 +16,7 @@ pillory_of:
 pilloried_by: 
 scout_of: 
 branch: quest/q001-castle-dev-console-monitor-view
-worktree: /Users/scrummage/Python/kilo-castle/.kilo/worktrees/quest-q001-castle-dev-console-monitor-view
+worktree: /Users/user/Python/kilo-castle/.kilo/worktrees/quest-q001-castle-dev-console-monitor-view
 serf_session_id: kilo-serf-94923
 serf_model: openrouter/z-ai/glm-5.3-flash
 master_of_coin_session_id: 

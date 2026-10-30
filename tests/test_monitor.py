@@ -64,6 +64,32 @@ def test_start_run_queues_then_dispatches_when_lease_frees(monkeypatch):
     assert any("dispatch" in t and "queued message" in t for t in texts)
 
 
+def test_start_run_dashed_prompt_uses_end_of_options(monkeypatch):
+    """A console message beginning with a dash (e.g. '--skip-ui-review') must
+    be passed after `--` so kilo's argument parser treats it as the positional
+    message. Passed bare, yargs reads it as an unknown flag, prints its usage
+    banner, and exits 1 — surfaced to the operator as
+    "agent exited before responding: … [boolean] [default: false]"."""
+    _stub_engine(monkeypatch)
+    monkeypatch.setattr(lease_mod, "read_lease", lambda *a, **k: None)
+    monkeypatch.setattr(lease_mod, "claim", lambda *a, **k: (True, "claimed", None))
+    popen = _mock_popen(monkeypatch)
+
+    msg = "--skip-ui-review on Q929 and Q955"
+    u._start_run(_park_job(), "/tmp/wt", "steward", msg, None, "test/model")
+
+    cmd = popen.call_args[0][0]
+    assert "--" in cmd, "option parsing must be terminated before the message"
+    assert cmd[cmd.index("--") + 1] == msg
+    assert cmd[-1] == msg, "the message must be the final positional"
+    assert cmd.index("--") > cmd.index("--format"), "flags must precede the separator"
+    # the dash-prefixed message head also becomes the title; a bare
+    # `--title <value>` would let yargs read the value as an unknown flag and
+    # exit 1, so the inline `--title=<value>` form is required.
+    assert "--title" not in cmd, "title must use the inline --title=<value> form"
+    assert any(t.startswith("--title=") for t in cmd)
+
+
 def test_start_run_cancel_while_parked_never_dispatches(monkeypatch):
     _stub_engine(monkeypatch)
     monkeypatch.setattr(

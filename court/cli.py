@@ -766,7 +766,9 @@ def standup_kilo_session(
                     "--dir", str(worktree_path),
                     "--title", title,
                     "--auto",
-                    prompt,
+                    # `--` ends option parsing so the task prompt is delivered
+                    # as a positional even if it begins with a dash.
+                    "--", prompt,
                 ]
                 proc = subprocess.Popen(
                     cmd,
@@ -3235,7 +3237,7 @@ def cmd_coin(args):
         "--dir", str(wt),
         "--title", title,
         "--auto",
-        rendered_prompt,
+        "--", rendered_prompt,
     ]
 
     auto_commit = not getattr(args, "no_commit", False)
@@ -3407,7 +3409,7 @@ def cmd_goad(args):
         "--dir", str(wt),
         "--title", title,
         "--auto",
-        rendered_prompt,
+        "--", rendered_prompt,
     ]
 
     auto_commit = not getattr(args, "no_commit", False)
@@ -3822,12 +3824,15 @@ def cmd_watch(args):
             "--agent", role,
             "--dir", str(wt or Path.cwd()),
             "--auto",
-            continuation,
         ]
         if target_session and not fresh_fallback:
             cmd += ["--session", target_session]
         if args.model:
             cmd += ["--model", args.model]
+        # `--` ends option parsing so the continuation is always delivered as a
+        # positional even if it begins with a dash; every flag must precede it
+        # (yargs otherwise prints its usage banner and exits 1).
+        cmd += ["--", continuation]
         log_file = (wt or Path.cwd()) / ".kilo" / f"{role}.log"
         (wt or Path.cwd()).mkdir(parents=True, exist_ok=True)
         with open(log_file, "a", encoding="utf-8") as f:
@@ -3961,7 +3966,10 @@ def cmd_artist_say(args):
         "--agent", "artist",
         "--session", session_id,
         "--model", qual_model,
-        args.instruction,
+        # `--` ends option parsing so an instruction beginning with a dash
+        # (e.g. "--make the nav sticky") is delivered as a positional message
+        # rather than parsed as an unknown flag.
+        "--", args.instruction,
     ]
     print(f"🎨 Delivering instruction to Court Artist session {session_id} ({quest.id}, model {qual_model})…")
     result = subprocess.run(cmd, env=_engine_spawn_env(wt))

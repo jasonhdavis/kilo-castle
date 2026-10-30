@@ -862,3 +862,57 @@ every subsequent navigation/new document hits the deferred path → dead.
   here. Suite green (233). Console serving it: pid 17897 (kilo-wrapper owned,
   took :8300 in a bind race with the session's own restart — the session's
   persistent instance lost the race and is stopped; console healthy).
+
+## 2026-10-26 03:2xZ — Console "agent exited before responding: … [boolean] [default: false]" = dashed message misparsed as a CLI flag
+
+- **Symptom**: console turns exit 1 with `agent exited before responding:` whose
+  tail is yargs' help banner last line (`[boolean] [default: false]`); the turn
+  never connects and no session is created.
+- **Root cause**: `court/ui_server.py::_start_run` appends the operator message
+  as a *bare positional* to `kilo run`. A message beginning with `-` is parsed
+  by kilo's yargs as an unknown option → the CLI prints its full usage banner to
+  stdout and exits 1. The console reader's `raw_tail` captured only the banner's
+  final line, which is exactly `[boolean] [default: false]`. Confirmed from the
+  console journal: every failing turn's `prompt_head` began with a dash
+  (`--skip-ui-review`, `--skip-ui-review on Q929 and Q955`); the last exit-0 turn
+  was plain prose.
+- **Fix**: terminate option parsing with `--` before the message
+  (`cmd += ["--", prompt[:20000]]`). Same hardening applied to every other spawn
+  site that passes prompt text as a positional where a leading dash could leak:
+  `court/cli.py` standup, goad, coin, the watchdog continuation (flags moved
+  *before* the separator), and the `court artist` instruction path.
+- **Verified**: negative control reproduces exit 1 + usage banner; the `--` form
+  parses cleanly and runs. Regression test
+  `tests/test_monitor.py::test_start_run_dashed_prompt_uses_end_of_options`.
+  Full unit suite: **410 passed**.
+- **Applied to BOTH** the castle trunk (`court/`) and pb-app's vendored engine
+  (`pb-app/.court/engine/`), which is where the live console runs. pb-app console
+  (port 8300) restarted to load the fix: old pid 93460 → `bgp_176399f4c001SI8HVVAaX43aCG`
+  (pid 45744); `/api/state` 200.
+
+### 2026-10-26 03:4xZ — same error persisted; SECOND cause: dash-prefixed `--title` value
+
+The positional `--` fix was necessary but **not sufficient**. After the restart the
+same `--skip-ui-review` sends still failed (journal 03:39:26Z, 03:40:08Z, exit 1,
+identical banner tail). The console *also* passes the message head as the session
+title:
+
+```
+--title  prompt.strip()[:60]   →   --title  --skip-ui-review
+```
+
+A value beginning with `--` is read by yargs as a **new flag**, not the value of
+`--title`, so the unknown-option banner fires regardless of the positional fix.
+Verified against the live binary: bare `--title --skip-ui-review` → banner/exit 1;
+inline `--title=--skip-ui-review` → parses and runs.
+
+**Fix**: build the title inline — `f"--title={title}"` — in both `court/ui_server.py`
+and pb-app's vendored copy. Regression test now also asserts no bare `--title`
+token and an inline `--title=` is present. Full suite: **410 passed**.
+pb-app console restarted again: `bgp_1764da80f001Kxdp2LwjKfabwA` (pid 15405/15607);
+`/api/state` + `/api/settings` 200.
+
+**End-to-end confirmation** (live console `POST /api/send`, dash-prefixed prompt
+`--smoke-test-only: …`): `agent connected - streaming`, session
+`ses_e89b08aa6ffe13uI2XOMrKjNGa`, `turn process exited (0)`. Both causes are now
+closed; the console dispatches dashed messages normally.

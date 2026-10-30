@@ -43,7 +43,7 @@ COURT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KILO_DB = os.path.expanduser("~/.local/share/kilo/kilo.db")
 CHILD_PATTERNS = ("mcp", "npx", "npm", "chromium", "chrome", "pytest", "playwright")
 MCP_GLOBAL = os.path.expanduser("~/.config/kilo/kilo.jsonc")
-MCP_PB_APP = "/Users/scrummage/Python/pb-app"
+MCP_PB_APP = os.path.expanduser("~/Python/pb-app")
 MCP_RUNNERS = {"npx", "npm", "node", "uvx", "uv", "pipx", "bun", "bunx", "docker",
                "python", "python3", "exec", "run", "x", "start", "install", "i"}
 MCP_FLAG_VALUES = {"-e", "-v", "-w", "--env", "--volume", "--workdir"}
@@ -776,8 +776,13 @@ window.addEventListener('popstate',()=>{
  renderNav();renderSessionsBar();renderTranscript();syncComposer();syncSessMeta();syncMarkRead();syncEaselChip();syncBrowserBtn();
 });
 
- async function poll(){
- try{S=await (await fetch('/api/state')).json();DS_CACHE=null;}catch(e){return;}
+ let __lastTxt=null;
+ async function __poll(gate){
+ let __txt;
+ try{__txt=await (await fetch('/api/state')).text();}catch(e){return;}
+ if(gate&&__txt===__lastTxt){syncAutoBadge();return;}
+ __lastTxt=__txt;
+ try{S=JSON.parse(__txt);DS_CACHE=null;}catch(e){return;}
  syncAutoBadge();
  if(!selRepo&&S.repos.length){
   selRepo=(S.repos.find(r=>r.key==='app')||S.repos[0]).key;
@@ -793,8 +798,9 @@ window.addEventListener('popstate',()=>{
    syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();syncMarkRead();
   if(view==='board'){
     const key=boardApp+'|'+(S.quests||[]).map(q=>q.id+q.status+(q.dirty?'d':'')+(q.app||'')+(q.cogship_id||'')+(q.moc_live?'m':'')+(q.cogship_live?'g':'')).join(',');
-   if(key!==boardKey){boardKey=key;renderBoard();}}
-}
+    if(key!==boardKey){boardKey=key;renderBoard();}}
+ }
+ async function poll(){return __poll(false);}
  // Per-directory turn state, from three observable signals — process
  // liveness (S.active), last emission (session time_updated), and the newest
  // session's message tail (S.tails: assistant `finish` is the deterministic
@@ -1069,7 +1075,7 @@ $('sessmenu').addEventListener('click',e=>{
 document.addEventListener('click',e=>{
  if(!e.target.closest('#sessmenu')&&!e.target.closest('#sess_burger'))closeSessMenu();});
 function newSess(){selSess=null;msgs=[];curLane='L'+(++LANESEQ);
- $('c_cont').innerHTML='new session in <b>'+esc(selWt?selWt.replace('/Users/scrummage/Python/',''):'?')+'</b> <span class="dim">— agent replies as a fresh session</span>';
+ $('c_cont').innerHTML='new session in <b>'+esc(selWt?selWt.replace(__HOME_PREFIX__,''):'?')+'</b> <span class="dim">— agent replies as a fresh session</span>';
  renderSessionsBar();renderTranscript();syncHash(true);syncComposer();syncSessMeta();syncMarkRead();}
 let sessOpenSeq=0;
 async function openSess(id){
@@ -2316,10 +2322,16 @@ $('c_model').addEventListener('change',()=>{
 }catch(e){}})();
 const bootHi=$('boot_hi');if(bootHi)bootHi.textContent=greet();
 const bootGl=$('boot_glyph');if(bootGl)bootGl.innerHTML=ROOK;
-poll();setInterval(poll,5000);
+let __pollTimer=null,__pollTick=0;
+function __armPoll(){if(__pollTimer)clearInterval(__pollTimer);
+ const iv=document.hidden?60000:10000;
+ __pollTimer=setInterval(()=>{__pollTick++;__poll(__pollTick%6!==0);},iv);}
+document.addEventListener('visibilitychange',()=>{__armPoll();if(!document.hidden)poll();});
+poll();__armPoll();
 </script></body></html>
 """
 PAGE = PAGE.replace("__STATUS_ORDER__", json.dumps(STATUS_ORDER))
+PAGE = PAGE.replace("__HOME_PREFIX__", json.dumps(os.path.expanduser("~/Python") + os.sep))
 
 
 _DIRTY_CACHE = {}
@@ -4359,6 +4371,12 @@ _SETTINGS_LOCK = threading.Lock()
 _ROLE_MODEL_RE = re.compile(r"^[\w.~@/-]{1,120}$")
 _ALIAS_NAME_RE = re.compile(r"^[\w .-]{1,60}$")
 
+# One-line command fields (suite.command, harness.command, studio.freshness_command).
+# Real unified suite commands are long — env pins plus an explicit test-target list
+# routinely run past 1000 chars (pb-app's is ~1.5k) — so the cap is generous and
+# exists only to bound accidental paste-bombs, not to police legitimate commands.
+_CMD_MAX_LEN = 4000
+
 
 def _settings_write(payload):
     """Merge validated settings into .court/config.json (atomic, .bak kept).
@@ -4426,7 +4444,7 @@ def _settings_write(payload):
             if not isinstance(value, str):
                 return False
             value = "".join(c for c in value.strip() if c >= " " or c == "\t")
-            if len(value) > 500:
+            if len(value) > _CMD_MAX_LEN:
                 return False
             blk = cfg.get(section)
             blk = dict(blk) if isinstance(blk, dict) else {}
@@ -4549,7 +4567,7 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
     job["sess"] = session_id
     job["events"].append({"type": "status", "text": (
         f"spawning agent - {agent} - {mode} - "
-        f"{directory.replace('/Users/scrummage/Python/', '')}")})
+        f"{directory.replace(os.path.expanduser('~/Python') + os.sep, '')}")})
     # Worker lease (Q799 stack class): the console must never stack a second
     # writer onto a DISPATCHED worker's worktree (dispatch / goad / watchdog
     # continuation). It must NOT, however, serialize console conversations —
@@ -4610,9 +4628,14 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
                 )
         job["events"].append({"type": "status",
                               "text": "lease free — dispatching queued message now"})
+    # A bare `--title <value>` breaks when the value itself begins with a dash
+    # (the message head is the title, so a prompt like "--skip-ui-review" does):
+    # yargs reads the value as a new flag and exits on the unknown option. The
+    # inline `--title=<value>` form keeps the value in one token.
+    title = prompt.strip()[:60] or "console turn"
     cmd = [_kilo_bin(), "run", "--dir", directory, "--agent", agent,
            "--format", "json", "--thinking", "--auto",
-           "--title", prompt.strip()[:60] or "console turn"]
+           f"--title={title}"]
     if session_id:
         cmd += ["--session", session_id]
     if model:
@@ -4623,7 +4646,12 @@ def _start_run(job, directory, agent, prompt, session_id, model=""):
         role = agent if agent in KNOWN_ROLE_MODELS else ""
         manifest_model = _canon_model((_manifest().get("models") or {}).get(role, ""))
         cmd += ["--model", manifest_model or "openrouter/z-ai/glm-5.3-flash"]
-    cmd.append(prompt[:20000])
+    # `--` ends option parsing so the message is always delivered as a
+    # positional, even when it begins with a dash. A prompt like
+    # "--skip-ui-review" passed bare is parsed by kilo's yargs as an unknown
+    # flag, which prints the usage banner and exits 1 — surfaced to the
+    # operator as "agent exited before responding: … [boolean] [default: false]".
+    cmd += ["--", prompt[:20000]]
     try:
         from court.cli import _engine_spawn_env
 

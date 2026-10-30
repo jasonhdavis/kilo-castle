@@ -346,6 +346,56 @@ class TestAutoFlag:
         assert kilo_cmds and "--auto" in kilo_cmds[-1]
 
 
+class TestBaseSyncBeforeSpawn:
+    """`court goad` / `court coin` must merge the base trunk in before spawning —
+    the drift class the studio close-out post-mortem traced to this missing step."""
+
+    def _quest(self):
+        return mock.MagicMock(id="Q1")
+
+    def test_base_absent_skips(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(cli.git_ops, "_run", lambda *a, **k: {"ok": False})
+        merged = []
+        monkeypatch.setattr(
+            cli.git_ops, "rebase_worktree_onto_base",
+            lambda *a, **k: merged.append(1) or {"ok": True},
+        )
+        cli._sync_base_before_spawn(tmp_path, self._quest(), "goad")
+        assert merged == []
+        assert "skipping base sync" in capsys.readouterr().err
+
+    def test_conflict_aborts_spawn(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(cli.git_ops, "_run", lambda *a, **k: {"ok": True})
+        monkeypatch.setattr(
+            cli.git_ops, "rebase_worktree_onto_base",
+            lambda *a, **k: {"ok": False, "conflict": True, "conflicting_files": ["court/cli.py"]},
+        )
+        with pytest.raises(SystemExit) as ei:
+            cli._sync_base_before_spawn(tmp_path, self._quest(), "coin")
+        assert ei.value.code == 1
+        assert "conflicts in: court/cli.py" in capsys.readouterr().err
+
+    def test_merged_reports_drift(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(cli.git_ops, "_run", lambda *a, **k: {"ok": True})
+        monkeypatch.setattr(
+            cli.git_ops, "rebase_worktree_onto_base",
+            lambda *a, **k: {"ok": True, "merged": True, "before_behind": 2000,
+                             "after_behind": 0, "auto_resolved_files": []},
+        )
+        cli._sync_base_before_spawn(tmp_path, self._quest(), "goad")
+        assert "behind 2000 → 0" in capsys.readouterr().out
+
+    def test_dirty_skips_without_abort(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(cli.git_ops, "_run", lambda *a, **k: {"ok": True})
+        monkeypatch.setattr(
+            cli.git_ops, "rebase_worktree_onto_base",
+            lambda *a, **k: {"ok": False, "conflict": False,
+                             "error": "worktree is dirty (3 uncommitted file(s))"},
+        )
+        cli._sync_base_before_spawn(tmp_path, self._quest(), "goad")  # must not raise
+        assert "base sync skipped" in capsys.readouterr().err
+
+
 class TestSpawnLiveness:
     def test_standup_reports_dead_spawn(self, tmp_path, monkeypatch):
         class DeadProc:

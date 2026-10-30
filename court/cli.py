@@ -3174,6 +3174,63 @@ def cmd_patchwork(args):
     print(f"   Promote to trunk: python3 -m court.cli patchwork {quest.id} --promote")
 
 
+def _sync_base_before_spawn(wt: Path, quest, label: str) -> None:
+    """Merge the base trunk into a Quest worktree before spawning a worker there.
+
+    Closes the gap where `court goad` / `court coin` spawned with NO base sync —
+    the drift the studio close-out post-mortem traced to this missing step (a
+    stalled branch resumed, or a Tribute audited, hundreds/thousands of commits
+    behind the integration trunk). Sibling spawn paths (`collect`, `studio`,
+    `atelier`, `watch`) already sync; `--ff-only` is only sound when the branch
+    has NOT diverged, so this uses the levy primitive
+    (git_ops.rebase_worktree_onto_base → a real `git merge <base> --no-edit`).
+
+    Behaviour:
+      * base ref absent (repos whose trunk is not `castle`) → warn, skip;
+      * worktree dirty → warn, skip (a resumed Serf may hold uncommitted work;
+        the merge would refuse anyway and stranding the worker is worse);
+      * merge conflict → the primitive aborts the merge cleanly; abort the spawn
+        (non-zero exit) and report the conflicting files.
+    """
+    base_branch = "castle"
+    probe = git_ops._run(["git", "rev-parse", "--verify", "--quiet", base_branch], wt)
+    if not probe.get("ok"):
+        print(
+            f"⚠️  {label}: base branch '{base_branch}' not found in {wt} — skipping base sync.",
+            file=sys.stderr,
+        )
+        return
+    res = git_ops.rebase_worktree_onto_base(
+        str(wt), base_branch=base_branch, own_quest_id=getattr(quest, "id", None)
+    )
+    if res.get("ok"):
+        if res.get("merged"):
+            auto = res.get("auto_resolved_files") or []
+            note = (
+                f" (auto-resolved {len(auto)} foreign ledger conflict(s) to {base_branch})"
+                if auto else ""
+            )
+            print(
+                f"🔄 {label}: base-synced {getattr(quest, 'id', '?')} onto {base_branch} "
+                f"(behind {res.get('before_behind')} → 0){note}"
+            )
+        return
+    if res.get("conflict"):
+        files = ", ".join(res.get("conflicting_files", [])[:8]) or "unknown files"
+        print(
+            f"ERROR: {label}: cannot spawn — `git merge {base_branch}` conflicts in: {files}. "
+            f"The merge was aborted cleanly; resolve on the branch (or dispatch a remediation "
+            f"Serf) before re-running `court {label}`.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(
+        f"⚠️  {label}: base sync skipped — {res.get('error') or 'merge could not run'}. "
+        f"Worktree left untouched; base drift may persist.",
+        file=sys.stderr,
+    )
+
+
 def cmd_coin(args):
     """Dispatch Master of Coin into a Quest's worktree via Kilo CLI to audit Tribute."""
     quest = store.load(args.quest_id)
@@ -3188,6 +3245,8 @@ def cmd_coin(args):
     if quest.status != "TRIBUTE_READY" and not getattr(args, "force", False):
         print(f"⚠️  {quest.id} is [{quest.status}], not [TRIBUTE_READY]. Pass --force to audit anyway.", file=sys.stderr)
         sys.exit(1)
+
+    _sync_base_before_spawn(wt, quest, "coin")
 
     kilo_bin = find_kilo_binary()
     if not kilo_bin:
@@ -3364,6 +3423,8 @@ def cmd_goad(args):
     if not kilo_bin:
         print("ERROR: Kilo binary not found. Cannot goad session via CLI.", file=sys.stderr)
         sys.exit(1)
+
+    _sync_base_before_spawn(wt, quest, "goad")
 
     is_scout = getattr(quest, "kind", "") == "scout" or getattr(quest, "section", "") == "Investigation"
     agent_role = "scout" if is_scout else "serf"

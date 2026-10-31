@@ -50,6 +50,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -309,6 +310,14 @@ def release_instance_lock(repo: Path) -> None:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _iso_from_epoch(ts) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat(
+            timespec="seconds").replace("+00:00", "Z")
+    except (TypeError, ValueError, OSError):
+        return str(ts)
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +820,52 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                                     "retry_backoff": policy.retry_backoff}))
         capacity -= 1
 
+    # --- Last resort: muster ONE Steward triage session ---------------------
+    # Everything above is a mechanical verb the watch can issue itself. When
+    # the board has been unchanged for `steward_stale_after`, NOTHING is
+    # running, and a standing blocker remains that only a Steward can decide,
+    # the watch may bring up one single-turn Steward session to unstick it.
+    # Opt-in (`--enable ...,steward`), cooldown-capped, and daily-capped.
+    if policy.allows("steward") and quests:
+        sig = board_signature(quests, notes)
+        prev_since = float(state.get("board_sig_since") or 0)
+        since = prev_since if (state.get("board_signature") == sig and prev_since) else now
+        stale_for = max(0.0, now - since)
+        steward_state = state.get("steward") or {}
+        recent = [float(t) for t in steward_state.get("spawns", [])
+                  if (now - float(t)) < 86400]
+        steward_live = bool((workers.get("by_role") or {}).get("steward")) or (
+            (workers.get("steward_lease") or {}).get("state") in ("live", "stalled", "watching"))
+        active = [q for q in quests.values() if q.get("status") in ACTIVE_STAGES]
+        blocker = any(n.get("level") == "human" for n in notes) or any(
+            q.get("status") in STEWARD_ONLY_STAGES for q in active)
+        if (active and blocker and not steward_live and not actions
+                and workers.get("count", 0) == 0
+                and stale_for >= policy.steward_stale_after):
+            if now < float(steward_state.get("retry_at") or 0):
+                pass
+            elif _within(steward_state.get("last_ts"), policy.steward_cooldown, now):
+                note("board", "wait",
+                     f"board unchanged for {int(stale_for // 60)}m but a Steward was mustered recently")
+            elif len(recent) >= max(1, policy.max_stewards_per_day):
+                note("board", "human",
+                     f"board unchanged for {int(stale_for // 60)}m and the daily Steward muster cap is "
+                     f"spent ({len(recent)}/{policy.max_stewards_per_day}) — needs a human",
+                     key="steward_cap")
+            elif capacity <= 0:
+                note("board", "skip",
+                     f"board unchanged for {int(stale_for // 60)}m but worker ceiling "
+                     f"reached ({busy_workers}/{policy.max_workers})")
+            else:
+                blocked = sum(1 for n in notes if n.get("level") == "human")
+                actions.append(Action(
+                    kind="steward", quest_ids=[],
+                    reason=(f"board unchanged for {int(stale_for // 60)}m with no live worker and "
+                            f"{blocked or len(active)} standing blocker(s) — mustering a Steward triage turn"),
+                    meta={"stale_for": int(stale_for), "board_signature": sig,
+                          "retry_backoff": policy.retry_backoff}))
+                capacity -= 1
+
     # --- report-only stages ------------------------------------------------
     for q in quests.values():
         status = q.get("status")
@@ -853,6 +908,10 @@ def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -
         # Bounded replacement dispatch: a spent serf is replaced by a fresh one
         # in the SAME worktree (`--replace`), inheriting the committed prior art.
         argv = ["dispatch", *action.quest_ids, "--replace"]
+    elif action.kind == "steward":
+        # One bounded triage session on the trunk. The reason is forwarded so
+        # the Steward's prompt names the exact stall the watch observed.
+        argv = ["muster", "--why", action.reason or "board stale"]
     else:
         argv = [action.kind, *action.quest_ids]
     if action.kind == "goad" and action.meta.get("mode"):
@@ -897,6 +956,12 @@ def _collect_packed(result: dict) -> bool:
     if not result.get("ok"):
         return False
     return "Stamped" in (result.get("stdout_tail") or "")
+
+
+def _muster_session(result: dict) -> str:
+    """Best-effort session id from the muster command's stdout."""
+    m = re.search(r"session\s+([A-Za-z0-9_-]+)", result.get("stdout_tail") or "")
+    return m.group(1) if m else ""
 
 
 def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, repo: Optional[Path] = None) -> None:
@@ -945,6 +1010,24 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
             st["coins"] = int(st.get("coins") or 0) + 1
             if ok:
                 st["last_coin_ts"] = now
+    elif action.kind == "steward":
+        # Muster bookkeeping lives on its own state key: it is a board-level
+        # action, not a Quest action. A failed muster retries on the short
+        # backoff but never earns the full cooldown; a successful one starts
+        # the cooldown and counts against the rolling 24-hour cap.
+        st = state.setdefault("steward", {})
+        st["spawns"] = [float(t) for t in st.get("spawns", []) if (now - float(t)) < 86400]
+        st["fails"] = int(st.get("fails") or 0) + 1
+        st["last_error"] = (result.get("stderr_tail") or result.get("stdout_tail") or "")[-400:]
+        if ok:
+            st["fails"] = 0
+            st["last_error"] = ""
+            st["last_ts"] = now
+            st["retry_at"] = 0
+            st["spawns"].append(now)
+            st["last_session"] = _muster_session(result)
+        elif backoff:
+            st["retry_at"] = now + backoff
     elif action.kind == "collect":
         key = action.meta.get("convoy") or action.cogship or "new"
         convoy = state.setdefault("convoys", {}).setdefault(key, {})
@@ -997,6 +1080,13 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
     now = time.time()
     spawns = _prune_spawns(state, now)
     workers = live_kilo_workers(repo)
+    # A Steward triage session runs on the trunk (repo root), where the
+    # worktree scan cannot see it. Surface its lease so `plan` never musters a
+    # second Steward onto a board that is already being looked at.
+    try:
+        workers["steward_lease"] = role_state(str(repo), "steward")
+    except Exception:  # noqa: BLE001 — observation must never kill a tick
+        workers["steward_lease"] = {"state": "idle"}
     try:
         snap = snapshot(repo, timeout=policy.status_timeout)
     except Exception as e:  # noqa: BLE001
@@ -1015,6 +1105,16 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
     actions, notes = plan(snap, state, policy, workers, now=now, ready_vigils=ready)
     notes = vigil_notice + notes
     _record_escalations(state, notes, now)
+    # Board fingerprint: only re-stamp the "observed since" timestamp when the
+    # board actually changes. This is what makes "stale for N minutes" honest
+    # across daemon restarts (state lives outside the repo).
+    try:
+        sig = board_signature(_quest_map(snap), notes)
+    except Exception:  # noqa: BLE001
+        sig = ""
+    if sig and state.get("board_signature") != sig:
+        state["board_signature"] = sig
+        state["board_sig_since"] = now
     executed = []
     for action in actions:
         if len(spawns) >= policy.max_spawns_per_hour:
@@ -1203,6 +1303,18 @@ def render_digest(repo: Path, journal: Optional[list] = None) -> str:
             lines.append(f"  ✗ {r['ts']} {r['action']['kind']} {','.join(r['action']['quest_ids'])} "
                          f"— exit {r['result'].get('exit')}: {tail[-1][:120] if tail else ''}")
 
+    steward = state.get("steward") or {}
+    if steward:
+        recent = [t for t in steward.get("spawns", []) if (time.time() - float(t)) < 86400]
+        last = steward.get("last_ts")
+        lines.append("")
+        lines.append(f"steward musters (24h): {len(recent)}/{policy.get('max_stewards_per_day', '?')} · "
+                     f"last {_iso_from_epoch(last) if last else '(never)'}")
+        if steward.get("last_session"):
+            lines.append(f"  last session: {steward['last_session']}")
+        if steward.get("fails"):
+            lines.append(f"  failed musters: {steward['fails']} — {str(steward.get('last_error') or '')[:160]}")
+
     if not fragile and not notified and not spent and not fails:
         lines.append("")
         lines.append("✅ no live issues detected in the journal/state window.")
@@ -1228,7 +1340,8 @@ def render_report(snap: dict, notes: list, workers: dict, executed: list, dry_ru
             a = e["action"]
             r = e["result"]
             mark = "✓" if r.get("ok") else "✗"
-            lines.append(f"  {mark} {a['kind']} {','.join(a['quest_ids'])} — {a['reason']}")
+            target = ",".join(a["quest_ids"]) or "(board)"
+            lines.append(f"  {mark} {a['kind']} {target} — {a['reason']}")
     watch = [q for q in quests.values() if q.get("status") in
              ("WORKING", "QUESTING", "TRIBUTE_READY", "GATE")]
     if watch:

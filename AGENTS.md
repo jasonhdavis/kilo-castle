@@ -220,6 +220,34 @@ court vigil add q234-after-q123 --when "quest-status:Q123=READY_TO_RAZE" \
 shows fires/expiry. Records live in `.court/vigils/<id>.json`. An un-renewed
 vigil expires silently — that is the point.
 
+### Stale board, no live Steward: bounded muster (opt-in, 2026-10-31)
+
+The watch cannot make Steward judgments, but a board can sit unchanged all
+night because no Steward session is live to make one. The opt-in `steward`
+action closes exactly that hole. Enable it explicitly —
+`court nightwatch --enable goad,coin,collect,dispatch,steward` (it is **not** in
+the default enable list because it spends a full reasoning worker).
+
+A muster is reachable only when ALL of these hold in the same tick:
+
+- at least one Quest is in a pre-terminal stage, and a standing `human`
+  escalation or a Steward-only stage (`PLANNED`/`CHARTERED`/`DISPATCHED`/
+  `READY_TO_RAZE`) remains;
+- **no live worker at all** — not a serf, scout, artist, Master of Coin,
+  Gatekeeper, or Steward (worktree leases, the trunk `steward` lease, and the
+  `kilo run` process table are all consulted);
+- the board fingerprint (`board_signature`: Quest statuses + worker states +
+  human escalations) has not changed for `--steward-stale-after` (45m default);
+- the `--steward-cooldown` (6h default) has elapsed and the rolling
+  `--max-stewards-per-day` cap (2 default) is not spent.
+
+It then runs `court muster --why "<observed stall>"`, which stands up ONE
+single-turn Steward session on the trunk with the live watch digest embedded in
+its prompt. No Quest is bound, so the continuation watchdog never re-prompts it:
+it is a triage turn, not a daemon. `court muster --print-prompt` renders the
+prompt without spawning anything. When the cap is spent the watch escalates to
+a human instead of mustering again.
+
 ### Context discipline (cheap restarts beat long sessions)
 
 The watch reports each worker's true context usage (last `step-finish`

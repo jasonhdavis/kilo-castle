@@ -497,3 +497,142 @@ def test_tick_survives_a_ready_vigil_note(tmp_path, monkeypatch):
     monkeypatch.setattr(vigils, "load_all", lambda repo, **kw: [])
     res = nw.tick(tmp_path, _policy(), nw.load_state(tmp_path), dry_run=True, say=lambda *a, **k: None)
     assert any(n["level"] == "vigil" for n in res["notes"])
+
+
+# ---------------------------------------------------------------------------
+# Steward muster — the opt-in last resort for a stale board
+# ---------------------------------------------------------------------------
+
+def _stale(snap, tmp_path, since=1000.0):
+    state = nw.load_state(tmp_path)
+    state["board_signature"] = nw.board_signature(nw._quest_map(snap), [])
+    state["board_sig_since"] = since
+    return state
+
+
+def test_musters_a_steward_when_the_board_is_stale_and_nothing_is_running(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt))
+    state = _stale(snap, tmp_path)
+    actions, _ = nw.plan(snap, state,
+                         _policy(enabled=("steward",), steward_stale_after=600),
+                         _workers(), now=2000.0)
+    assert [a.kind for a in actions] == ["steward"]
+    assert actions[0].quest_ids == []
+
+
+def test_does_not_muster_on_a_fresh_board(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt))
+    state = _stale(snap, tmp_path, since=1950.0)
+    actions, _ = nw.plan(snap, state,
+                         _policy(enabled=("steward",), steward_stale_after=600),
+                         _workers(), now=2000.0)
+    assert actions == []
+
+
+def test_does_not_muster_when_a_steward_is_already_live(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt))
+    state = _stale(snap, tmp_path)
+    live = _workers()
+    live["by_role"] = {"steward": 1}
+    actions, _ = nw.plan(snap, state,
+                         _policy(enabled=("steward",), steward_stale_after=600),
+                         live, now=2000.0)
+    assert actions == []
+
+    leased = _workers()
+    leased["steward_lease"] = {"state": "live"}
+    actions, _ = nw.plan(snap, state,
+                         _policy(enabled=("steward",), steward_stale_after=600),
+                         leased, now=2000.0)
+    assert actions == []
+
+
+def test_does_not_muster_while_any_worker_is_running(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt))
+    state = _stale(snap, tmp_path)
+    actions, _ = nw.plan(snap, state,
+                         _policy(enabled=("steward",), steward_stale_after=600),
+                         _workers(count=1), now=2000.0)
+    assert actions == []
+
+
+def test_steward_cooldown_suppresses_a_repeat_muster(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt))
+    state = _stale(snap, tmp_path)
+    state["steward"] = {"last_ts": 1900.0}
+    actions, notes = nw.plan(snap, state,
+                             _policy(enabled=("steward",), steward_stale_after=600,
+                                     steward_cooldown=3600),
+                             _workers(), now=2000.0)
+    assert actions == []
+    assert any(n["level"] == "wait" for n in notes)
+
+
+def test_daily_muster_cap_escalates_to_a_human(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt))
+    state = _stale(snap, tmp_path)
+    state["steward"] = {"last_ts": 100.0, "spawns": [1900.0, 1950.0]}
+    actions, notes = nw.plan(snap, state,
+                             _policy(enabled=("steward",), steward_stale_after=600,
+                                     steward_cooldown=60, max_stewards_per_day=2),
+                             _workers(), now=2000.0)
+    assert actions == []
+    assert any(n["level"] == "human" and "muster cap" in n["text"] for n in notes)
+
+
+def test_steward_is_opt_in(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt))
+    state = _stale(snap, tmp_path)
+    actions, _ = nw.plan(snap, state,
+                         _policy(enabled=("goad", "coin", "collect", "dispatch"),
+                                 steward_stale_after=600),
+                         _workers(), now=2000.0)
+    assert actions == []
+
+
+def test_board_signature_changes_when_the_pipeline_moves(tmp_path):
+    wt = _free(tmp_path)
+    a = nw.board_signature(nw._quest_map(_snap(_q("Q1", "WORKING", wt))), [])
+    b = nw.board_signature(nw._quest_map(_snap(_q("Q1", "TRIBUTE_READY", wt))), [])
+    assert a != b
+
+
+def test_muster_action_runs_the_court_muster_verb(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(nw, "_court", lambda repo, *argv, **kw: seen.setdefault("argv", list(argv))
+                        or __import__("subprocess").CompletedProcess(argv, 0, "", ""))
+    nw.execute(tmp_path, nw.Action(kind="steward", reason="board stale"))
+    assert seen["argv"] == ["muster", "--why", "board stale"]
+
+
+def test_muster_bookkeeping_counts_the_spawn_and_retries_short_on_failure(tmp_path):
+    state = nw.load_state(tmp_path)
+    action = nw.Action(kind="steward", meta={"retry_backoff": 300})
+    nw._apply_bookkeeping(state, action, {"ok": False, "stderr_tail": "boom"}, 1000.0)
+    assert state["steward"]["retry_at"] == 1300.0
+    assert state["steward"]["fails"] == 1
+    nw._apply_bookkeeping(state, action,
+                          {"ok": True, "stdout_tail": "🧭 Stood up session ses_9 via Kilo CLI"},
+                          1500.0)
+    assert state["steward"]["retry_at"] == 0
+    assert state["steward"]["last_ts"] == 1500.0
+    assert state["steward"]["spawns"] == [1500.0]
+    assert state["steward"]["last_session"] == "ses_9"
+
+
+def test_no_muster_while_the_watch_still_has_a_mechanical_move(tmp_path):
+    wt1, wt2 = _free(tmp_path, "a"), _free(tmp_path, "b")
+    snap = _snap(_q("Q1", "WORKING", wt1, worker="exited"),
+                 _q("Q2", "READY_TO_RAZE", wt2))
+    state = _stale(snap, tmp_path)
+    actions, _ = nw.plan(snap, state,
+                         _policy(enabled=("goad", "steward"), steward_stale_after=600),
+                         _workers(), now=2000.0)
+    assert [a.kind for a in actions] == ["goad"]

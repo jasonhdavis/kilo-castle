@@ -338,6 +338,32 @@ def build_serf_replacement_prompt(quest: Quest) -> str:
     return rendered.strip() + "\n\n" + task
 
 
+def build_steward_triage_prompt(repo: Path, why: str) -> str:
+    """Prompt for a Night's Watch MUSTER: one bounded Steward triage turn.
+
+    The watch has already done everything mechanical and is out of moves; the
+    Steward is summoned to look at the board and unstick it, not to re-plan the
+    realm. The live digest is embedded so the turn starts from durable state
+    rather than spending its first minutes re-discovering it."""
+    tmpl = config.find_court_dir() / "templates" / "steward_triage_prompt.md"
+    if not tmpl.is_file():
+        tmpl = Path(__file__).resolve().parent / "templates" / "steward_triage_prompt.md"
+    try:
+        text = tmpl.read_text(encoding="utf-8")
+    except OSError:
+        text = (
+            "# Steward Triage\n\n"
+            "You were mustered by the Night's Watch because the board is stale.\n\n"
+            "Why: <WHY>\n\n<DIGEST>\n\n"
+            "Triage only, act through the court CLI, and end your turn with a short report."
+        )
+    try:
+        digest = nightwatch.render_digest(repo)
+    except Exception as e:  # noqa: BLE001 — the prompt must still render
+        digest = f"(digest unavailable: {e})"
+    return text.replace("<WHY>", why or "board stale").replace("<DIGEST>", digest[:4000])
+
+
 def setup_worktree_agent_config(worktree_path: Path, agent: str = "serf") -> None:
     """Ensure a worktree directory has worktree-scoped configuration
     defaulting to the specified agent (default: 'serf')."""
@@ -688,6 +714,8 @@ def standup_kilo_session(
     watch_quest: str = "",
     holder: str = "standup",
     force: bool = False,
+    configure_agent: bool = True,
+    task_file: Optional[str] = "TASK.md",
 ) -> dict:
     """Stand up a Kilo session in a worktree with explicit agent mode.
 
@@ -708,7 +736,8 @@ def standup_kilo_session(
     - 'message': str
     """
     # 1. Worktree-scoped config (mechanism 4)
-    setup_worktree_agent_config(worktree_path, agent)
+    if configure_agent:
+        setup_worktree_agent_config(worktree_path, agent)
 
     # 2. Local Kilo Server HTTP API (mechanism 3)
     port = server_port or os.environ.get("KILO_PORT")
@@ -751,11 +780,12 @@ def standup_kilo_session(
 
     # 3. Kilo CLI (mechanisms 1 & 2)
     bin_path = kilo_bin or find_kilo_binary()
-    task_file = worktree_path / ".kilo" / "TASK.md"
-    try:
-        task_file.write_text(prompt, encoding="utf-8")
-    except Exception:
-        pass
+    if task_file:
+        task_path = worktree_path / ".kilo" / task_file
+        try:
+            task_path.write_text(prompt, encoding="utf-8")
+        except Exception:
+            pass
 
     if bin_path and run_now:
         try:
@@ -6734,6 +6764,56 @@ def cmd_monitor(args):
         print("  → run `court fork-teardown-list` for the move/stop/triage order")
 
 
+def cmd_muster(args):
+    """Summon ONE bounded Steward triage session for a stalled board.
+
+    The Night's Watch's mechanical verbs (goad/coin/collect/dispatch) have
+    nothing left to do: no worker is live, the board has not changed, and a
+    standing blocker needs a Steward decision. This stands up a single-turn
+    Steward session on the trunk with the live digest embedded. It is not a
+    daemon: no quest is bound, so no continuation watchdog re-prompts it.
+    """
+    repo = Path(getattr(args, "repo", None) or git_ops.get_repo_root()).resolve()
+    if not (repo / ".court").is_dir():
+        print(f"ERROR: {repo} has no .court/ — not a Court repository", file=sys.stderr)
+        sys.exit(1)
+
+    why = (getattr(args, "why", "") or "").strip() or "board stale (manual muster)"
+    prompt = build_steward_triage_prompt(repo, why)
+    if getattr(args, "print_prompt", False):
+        print(prompt)
+        return
+
+    kilo_bin = find_kilo_binary()
+    if not kilo_bin:
+        print("ERROR: Kilo binary not found. Cannot summon a Steward.", file=sys.stderr)
+        sys.exit(1)
+
+    model = getattr(args, "model", None) or config.get_model("steward")
+    title = f"Night's Watch triage — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    spawn = standup_kilo_session(
+        repo,
+        agent="steward",
+        model=model,
+        prompt=prompt,
+        title=title,
+        kilo_bin=kilo_bin,
+        provider_hint="steward",
+        holder="nightwatch",
+        # The trunk already carries the Steward default agent; do not rewrite
+        # the root's agent config, and do not clobber a root .kilo/TASK.md.
+        configure_agent=False,
+        task_file=None,
+    )
+    if spawn.get("mode") == "lease-held" or not spawn.get("ok") or spawn.get("mode") not in ("api", "cli"):
+        print(f"ERROR: {spawn.get('message')}", file=sys.stderr)
+        sys.exit(1)
+    print(f"🧭 {spawn.get('message')}")
+    if spawn.get("log"):
+        print(f"   log: {spawn['log']}")
+    print(f"   why: {why}")
+
+
 def cmd_nightwatch(args):
     """Deterministic overnight supervisor: reads durable quest state and issues
     `goad` / `coin` / `collect --standup` under hard RAM and cooldown caps.
@@ -6776,6 +6856,13 @@ def cmd_nightwatch(args):
                 print(f"  {qid}: {', '.join(bits) or 'no actions'}")
         else:
             print("\nno actions recorded yet")
+        steward = state.get("steward") or {}
+        if steward:
+            recent = [t for t in steward.get("spawns", [])
+                      if (time.time() - float(t)) < 86400]
+            print(f"\nsteward musters (24h): {len(recent)} · "
+                  f"last session {steward.get('last_session') or '(none)'} · "
+                  f"failed {int(steward.get('fails') or 0)}")
         return
 
     if getattr(args, "report", False):
@@ -6815,6 +6902,9 @@ def cmd_nightwatch(args):
         serf_slots=getattr(args, "serf_slots", None) or nightwatch.DEFAULT_SERF_SLOTS,
         collect_noop_backoff=getattr(args, "collect_noop_backoff", None) or nightwatch.DEFAULT_COLLECT_NOOP_BACKOFF,
         retry_backoff=int(getattr(args, "retry_backoff", 0) or 0),
+        steward_stale_after=int(getattr(args, "steward_stale_after", 0) or nightwatch.DEFAULT_STEWARD_STALE_AFTER),
+        steward_cooldown=int(getattr(args, "steward_cooldown", 0) or nightwatch.DEFAULT_STEWARD_COOLDOWN),
+        max_stewards_per_day=int(getattr(args, "max_stewards_per_day", 0) or nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY),
         cull_soft=cull_soft,
         hard_red_zone=hard_red_zone,
         bloat_cold_start=bool(args.bloat_cold_start),
@@ -8763,6 +8853,16 @@ def build_parser():
     )
     p_monitor.set_defaults(func=cmd_monitor)
 
+    p_muster = sub.add_parser(
+        "muster",
+        help="Summon ONE bounded Steward triage session on the trunk for a stalled board (used by the Night's Watch's opt-in steward action)",
+    )
+    p_muster.add_argument("--repo", default=None, help="Court repository (default: this repo)")
+    p_muster.add_argument("--why", default=None, help="Why this muster was triggered (embedded in the prompt and journal)")
+    p_muster.add_argument("--model", default=None, help="Override the Steward model (default: manifest models.steward)")
+    p_muster.add_argument("--print-prompt", dest="print_prompt", action="store_true", help="Print the rendered triage prompt and exit (no session)")
+    p_muster.set_defaults(func=cmd_muster)
+
     p_nightwatch = sub.add_parser(
         "nightwatch",
         help="Deterministic fleet supervisor (the Night's Watch): polls durable quest state and issues goad / coin / collect --standup under RAM, cooldown, and attempt caps — no LLM polling, no tokens",
@@ -8790,7 +8890,10 @@ def build_parser():
     p_nightwatch.add_argument("--bloat-cold-start", dest="bloat_cold_start", action="store_true", help="When a watchdog is about to re-prompt a session past the cull line, supersede it with a fresh cold-start goad (requires --allow-force-goad; off by default, so such sessions are flagged for a human instead)")
     p_nightwatch.add_argument("--retry-backoff", dest="retry_backoff", type=int, default=nightwatch.DEFAULT_RETRY_BACKOFF, help=f"Seconds to wait before retrying a FAILED action (a failed attempt must not burn the full cooldown; 0 disables; default {nightwatch.DEFAULT_RETRY_BACKOFF})")
     p_nightwatch.add_argument("--max-coins", dest="max_coins", type=int, default=nightwatch.DEFAULT_MAX_COINS, help=f"Coin attempts before a Quest is flagged for a human (default {nightwatch.DEFAULT_MAX_COINS})")
-    p_nightwatch.add_argument("--enable", default="goad,coin,collect,dispatch", help="Comma list of permitted actions (goad,coin,collect,dispatch)")
+    p_nightwatch.add_argument("--steward-stale-after", dest="steward_stale_after", type=int, default=nightwatch.DEFAULT_STEWARD_STALE_AFTER, help=f"Seconds an unchanged board with no live worker must sit before a Steward may be mustered (default {nightwatch.DEFAULT_STEWARD_STALE_AFTER})")
+    p_nightwatch.add_argument("--steward-cooldown", dest="steward_cooldown", type=int, default=nightwatch.DEFAULT_STEWARD_COOLDOWN, help=f"Seconds between Steward musters (default {nightwatch.DEFAULT_STEWARD_COOLDOWN})")
+    p_nightwatch.add_argument("--max-stewards-per-day", dest="max_stewards_per_day", type=int, default=nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY, help=f"Rolling 24-hour Steward muster cap (default {nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY})")
+    p_nightwatch.add_argument("--enable", default="goad,coin,collect,dispatch", help="Comma list of permitted actions (goad,coin,collect,dispatch,steward). `steward` is OPT-IN: it spends a full reasoning worker to triage a stale board.")
     p_nightwatch.add_argument("--allow-force-goad", dest="allow_force_goad", action="store_true", help="Permit --force goads (supersedes a live worker). Off by default.")
     p_nightwatch.add_argument("--quiet", action="store_true", help="Journal only; suppress per-tick console output")
     p_nightwatch.set_defaults(func=cmd_nightwatch)

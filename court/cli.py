@@ -47,6 +47,7 @@ from . import migration_graph
 from . import browser as studio_browser
 from . import studio_close
 from . import lease as worker_lease
+from . import metrics as quest_metrics
 
 # The Ward's durable workspace: patrol ledger + Warden Report queue.
 WARD_DIR = Path(__file__).resolve().parent.parent / "ward"
@@ -6922,6 +6923,142 @@ def cmd_tally(args):
         print(content)
 
 
+def cmd_metrics(args):
+    """Read-only per-Quest rollup: cost, wall-clock, turns, goads.
+
+    Folds the local kilo.db session accounting and the Court's own goad ledger
+    (worktree logs) into one row per Quest, so the live pipeline reports the
+    same four measurements an offline model bake-off ranks on. Never writes:
+    no quest file, event log, or git ref is touched.
+    """
+    quests = resolve_quest_selection(args, batchable=True, required=False)
+    if not quests:
+        print("(no Quests matched the given filters)")
+        return
+
+    rollup = quest_metrics.rollup_metrics(
+        quests,
+        db_path=getattr(args, "db", None),
+    )
+    results = rollup["quests"]
+
+    sort_key = getattr(args, "sort", "id")
+    _sorters = {
+        "id": lambda m: m["quest_id"],
+        "cost": lambda m: m["cost_usd"],
+        "wall": lambda m: m["wall_clock_seconds"],
+        "turns": lambda m: m["turns"],
+        "goads": lambda m: m["goads"],
+        "sessions": lambda m: m["sessions"],
+    }
+    results.sort(key=_sorters.get(sort_key, _sorters["id"]),
+                 reverse=sort_key != "id")
+
+    grand = quest_metrics.totals(results)
+
+    if getattr(args, "json", False):
+        print(json.dumps(
+            {
+                "db_path": rollup["db_path"],
+                "db_available": rollup["db_available"],
+                "quests": results,
+                "totals": grand,
+            },
+            indent=2,
+        ))
+        return
+
+    if getattr(args, "by_model", False):
+        _print_metrics_by_model(results, rollup)
+        return
+
+    db_state = "available" if rollup["db_available"] else "MISSING — session metrics read zero"
+    print("=" * 108)
+    print(f"COURT METRICS — per-Quest cost · wall-clock · turns · goads  (read-only, {len(results)} Quests)")
+    print("=" * 108)
+    print(f"kilo.db: {rollup['db_path']}  [{db_state}]")
+    print()
+    header = (
+        f"{'QUEST':<34} {'STATUS':<15} {'MODEL':<26} "
+        f"{'COST':>9} {'WALL':>7} {'TURNS':>6} {'GOAD':>5} {'SESS':>5}"
+    )
+    print(header)
+    print("-" * 108)
+    for m in results:
+        model = _metrics_model_cell(m["models"])
+        print(
+            f"{m['quest_id'][:34]:<34} {m['status'][:15]:<15} {model:<26} "
+            f"{('$' + format(m['cost_usd'], '.4f')):>9} "
+            f"{quest_metrics.format_wall_clock(m['wall_clock_seconds']):>7} "
+            f"{m['turns']:>6} {m['goads']:>5} {m['sessions']:>5}"
+        )
+    print("-" * 108)
+    print(
+        f"{'TOTALS':<34} {'':<15} {'':<26} "
+        f"{('$' + format(grand['cost_usd'], '.4f')):>9} "
+        f"{quest_metrics.format_wall_clock(grand['wall_clock_seconds']):>7} "
+        f"{grand['turns']:>6} {grand['goads']:>5} {grand['sessions']:>5}"
+    )
+    tok = grand["tokens"]
+    print(
+        f"\ntokens: in {tok['input']:,} · out {tok['output']:,} · "
+        f"reasoning {tok['reasoning']:,} · cache r/w {tok['cache_read']:,}/{tok['cache_write']:,}  "
+        f"| messages {grand['messages']:,} (assistant {grand['assistant_messages']:,})"
+    )
+    print(
+        "definitions: cost = provider-reported session spend · wall-clock = first-start→last-update span · "
+        "turns = user prompts · goads = `--- Goad` markers in worktree logs"
+    )
+
+
+def _metrics_model_cell(models: list) -> str:
+    if not models:
+        return "-"
+    if len(models) == 1:
+        return models[0]
+    return f"{models[0]} +{len(models) - 1}"
+
+
+def _print_metrics_by_model(results: list, rollup: dict) -> None:
+    """Aggregate the same four measurements by model (bake-off view).
+
+    Attribution comes from each Quest's per-model session breakdown, so a Quest
+    that touched two models contributes to both without double-counting cost or
+    turns. Goads here are the kilo.db goad-session counts (per-model
+    attributable); the Quest rollup's primary ``goads`` uses the log ledger.
+    """
+    by_model: dict[str, dict] = {}
+    for m in results:
+        for model, b in (m.get("by_model") or {}).items():
+            bucket = by_model.setdefault(
+                model,
+                {"model": model, "quests": 0, "sessions": 0, "cost_usd": 0.0,
+                 "wall_clock_seconds": 0.0, "turns": 0, "goads": 0},
+            )
+            bucket["quests"] += 1
+            bucket["sessions"] += b["sessions"]
+            bucket["cost_usd"] += b["cost_usd"]
+            bucket["wall_clock_seconds"] += b["active_seconds"]
+            bucket["turns"] += b["turns"]
+            bucket["goads"] += b["goads"]
+    rows = sorted(by_model.values(), key=lambda b: b["cost_usd"], reverse=True)
+
+    print("=" * 96)
+    print(f"COURT METRICS — by model  (read-only, {len(results)} Quests across {len(rows)} model(s))")
+    print("=" * 96)
+    print(f"kilo.db: {rollup['db_path']}")
+    print()
+    print(f"{'MODEL':<40} {'QUESTS':>7} {'SESS':>6} {'COST':>10} {'ACTIVE':>8} {'TURNS':>6} {'GOAD':>5}")
+    print("-" * 96)
+    for b in rows:
+        print(
+            f"{b['model'][:40]:<40} {b['quests']:>7} {b['sessions']:>6} "
+            f"{('$' + format(b['cost_usd'], '.4f')):>10} "
+            f"{quest_metrics.format_wall_clock(b['wall_clock_seconds']):>8} "
+            f"{b['turns']:>6} {b['goads']:>5}"
+        )
+
+
 def cmd_edict(args):
     current = store.load_edicts()
     if args.content or args.file:
@@ -8091,6 +8228,16 @@ def build_parser():
     p_tally = sub.add_parser("tally", help="Extract and summarize production verification runbooks and UI paths across Quests (/tally)")
     add_quest_selector(p_tally, batchable=True, filters=("status", "app", "epic", "cogship"))
     p_tally.set_defaults(func=cmd_tally)
+    p_metrics = sub.add_parser(
+        "metrics",
+        help="Read-only per-Quest rollup: cost, wall-clock, turns, goads (kilo.db + goad ledger) — the live-pipeline twin of a model bake-off",
+    )
+    add_quest_selector(p_metrics, batchable=True, filters=("status", "app", "epic", "cogship"))
+    p_metrics.add_argument("--sort", default="id", choices=("id", "cost", "wall", "turns", "goads", "sessions"), help="Sort rows by this measurement (descending; default: quest id)")
+    p_metrics.add_argument("--by-model", dest="by_model", action="store_true", help="Aggregate the four measurements by model instead of per-Quest (bake-off view)")
+    p_metrics.add_argument("--db", default=None, help="Override the kilo.db path (default: ~/.local/share/kilo/kilo.db or $COURT_KILO_DB)")
+    p_metrics.add_argument("--json", action="store_true", help="Output the full rollup as JSON")
+    p_metrics.set_defaults(func=cmd_metrics)
 
     p_collect = sub.add_parser("collect", help="Pack Master-of-Coin-approved Quests into a Cog Ship convoy: audit, stamp, batch-advance to GATE, print the Gatekeeper NEXT STEPS")
     add_quest_selector(p_collect, batchable=True, filters=("status", "app", "epic"))
@@ -8356,7 +8503,7 @@ def build_parser():
 # Gatekeeper, raze/commute) queue cleanly instead of colliding on the shared
 # checkout's index / dirty tree. Read-only reporting commands never take it.
 _READ_ONLY_COMMANDS = {
-    "status", "show", "list", "tally", "ward", "ship", "diff", "timber",
+    "status", "show", "list", "tally", "metrics", "ward", "ship", "diff", "timber",
     "model", "verify-merged", "verify-manifest", "runsuite", "browser",
     # `watch` only observes durable state and re-prompts sessions; it never
     # commits, so it must not serialize behind the write lock (a watchdog

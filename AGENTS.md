@@ -174,6 +174,78 @@ Rules for every agent role (Steward, Serf, Gatekeeper, Master of Coin):
    activity signal (`court status` renders LIVE/STALLED/exited badges, and
    `court watch`'s stall referee kills a worker silent past its role's
    threshold — serf 20m, scout 30m, master_of_coin 30m, gatekeeper 45m —
-   then re-prompts through the same attempt budget). Watch/lease state files
+   then re-prompts through the same attempt budget).
+
+## Night's Watch — Fleet Supervision Is Deterministic (2026-10-31)
+
+Do **not** supervise the pipeline with `schedule_wakeup` / `cron_create` LLM
+polling. A wakeup is an in-memory session timer that dies with its session (the
+cogship-281 class above), and a reasoning model handed "check back in 15
+minutes, then coin it" almost always answers by setting another wakeup and
+ending the turn — a spin loop that re-reads full context and advances nothing.
+
+Use `court nightwatch` instead: a small stdlib supervisor (no model calls, no
+session, no tokens) that reads `court status --json` on a timer and issues
+`goad` / `coin` / `collect --standup` under hard caps:
+
+- live-worker ceiling (`--max-workers`) — the RAM guard; no spawns above it
+- per-tick and rolling per-hour spawn budgets
+- per-quest cooldowns plus a goad ceiling that escalates to "needs a human"
+- single-instance lock per repo, and worktree occupancy checks that refuse to
+  stack a worker beneath any live `kilo run` in the same worktree (lease or ps)
+- report-only for `PLANNED`/`CHARTERED`/`DISPATCHED` (dispatch is a Steward
+  judgment), `READY_TO_RAZE` (razing stays human), and pending-Audience quests
+
+Operate it with `--repo <path> --once` from cron or as a persistent loop;
+`--dry-run` prints decisions, `--status` reports daemon/state/counters. Journal
+lives at `~/.local/state/kilo-castle/nightwatch/<repo>.jsonl`.
+
+### Handing a watch off: vigils (narrowly gated, never indefinite)
+
+A Steward hands the watch a future intent only through `court vigil` — never a
+free-form "keep checking". Every vigil MUST carry a `--why` reason, a mandatory
+`--expires` (7-day ceiling), a bounded `--max-fires` (default 1), and an action
+from an allow-list (`dispatch`, `goad`, `coin`, `collect`, `advance`, `note`).
+`ship`/`raze`/`pillory` are not vigil-executable. Conditions are deterministic
+predicates (`quest-status:Q123=READY_TO_RAZE`, `quest-merged:Q123`,
+`branch-merged:<branch>`, `file-exists:<path>`, `after:<iso>`), so the watch can
+evaluate them with no model call:
+
+```
+court vigil add q234-after-q123 --when "quest-status:Q123=READY_TO_RAZE" \
+  --then "dispatch:Q234" --why "Q234 needs Q123 promoted to castle" --expires 6h
+```
+
+`court vigil check` previews; `court vigil run` fires now; `court vigil list`
+shows fires/expiry. Records live in `.court/vigils/<id>.json`. An un-renewed
+vigil expires silently — that is the point.
+
+### Context discipline (cheap restarts beat long sessions)
+
+The watch reports each worker's true context usage (last `step-finish`
+`tokens.total`) and prefers a FRESH session over a bloated one. Two thresholds
+resolved from the manifest's `context.*` block (`get_context_limits`; overridable
+per role via `context.per_role.<role>`) govern the decision
+(`handoff.continuation_decision`):
+
+- **`context.cull_soft`** (default 350k) — a cull *opportunity*: `court watch`
+  cold-starts a fresh session once a session reaches this **and the worktree is
+  committed** (a clean tree means a fresh start loses nothing); uncommitted work
+  keeps the session so a cold start cannot discard in-flight edits.
+- **`context.hard_red_zone`** (default 750k) — the red zone: a same-session
+  continuation is never re-prompted past this, committed or not.
+- `context.sweet_spot` (default 200k) is the comfortable working size, informational.
+- The legacy single cap `--max-context` / `COURT_WATCH_MAX_CONTEXT` still works
+  (it becomes both thresholds); the soft/hard defaults now come from
+  `context.*`, not an engine constant.
+- `court nightwatch` flags a live watchdog about to re-prompt a session past the
+  cull line; `--bloat-cold-start --allow-force-goad` supersedes it with a fresh
+  cold-start goad instead.
+- a cold-start prompt is bounded: unchecked Expected-Tribute items + explicit
+  "never dump a file/log/dataset; use grep/sed/head/tail" discipline;
+- the Night's Watch itself is a token-free process — it has no context window
+  to bloat, which is precisely why supervision belongs here and not in an LLM
+  polling loop.
+ Watch/lease state files
    self-ignore in `.kilo/watch/.gitignore` so they never trip dirty-tree
    compliance alarms.

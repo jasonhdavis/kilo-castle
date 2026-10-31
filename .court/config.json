@@ -25,6 +25,11 @@
   "suite": {
     "command": "python3 -m pytest tests -q"
   },
+  "context": {
+    "sweet_spot": 200000,
+    "cull_soft": 350000,
+    "hard_red_zone": 750000
+  },
   "no_kilo_mode": false,
   "model_presets": [
     "openrouter/z-ai/glm-5.3-flash",

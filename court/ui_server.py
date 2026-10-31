@@ -2615,15 +2615,20 @@ def _court_audit(root, ttl=120):
 
 def _repos():
     base = os.path.dirname(COURT_DIR)
-    out = []
+    out, seen = [], set()
     for key, name, path in (
         ("app", "pb-app", os.path.join(base, "pb-app")),
         ("balloon", "pb-balloon", os.path.join(base, "pb-balloon")),
         ("custom", "pb-custom", os.path.join(base, "pb-custom")),
         ("castle", "kilo-castle", COURT_DIR),
     ):
-        if os.path.isdir(os.path.join(path, ".git")) or os.path.isdir(path):
-            out.append({"key": key, "name": name, "root": path})
+        if not (os.path.isdir(os.path.join(path, ".git")) or os.path.isdir(path)):
+            continue
+        real = os.path.realpath(path)
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append({"key": key, "name": name, "root": path})
     return out
 
 

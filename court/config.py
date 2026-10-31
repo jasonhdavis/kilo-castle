@@ -15,6 +15,12 @@ role configuration:
 - `sync.auto_interval_minutes`— dashboard (`court ui`) auto-reconcile cadence
                               for the classified `court sync --all` fold
                               (absent/0 disables; see `get_auto_sync`).
+- `context.sweet_spot` / `context.cull_soft` / `context.hard_red_zone`
+                             — the soft/hard token budgets the engine uses to
+                              decide whether to continue a worker session or
+                              cold-start a fresh one (`get_context_limits`); a
+                              `context.per_role.<role>` block may override any
+                              of them per Court role.
 
 No model-ID constants live in engine code: every role model resolves through
 `get_model()` / `get_provider()` against the manifest. A missing role is a
@@ -172,6 +178,54 @@ def get_studio_freshness(court_dir: Optional[Path] = None) -> dict:
         "command": str(studio.get("freshness_command") or "").strip(),
         "max_age_hours": max_age,
     }
+
+
+# Context-window budget: the soft/hard thresholds the engine uses to decide
+# whether to CONTINUE a worker session or COLD-START a fresh one. A session's
+# true context (`tokens.total` on its last step-finish) is re-read in full on
+# every continuation turn, so past a point a fresh session that reads the
+# charter and worktree from disk is both cheaper and sharper.
+#   sweet_spot     — the comfortable working size (informational).
+#   cull_soft      — a cull OPPORTUNITY: prefer a fresh session once a session
+#                    reaches this AND the worktree is committed (uncommitted
+#                    work keeps the session so a cold start cannot lose it).
+#   hard_red_zone  — the red zone: never re-prompt a same-session continuation.
+DEFAULT_CONTEXT_SWEET_SPOT = 200_000
+DEFAULT_CONTEXT_CULL_SOFT = 350_000
+DEFAULT_CONTEXT_HARD_RED_ZONE = 750_000
+
+
+def get_context_limits(role: Optional[str] = None, court_dir: Optional[Path] = None) -> dict:
+    """Resolve the soft/hard context thresholds from the manifest (context.*).
+
+    Global values come from ``context.sweet_spot`` / ``context.cull_soft`` /
+    ``context.hard_red_zone``; a ``context.per_role.<role>`` block may override
+    any of them per Court role. Absent, non-numeric, or negative values fall
+    back to the structural defaults above. Returns a dict of ints keyed
+    ``sweet_spot`` / ``cull_soft`` / ``hard_red_zone`` (0 disables a threshold).
+    """
+    cfg = load_config(court_dir)
+    ctx = cfg.get("context") if isinstance(cfg.get("context"), dict) else {}
+
+    def _int(source: dict, key: str, default: int) -> int:
+        try:
+            value = int(source.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return value if value >= 0 else default
+
+    limits = {
+        "sweet_spot": _int(ctx, "sweet_spot", DEFAULT_CONTEXT_SWEET_SPOT),
+        "cull_soft": _int(ctx, "cull_soft", DEFAULT_CONTEXT_CULL_SOFT),
+        "hard_red_zone": _int(ctx, "hard_red_zone", DEFAULT_CONTEXT_HARD_RED_ZONE),
+    }
+    per = ctx.get("per_role") if isinstance(ctx.get("per_role"), dict) else {}
+    override = per.get(role) if role and isinstance(per.get(role), dict) else None
+    if isinstance(override, dict):
+        for key in limits:
+            if key in override:
+                limits[key] = _int(override, key, limits[key])
+    return limits
 
 
 def canonical_model_id(model_str: str, provider: Optional[str] = None, court_dir: Optional[Path] = None) -> str:

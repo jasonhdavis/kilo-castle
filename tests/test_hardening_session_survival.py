@@ -82,6 +82,7 @@ def _make_watch_args(**kw):
         pid=None, dir=None, agent="gatekeeper", model=None, session="",
         quest="", task_file="TASK.md", max_attempts=2, attempt=1,
         exclude="", session_resolve_seconds=0, wall_cap=60,
+        max_context=0, context_soft=0, context_hard=0,
     )
     defaults.update(kw)
     return argparse.Namespace(**defaults)
@@ -91,6 +92,9 @@ def _run_watch_bounded(args, monkeypatch):
     """Run cmd_watch with a wall clock that fires right after the first
     decision, so the loop is exercised exactly once per spawn cycle."""
     monkeypatch.setattr(cli, "WATCH_POLL_SECONDS", 0.01)
+    # Keep the git checkpoint probe out of unit tests (the faked Popen below is
+    # not a full subprocess.Popen, which subprocess.run would require).
+    monkeypatch.setattr(cli.handoff, "worktree_is_clean", lambda wt: False)
     ticks = iter([0] + [10 ** 12] * 200)
     monkeypatch.setattr(cli.time, "time", lambda: next(ticks, 10 ** 12))
     cli.cmd_watch(args)
@@ -123,7 +127,12 @@ def test_watch_falls_back_to_fresh_session_when_id_unresolvable(tmp_path, monkey
     cmd = kilo_spawns[0]
     assert "--session" not in cmd
     assert "--agent" in cmd and "gatekeeper" in cmd
-    assert "Integrate the convoy." in cmd[-1]
+    # 2026-10-31: the fresh fallback is now a bounded cold-start handoff —
+    # it directs the fresh session to read the charter/TASK.md on disk and
+    # states the context discipline, instead of pasting the old task text.
+    prompt = cmd[-1]
+    assert "TASK.md" in prompt or ".court/quests/" in prompt
+    assert "Context discipline" in prompt
     log = (tmp_path / ".kilo" / "gatekeeper.log").read_text(encoding="utf-8")
     assert "falling back to a fresh-session continuation" in log
 
@@ -377,3 +386,36 @@ def test_provision_env_noop_without_root_env(tmp_path, monkeypatch):
     monkeypatch.setattr("court.git_ops._primary_repo_root_for", lambda p: root)
     assert provision_env_file(wt) is False
     assert not (wt / ".env").exists()
+
+
+def test_watch_cold_starts_when_session_context_is_bloated(tmp_path, monkeypatch):
+    """2026-10-31 context guard: re-prompting a session whose true context has
+    grown past the hard cap makes every continuation re-read the whole
+    history. The watchdog must cold-start a fresh session instead."""
+    (tmp_path / ".kilo").mkdir()
+    (tmp_path / ".kilo" / "TASK.md").write_text("Integrate the convoy.", encoding="utf-8")
+    fake_quest = MagicMock(status="GATE", id="Q900-Bloat")
+    fake_quest.body_sections = {"Expected Tribute": "- [ ] merge and promote the convoy\n"}
+    monkeypatch.setattr(cli, "_load_watch_quests", lambda qids, wt: [fake_quest])
+    monkeypatch.setattr(cli, "find_kilo_binary", lambda: "/usr/local/bin/kilo")
+    monkeypatch.setattr(cli, "query_latest_kilo_session_id", lambda *a, **k: "ses_bloated")
+    monkeypatch.setattr(cli.handoff, "session_context_tokens", lambda sid: 250_000)
+    spawned = []
+
+    class FakeProc:
+        def __init__(self):
+            self.pid = 515151
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda cmd, **kw: (spawned.append(cmd), FakeProc())[1])
+    _run_watch_bounded(
+        _make_watch_args(dir=str(tmp_path), wall_cap=5, session="ses_bloated", max_context=120_000),
+        monkeypatch,
+    )
+    kilo_spawns = [c for c in spawned if "kilo" in str(c[0])]
+    assert kilo_spawns, "a bloated session must still be continued — as a fresh session"
+    cmd = kilo_spawns[0]
+    assert "--session" not in cmd, "bloated session must not be re-prompted in place"
+    assert "250,000 tokens" in cmd[-1]
+    assert "Context discipline" in cmd[-1]
+    log = (tmp_path / ".kilo" / "gatekeeper.log").read_text(encoding="utf-8")
+    assert "context guard" in log

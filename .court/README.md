@@ -163,5 +163,68 @@ court advance <id> <STATUS>         # Advance stage
 court rollup --section <type>       # Siphon tribute sections across fleet
 court ship                          # Cog Ship: deployment convoy summary (Bard/Coffers/Atone/Murmur + castle..main vector)
 court ward                          # Compliance/patrol dashboard: last survey, pending Warden Reports, realm health
+court nightwatch --repo <path>      # Night's Watch: deterministic supervisor (goad/coin/collect under RAM + attempt caps)
+court vigil list|add|check          # Bounded Steward hand-offs the Night's Watch executes (when <condition> then <action>)
 court teardown-list                 # View worktrees ready to prune
 ```
+
+## The Night's Watch (deterministic supervision)
+
+`court nightwatch` is the mechanical answer to "who moves the pipeline while I
+sleep". It is a small stdlib process — **no model calls, no session, no tokens** —
+that reads `court status --json` on a timer and issues the same verbs a human
+Steward would:
+
+| Quest state | Supervisor action |
+|---|---|
+| `WORKING`/`QUESTING`, worker dead (exited/idle) | `goad` (bounded per quest) |
+| `TRIBUTE_READY`, no live Master of Coin | `coin` |
+| `GATE`, no live or recorded Gatekeeper | `collect --standup` (one convoy per cogship) |
+| `PLANNED`/`CHARTERED`/`DISPATCHED` | report only — dispatch is a Steward judgment call |
+| `READY_TO_RAZE` | report only — razing stays human/Steward |
+| `HELD` / pending Audience | parked |
+
+Guardrails: a live-worker ceiling (`--max-workers`, the RAM guard), per-tick and
+per-hour spawn budgets, per-quest cooldowns, a goad ceiling that escalates to
+"needs a human", single-instance locking, and worktree occupancy checks that
+refuse to stack a goad beneath a live artist/Master of Coin/any live `kilo run`
+in the same worktree. Run `--once` from cron or leave it as a loop; `--status`
+reports the daemon, state file, and per-quest counters; `--dry-run` prints the
+decision without acting. Journal:
+`~/.local/state/kilo-castle/nightwatch/<repo>.jsonl`.
+
+### Vigils — the Steward's bounded hand-off
+
+The watch has no authority to invent work. The only way a Steward hands it a
+future intent is `court vigil`, which is deliberately narrow — **there are no
+indefinite watches**. Every vigil requires:
+
+- `--why "<reason>"` — why the recurring look exists (min 12 chars);
+- `--expires <6h|2d|ISO>` — mandatory, capped at 7 days; an un-renewed vigil
+  dies on its own;
+- `--max-fires N` — 1..5, default 1: it announces a follow-on action, it does
+  not become a daemon;
+- `--when <condition>` (repeatable, ANDed) and `--then <action>`.
+
+```
+court vigil add q234-after-q123 \
+  --when "quest-status:Q123=READY_TO_RAZE" \
+  --then "dispatch:Q234" \
+  --why "Q234 needs Q123's schema promoted to castle first" --expires 6h
+```
+
+Conditions (deterministic, no model): `quest-status:<QID>=<STATUS>`,
+`quest-status:<QID>!=<STATUS>`, `quest-merged:<QID>`, `branch-merged:<branch>`,
+`file-exists:<path>`, `after:<iso>`.
+Actions: `dispatch:<QID>` (worktree cut from `castle` tip), `goad:<QID>`,
+`coin:<QID>`, `collect[:<QID>]`, `advance:<QID>=<STATUS>`, `note:<text>`.
+`ship`, `raze`, and `pillory` are **not** executable by a vigil — a timer never
+publishes to production or freezes a quest. Stories live in
+`.court/vigils/<id>.json`; `court vigil check` previews what is ready,
+`court vigil run` fires it immediately.
+
+Do **not** re-implement this with `schedule_wakeup`: a wakeup is an in-memory
+session timer that dies with its session, and a reasoning model handed "check
+back in 15 minutes" tends to answer by setting another wakeup — a token-burning
+spin loop that advances nothing.
+

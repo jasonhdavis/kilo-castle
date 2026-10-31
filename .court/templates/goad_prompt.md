@@ -12,6 +12,14 @@ Treat this as a cold start: do not assume any prior in-context state survived.
 3. `python3 -m court.cli show <QUEST_ID>` — read `# Expected Tribute` (checklist),
    `# Tribute Rendered` (narrative writeup), and current `status:`.
 
+**Step 0.5 — Context discipline (you are a fresh session; stay cheap and sharp):**
+- Read only the `# Expected Tribute` checklist and `# Castle Ledger` of the quest file — not the
+  whole record. Never dump a whole file, log, artifact, or dataset into context; use
+  `grep -n`, `sed -n 'A,Bp'`, `head`, or `tail` on the smallest window that answers the question.
+- Use `git status --porcelain` and `git diff --stat` rather than reading diffs wholesale.
+- Do not re-run a step whose output is already on disk; read the existing artifact's summary first.
+- Keep command output short (`-q`, `--stat`, `--quiet`, `| tail -20`).
+
 **Step 1 — Diagnose which of these two states you're actually in:**
 
 - **Case A — Tasks checklist is 100% checked off, working tree is clean, but `# Tribute

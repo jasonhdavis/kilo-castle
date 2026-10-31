@@ -385,6 +385,7 @@ def test_watch_stall_referee_kills_hung_worker_then_reprompts(tmp_path, monkeypa
             pid = 424242
 
         monkeypatch.setattr(cli.subprocess, "Popen", lambda cmd, **kw: spawned.append(cmd) or FakeProc())
+        monkeypatch.setattr(cli.handoff, "worktree_is_clean", lambda wt: False)
         _seed_lease(tmp_path, "serf", _final_payload(s.pid, pgid=os.getpgid(s.pid)))
         monkeypatch.setattr(cli, "WATCH_POLL_SECONDS", 0.01)
         cli.cmd_watch(_make_watch_args(

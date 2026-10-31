@@ -47,6 +47,9 @@ from . import migration_graph
 from . import browser as studio_browser
 from . import studio_close
 from . import lease as worker_lease
+from . import handoff
+from . import vigils
+from . import nightwatch
 from . import metrics as quest_metrics
 
 # The Ward's durable workspace: patrol ledger + Warden Report queue.
@@ -304,6 +307,35 @@ def build_serf_task_prompt(quest: Quest) -> str:
         ])
 
     return "\n".join(lines).strip() + "\n"
+
+
+def build_serf_replacement_prompt(quest: Quest) -> str:
+    """Prompt for a REPLACEMENT serf dispatched by the Night's Watch after a
+    prior serf spent its goad budget (the "falls over to dispatch" path).
+
+    Renders `serf_replacement_prompt.md` when present, filling the placeholders
+    the template declares; otherwise falls back to the plain task prompt, which
+    is still correct (a fresh session re-reads the charter and worktree)."""
+    branch = quest.branch or quest.tree_branch or "-"
+    tmpl = config.find_court_dir() / "templates" / "serf_replacement_prompt.md"
+    if not tmpl.is_file():
+        tmpl = Path(__file__).resolve().parent.parent / "templates" / "serf_replacement_prompt.md"
+    if not tmpl.is_file():
+        return build_serf_task_prompt(quest)
+    try:
+        text = tmpl.read_text(encoding="utf-8")
+    except OSError:
+        return build_serf_task_prompt(quest)
+    task = build_serf_task_prompt(quest)
+    rendered = (
+        text.replace("{{ quest_id }}", quest.id)
+        .replace("{{ quest_title }}", quest.title or "-")
+        .replace("{{ branch }}", branch)
+        .replace("{{ demoted_at }}", "n/a (replaced after repeated idle goads)")
+        .replace("<QUEST_ID>", quest.id)
+        .replace("<canonical_branch>", branch)
+    )
+    return rendered.strip() + "\n\n" + task
 
 
 def setup_worktree_agent_config(worktree_path: Path, agent: str = "serf") -> None:
@@ -1930,6 +1962,12 @@ def cmd_status(args):
         results = []
         for q in quests:
             audit = ward.audit_quest(q, base_branch="castle")
+            try:
+                wt_charter = _quest_worktree_charter(q)
+            except Exception:
+                wt_charter = None
+            ui_review = ((wt_charter.extract_ui_review_status() if wt_charter is not None else "")
+                         or q.extract_ui_review_status())
             q_dict = {
                 "id": q.id,
                 "title": q.title,
@@ -1960,6 +1998,7 @@ def cmd_status(args):
                 "commutation": q.extract_commutation(),
                 "commutation_done": q.commutation_complete(),
                 "pending_audience": q.has_pending_audience(),
+                "ui_review": ui_review,
                 "worker": _worker_verdict_for_quest(q, audit.worktree_path),
             }
             results.append(q_dict)
@@ -2914,7 +2953,10 @@ def cmd_dispatch(args):
         )
 
     # Build pure task prompt (zero persona boilerplate)
-    task_prompt = getattr(args, "prompt", None) or build_serf_task_prompt(quest)
+    if getattr(args, "replace", False):
+        task_prompt = getattr(args, "prompt", None) or build_serf_replacement_prompt(quest)
+    else:
+        task_prompt = getattr(args, "prompt", None) or build_serf_task_prompt(quest)
 
     # Stand up session if requested or available
     session_id = getattr(args, "session_id", None)
@@ -3462,6 +3504,29 @@ def cmd_goad(args):
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"{agent_role}.log"
 
+    # Context-aware re-prompt vs cold start (2026-10-31): a deterministic fresh
+    # spawn on every goad re-reads a bloated history for a fraction of the value
+    # and churns sessions. `--mode auto` continues the SAME session when it is
+    # healthy (or soft-capped with uncommitted work) and cold-starts only when
+    # the session is in the red zone or soft-capped on a committed tree.
+    mode = (getattr(args, "mode", None) or "auto").lower()
+    prior_raw = getattr(quest, "serf_session_id", "") or ""
+    prior_sid = prior_raw.strip() if isinstance(prior_raw, str) else ""
+    resume_sid = ""
+    if mode == "auto":
+        try:
+            limits = config.get_context_limits(court_dir=config.find_court_dir())
+            ctx = handoff.session_context_tokens(prior_sid)
+            checkpointed = handoff.worktree_is_clean(wt)
+            cold, _why = handoff.continuation_decision(
+                ctx, limits["cull_soft"], limits["hard_red_zone"], checkpointed)
+        except Exception:
+            cold, prior_sid = True, ""
+        mode = "cold" if (cold or not prior_sid) else "resume"
+    if mode == "resume" and prior_sid:
+        resume_sid = prior_sid
+    mode = "resume" if resume_sid else "cold"
+
     title = f"{quest.id} {role_label} Goad"
     cmd = [
         str(kilo_bin),
@@ -3471,8 +3536,10 @@ def cmd_goad(args):
         "--dir", str(wt),
         "--title", title,
         "--auto",
-        "--", rendered_prompt,
     ]
+    if resume_sid:
+        cmd += ["--session", resume_sid]
+    cmd += ["--", rendered_prompt]
 
     auto_commit = not getattr(args, "no_commit", False)
     pre_existing = query_kilo_session_ids(wt)
@@ -3523,6 +3590,11 @@ def cmd_goad(args):
         pgid=worker_pgid,
     )
     session_id = query_latest_kilo_session_id(wt, exclude_ids=pre_existing)
+    if resume_sid and not session_id:
+        # A `--session` continuation appends to the SAME session, so no new
+        # session id appears in kilo.db; keep the resumed id rather than
+        # stamping UNRESOLVED over a healthy session.
+        session_id = resume_sid
     # Same instant-death verification as cmd_coin (Q699 class): refuse to
     # record a session id for a process that died on spawn.
     poll_res = proc.poll() if hasattr(proc, "poll") else None
@@ -3538,7 +3610,7 @@ def cmd_goad(args):
     worker_lease.update(wt, agent_role, session_id=session_id)
     quest.serf_session_id = session_id
     store.save(quest, auto_commit=auto_commit, commit_msg=f"court: goad {role_label} session {session_label(session_id)} for {quest.id}")
-    print(f"⚡ Goaded {role_label} for {quest.id}:")
+    print(f"⚡ Goaded {role_label} for {quest.id} ({'continued same session' if resume_sid else 'fresh session'}):")
     print(f"   Session:  {session_label(session_id)} (PID {proc.pid})")
     print(f"   Agent:    {agent_role}")
     print(f"   Model:    {qual_model}")
@@ -3559,7 +3631,32 @@ def cmd_goad(args):
 
 WATCH_POLL_SECONDS = 5
 WATCH_MAX_ATTEMPTS = 3
+# Continuation context guard (2026-10-31, soft/hard 2026-10-31): re-prompting a
+# session whose true context has grown large makes the next turn re-read
+# everything for a fraction of the value. Two thresholds decide a cold start
+# (`handoff.continuation_decision`): a soft "cull opportunity" taken only when
+# the worktree is committed, and a hard red zone that is never re-prompted
+# in place. Both resolve from the manifest's `context.*` limits; this legacy
+# single cap (env-only, 0 = disabled) overrides both when set.
+WATCH_MAX_CONTEXT_TOKENS = int(os.environ.get("COURT_WATCH_MAX_CONTEXT", "0") or 0)
 WATCH_WALL_CAP_SECONDS = 24 * 3600
+
+
+def _watch_context_limits(wt: Optional[Path], args) -> tuple[int, int]:
+    """Resolve (cull_soft, hard_red_zone) for a continuation.
+
+    Precedence: the legacy single ``--max-context``/``COURT_WATCH_MAX_CONTEXT``
+    cap wins and becomes both thresholds; then explicit ``--context-soft`` /
+    ``--context-hard``; then the worktree repo's manifest ``context.*``; then
+    the structural defaults."""
+    legacy = int(getattr(args, "max_context", 0) or 0) or WATCH_MAX_CONTEXT_TOKENS
+    if legacy > 0:
+        return legacy, legacy
+    limits = config.get_context_limits(court_dir=(Path(wt) / ".court") if wt else None)
+    soft = int(getattr(args, "context_soft", 0) or 0) or limits["cull_soft"]
+    hard = int(getattr(args, "context_hard", 0) or 0) or limits["hard_red_zone"]
+    return soft, hard
+
 
 # A worker's turn may end early ONLY while its quest sits in one of these
 # pre-terminal states; anything else means the run finished its durable
@@ -3822,16 +3919,20 @@ def cmd_watch(args):
             return
 
         # Re-prompt the SAME session with a continuation of the original task.
+        # Task text is read only when a same-session continuation is actually
+        # used: a cold start must NOT paste the old task dump (that is the
+        # bloat this path exists to avoid).
         task_text = ""
-        for tf in ((getattr(args, "task_file", "") or "TASK.md"), "TASK.md"):
-            if wt and tf:
-                p = wt / ".kilo" / tf
-                if p.is_file():
-                    try:
-                        task_text = p.read_text(encoding="utf-8")
-                    except OSError:
-                        task_text = ""
-                    break
+        if not getattr(args, "cold_start", False):
+            for tf in ((getattr(args, "task_file", "") or "TASK.md"), "TASK.md"):
+                if wt and tf:
+                    p = wt / ".kilo" / tf
+                    if p.is_file():
+                        try:
+                            task_text = p.read_text(encoding="utf-8")
+                        except OSError:
+                            task_text = ""
+                        break
         continuation = (
             "Your previous turn ended before the assigned task was complete "
             f"(continuation attempt {attempt + 1} of {max_attempts}). Continue from where you "
@@ -3850,6 +3951,23 @@ def cmd_watch(args):
         if session_id or (wt and exclude):
             target_session = session_id or query_latest_kilo_session_id(wt, timeout_seconds=5, exclude_ids=exclude) or ""
         fresh_fallback = False
+        soft, hard = _watch_context_limits(wt, args)
+        if target_session and (soft > 0 or hard > 0):
+            tokens = handoff.session_context_tokens(target_session)
+            checkpointed = handoff.worktree_is_clean(wt) if wt else False
+            cold, why = handoff.continuation_decision(tokens, soft, hard, checkpointed)
+            _watch_log(wt or Path.cwd(), role, f"context guard: {why}")
+            if cold:
+                # Cheaper AND sharper than continuing: a fresh session reads
+                # the charter and worktree on disk instead of reloading a
+                # bloated transcript every turn.
+                fresh_fallback = True
+                continuation = handoff.cold_start_prompt(quests, prior_tokens=tokens)
+                # NOTE: target_session is intentionally NOT cleared — it is the
+                # trigger for this cold start, and the spawn below already
+                # skips `--session` whenever fresh_fallback is set. Clearing it
+                # would fall through into the unresolvable-id branch and
+                # rebuild the prompt without the prior-token context.
         if not target_session:
             # Fresh-worktree fallback (2026-10-06 cogship-281 hardening): a
             # worker whose session id never resolved used to orphan its quest
@@ -3862,6 +3980,8 @@ def cmd_watch(args):
                 _watch_log(wt or Path.cwd(), role, "no resolvable session id and no worktree — cannot continue")
                 return
             fresh_fallback = True
+            if not continuation.startswith("Resume Quest"):
+                continuation = handoff.cold_start_prompt(quests, task_file=(getattr(args, "task_file", "") or "TASK.md"))
             _watch_log(wt or Path.cwd(), role, "session id unresolvable — falling back to a fresh-session continuation in the same worktree")
 
         # Lease arbitration for the continuation itself: claim BEFORE spawning
@@ -6614,6 +6734,196 @@ def cmd_monitor(args):
         print("  → run `court fork-teardown-list` for the move/stop/triage order")
 
 
+def cmd_nightwatch(args):
+    """Deterministic overnight supervisor: reads durable quest state and issues
+    `goad` / `coin` / `collect --standup` under hard RAM and cooldown caps.
+
+    Replaces the LLM `schedule_wakeup` polling loop, which dies with its session
+    and burns a reasoning pass per check. This is a small stdlib process: no
+    model calls of its own, no session, no token spend. Every action it takes is
+    the same verb a human Steward would run by hand.
+    """
+    repo = Path(getattr(args, "repo", None) or git_ops.get_repo_root()).resolve()
+    if not (repo / ".court").is_dir():
+        print(f"ERROR: {repo} has no .court/ — not a Court repository", file=sys.stderr)
+        sys.exit(1)
+
+    if getattr(args, "status", False):
+        state = nightwatch.load_state(repo)
+        lock_holder = {}
+        try:
+            lock_holder = json.loads(nightwatch.lock_path(repo).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        alive = nightwatch._pid_alive(lock_holder.get("pid"))
+        print(f"== Night's Watch — {repo} ==")
+        print(f"state file: {nightwatch.state_path(repo)}")
+        print(f"journal:    {nightwatch.journal_path(repo)}")
+        print(f"daemon:     {'RUNNING pid ' + str(lock_holder.get('pid')) if alive else 'not running'}")
+        print(f"last tick:  {state.get('last_tick') or '(never)'}")
+        quests = state.get("quests") or {}
+        if quests:
+            print("\nper-quest counters:")
+            for qid in sorted(quests):
+                st = quests[qid]
+                bits = []
+                if st.get("goads"):
+                    bits.append(f"goads {st['goads']}")
+                if st.get("last_kind"):
+                    bits.append(f"last {st['last_kind']}")
+                if st.get("fails"):
+                    bits.append(f"fails {st['fails']}")
+                print(f"  {qid}: {', '.join(bits) or 'no actions'}")
+        else:
+            print("\nno actions recorded yet")
+        return
+
+    if getattr(args, "report", False):
+        print(nightwatch.render_digest(repo))
+        return
+
+    if getattr(args, "reset", False):
+        for p in (nightwatch.state_path(repo), nightwatch.journal_path(repo)):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        print(f"🧹 Cleared Night's Watch state for {repo}")
+
+    enabled = tuple(
+        s.strip() for s in (getattr(args, "enable", None) or "goad,coin,collect,dispatch").split(",") if s.strip()
+    )
+    bad = [k for k in enabled if k not in nightwatch.ENABLED_ACTIONS]
+    if bad:
+        print(f"ERROR: unknown action(s) {bad}; choose from {list(nightwatch.ENABLED_ACTIONS)}", file=sys.stderr)
+        sys.exit(1)
+
+    limits = config.get_context_limits(court_dir=repo / ".court")
+    cull_soft = int(getattr(args, "context_soft", 0) or 0) or limits["cull_soft"]
+    hard_red_zone = int(getattr(args, "context_hard", 0) or 0) or limits["hard_red_zone"]
+
+    policy = nightwatch.Policy(
+        max_workers=args.max_workers,
+        max_spawns_per_tick=args.max_spawns_per_tick,
+        max_spawns_per_hour=args.max_spawns_per_hour,
+        goad_cooldown=args.goad_cooldown,
+        coin_cooldown=args.coin_cooldown,
+        gate_cooldown=args.gate_cooldown,
+        max_goads=getattr(args, "goads_per_serf", None) or nightwatch.DEFAULT_GOADS_PER_SERF,
+        max_coins=args.max_coins,
+        goads_per_serf=getattr(args, "goads_per_serf", None) or nightwatch.DEFAULT_GOADS_PER_SERF,
+        serf_slots=getattr(args, "serf_slots", None) or nightwatch.DEFAULT_SERF_SLOTS,
+        collect_noop_backoff=getattr(args, "collect_noop_backoff", None) or nightwatch.DEFAULT_COLLECT_NOOP_BACKOFF,
+        retry_backoff=int(getattr(args, "retry_backoff", 0) or 0),
+        cull_soft=cull_soft,
+        hard_red_zone=hard_red_zone,
+        bloat_cold_start=bool(args.bloat_cold_start),
+        allow_dispatch=not bool(getattr(args, "no_dispatch", False)),
+        enabled=enabled,
+        allow_force_goad=bool(args.allow_force_goad),
+    )
+    sys.exit(nightwatch.run_loop(
+        repo,
+        policy,
+        interval=max(10, args.interval),
+        once=bool(args.once),
+        dry_run=bool(args.dry_run),
+        quiet=bool(args.quiet),
+    ))
+
+
+def cmd_vigil(args):
+    """Register, list, remove, or dry-check a bounded watch hand-off.
+
+    A vigil is the ONLY sanctioned way to say "watch for X and then do Y":
+    it requires a reason, an expiry, and a bounded fire count, so the Night's
+    Watch never accumulates indefinite polls. See court/vigils.py."""
+    repo = Path(getattr(args, "repo", None) or git_ops.get_repo_root()).resolve()
+    action = args.action
+
+    if action == "list":
+        specs = vigils.load_all(repo, include_finished=bool(getattr(args, "all", False)))
+        if not specs:
+            print("No vigils registered.")
+            return
+        print(f"== Vigils — {repo} ==")
+        for spec in specs:
+            fires = len(spec.get("fires") or [])
+            print(f"  [{spec.get('status','?')}] {spec['id']}  fires {fires}/{spec.get('max_fires',1)}  "
+                  f"expires {spec.get('expires_at')}")
+            print(f"      when: {' AND '.join(spec.get('when') or [])}")
+            print(f"      then: {spec.get('then')}")
+            print(f"      why:  {spec.get('reason')}")
+        return
+
+    if action == "remove":
+        ok = vigils.remove(repo, args.id)
+        print(f"{'🗑️  Removed' if ok else '⚠️  No such vigil:'} {args.id}")
+        sys.exit(0 if ok else 1)
+
+    if action in ("check", "run"):
+        try:
+            snap = nightwatch.snapshot(repo)
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: could not read court status: {e}", file=sys.stderr)
+            sys.exit(1)
+        quests = {q["id"]: q for q in snap.get("quests", [])}
+        ready, notes = vigils.ready_vigils(repo, quests)
+        for n in notes:
+            print(f"  ⏳ {n['id']}: {n['text']}")
+        if not ready:
+            print("No vigil conditions are currently satisfied.")
+        for spec, why in ready:
+            print(f"  ✅ {spec['id']} ready — {why}")
+            print(f"      then: {spec['then']}")
+        if action == "run":
+            for spec, _why in ready:
+                argv, _spawns = vigils.action_argv(spec["then"])
+                if not argv:
+                    print(f"  ℹ️  {spec['id']} is a note-only vigil: {spec['then']}")
+                    vigils.mark_fired(repo, spec, {"ok": True, "exit": 0, "seconds": 0})
+                    continue
+                print(f"  ▶ court {' '.join(argv)}")
+                try:
+                    res = subprocess.run([sys.executable, "-m", "court.cli", *argv],
+                                         cwd=str(repo), capture_output=True, text=True, timeout=900)
+                    out = (res.stdout or "").strip()
+                    if out:
+                        print("    " + out.splitlines()[-1][:200])
+                    vigils.mark_fired(repo, spec, {"ok": res.returncode == 0, "exit": res.returncode,
+                                                   "seconds": 0})
+                except Exception as e:  # noqa: BLE001
+                    print(f"    ❌ {e}")
+        return
+
+    if action == "add":
+        try:
+            spec = vigils.build(
+                id=args.id,
+                when=args.when or [],
+                then=args.then,
+                reason=args.why,
+                expires=args.expires,
+                max_fires=args.max_fires,
+                created_by="steward",
+            )
+        except vigils.VigilError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        p = vigils.save(repo, spec)
+        print(f"🕯️  Vigil registered: {spec['id']}")
+        print(f"   when: {' AND '.join(spec['when'])}")
+        print(f"   then: {spec['then']}")
+        print(f"   why:  {spec['reason']}")
+        print(f"   expires: {spec['expires_at']} (max fires {spec['max_fires']})")
+        print(f"   file: {p}")
+        print("   The Night's Watch evaluates it every tick; verify with `court vigil check`.")
+        return
+
+    print(f"ERROR: unknown vigil action {action!r} (add|list|remove|check|run)", file=sys.stderr)
+    sys.exit(1)
+
+
 def cmd_teardown_list(args):
     import json
     am_path = agent_manager_json_path()
@@ -8006,7 +8316,9 @@ def build_parser():
         default=None,
         help="Worker model (default: manifest models.serf in .court/config.json)",
     )
-    p_dispatch.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
+    p_dispatch.add_argument("--replace", action="store_true", help="Bounded REPLACEMENT dispatch (Night's Watch 'falls over to dispatch'): re-spawn a fresh serf into an existing WORKING worktree, inheriting committed prior art (uses serf_replacement_prompt.md)")
+    p_dispatch.add_argument(
+        "--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_dispatch.set_defaults(func=cmd_dispatch)
 
     p_coin = sub.add_parser(
@@ -8028,6 +8340,7 @@ def build_parser():
     p_goad.add_argument("--model", default=None, help="Model override for goad")
     p_goad.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_goad.add_argument("--force", action="store_true", help="Supersede a live worker lease: kill the current worker's process group, then spawn the goad (default: refuse while a worker is live)")
+    p_goad.add_argument("--mode", default="auto", choices=("auto", "cold", "resume"), help="Re-prompt mode: auto (continue the same session when healthy, cold-start when bloated/committed; default), cold (always a fresh session), resume (always continue the recorded serf session)")
     p_goad.set_defaults(func=cmd_goad)
 
     p_dispatch_complete = sub.add_parser(
@@ -8228,6 +8541,7 @@ def build_parser():
     p_tally = sub.add_parser("tally", help="Extract and summarize production verification runbooks and UI paths across Quests (/tally)")
     add_quest_selector(p_tally, batchable=True, filters=("status", "app", "epic", "cogship"))
     p_tally.set_defaults(func=cmd_tally)
+
     p_metrics = sub.add_parser(
         "metrics",
         help="Read-only per-Quest rollup: cost, wall-clock, turns, goads (kilo.db + goad ledger) — the live-pipeline twin of a model bake-off",
@@ -8437,6 +8751,10 @@ def build_parser():
     p_watch.add_argument("--session-resolve-seconds", dest="session_resolve_seconds", type=int, default=6, help="How long to poll kilo.db for the worker session id when only a pid is known")
     p_watch.add_argument("--wall-cap", type=int, default=WATCH_WALL_CAP_SECONDS, help="Hard wall-clock cap for the whole watch (seconds)")
     p_watch.add_argument("--stall-seconds", dest="stall_seconds", type=int, default=0, help="Stall referee threshold override in seconds (0 = role default: serf 20m, scout 30m, master_of_coin 30m, gatekeeper 45m of log silence)")
+    p_watch.add_argument("--max-context", dest="max_context", type=int, default=0, help="DEPRECATED single context cap: cold-start a fresh session once a session reaches this many tokens (becomes BOTH the soft and hard thresholds; 0 = use the manifest's context.* limits)")
+    p_watch.add_argument("--context-soft", dest="context_soft", type=int, default=0, help="Cull opportunity (tokens): prefer a fresh session once a session reaches this and the worktree is committed (0 = manifest context.cull_soft)")
+    p_watch.add_argument("--context-hard", dest="context_hard", type=int, default=0, help="Red zone (tokens): never re-prompt a same-session continuation past this (0 = manifest context.hard_red_zone)")
+    p_watch.add_argument("--cold-start", dest="cold_start", action="store_true", help="Always continue with a fresh session (never re-prompt the recorded session)")
     p_watch.set_defaults(func=cmd_watch)
 
     p_monitor = sub.add_parser(
@@ -8444,6 +8762,53 @@ def build_parser():
         help="One-shot cron task: classified `court sync --all` status roll-up + lifecycle teardown sweep (safe to schedule; exits 0)",
     )
     p_monitor.set_defaults(func=cmd_monitor)
+
+    p_nightwatch = sub.add_parser(
+        "nightwatch",
+        help="Deterministic fleet supervisor (the Night's Watch): polls durable quest state and issues goad / coin / collect --standup under RAM, cooldown, and attempt caps — no LLM polling, no tokens",
+    )
+    p_nightwatch.add_argument("--repo", default=None, help="Court repository to supervise (default: this repo). Point at another checkout to watch its pipeline.")
+    p_nightwatch.add_argument("--once", action="store_true", help="Run a single tick and exit (cron-friendly)")
+    p_nightwatch.add_argument("--interval", type=int, default=nightwatch.DEFAULT_INTERVAL, help=f"Seconds between ticks in loop mode (default {nightwatch.DEFAULT_INTERVAL})")
+    p_nightwatch.add_argument("--dry-run", action="store_true", help="Decide and print, take no action")
+    p_nightwatch.add_argument("--status", action="store_true", help="Print daemon presence, state file, and per-quest counters, then exit")
+    p_nightwatch.add_argument("--reset", action="store_true", help="Clear persisted counters/journal for the target repo before starting")
+    p_nightwatch.add_argument("--max-workers", type=int, default=nightwatch.DEFAULT_MAX_WORKERS, help=f"Live kilo worker ceiling; no new spawns above it (default {nightwatch.DEFAULT_MAX_WORKERS})")
+    p_nightwatch.add_argument("--max-spawns-per-tick", dest="max_spawns_per_tick", type=int, default=nightwatch.DEFAULT_MAX_SPAWNS_PER_TICK, help=f"Max actions per tick (default {nightwatch.DEFAULT_MAX_SPAWNS_PER_TICK})")
+    p_nightwatch.add_argument("--max-spawns-per-hour", dest="max_spawns_per_hour", type=int, default=nightwatch.DEFAULT_MAX_SPAWNS_PER_HOUR, help=f"Rolling one-hour spawn budget (default {nightwatch.DEFAULT_MAX_SPAWNS_PER_HOUR})")
+    p_nightwatch.add_argument("--goad-cooldown", dest="goad_cooldown", type=int, default=nightwatch.DEFAULT_GOAD_COOLDOWN, help=f"Seconds between goads of one Quest (default {nightwatch.DEFAULT_GOAD_COOLDOWN})")
+    p_nightwatch.add_argument("--coin-cooldown", dest="coin_cooldown", type=int, default=nightwatch.DEFAULT_COIN_COOLDOWN, help=f"Seconds between coin attempts for one Quest (default {nightwatch.DEFAULT_COIN_COOLDOWN})")
+    p_nightwatch.add_argument("--gate-cooldown", dest="gate_cooldown", type=int, default=nightwatch.DEFAULT_GATE_COOLDOWN, help=f"Seconds between collect attempts per convoy (default {nightwatch.DEFAULT_GATE_COOLDOWN})")
+    p_nightwatch.add_argument("--max-goads", dest="goads_per_serf", type=int, default=nightwatch.DEFAULT_GOADS_PER_SERF, help=f"Goads per serf before a replacement serf is dispatched (default {nightwatch.DEFAULT_GOADS_PER_SERF})")
+    p_nightwatch.add_argument("--goads-per-serf", dest="goads_per_serf", type=int, default=nightwatch.DEFAULT_GOADS_PER_SERF, help=f"Alias of --max-goads (default {nightwatch.DEFAULT_GOADS_PER_SERF})")
+    p_nightwatch.add_argument("--serf-slots", dest="serf_slots", type=int, default=nightwatch.DEFAULT_SERF_SLOTS, help=f"Serfs per Quest before bubbling up to a Steward (goad budget = serf_slots x goads_per_serf; default {nightwatch.DEFAULT_SERF_SLOTS})")
+    p_nightwatch.add_argument("--collect-noop-backoff", dest="collect_noop_backoff", type=int, default=nightwatch.DEFAULT_COLLECT_NOOP_BACKOFF, help=f"Seconds to back a convoy off after a collect that packed nothing (default {nightwatch.DEFAULT_COLLECT_NOOP_BACKOFF})")
+    p_nightwatch.add_argument("--report", action="store_true", help="Roll up where the Night's Watch is stuck (livelocks, stale holds, goad/budget ceilings, failures) from the journal + state, then exit")
+    p_nightwatch.add_argument("--context-soft", dest="context_soft", type=int, default=0, help="Cull line (tokens) at which a live watchdog re-prompting a session is flagged (0 = manifest context.cull_soft)")
+    p_nightwatch.add_argument("--context-hard", dest="context_hard", type=int, default=0, help="Red zone (tokens) past which a live watchdog's same-session re-prompt is unacceptable (0 = manifest context.hard_red_zone)")
+    p_nightwatch.add_argument("--no-dispatch", dest="no_dispatch", action="store_true", help="Forbid vigils from dispatching new quests (dispatching is otherwise allowed ONLY through an explicitly registered vigil)")
+    p_nightwatch.add_argument("--bloat-cold-start", dest="bloat_cold_start", action="store_true", help="When a watchdog is about to re-prompt a session past the cull line, supersede it with a fresh cold-start goad (requires --allow-force-goad; off by default, so such sessions are flagged for a human instead)")
+    p_nightwatch.add_argument("--retry-backoff", dest="retry_backoff", type=int, default=nightwatch.DEFAULT_RETRY_BACKOFF, help=f"Seconds to wait before retrying a FAILED action (a failed attempt must not burn the full cooldown; 0 disables; default {nightwatch.DEFAULT_RETRY_BACKOFF})")
+    p_nightwatch.add_argument("--max-coins", dest="max_coins", type=int, default=nightwatch.DEFAULT_MAX_COINS, help=f"Coin attempts before a Quest is flagged for a human (default {nightwatch.DEFAULT_MAX_COINS})")
+    p_nightwatch.add_argument("--enable", default="goad,coin,collect,dispatch", help="Comma list of permitted actions (goad,coin,collect,dispatch)")
+    p_nightwatch.add_argument("--allow-force-goad", dest="allow_force_goad", action="store_true", help="Permit --force goads (supersedes a live worker). Off by default.")
+    p_nightwatch.add_argument("--quiet", action="store_true", help="Journal only; suppress per-tick console output")
+    p_nightwatch.set_defaults(func=cmd_nightwatch)
+
+    p_vigil = sub.add_parser(
+        "vigil",
+        help="Register/inspect a bounded watch hand-off for the Night's Watch: when <condition> then <action>, with a mandatory reason, expiry, and fire cap",
+    )
+    p_vigil.add_argument("action", choices=["add", "list", "remove", "check", "run"], help="add | list | remove | check (dry) | run (fire ready vigils now)")
+    p_vigil.add_argument("id", nargs="?", default=None, help="Vigil id (add/remove)")
+    p_vigil.add_argument("--repo", default=None, help="Court repository (default: this repo)")
+    p_vigil.add_argument("--when", action="append", default=[], help="Condition, repeatable and ANDed: quest-status:Q123=READY_TO_RAZE, quest-merged:Q123, branch-merged:<branch>, file-exists:<path>, after:<iso>")
+    p_vigil.add_argument("--then", default=None, help="Action to take: dispatch:<QID>, goad:<QID>, coin:<QID>, collect[:<QID>], advance:<QID>=<STATUS>, note:<text>")
+    p_vigil.add_argument("--why", default=None, help="REQUIRED: why this watch exists")
+    p_vigil.add_argument("--expires", default=None, help=f"REQUIRED: absolute ISO timestamp or a span like 6h/2d (ceiling {vigils.MAX_VIGIL_HOURS // 24} days)")
+    p_vigil.add_argument("--max-fires", dest="max_fires", type=int, default=vigils.DEFAULT_MAX_FIRES, help=f"How many times it may fire before retiring (1..{vigils.MAX_FIRES_CEILING}, default {vigils.DEFAULT_MAX_FIRES})")
+    p_vigil.add_argument("--all", action="store_true", help="list: include retired/expired vigils")
+    p_vigil.set_defaults(func=cmd_vigil)
 
     p_verify_manifest = sub.add_parser(
         "verify-manifest",
@@ -8510,6 +8875,10 @@ _READ_ONLY_COMMANDS = {
     # blocking on a busy castle would delay continuations). `monitor` runs
     # sync as its own subprocess which takes the lock itself.
     "watch", "monitor",
+    # `nightwatch` is a long-lived supervisor: it must not hold the court-wide
+    # write lock for its lifetime (same class as the `ui` deadlock). It shells
+    # out to mutating verbs, which take the lock themselves, one at a time.
+    "nightwatch",
     # `ui` is a long-lived server: it must never hold the court-wide write
     # lock for its whole lifetime (that deadlocked every root-level mutation
     # until the server died). Its in-process court ops shell out as

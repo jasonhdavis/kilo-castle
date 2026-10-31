@@ -643,7 +643,13 @@ function addUnit(sec,path,b,w){
  if(sec.seen.has(path))return;
  sec.seen.add(path);sec.units.push({b,w});
 }
-let view='chat', boardApp='all', boardKey='', CMDS=[], cmdIdx=0;
+let view='chat', boardApp=null, boardKey='', CMDS=[], cmdIdx=0;
+function boardScope(){return boardApp||selRepo||'all';}
+function inBoardScope(q,s){
+ if(!s||s==='all')return true;
+ const k=String(s).trim().toLowerCase();
+ return [q.app,q.repo].some(v=>String(v||'').trim().toLowerCase()===k);
+}
 let BOARD_SEL=new Set();
 const TURNSEQ=[0];
 const foldMemo={};
@@ -750,7 +756,7 @@ function applyHash(){
  const p=hashState();let hit=false;
  NAVSUP=true;
  try{
-  if(p.app&&S.repos.some(r=>r.key===p.app)){selRepo=p.app;hit=true;}
+  if(p.app&&S.repos.some(r=>r.key===p.app)){selRepo=p.app;boardApp=null;hit=true;}
   if(p.view==='board'||p.view==='settings')setView(p.view);
   else if(view!=='chat')setView('chat');
   if(p.wt){
@@ -797,7 +803,7 @@ window.addEventListener('popstate',()=>{
   $('t_today').innerHTML=`$ <b>${(ty.cost||0).toFixed(2)}</b> today`;
    syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();syncMarkRead();
   if(view==='board'){
-    const key=boardApp+'|'+(S.quests||[]).map(q=>q.id+q.status+(q.dirty?'d':'')+(q.app||'')+(q.cogship_id||'')+(q.moc_live?'m':'')+(q.cogship_live?'g':'')).join(',');
+    const key=boardScope()+'|'+(S.quests||[]).map(q=>q.id+q.status+(q.dirty?'d':'')+(q.app||'')+(q.cogship_id||'')+(q.moc_live?'m':'')+(q.cogship_live?'g':'')).join(',');
     if(key!==boardKey){boardKey=key;renderBoard();}}
  }
  async function poll(){return __poll(false);}
@@ -953,11 +959,12 @@ window.addEventListener('popstate',()=>{
   const wt=e.target.closest('[data-wt]');
   if(wt){pickWt(wt.dataset.wt||null,wt.dataset.branch||null);}
 });
-function switchApp(key){selRepo=key;selWt=null;selSess=null;msgs=[];curLane=null;
+function switchApp(key){selRepo=key;boardApp=null;selWt=null;selSess=null;msgs=[];curLane=null;
  $('wt_label').textContent='select a worktree';$('wt_badge').innerHTML='';
  $('c_cont').innerHTML='new session — pick a worktree, or open the ☰ sessions menu to continue one';
  CMDS=[];renderCmdList();
-  renderNav();renderTranscript();syncHash(true);syncComposer();syncMarkRead();}
+  renderNav();renderTranscript();syncHash(true);syncComposer();syncMarkRead();
+  if(view==='board'){boardKey='';renderBoard();}}
 let cmdSeq=0;
 const CMD_CACHE={};
 async function loadCmds(){
@@ -1571,7 +1578,14 @@ function setView(v){
  if(v==='board'){boardKey='';renderBoard();}
  if(v==='settings')renderSettings();
 }
-function boardFilter(a){boardApp=a;renderBoard();}
+function boardFilter(a){
+ if(a==='all'){boardApp='all';}
+ else{
+  boardApp=a;
+  const r=(S.repos||[]).find(r=>String(r.key).toLowerCase()===String(a).toLowerCase());
+  if(r)selRepo=r.key;
+ }
+ renderBoard();}
 function openQuestWt(p){
  const r=(S.repos||[]).find(r=>(r.worktrees||[]).some(w=>w.path===p));
  if(r)selRepo=r.key;
@@ -1591,10 +1605,11 @@ function boardAttn(q){
 function renderBoardBar(){
  if(view!=='board')return;
  const qs=S.quests||[];
- const apps={};for(const q of qs){const a=q.app||q.repo||'other';apps[a]=(apps[a]||0)+1;}
+ const apps={};for(const q of qs){const a=String(q.app||q.repo||'other').trim().toLowerCase();apps[a]=(apps[a]||0)+1;}
  const nAttn=qs.filter(boardAttn).length;
- let h='<div class="bfil"><span class="chipx '+(boardApp==='all'?'on':'')+'" data-app="all">all · '+qs.length+'</span>'+
-  Object.keys(apps).sort().map(a=>`<span class="chipx ${a===boardApp?'on':''}" data-app="${esc(a)}">${esc(a)} · ${apps[a]}</span>`).join('')+
+ const bapp=boardScope().toLowerCase();
+ let h='<div class="bfil"><span class="chipx '+(bapp==='all'?'on':'')+'" data-app="all">all · '+qs.length+'</span>'+
+  Object.keys(apps).sort().map(a=>`<span class="chipx ${a===bapp?'on':''}" data-app="${esc(a)}">${esc(appBadge(a))} · ${apps[a]}</span>`).join('')+
   (nAttn?`<span class="chipx" style="border-color:rgba(248,81,73,.5);color:var(--red)">${nAttn} need attention</span>`:'')+
   '<button class="bgo" data-bulk="syncall" title="court sync --all — pull branch-tip quest paperwork onto the main checkout for every quest (branch-wins union; true edit wars report)">⇅ sync all</button>'+  (BOARD_SEL.size?`<div class="bbulk"><b>${BOARD_SEL.size} selected</b>`+
    '<button class="bgo" data-bulk="collect">🚢 pack</button>'+
@@ -1617,7 +1632,7 @@ function renderBoard(){
   // but-undeployed (ship_ready). Click a card → ship manifest document;
   // confirm button → court ship --confirm for the convoy's ready members.
   // Fully-deployed/archived convoys drop off.
-   const rel=qs.filter(q=>boardApp==='all'||(q.app||q.repo)===boardApp);
+   const rel=qs.filter(q=>inBoardScope(q,boardScope()));
    const trunkAhead=rel.length?Math.max(0,...rel.map(q=>q.trunk_ahead||0)):0;
    const byCs={};
    for(const q of rel)if(q.cogship_id&&csActive(q))(byCs[q.cogship_id]=byCs[q.cogship_id]||[]).push(q);
@@ -1664,7 +1679,7 @@ function renderBoard(){
   let cols='';
   for(const st of STATUS_ORDER){
    if(st==='ASHES')continue;
-   const items=qs.filter(q=>q.status===st&&(boardApp==='all'||(q.app||q.repo)===boardApp));
+   const items=qs.filter(q=>q.status===st&&inBoardScope(q,boardScope()));
   const allSel=items.length&&items.every(q=>BOARD_SEL.has(q.id));
   cols+=`<div class="bcol"><h3><label class="bselall" title="select all in this column">`+
    `<input type="checkbox" class="bselall" data-bselall="${esc(st)}"${allSel?' checked':''}>`+
@@ -1727,7 +1742,7 @@ $('boardbar').addEventListener('click',e=>{
   const sa=e.target.closest('[data-bselall]');
  if(sa){const st=sa.dataset.bselall;
   const qs=S.quests||[];
-  const ids=qs.filter(q=>q.status===st&&(boardApp==='all'||(q.app||q.repo)===boardApp)).map(q=>q.id);
+  const ids=qs.filter(q=>q.status===st&&inBoardScope(q,boardScope())).map(q=>q.id);
   const all=ids.length&&ids.every(id=>BOARD_SEL.has(id));
   if(all)ids.forEach(id=>BOARD_SEL.delete(id));else ids.forEach(id=>BOARD_SEL.add(id));
   renderBoard();return;}

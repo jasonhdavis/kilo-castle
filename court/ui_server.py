@@ -2280,6 +2280,7 @@ function jumpToSession(sid){
 let META=null, SETTINGS=null;
 function canonModelJS(v){
  const m=String(v||'').trim();if(!m)return'';
+ if(m.startsWith('~'))return'kilo/'+m;
  if(m.includes('/'))return m;
  const low=m.toLowerCase().replace(/ /g,'').replace(/-/g,'').replace(/\./g,'');
  for(const[name,q]of Object.entries((META&&META.aliases)||{})){
@@ -4328,6 +4329,11 @@ def _canon_model(v, cfg=None):
     m = str(v or "").strip()
     if not m:
         return ""
+    # `~vendor/model` is the gateway's shorthand family (e.g.
+    # `~deepseek/deepseek-flash-latest`). It is not a provider-qualified id:
+    # passed through bare, `kilo run` rejects it with "Model not found".
+    if m.startswith("~"):
+        return "kilo/" + m
     if "/" in m:
         return m
     cfg = cfg if cfg is not None else _manifest()
@@ -5692,6 +5698,8 @@ class Handler(BaseHTTPRequestHandler):
         if model and (len(model) > 120 or not re.fullmatch(r"[\w.~@/-]+", model)):
             self._json({"error": "bad model id"}, 400)
             return
+        if model:
+            model = _canon_model(model)
         if not prompt:
             self._json({"error": "empty prompt"}, 400)
             return

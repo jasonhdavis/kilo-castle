@@ -2280,7 +2280,7 @@ function jumpToSession(sid){
 let META=null, SETTINGS=null;
 function canonModelJS(v){
  const m=String(v||'').trim();if(!m)return'';
- if(m.startsWith('~'))return'kilo/'+m;
+ if(m.startsWith('~'))return'openrouter/'+m;
  if(m.includes('/'))return m;
  const low=m.toLowerCase().replace(/ /g,'').replace(/-/g,'').replace(/\./g,'');
  for(const[name,q]of Object.entries((META&&META.aliases)||{})){
@@ -4333,7 +4333,7 @@ def _canon_model(v, cfg=None):
     # `~deepseek/deepseek-flash-latest`). It is not a provider-qualified id:
     # passed through bare, `kilo run` rejects it with "Model not found".
     if m.startswith("~"):
-        return "kilo/" + m
+        return "openrouter/" + m
     if "/" in m:
         return m
     cfg = cfg if cfg is not None else _manifest()

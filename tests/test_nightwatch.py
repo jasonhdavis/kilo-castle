@@ -872,3 +872,10 @@ def test_a_second_scheduler_is_reported_once_an_hour(tmp_path, monkeypatch, caps
     nw.report_lock_refusal(tmp_path, "another nightwatch is running (pid 1)")
     captured = capsys.readouterr()
     assert captured.err.count("another nightwatch") == 1
+
+
+def test_policy_describe_names_the_effective_levers():
+    line = _policy(max_workers=2, max_spawns_per_tick=1, max_spawns_per_hour=8).describe()
+    assert "workers<=2" in line
+    assert "spawns=1/tick,8/h" in line
+    assert "enable=goad,coin,collect,dispatch" in line

@@ -186,6 +186,21 @@ class Policy:
     def allows(self, kind: str) -> bool:
         return kind in self.enabled
 
+    def describe(self) -> str:
+        """One-line effective policy, for the journal banner and `--status`.
+
+        Two schedulers per repo is a normal shape, and the tuned one can lose
+        the lock race to a looser one. Naming the live policy where it is read
+        makes "which scheduler is actually acting?" a status check instead of a
+        `ps` archaeology dig.
+        """
+        return (
+            f"enable={','.join(self.enabled)} · workers<={self.max_workers} · "
+            f"spawns={self.max_spawns_per_tick}/tick,{self.max_spawns_per_hour}/h · "
+            f"goad={self.goad_cooldown}s coin={self.coin_cooldown}s gate={self.gate_cooldown}s "
+            f"raze={self.raze_cooldown}s"
+        )
+
     def goad_budget(self) -> int:
         """Total worker-recovery goads before a Quest bubbles up to a Steward
         (`serf_slots` serfs x `goads_per_serf` goads)."""
@@ -1715,8 +1730,22 @@ def run_loop(repo: Path, policy: Policy, interval: int, once: bool, dry_run: boo
             print(*args, flush=True, **kwargs)
 
     state = load_state(repo)
-    _journal(repo, {"ts": _now_iso(), "event": "start", "pid": os.getpid(), "dry_run": dry_run,
-                    "policy": policy.__dict__, "interval": interval, "once": once})
+    banner = policy.describe()
+    previous = state.get("policy_line") or ""
+    state["policy_line"] = banner
+    state["policy"] = dict(policy.__dict__)
+    state["pid"] = os.getpid()
+    save_state(repo, state)
+    say(f"🧭 policy (pid {os.getpid()}): {banner}")
+    if not once:
+        _journal(repo, {"ts": _now_iso(), "event": "start", "pid": os.getpid(), "dry_run": dry_run,
+                        "policy": policy.__dict__, "policy_line": banner, "interval": interval, "once": once})
+    elif banner != previous:
+        # A wrapper ticking every few minutes would otherwise write a start line
+        # per tick (159 of them in pb-custom); record the policy only when it
+        # actually changes.
+        _journal(repo, {"ts": _now_iso(), "event": "policy", "pid": os.getpid(),
+                        "policy_line": banner, "previous": previous})
     rc = 0
     try:
         while True:
@@ -1739,6 +1768,8 @@ def run_loop(repo: Path, policy: Policy, interval: int, once: bool, dry_run: boo
             if stop["flag"]:
                 break
     finally:
-        _journal(repo, {"ts": _now_iso(), "event": "stop", "pid": os.getpid(), "reason": "signal" if stop["flag"] else "done"})
+        if not once:
+            _journal(repo, {"ts": _now_iso(), "event": "stop", "pid": os.getpid(),
+                            "reason": "signal" if stop["flag"] else "done"})
         release_instance_lock(repo)
     return rc

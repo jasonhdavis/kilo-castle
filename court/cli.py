@@ -6925,6 +6925,8 @@ def cmd_nightwatch(args):
         print(f"journal:    {nightwatch.journal_path(repo)}")
         print(f"daemon:     {'RUNNING pid ' + str(lock_holder.get('pid')) if alive else 'not running'}")
         print(f"last tick:  {state.get('last_tick') or '(never)'}")
+        if state.get("policy_line"):
+            print(f"policy:     {state['policy_line']}")
         quests = state.get("quests") or {}
         if quests:
             print("\nper-quest counters:")

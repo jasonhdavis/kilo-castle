@@ -2889,11 +2889,51 @@ def _print_dispatch_next_steps(quest: Quest, standup_res: Optional[dict] = None)
     _print_next_steps(f"⚙️ NEXT STEPS — {quest.id} IS NOW WORKING", steps)
 
 
+WATCH_LIVE_WINDOW = 900
+
+
+def _watch_dispatch_block(repo: Path, quest) -> str:
+    """Return a refusal reason when a live Night's Watch should own this dispatch.
+
+    Routine new work belongs in the capacity-gated queue (`court enqueue`), which
+    is how the fleet supervisor avoids stampeding a 16 GB machine. Direct
+    dispatch stays legitimate for remediation and re-dispatch — a Quest that is
+    already DISPATCHED/WORKING has a live worktree to address — and for a stopped
+    watch, which the caller records with --break-glass.
+    """
+    if (quest.status or "").upper() not in ("OPEN", "PLANNED", "CHARTERED"):
+        return ""
+    state = nightwatch.load_state(repo)
+    last = state.get("last_tick")
+    if not last:
+        return ""
+    try:
+        age = time.time() - datetime.strptime(str(last), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return ""
+    if age > WATCH_LIVE_WINDOW:
+        return ""
+    return (
+        f"the Night's Watch is live (last tick {last}, {int(age)}s ago) — new work goes through "
+        f"the queue: `court enqueue {quest.id.split('-')[0]} --why \"...\"`. "
+        f"Re-run with --break-glass for a deliberate bypass (recorded in the ledger)."
+    )
+
+
 def cmd_dispatch(args):
     """Dispatch a Quest to a worktree (creates worktree and configures agent mode,
     advances to WORKING)."""
     quest = store.load(args.quest_id)
     auto_commit = not getattr(args, "no_commit", False)
+
+    block = _watch_dispatch_block(git_ops.get_repo_root(), quest)
+    if block and not getattr(args, "break_glass", False):
+        print(f"ERROR: {block}", file=sys.stderr)
+        sys.exit(1)
+    if block:
+        quest.log_ledger(quest.status, quest.status,
+                         "Break-glass dispatch (--break-glass): Night's Watch queue bypassed")
 
     branch = getattr(args, "branch", None) or quest.branch or quest.tree_branch
     is_valid, err = validate_branch_name(branch)
@@ -7232,6 +7272,11 @@ def cmd_enqueue(args):
     print(f"   expires: {spec['expires_at']}")
     print(f"   queue:   {depth + 1} dispatch hand-off(s) active")
     print(f"   file:    {p}")
+    quest.log_ledger(quest.status, quest.status, f"Queued for the Night's Watch ({vid})")
+    try:
+        store.save(quest, court_root=repo / ".court", auto_commit=True)
+    except Exception as e:  # never lose the queue entry over a ledger write
+        print(f"⚠️  queue registered but the ledger line failed: {e}")
     print("   Inspect with `court vigil list` / `court nightwatch --report`.")
 
 
@@ -8746,6 +8791,10 @@ def build_parser():
     p_dispatch.add_argument("--agent", default=None, help="Agent to use (default: serf, or scout for investigations)")
     p_dispatch.add_argument("--prompt", default=None, help="Custom prompt override (defaults to pure charter task instructions)")
     p_dispatch.add_argument("--base", default="castle", help="Base branch for new worktrees (default: castle)")
+    p_dispatch.add_argument(
+        "--break-glass", dest="break_glass", action="store_true", default=False,
+        help="Dispatch directly even when the Night's Watch is live (recorded in the ledger)",
+    )
     p_dispatch.add_argument("--session-id", default=None, dest="session_id", help="Pre-resolved agent session ID (default: whatever the spawn resolves; unresolved when none)")
     p_dispatch.add_argument(
         "--model", "--serf-model",

@@ -1415,6 +1415,65 @@ def read_journal(repo: Path, max_events: int = 20000) -> list:
     return out
 
 
+_LEDGER_DISPATCHED_RE = re.compile(
+    r"^- \*\*(\d{4}-\d\d-\d\dT[\d:]+Z)\*\* — \S+ → DISPATCHED:", re.MULTILINE)
+
+
+def dispatch_compliance(repo: Path, hours: int = 24) -> dict:
+    """Classify recent dispatches as queue-driven vs direct (break-glass).
+
+    The enqueue contract says routine new work goes through the Night's Watch
+    queue; a dispatch is legitimate only when it is remediation, or when the
+    watch is down (recorded as break-glass). Nothing enforced that, so measure
+    it: a dispatch is "queued" when a `dispatch:<quest>` vigil fired within ten
+    minutes of the ledger entry, and "direct" otherwise.
+    """
+    cutoff = time.time() - hours * 3600
+    vigils: dict[str, list[float]] = {}
+    try:
+        from . import vigils as vigil_store
+
+        for spec in vigil_store.load_all(repo, include_finished=True):
+            action = str(spec.get("action") or spec.get("then") or "")
+            if not action.startswith("dispatch:"):
+                continue
+            qid = action.split(":", 1)[1].split("-")[0].upper()
+            for fire in spec.get("fires") or []:
+                try:
+                    ts = datetime.strptime(str(fire.get("ts")), "%Y-%m-%dT%H:%M:%SZ").replace(
+                        tzinfo=timezone.utc).timestamp()
+                except (TypeError, ValueError):
+                    continue
+                if ts >= cutoff:
+                    vigils.setdefault(qid, []).append(ts)
+    except Exception:
+        pass
+
+    queued: list[tuple[str, float]] = []
+    direct: list[tuple[str, float]] = []
+    quests_dir = Path(repo) / ".court" / "quests"
+    if quests_dir.is_dir():
+        for path in sorted(quests_dir.glob("*.md")):
+            qid = path.name.split("-")[0].upper()
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for match in _LEDGER_DISPATCHED_RE.finditer(text):
+                try:
+                    ts = datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(
+                        tzinfo=timezone.utc).timestamp()
+                except ValueError:
+                    continue
+                if ts < cutoff:
+                    continue
+                if any(abs(ts - fired) <= 600 for fired in vigils.get(qid, [])):
+                    queued.append((qid, ts))
+                else:
+                    direct.append((qid, ts))
+    return {"queued": queued, "direct": direct}
+
+
 def render_digest(repo: Path, journal: Optional[list] = None) -> str:
     """A Steward-facing roll-up of where the Night's Watch is stuck.
 
@@ -1611,6 +1670,16 @@ def render_digest(repo: Path, journal: Optional[list] = None) -> str:
             lines.append(f"  last session: {steward['last_session']}")
         if steward.get("fails"):
             lines.append(f"  failed musters: {steward['fails']} — {str(steward.get('last_error') or '')[:160]}")
+
+    compliance = dispatch_compliance(repo)
+    lines.append("")
+    if compliance["direct"]:
+        lines.append(f"dispatch contract (24h): {len(compliance['queued'])} via queue · "
+                     f"{len(compliance['direct'])} DIRECT (queue bypassed)")
+        for qid, ts in compliance["direct"][-8:]:
+            lines.append(f"  🔴 {_iso_from_epoch(ts)} {qid} dispatched without a dispatch vigil")
+    else:
+        lines.append(f"dispatch contract (24h): {len(compliance['queued'])} via queue · 0 direct ✅")
 
     if not stuck and not livelocks and not raze_ready and not notified and not spent and not fails:
         lines.append("")

@@ -7697,6 +7697,119 @@ def cmd_edict(args):
             print("(no royal edicts recorded; add with: python3 -m court.cli edict 'Your priority')")
 
 
+def cmd_ui_signoff(args):
+    """Record M'Lord's written UI assent (or an explicit waiver / none-required).
+
+    Chat is the authority — "this is approved" said to the artist in the
+    worktree, or to the Steward — but a gate cannot read a chat. This command is
+    where assent becomes evidence: it rewrites the Master of Coin's Audit
+    `UI Review` line and appends a timestamped `**UI Sign-off:**` line, so both
+    `court collect` and the pre-ship interrogation agree that a decision was
+    actually made rather than asserted.
+    """
+    quest = store.load(args.quest_id)
+    by = (args.by or "").strip()
+    if not by:
+        print("ERROR: --by is required (who assented, for example \"M'Lord\")", file=sys.stderr)
+        sys.exit(1)
+    note = (args.note or "").strip()
+    stamp = now_iso()
+    suffix = f" — {note}" if note else ""
+    if args.waive:
+        review_line = f"- **UI Review:** WAIVED by {by} — {stamp}{suffix}"
+        kind = "waiver"
+    elif args.none_required:
+        review_line = f"- **UI Review:** None required — {by} — {stamp}{suffix}"
+        kind = "none-required declaration"
+    else:
+        review_line = f"- **UI Review:** APPROVED — signed off by {by} on {stamp}{suffix}"
+        kind = "approval"
+
+    section_name = "Master of Coin's Audit"
+    section = quest.body_sections.get(section_name) or quest.body_sections.get("Master of Coin Review", "")
+    lines = section.splitlines()
+    replaced = False
+    for index, line in enumerate(lines):
+        if re.match(r"(?i)^\s*[-*]?\s*\*{0,2}UI Review\*{0,2}:", line):
+            lines[index] = review_line
+            replaced = True
+    if not replaced:
+        lines.append(review_line)
+    lines.append(f"- **UI Sign-off:** {by} — {stamp}{suffix}")
+    quest.body_sections[section_name] = "\n".join(line for line in lines if line is not None).strip()
+    quest.log_ledger(quest.status, quest.status, f"UI {kind} recorded by {by}{suffix}")
+    store.save(quest, auto_commit=not getattr(args, "no_commit", False))
+    print(f"✅ {quest.id}: UI {kind} recorded by {by} at {stamp}")
+    if not replaced:
+        print("   (no prior UI Review line existed — one was added to Master of Coin's Audit)")
+
+
+def _ship_interrogation(args, quests, trunk: str) -> tuple[list[str], list[str]]:
+    """Pre-confirm interrogation of what `ship --confirm` would carry.
+
+    Returns ``(integrity, ui)`` problems. Integrity findings always block:
+    they mean the trunk itself is wrong (code merged with no promotion decision,
+    or a convoy rider). UI findings block unless --skip-ui-review was passed,
+    and the waiver is named in the report so it is never silent.
+    """
+    repo_root = git_ops.get_repo_root()
+    integrity: list[str] = []
+    ui: list[str] = []
+
+    print("\n" + "=" * 76)
+    print(f"🔎 PRE-SHIP INTERROGATION — what --confirm would carry {trunk} → production")
+    print("=" * 76)
+
+    print("\n1. Trunk invariant — every merged Quest branch must record its promotion decision")
+    trunk_findings = convoy_guard.unpromoted_quests_in_trunk(repo_root, trunk=trunk)
+    for finding in trunk_findings:
+        integrity.append(finding.message)
+        print(f"   {finding.render()}")
+    if not trunk_findings:
+        print("   ✅ no undecided Quest code in the trunk")
+
+    print("\n2. Convoy membership — no silent riders per Cog Ship")
+    manifest_ids = {q.id for q in quests}
+    rider_findings = []
+    for cid in sorted({store.normalize_cogship_id(q.cogship_id) for q in quests if q.cogship_id}):
+        rider_findings.extend(
+            convoy_guard.riders_in_trunk(repo_root, cid, trunk=trunk, manifest_quest_ids=manifest_ids)
+        )
+    for finding in rider_findings:
+        integrity.append(finding.message)
+        print(f"   {finding.render()}")
+    if not rider_findings:
+        print("   ✅ every convoy member is in the manifest")
+
+    print("\n3. UI review — written assent per Quest (chat approval must be recorded)")
+    skip_ui = bool(getattr(args, "skip_ui_review", False))
+    for quest in quests:
+        state, detail = convoy_guard.ui_assent_state(repo_root, quest.id)
+        if state in ("signed", "waived", "not_required"):
+            print(f"   ✅ {quest.id}: UI {state} — {detail[:90]}")
+            continue
+        ui.append(
+            f"{quest.id}: UI review {state}"
+            + (f" — {detail[:120]}" if detail else " (no UI record in the charter)")
+            + f" → court ui-signoff {quest.id.split('-')[0]} --by \"M'Lord\""
+        )
+        print(f"   🔴 {quest.id}: UI {state}" + (f" — {detail[:110]}" if detail else " — no charter record"))
+    waived: list[str] = []
+    if skip_ui and ui:
+        print(f"\n   ⚠️  --skip-ui-review passed: waiving {len(ui)} UI finding(s) for this ship.")
+        waived, ui = ui, []
+
+    print("\n" + "-" * 76)
+    if not integrity and not ui:
+        print("✅ INTERROGATION PASSED")
+    else:
+        print(f"❌ INTERROGATION: {len(integrity)} integrity + {len(ui)} UI blocking finding(s)")
+        if waived:
+            print(f"   (UI waived by --skip-ui-review: {len(waived)})")
+    print("-" * 76)
+    return integrity, ui
+
+
 def cmd_ship(args):
     # v1332 double-ship guard: two operators (or two agents) packing the
     # manifest concurrently produce two Cog Ship manifests for one convoy.
@@ -7846,6 +7959,18 @@ def cmd_ship(args):
     # Q147: `--confirm` promotes the staged convoy into production. Everything
     # above stays a read-only report; only this branch mutates git/remote/Fly.
     if getattr(args, "confirm", False):
+        integrity, ui = _ship_interrogation(args, quests or [], head_branch)
+        if integrity or ui:
+            print(
+                f"\n❌ SHIP REFUSED — {len(integrity)} integrity finding(s), {len(ui)} UI finding(s). "
+                f"Nothing was merged or pushed."
+            )
+            for problem in integrity + ui:
+                print(f"   - {problem}")
+            if ui:
+                print("   Record the decision (`court ui-signoff <quest> --by \"M'Lord\"`), or pass")
+                print("   --skip-ui-review to waive ONLY the UI segment (named in the report).")
+            sys.exit(1)
         rc = _execute_ship_deployment(args, base_branch, head_branch, quests=quests)
         sys.exit(rc)
 
@@ -8999,6 +9124,10 @@ def build_parser():
         help="With --confirm: run preflight safety checks only; no merge/push/deploy is executed",
     )
     p_ship.add_argument(
+        "--skip-ui-review", dest="skip_ui_review", action="store_true", default=False,
+        help="Waive ONLY the UI-assent segment of the pre-ship interrogation (integrity findings still block)",
+    )
+    p_ship.add_argument(
         "--fly-app",
         action="append",
         default=None,
@@ -9007,6 +9136,18 @@ def build_parser():
         help="Fly app(s) to deploy (repeatable; default: all apps with a config in the repo root)",
     )
     p_ship.set_defaults(func=cmd_ship)
+
+    p_ui_signoff = sub.add_parser(
+        "ui-signoff",
+        help="Record M'Lord's written UI assent (or waiver / none-required) so the ship gate can verify it",
+    )
+    p_ui_signoff.add_argument("quest_id", help="Quest ID that was given a UI decision")
+    p_ui_signoff.add_argument("--by", required=True, help="Who assented (for example M'Lord)")
+    p_ui_signoff.add_argument("--note", default="", help="Provenance: which session/chat the assent came from")
+    p_ui_signoff.add_argument("--waive", action="store_true", help="Record an explicit UI review waiver instead of approval")
+    p_ui_signoff.add_argument("--none-required", dest="none_required", action="store_true", help="Declare no UI surface was touched")
+    p_ui_signoff.add_argument("--no-commit", dest="no_commit", action="store_true", help="Write the charter without committing")
+    p_ui_signoff.set_defaults(func=cmd_ui_signoff)
 
     p_audit = sub.add_parser("audit", help="Audit Quest tribute presence, gaps, and protocol compliance")
     add_quest_selector(p_audit, batchable=True, filters=("status", "app", "epic"))

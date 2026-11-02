@@ -242,6 +242,96 @@ def ui_review_pending(repo_root: Path, quest_id: str) -> bool:
     return "pending" in last.lower()
 
 
+_UI_LINE_RE = re.compile(r"(?im)^\s*[-*]?\s*\*{0,2}UI Review\*{0,2}:?\*{0,2}\s*(.+)$")
+_SIGNOFF_LINE_RE = re.compile(r"(?im)^\s*[-*]?\s*\*{0,2}UI Sign-off\*{0,2}:?\*{0,2}\s*(.+)$")
+_PLACEHOLDER_RE = re.compile(r"(?i)^(pending|tbd|todo|n/a|none|unknown)?[\s.…-]*$")
+
+
+def ui_assent_state(repo_root: Path, quest_id: str) -> tuple[str, str]:
+    """Classify the Quest's UI review as recorded *in writing* in the charter.
+
+    Returns ``(state, detail)`` where state is one of:
+
+    * ``signed``       — an explicit ``**UI Sign-off:** <who> <when>`` line;
+    * ``waived``       — ``UI Review: WAIVED …`` (the explicit --skip-ui-review trail);
+    * ``not_required`` — ``UI Review: None required`` / ``not required``;
+    * ``pending``      — any other outstanding review text;
+    * ``missing``      — no UI Review or UI Sign-off record at all.
+
+    An ``APPROVED`` claim with no sign-off line is NOT approval: chat assent is
+    authoritative, and this is where it has to become evidence a gate can read.
+    """
+    path = _quest_file(repo_root, quest_id)
+    if path is None:
+        return "missing", ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return "missing", ""
+
+    signoff = ""
+    for match in _SIGNOFF_LINE_RE.finditer(text):
+        value = match.group(1).strip().strip("*").strip()
+        if value and not _PLACEHOLDER_RE.match(value):
+            signoff = value
+    if signoff:
+        return "signed", signoff
+
+    review = ""
+    for match in _UI_LINE_RE.finditer(text):
+        review = match.group(1).strip().strip("*").strip()
+    if not review:
+        return "missing", ""
+
+    lowered = review.lower()
+    if "waived" in lowered:
+        return "waived", review
+    if "not required" in lowered or "none required" in lowered or "no ui" in lowered:
+        return "not_required", review
+    if any(word in lowered for word in ("approved", "verified", "passed")):
+        # An APPROVED assertion with no UI Sign-off line: treated as outstanding.
+        return "pending", review + " (asserted without a recorded sign-off)"
+    return "pending", review
+
+
+def unpromoted_quests_in_trunk(
+    repo_root: Path,
+    trunk: str = "castle",
+    allowed_statuses: frozenset[str] = frozenset({"READY_TO_RAZE", "DONE"}),
+) -> list[Finding]:
+    """Trunk invariant: no Quest branch may be merged into ``trunk`` unless its
+    charter already records the promotion decision.
+
+    Message-independent (unlike merge-subject parsing), so it catches a rider
+    even when the merge commit was written with a custom subject. Quests whose
+    charter cannot be located (archived/razed) are skipped: an absent charter is
+    not evidence of an undecided promotion.
+    """
+    findings: list[Finding] = []
+    res = _git(repo_root, "for-each-ref", "--format=%(refname:short)", "refs/heads/quest/")
+    if res.returncode != 0:
+        return findings
+    for name in res.stdout.splitlines():
+        branch = name.strip()
+        if not branch:
+            continue
+        qid = quest_id_from_branch(branch)
+        if not qid:
+            continue
+        if _git(repo_root, "merge-base", "--is-ancestor", branch, trunk).returncode != 0:
+            continue
+        status = quest_status(repo_root, qid)
+        if status and status not in allowed_statuses:
+            findings.append(Finding(
+                "error",
+                f"{qid} ({branch}) is already merged into {trunk} but its status is {status} — "
+                f"code in the trunk with no promotion decision.",
+                quest=qid,
+                branch=branch,
+            ))
+    return findings
+
+
 def suite_proof(repo_root: Path, cogship_id: str) -> dict:
     path = Path(repo_root) / ".court" / "suites" / f"{normalize_cogship_id(cogship_id)}.json"
     try:
@@ -358,6 +448,24 @@ def audit_promotion(
     return findings
 
 
+def _stamped_quest_ids(repo_root: Path, cogship_id: str) -> set[str]:
+    """Quest ids whose charter records this cogship_id (active + archived)."""
+    cid = normalize_cogship_id(cogship_id)
+    found: set[str] = set()
+    for directory in (Path(repo_root) / ".court" / "quests", Path(repo_root) / ".court" / "archive"):
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("*.md"):
+            try:
+                head = path.read_text(encoding="utf-8", errors="ignore")[:2000]
+            except OSError:
+                continue
+            match = re.search(r"^cogship_id:\s*(\S+)", head, re.MULTILINE)
+            if match and normalize_cogship_id(match.group(1)) == cid:
+                found.add(path.name.split("-")[0].upper())
+    return found
+
+
 def riders_in_trunk(
     repo_root: Path,
     cogship_id: str,
@@ -369,11 +477,14 @@ def riders_in_trunk(
     ancestors of ``trunk`` but were never part of the manifest."""
     cid = normalize_cogship_id(cogship_id)
     targets = {convoy_branch(cid)}
-    # The pack record is the promotion allow-list; a stamped-but-never-collected
-    # Quest is exactly the rider class this check exists for, so it takes
-    # precedence over the (broader) manifest set when one was recorded.
+    # Authority order: the pack record (what collect actually authorised), then
+    # the Quests stamped onto this convoy (board truth), then the caller's set.
+    # The caller's set may be a filtered ship selection, so it is the weakest
+    # signal: a Quest stamped on the convoy but excluded by a --status filter is
+    # not a rider.
     pack_ids = {q.split("-")[0].upper() for q in (load_pack(repo_root, cid).get("quest_ids") or [])}
-    manifest = pack_ids or {q.split("-")[0].upper() for q in (manifest_quest_ids or [])}
+    stamped_ids = _stamped_quest_ids(repo_root, cid)
+    manifest = pack_ids or stamped_ids or {q.split("-")[0].upper() for q in (manifest_quest_ids or [])}
     findings: list[Finding] = []
     res = _git(repo_root, "log", trunk, "--merges", f"--max-count={scan}", "--format=%H%x09%s")
     if res.returncode != 0:

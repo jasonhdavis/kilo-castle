@@ -197,3 +197,70 @@ def test_a_non_pending_ui_review_does_not_block(tmp_path):
     repo = _repo(tmp_path)
     _charter(repo, "Q1009", "GATE", ui_review="Not required — no templates touched")
     assert cg.ui_review_pending(repo, "Q1009") is False
+
+
+# ---------------------------------------------------------------------------
+# Written UI assent + trunk invariant
+# ---------------------------------------------------------------------------
+
+def test_an_approved_claim_without_a_signoff_is_not_assent(tmp_path):
+    repo = _repo(tmp_path)
+    _charter(repo, "Q1009", "GATE", ui_review="APPROVED by M'Lord via Court Artist")
+    state, detail = cg.ui_assent_state(repo, "Q1009")
+    assert state == "pending"
+    assert "without a recorded sign-off" in detail
+
+
+def test_an_explicit_signoff_line_is_assent(tmp_path):
+    repo = _repo(tmp_path)
+    _charter(repo, "Q1009", "GATE", ui_review="PENDING")
+    charter = repo / ".court" / "quests" / "Q1009-Test.md"
+    charter.write_text(charter.read_text() + "\n- **UI Sign-off:** M'Lord — 2026-11-02 — said approved in chat\n")
+    state, detail = cg.ui_assent_state(repo, "Q1009")
+    assert state == "signed" and "M'Lord" in detail
+
+
+def test_waiver_and_none_required_are_accepted(tmp_path):
+    repo = _repo(tmp_path)
+    _charter(repo, "Q1", "GATE", ui_review="WAIVED by M'Lord — deliberate skip")
+    _charter(repo, "Q2", "GATE", ui_review="None required (backend only)")
+    assert cg.ui_assent_state(repo, "Q1")[0] == "waived"
+    assert cg.ui_assent_state(repo, "Q2")[0] == "not_required"
+
+
+def test_a_charter_with_no_ui_record_is_missing_not_approved(tmp_path):
+    repo = _repo(tmp_path)
+    _charter(repo, "Q1", "GATE")
+    assert cg.ui_assent_state(repo, "Q1")[0] == "missing"
+
+
+def test_the_trunk_invariant_flags_code_merged_without_a_decision(tmp_path):
+    repo = _repo(tmp_path)
+    _charter(repo, "Q1009", "READY_TO_RAZE")
+    _charter(repo, "Q1013", "GATE")
+    _quest_branch(repo, "quest/q1009-orders-fulfillment")
+    _quest_branch(repo, "quest/q1013-marketing-email")
+    convoy = _convoy(repo)
+    _merge_into(repo, "quest/q1009-orders-fulfillment", convoy)
+    _merge_into(repo, "quest/q1013-marketing-email", convoy)
+    _git(repo, "checkout", "castle")
+    _git(repo, "merge", "--no-ff", convoy, "-m", f"Merge {convoy} into castle")
+
+    findings = cg.unpromoted_quests_in_trunk(repo, trunk="castle")
+    assert [f.quest for f in findings] == ["Q1013"]
+
+
+def test_a_stamped_quest_excluded_from_a_filtered_ship_is_not_a_rider(tmp_path):
+    repo = _repo(tmp_path)
+    _charter(repo, "Q1079", "READY_TO_RAZE")
+    charter = repo / ".court" / "quests" / "Q1079-Test.md"
+    charter.write_text(charter.read_text().replace("status: READY_TO_RAZE", "status: READY_TO_RAZE\ncogship_id: cogship-395"))
+    _quest_branch(repo, "quest/q1079-marketing-stack-intel")
+    convoy = _convoy(repo, "cogship-395")
+    _merge_into(repo, "quest/q1079-marketing-stack-intel", convoy)
+    _git(repo, "checkout", "castle")
+    _git(repo, "merge", "--no-ff", convoy, "-m", f"Merge {convoy} into castle")
+
+    # The ship selection filtered it out, but it is stamped on the convoy.
+    findings = cg.riders_in_trunk(repo, "cogship-395", trunk="castle", manifest_quest_ids={"Q1009-Other"})
+    assert findings == []

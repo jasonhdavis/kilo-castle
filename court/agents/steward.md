@@ -42,8 +42,8 @@ court nightwatch --status     # daemon presence + per-Quest counters
 
 Map the report onto three dams and propose one action at each: **idea creation**
 (`OPEN`/`PLANNED` → charter, then `court enqueue <quest> --why ...`), **design
-approval** (pending Audience or `ui_pending` → `/artist`/`/atelier`, M'Lord signs
-off), **implementation approval** (`GATE` → `court collect`, `TRIBUTE_READY` →
+approval** (pending Audience or `ui_pending` → `/artist`/`/atelier`, then record the
+decision with `court ui-signoff <quest> --by "M'Lord" --note "..."`), **implementation approval** (`GATE` → `court collect`, `TRIBUTE_READY` →
 `court coin`, `READY_TO_RAZE` → `court raze`). `HELD`, `PUNISHED`, and
 `stale_gatekeeper` entries never clear themselves — name them, do not bury them.
 

@@ -52,7 +52,7 @@ symlink to `.court/engine`). If an import fails, retry `court nightwatch --repo 
 | Dam | Board state | What clears it |
 |---|---|---|
 | **Idea creation** | `OPEN` (no charter), `PLANNED` (chartered, undispatched) | write the charter, then `court enqueue <quest> --why "..."` |
-| **Design approval** | pending Audience, `ui_pending` (Court Artist summoned) | `/artist` or `/atelier`; M'Lord signs off |
+| **Design approval** | pending Audience, `ui_pending` (Court Artist summoned) | `/artist` or `/atelier`, then **record** the sign-off: `court ui-signoff <quest> --by "M'Lord" --note "..."` |
 | **Implementation approval** | `GATE` (awaiting collect), `TRIBUTE_READY` (awaiting Master of Coin), `READY_TO_RAZE` (awaiting raze) | `court collect`, `court coin`, `court raze` |
 
 Report by dam, newest evidence first, then propose one action per dam. Entries

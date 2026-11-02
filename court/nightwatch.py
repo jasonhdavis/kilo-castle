@@ -1669,10 +1669,38 @@ def render_report(snap: dict, notes: list, workers: dict, executed: list, dry_ru
 # ---------------------------------------------------------------------------
 
 
+LOCK_REFUSAL_NOTICE_INTERVAL = 60 * 60
+
+
+def report_lock_refusal(repo: Path, why: str) -> None:
+    """Announce a lost lock race at most once an hour.
+
+    Two schedulers per repo is a normal shape (a tuned wrapper ticking beside a
+    long-lived daemon, or a human's manual `--once`), and the per-repo lock
+    already guarantees only one of them acts. Logging the refusal every tick
+    buried real failures: 119 identical lines in pb-app and 85 in pb-custom by
+    2026-11-02, all while the watch was healthy.
+    """
+    marker = state_dir(repo) / ".lock-refusal"
+    now = time.time()
+    try:
+        last = float(marker.read_text(encoding="utf-8").strip() or 0)
+    except (OSError, ValueError):
+        last = 0.0
+    if now - last < LOCK_REFUSAL_NOTICE_INTERVAL:
+        return
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(now), encoding="utf-8")
+    except OSError:
+        pass
+    print(f"ERROR: {why}", file=sys.stderr)
+
+
 def run_loop(repo: Path, policy: Policy, interval: int, once: bool, dry_run: bool, quiet: bool = False) -> int:
     ok, why = acquire_instance_lock(repo)
     if not ok:
-        print(f"ERROR: {why}", file=sys.stderr)
+        report_lock_refusal(repo, why)
         return 2
     stop = {"flag": False}
 

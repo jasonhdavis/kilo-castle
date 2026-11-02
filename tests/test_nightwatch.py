@@ -863,3 +863,12 @@ def test_a_hard_collect_failure_increments_the_convoy_fail_counter(tmp_path):
         {"ok": False, "exit": 2, "stdout_tail": "", "stderr_tail": "boom"}, 1000.0)
     assert state["convoys"]["cogship-9"]["fails"] == 1
     assert "boom" in state["convoys"]["cogship-9"]["last_error"]
+
+
+def test_a_second_scheduler_is_reported_once_an_hour(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(nw, "state_dir", lambda repo: tmp_path / "state")
+    nw.report_lock_refusal(tmp_path, "another nightwatch is running (pid 1)")
+    nw.report_lock_refusal(tmp_path, "another nightwatch is running (pid 1)")
+    nw.report_lock_refusal(tmp_path, "another nightwatch is running (pid 1)")
+    captured = capsys.readouterr()
+    assert captured.err.count("another nightwatch") == 1

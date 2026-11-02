@@ -172,3 +172,28 @@ def test_quest_id_parsing_uses_the_last_branch_segment():
     assert cg.quest_id_from_branch("quest/q1025/q1059-purchases-supplier") == "Q1059"
     assert cg.quest_id_from_branch("scout/q1079-marketing-stack") == "Q1079"
     assert cg.quest_id_from_branch("castle") == ""
+
+
+def test_a_rider_merged_with_a_custom_subject_is_still_detected(tmp_path):
+    repo = _repo(tmp_path)
+    _charter(repo, "Q1009", "GATE")
+    _charter(repo, "Q1013", "GATE")
+    _quest_branch(repo, "quest/q1009-orders-fulfillment")
+    _quest_branch(repo, "quest/q1013-marketing-email")
+    convoy = _convoy(repo)
+    _merge_into(repo, "quest/q1009-orders-fulfillment", convoy)
+    cg.record_pack(repo, "cogship-382", ["Q1009-Orders-Fulfillment"])
+    # An artist merge whose message hides the source branch: subject parsing
+    # cannot see it, branch containment must.
+    _git(repo, "checkout", convoy)
+    _git(repo, "merge", "--no-ff", "quest/q1013-marketing-email", "-m", "preview the email UI")
+    _git(repo, "checkout", "castle")
+
+    findings = cg.audit_promotion(repo, "cogship-382")
+    assert "Q1013" in {f.quest for f in findings if f.level == "error"}
+
+
+def test_a_non_pending_ui_review_does_not_block(tmp_path):
+    repo = _repo(tmp_path)
+    _charter(repo, "Q1009", "GATE", ui_review="Not required — no templates touched")
+    assert cg.ui_review_pending(repo, "Q1009") is False

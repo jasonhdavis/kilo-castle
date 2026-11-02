@@ -109,6 +109,32 @@ def merged_quest_branches(repo_root: Path, branch: str, base: str = "castle") ->
     return merged
 
 
+def contained_quest_branches(repo_root: Path, branch: str, base: str = "castle") -> dict[str, list[str]]:
+    """Quest branches whose tip is already inside ``branch`` and not in ``base``.
+
+    Merge subjects are advisory — `git merge --no-ff -m "preview Q1013"` hides
+    the source branch name entirely. Containment is authoritative: if a branch
+    tip is reachable from the convoy tip but not from the trunk, that code is on
+    the convoy whether or not a merge commit names it.
+    """
+    found: dict[str, list[str]] = {}
+    res = _git(repo_root, "for-each-ref", "--format=%(refname:short)",
+               "refs/heads/quest/", "refs/heads/scout/")
+    if res.returncode != 0:
+        return found
+    for name in res.stdout.splitlines():
+        name = name.strip()
+        if not name:
+            continue
+        if _git(repo_root, "merge-base", "--is-ancestor", name, branch).returncode != 0:
+            continue
+        if _git(repo_root, "merge-base", "--is-ancestor", name, base).returncode == 0:
+            continue
+        tip = _git(repo_root, "rev-parse", name).stdout.strip()
+        found[name] = [tip]
+    return found
+
+
 def pack_record_path(repo_root: Path, cogship_id: str) -> Path:
     return Path(repo_root) / ".court" / "convoys" / f"{normalize_cogship_id(cogship_id)}.json"
 
@@ -185,6 +211,22 @@ def quest_status(repo_root: Path, quest_id: str) -> str:
 
 
 def ui_review_pending(repo_root: Path, quest_id: str) -> bool:
+    """True when the Quest's UI review is still outstanding.
+
+    Prefers the engine's own extraction (it understands the Master of Coin's
+    Audit / Tribute Rendered sections and sign-off evidence); falls back to the
+    LAST matching ``UI Review:`` line, because reviews are appended and an early
+    PENDING note must not outlive a later approval.
+    """
+    try:
+        from . import store
+
+        quest = store.load(quest_id, court_root=Path(repo_root) / ".court")
+        status = quest.extract_ui_review_status()
+        if status:
+            return status.strip().upper().startswith("PENDING")
+    except Exception:
+        pass
     path = _quest_file(repo_root, quest_id)
     if path is None:
         return False
@@ -192,11 +234,12 @@ def ui_review_pending(repo_root: Path, quest_id: str) -> bool:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return False
+    last = ""
     for line in text.splitlines():
         match = _UI_REVIEW_RE.match(line)
-        if match and "pending" in match.group(1).lower():
-            return True
-    return False
+        if match:
+            last = match.group(1)
+    return "pending" in last.lower()
 
 
 def suite_proof(repo_root: Path, cogship_id: str) -> dict:
@@ -251,7 +294,12 @@ def audit_promotion(
         findings.extend(riders_in_trunk(repo_root, cid, trunk=base, manifest_quest_ids=authorised or None))
         return findings
 
+    # Union of two detectors: merge subjects name the branch (fast, readable),
+    # containment proves it even when a merge was committed with a custom
+    # message that hides the source branch.
     merged = merged_quest_branches(repo_root, branch, base=base)
+    for source, shas in contained_quest_branches(repo_root, branch, base=base).items():
+        merged.setdefault(source, shas)
 
     for source, shas in sorted(merged.items()):
         qid = quest_id_from_branch(source)

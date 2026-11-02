@@ -446,6 +446,24 @@ def test_a_noop_collect_backs_the_convoy_off_hard(tmp_path):
     assert not state["convoys"]["cogship-9"].get("last_ts")
 
 
+def test_a_live_convoy_defers_collect_without_counting_a_quest_failure(tmp_path):
+    state = nw.load_state(tmp_path)
+    action = nw.Action(kind="collect", quest_ids=["Q1", "Q2"],
+                       meta={"convoy": "new", "retry_backoff": 300, "live_backoff": 3600})
+    nw._apply_bookkeeping(state, action, {
+        "ok": False,
+        "stderr_tail": ("ERROR: convoy cogship-396 is LIVE — its gatehouse worktree "
+                        "(/tmp/x/the-gatehouse-cogship-396) is mid-integration"),
+    }, 1000.0)
+    convoy = state["convoys"]["new"]
+    assert convoy["retry_at"] == 4600.0
+    assert convoy["live"]["convoy"] == "cogship-396"
+    for qid in ("Q1", "Q2"):
+        assert not state["quests"][qid].get("fails")
+        assert not state["quests"][qid].get("retry_at")
+        assert "cogship-396 is LIVE" in state["quests"][qid]["last_error"]
+
+
 def test_a_real_pack_sets_the_gate_cooldown(tmp_path):
     state = nw.load_state(tmp_path)
     action = nw.Action(kind="collect", quest_ids=["Q1"], meta={"convoy": "cogship-9", "noop_backoff": 3600})
@@ -636,3 +654,212 @@ def test_no_muster_while_the_watch_still_has_a_mechanical_move(tmp_path):
                          _policy(enabled=("goad", "steward"), steward_stale_after=600),
                          _workers(), now=2000.0)
     assert [a.kind for a in actions] == ["goad"]
+
+
+# ---------------------------------------------------------------------------
+# Stale convoy: a dead convoy's gatehouse worktree still exists
+# ---------------------------------------------------------------------------
+
+def test_a_stale_convoy_is_held_and_escalated_once(tmp_path):
+    gate = _free(tmp_path, "the-gatehouse-cogship-9")
+    wt = _free(tmp_path, "q1")
+    state = nw.load_state(tmp_path)
+    state["convoys"]["cogship-9"] = {"stale": {"worktree": gate, "reason": "died"}}
+    snap = _snap(_q("Q1", "GATE", wt, cogship_id="cogship-9"))
+    actions, notes = nw.plan(snap, state, _policy(), _workers())
+    assert actions == []
+    (note,) = [n for n in notes if n.get("key") == "stale_convoy"]
+    assert note["level"] == "human" and note["new"] is True
+    assert "already exists" in note["text"] or "stale gatehouse" in note["text"]
+
+    nw._record_escalations(state, notes, 1000.0)
+    _, notes2 = nw.plan(snap, state, _policy(), _workers())
+    (note2,) = [n for n in notes2 if n.get("key") == "stale_convoy"]
+    assert note2["new"] is False
+
+
+def test_a_stale_convoy_heals_once_its_worktree_is_gone(tmp_path):
+    wt = _free(tmp_path, "q1")
+    state = nw.load_state(tmp_path)
+    state["convoys"]["cogship-9"] = {
+        "stale": {"worktree": str(tmp_path / "gone-gatehouse")},
+        "retry_at": 9_999_999_999.0,
+    }
+    nw._heal_stale_convoys(state)
+    assert "stale" not in state["convoys"]["cogship-9"]
+    assert state["convoys"]["cogship-9"]["retry_at"] == 0
+    snap = _snap(_q("Q1", "GATE", wt, cogship_id="cogship-9"))
+    actions, _ = nw.plan(snap, state, _policy(), _workers())
+    assert [a.kind for a in actions] == ["collect"]
+
+
+def test_a_stale_gatehouse_failure_sets_a_long_hold(tmp_path):
+    state = nw.load_state(tmp_path)
+    action = nw.Action(kind="collect", quest_ids=["Q1", "Q2"], cogship="cogship-9",
+                       meta={"convoy": "cogship-9", "retry_backoff": 300, "stale_backoff": 3600})
+    result = {
+        "ok": False, "exit": 1,
+        "stdout_tail": "🚢 Stamped 2 Quest(s) onto cogship-9.\n",
+        "stderr_tail": "ERROR: Gatehouse worktree /tmp/the-gatehouse-cogship-9 already exists (no fresh session)",
+    }
+    nw._apply_bookkeeping(state, action, result, 1000.0)
+    convoy = state["convoys"]["cogship-9"]
+    assert convoy["stale"]["worktree"] == "/tmp/the-gatehouse-cogship-9"
+    assert convoy["retry_at"] == 4600.0
+    assert "last_ts" not in convoy
+
+
+def test_digest_names_stuck_convoys_and_separates_noops(tmp_path, monkeypatch):
+    state = nw.load_state(tmp_path)
+    state["convoys"]["cogship-9"] = {"stale": {"worktree": "/tmp/the-gatehouse-cogship-9"}}
+    monkeypatch.setattr(nw, "load_state", lambda repo: state)
+    journal = [
+        {"ts": "t1", "event": "action", "action": {"kind": "collect", "quest_ids": ["Q1", "Q2"],
+         "cogship": "cogship-9", "meta": {"convoy": "cogship-9"}},
+         "result": {"ok": False, "exit": 1, "stdout_tail": "🚢 Stamped 2 Quest(s) onto cogship-9.",
+                    "stderr_tail": "ERROR: Gatehouse worktree /tmp/the-gatehouse-cogship-9 already exists"}},
+        {"ts": "t2", "event": "action", "action": {"kind": "collect", "quest_ids": ["Q3"],
+         "cogship": "cogship-7", "meta": {"convoy": "cogship-7"}},
+         "result": {"ok": True, "exit": 0, "stdout_tail": "Skipped 2 candidate(s) (not ready to pack)",
+                    "stderr_tail": ""}},
+        {"ts": "t3", "event": "action", "action": {"kind": "collect", "quest_ids": ["Q3"],
+         "cogship": "cogship-7", "meta": {"convoy": "cogship-7"}},
+         "result": {"ok": True, "exit": 0, "stdout_tail": "Skipped 2 candidate(s) (not ready to pack)",
+                    "stderr_tail": ""}},
+    ]
+    out = nw.render_digest(tmp_path, journal=journal)
+    assert "stuck convoys" in out and "the-gatehouse-cogship-9" in out
+    assert "livelock" in out and "cogship-7" in out
+    assert "cogship-9: /tmp/the-gatehouse-cogship-9" in out
+
+
+# ---------------------------------------------------------------------------
+# Opt-in raze / teardown help
+# ---------------------------------------------------------------------------
+
+def test_raze_is_off_by_default_and_planned_when_enabled(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt, worker="idle"))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers())
+    assert actions == []
+    assert any(n["level"] == "report" and "READY_TO_RAZE" in n["text"] for n in notes)
+
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path),
+                         _policy(enabled=("raze",), max_workers=4), _workers())
+    assert [(a.kind, a.quest_ids) for a in actions] == [("raze", ["Q1"])]
+
+
+def test_raze_waits_for_a_live_worker(tmp_path):
+    wt = _free(tmp_path)
+    Path(wt, ".kilo", "watch").mkdir(parents=True)
+    import os
+    Path(wt, ".kilo", "watch", "serf.lease.json").write_text(
+        '{"v":1,"pending":false,"pid":%d,"pgid":null,"session_id":"ses_x",'
+        '"watchdog_pid":null,"holder":"serf","started":0}' % os.getpid())
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt, worker="idle"))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path),
+                             _policy(enabled=("raze",), max_workers=4), _workers())
+    assert actions == []
+    assert any(n["level"] == "wait" for n in notes)
+
+
+def test_raze_action_runs_court_raze(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(nw, "_court", lambda repo, *argv, **kw: seen.setdefault("argv", list(argv))
+                        or __import__("subprocess").CompletedProcess(argv, 0, "", ""))
+    nw.execute(tmp_path, nw.Action(kind="raze", quest_ids=["Q7"]))
+    assert seen["argv"] == ["raze", "Q7"]
+
+
+def test_teardown_is_opt_in_and_planned_when_the_convoy_is_dead(tmp_path):
+    gate = _free(tmp_path, "the-gatehouse-cogship-9")
+    wt = _free(tmp_path, "q1")
+    state = nw.load_state(tmp_path)
+    state["convoys"]["cogship-9"] = {"stale": {"worktree": gate}}
+    snap = _snap(_q("Q1", "GATE", wt, cogship_id="cogship-9"))
+
+    # default: report only, no teardown
+    actions, notes = nw.plan(snap, state, _policy(), _workers())
+    assert actions == []
+    assert any(n.get("key") == "stale_convoy" for n in notes)
+
+    # opt-in: plan a teardown of the dead worktree
+    actions, _ = nw.plan(snap, state, _policy(enabled=("teardown",), max_workers=4), _workers())
+    assert [a.kind for a in actions] == ["teardown"]
+    assert actions[0].meta["worktree"] == gate
+    assert actions[0].meta["branch"] == "the-gatehouse/cogship-9"
+
+
+def test_teardown_action_removes_worktree_and_branch(tmp_path, monkeypatch):
+    calls = []
+
+    class R:
+        def __init__(self, rc=0, out="", err=""):
+            self.returncode = rc; self.stdout = out; self.stderr = err
+
+    monkeypatch.setattr(nw.subprocess, "run", lambda cmd, **kw: (calls.append(list(cmd)) or R()))
+    gate = _free(tmp_path, "the-gatehouse-cogship-9")
+    res = nw.execute(tmp_path, nw.Action(kind="teardown", quest_ids=["Q1"],
+                                         meta={"worktree": gate, "branch": "the-gatehouse/cogship-9"}))
+    assert res["ok"] is True
+    assert calls[0][:5] == ["git", "-C", str(tmp_path), "worktree", "remove"]
+    assert calls[1][:5] == ["git", "-C", str(tmp_path), "branch", "-D"]
+    assert calls[1][-1] == "the-gatehouse/cogship-9"
+
+
+def test_teardown_bookkeeping_clears_the_hold(tmp_path):
+    state = nw.load_state(tmp_path)
+    state["convoys"]["cogship-9"] = {"stale": {"worktree": "/tmp/x"}, "retry_at": 9999}
+    nw._apply_bookkeeping(state, nw.Action(kind="teardown", quest_ids=["Q1"],
+                                           meta={"convoy": "cogship-9"}),
+                          {"ok": True, "exit": 0}, 1000.0)
+    assert "stale" not in state["convoys"]["cogship-9"]
+    assert state["convoys"]["cogship-9"]["retry_at"] == 0
+
+
+def test_digest_lists_ready_to_raze(tmp_path, monkeypatch):
+    journal = [{"ts": "t1", "event": "tick", "statuses": {"Q1": "READY_TO_RAZE", "Q2": "GATE"}}]
+    out = nw.render_digest(tmp_path, journal=journal)
+    assert "ready to raze" in out and "Q1" in out
+
+
+def test_digest_reports_capacity_and_the_dispatch_queue(tmp_path):
+    """The Steward coordinates the MacBook by reading the watch's capacity and
+    the queued dispatch hand-offs, not by spawning workers directly."""
+    from court import vigils
+    (tmp_path / ".court" / "vigils").mkdir(parents=True)
+    spec = vigils.build(
+        id="dispatch-q001",
+        when=["after:2020-01-01T00:00:00Z"],
+        then="dispatch:Q001",
+        reason="queue this for the watch when capacity frees",
+        expires="2h",
+    )
+    vigils.save(tmp_path, spec)
+    journal = [
+        {"event": "start", "policy": {"max_workers": 3}},
+        {"event": "tick", "workers": 1, "rss_mb": 512},
+    ]
+    out = nw.render_digest(tmp_path, journal=journal)
+    assert "capacity: 1/3 live workers" in out
+    assert "dispatch queue: 1 hand-off(s)" in out
+    assert "dispatch:Q001" in out
+
+
+def test_repeated_convoy_failures_are_flagged_to_the_steward(tmp_path):
+    wt = _free(tmp_path)
+    state = nw.load_state(tmp_path)
+    state["convoys"]["cogship-9"] = {"fails": 3, "last_error": "boom", "retry_at": 0}
+    snap = _snap(_q("Q1", "GATE", wt, cogship_id="cogship-9"))
+    actions, notes = nw.plan(snap, state, _policy(), _workers())
+    assert any(n["level"] == "human" and n.get("key") == "convoy_fails" for n in notes)
+
+
+def test_a_hard_collect_failure_increments_the_convoy_fail_counter(tmp_path):
+    state = nw.load_state(tmp_path)
+    nw._apply_bookkeeping(
+        state, nw.Action(kind="collect", quest_ids=["Q1"], cogship="cogship-9",
+                         meta={"convoy": "cogship-9", "retry_backoff": 300}),
+        {"ok": False, "exit": 2, "stdout_tail": "", "stderr_tail": "boom"}, 1000.0)
+    assert state["convoys"]["cogship-9"]["fails"] == 1
+    assert "boom" in state["convoys"]["cogship-9"]["last_error"]

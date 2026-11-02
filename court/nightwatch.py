@@ -22,7 +22,8 @@ Scope of authority (deliberately narrow):
                                            Steward judgment call, not a timer —
                                            the one exception is a bounded
                                            replacement serf for a spent Quest)
-  * READY_TO_RAZE                       -> report only (razing is destructive)
+  * READY_TO_RAZE                       -> report only by default; opt-in `raze`
+                                           (`--enable ...,raze`) runs `court raze`
   * stale board, nobody running         -> `muster` ONE bounded Steward triage
                                            session (opt-in; see below)
 
@@ -83,6 +84,15 @@ DEFAULT_SERF_SLOTS = 2
 # NOT progress: back the convoy off for this long instead of a bare retry so a
 # blocked convoy cannot consume the per-tick action budget forever.
 DEFAULT_COLLECT_NOOP_BACKOFF = 60 * 60
+# A convoy whose gatehouse worktree still exists from a prior mid-integration
+# death cannot be re-collected: `court collect` stamps the quests, then refuses
+# to re-create the worktree and exits 1. Re-stamping every tick is pure churn,
+# so hold the convoy (escalate once) until the worktree is torn down.
+DEFAULT_STALE_CONVOY_BACKOFF = 60 * 60
+# A new convoy cannot be packed while another is mid-integration (`court
+# collect` reports "convoy <id> is LIVE"). That is a busy signal, not a Quest
+# failure: wait out the gate window instead of retrying on the short backoff.
+DEFAULT_LIVE_CONVOY_BACKOFF = 60 * 60
 DEFAULT_RETRY_BACKOFF = 300
 # Steward muster: the last-resort action. The board must be unchanged for
 # `steward_stale_after`, with no live worker at all and a standing blocker,
@@ -114,7 +124,7 @@ STALL_THRESHOLDS = {
     "master_of_coin": 30 * 60,
 }
 
-ENABLED_ACTIONS = ("goad", "coin", "collect", "dispatch", "steward")
+ENABLED_ACTIONS = ("goad", "coin", "collect", "dispatch", "steward", "raze", "teardown")
 
 # A board is only "live" while at least one Quest is in a pre-terminal stage.
 # Statuses the watch can move mechanically are excluded from the `steward`
@@ -149,11 +159,16 @@ class Policy:
     goads_per_serf: int = DEFAULT_GOADS_PER_SERF
     serf_slots: int = DEFAULT_SERF_SLOTS
     collect_noop_backoff: int = DEFAULT_COLLECT_NOOP_BACKOFF
+    stale_convoy_backoff: int = DEFAULT_STALE_CONVOY_BACKOFF
     retry_backoff: int = DEFAULT_RETRY_BACKOFF
     # Steward muster (last resort). See DEFAULT_STEWARD_* above.
     steward_stale_after: int = DEFAULT_STEWARD_STALE_AFTER
     steward_cooldown: int = DEFAULT_STEWARD_COOLDOWN
     max_stewards_per_day: int = DEFAULT_MAX_STEWARDS_PER_DAY
+    # Raze/teardown help (opt-in, destructive): the watch may clear a
+    # READY_TO_RAZE Quest (`court raze` verifies merge ancestry first) and a dead
+    # convoy's gatehouse worktree, but only when explicitly enabled.
+    raze_cooldown: int = 1800
     cull_soft: int = DEFAULT_CULL_SOFT
     hard_red_zone: int = DEFAULT_HARD_RED_ZONE
     bloat_cold_start: bool = False
@@ -161,7 +176,10 @@ class Policy:
     # vigil (which carries its own reason, expiry, and fire cap) — the watch
     # never invents new work on its own.
     allow_dispatch: bool = True
-    enabled: tuple = ENABLED_ACTIONS
+    # Default to the safe mechanical set. `steward`, `raze`, and `teardown` are
+    # deliberate opt-ins: steward spends a reasoning worker; raze/teardown are
+    # destructive. ENABLED_ACTIONS is the full vocabulary for `--enable`.
+    enabled: tuple = ("goad", "coin", "collect", "dispatch")
     allow_force_goad: bool = False
     status_timeout: int = DEFAULT_STATUS_TIMEOUT
 
@@ -610,6 +628,7 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
 
     # --- GATE: hand the convoy to a Gatekeeper -----------------------------
     by_cogship: dict[str, list[str]] = {}
+    teardown_keys: set[str] = set()
     for q in quests.values():
         if q.get("status") != "GATE":
             continue
@@ -638,12 +657,50 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                  key="stale_gatekeeper")
             continue
         cog = q.get("cogship_id") or ""
-        convoy = convoys.get(cog or "new", {})
+        key = cog or "new"
+        convoy = convoys.get(key, {})
+        # A stale-convoy hold: a prior convoy died mid-integration and left its
+        # gatehouse worktree behind. `court collect` would stamp then refuse, so
+        # re-collecting is a guaranteed no-op. Escalate once and hold; tick()
+        # clears the hold the moment the worktree is torn down.
+        stale = convoy.get("stale") if isinstance(convoy.get("stale"), dict) else {}
+        if stale:
+            wt = stale.get("worktree") or ""
+            # Opt-in help: if the gatehouse worktree is provably dead (no live
+            # process or lease), tear it down so the convoy can be re-collected.
+            if (policy.allows("teardown") and wt and key not in teardown_keys
+                    and not occupied(wt) and not process_in(wt)):
+                if capacity <= 0:
+                    note(q["id"], "skip",
+                         f"stale convoy {key} ready to tear down but worker ceiling "
+                         f"reached ({busy_workers}/{policy.max_workers})")
+                    continue
+                teardown_keys.add(key)
+                actions.append(Action(
+                    kind="teardown", quest_ids=[q["id"]],
+                    reason=(f"convoy {key} is dead (stale gatehouse worktree {wt}) — tearing it "
+                            f"down so the convoy can re-collect"),
+                    meta={"convoy": key, "worktree": wt, "branch": f"the-gatehouse/{key}",
+                          "retry_backoff": policy.retry_backoff}))
+                capacity -= 1
+                continue
+            note(q["id"], "human",
+                 f"convoy {key} is stuck on a stale gatehouse worktree"
+                 f"{(' ' + wt) if wt else ''} — a prior convoy died mid-integration; "
+                 f"tear it down (or regate) and the watch will re-collect "
+                 f"(opt in with `--enable ...,teardown` to let it clear them)",
+                 key="stale_convoy")
+            continue
+        if int(convoy.get("fails") or 0) >= 3:
+            note(q["id"], "human",
+                 f"convoy {key} failed {convoy.get('fails')} collect attempt(s) — needs a Steward look "
+                 f"(last error: {str(convoy.get('last_error') or '')[:140]})",
+                 key="convoy_fails")
         if now < float(convoy.get("retry_at") or 0):
             continue
         if _within(convoy.get("last_ts"), policy.gate_cooldown, now):
             continue
-        by_cogship.setdefault(cog or "new", []).append(q["id"])
+        by_cogship.setdefault(key, []).append(q["id"])
 
     for cog, ids in by_cogship.items():
         if not policy.allows("collect"):
@@ -658,7 +715,9 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
             cogship="" if cog == "new" else cog,
             reason=f"{len(ids)} Quest(s) in GATE awaiting a Gatekeeper",
             meta={"convoy": cog, "retry_backoff": policy.retry_backoff,
-                  "noop_backoff": policy.collect_noop_backoff},
+                  "noop_backoff": policy.collect_noop_backoff,
+                  "stale_backoff": policy.stale_convoy_backoff,
+                  "live_backoff": policy.gate_cooldown},
         ))
         capacity -= 1
 
@@ -866,13 +925,33 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                           "retry_backoff": policy.retry_backoff}))
                 capacity -= 1
 
-    # --- report-only stages ------------------------------------------------
+    # --- report-only stages (raze is opt-in destructive help) ---------------
     for q in quests.values():
         status = q.get("status")
         if status in ("PLANNED", "CHARTERED", "DISPATCHED"):
             note(q["id"], "report", f"{status} — waiting on a Steward dispatch decision")
         elif status == "READY_TO_RAZE":
-            note(q["id"], "report", "READY_TO_RAZE — promotion verified; `court raze` is a human/Steward call")
+            if not policy.allows("raze"):
+                note(q["id"], "report",
+                     "READY_TO_RAZE — promotion verified; `court raze` is a human/Steward call "
+                     "(opt in with `--enable ...,raze`)")
+                continue
+            if q.get("kind") == "epic":
+                note(q["id"], "report", "READY_TO_RAZE epic — raze via the Steward")
+                continue
+            if q.get("pending_audience"):
+                note(q["id"], "skip", "READY_TO_RAZE but pending Audience — parked")
+                continue
+            if q.get("worktree") and (occupied(q.get("worktree")) or process_in(q.get("worktree"))):
+                note(q["id"], "wait", "READY_TO_RAZE but a worker is still live in its worktree")
+                continue
+            st = qstate.get(q["id"]) or {}
+            if _within(st.get("last_raze_ts"), policy.raze_cooldown, now):
+                continue
+            actions.append(Action(
+                kind="raze", quest_ids=[q["id"]],
+                reason="READY_TO_RAZE — promotion verified; razing (opt-in) to free the worktree",
+                meta={"retry_backoff": policy.retry_backoff}))
         elif status == "HELD":
             note(q["id"], "report", "HELD — awaiting Audience")
 
@@ -891,7 +970,43 @@ def _prune_spawns(state: dict, now: float) -> list:
     return spawns
 
 
+def _execute_teardown(repo: Path, action: Action, timeout: int = 120) -> dict:
+    """Remove a dead convoy's gatehouse worktree so `collect` can re-create it.
+
+    Destructive but tightly scoped: only ever called for a worktree plan() has
+    proven stale AND has confirmed has no live worker/lease (and only when the
+    operator opted in with `--enable ...,teardown`). Removes the git worktree
+    and deletes its `the-gatehouse/<cogship>` branch."""
+    wt = str(action.meta.get("worktree") or "")
+    branch = str(action.meta.get("branch") or "")
+    started = time.time()
+    if not wt or not Path(wt).is_dir():
+        return {"ok": True, "exit": 0, "argv": [],
+                "stdout_tail": "gatehouse worktree already gone", "stderr_tail": "",
+                "seconds": 0.0}
+    cmds = [["git", "-C", str(repo), "worktree", "remove", "--force", wt]]
+    if branch:
+        cmds.append(["git", "-C", str(repo), "branch", "-D", branch])
+    outs = []
+    for cmd in cmds:
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "exit": -1, "argv": cmd, "stdout_tail": "",
+                    "stderr_tail": str(e)[:500], "seconds": round(time.time() - started, 1)}
+        if res.returncode != 0:
+            return {"ok": False, "exit": res.returncode, "argv": cmd,
+                    "stdout_tail": (res.stdout or "")[-1200:],
+                    "stderr_tail": (res.stderr or "")[-1200:],
+                    "seconds": round(time.time() - started, 1)}
+        outs.append((res.stdout or "").strip())
+    return {"ok": True, "exit": 0, "argv": cmds[-1], "stdout_tail": "\n".join(outs)[-1200:],
+            "stderr_tail": "", "seconds": round(time.time() - started, 1)}
+
+
 def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -> dict:
+    if action.kind == "teardown":
+        return _execute_teardown(repo, action)
     if action.kind == "vigil":
         then = action.meta.get("then") or ""
         if not action.meta.get("spawns", True):
@@ -964,6 +1079,55 @@ def _muster_session(result: dict) -> str:
     return m.group(1) if m else ""
 
 
+_STALE_CONVOY_RE = re.compile(r"Gatehouse worktree (\S+) already exists")
+_LIVE_CONVOY_RE = re.compile(r"convoy (\S+) is LIVE")
+
+
+def _stale_convoy_worktree(result: dict) -> str:
+    """Return the stale gatehouse worktree path a failed collect named, or "".
+
+    `court collect` stamps the convoy and THEN refuses to re-create a gatehouse
+    worktree left behind by a convoy that died mid-integration:
+    ``ERROR: Gatehouse worktree <path> already exists (...). Refusing to
+    re-create it``. That is a distinct, human-fixable condition — not a
+    transient failure to retry on the short backoff."""
+    text = (result.get("stderr_tail") or "") + "\n" + (result.get("stdout_tail") or "")
+    match = _STALE_CONVOY_RE.search(text)
+    return match.group(1) if match else ""
+
+
+def _live_convoy_name(result: dict) -> str:
+    """Return the convoy a failed collect refused to disturb, or "".
+
+    ``court collect`` refuses a new convoy while another one is mid-integration:
+    ``ERROR: convoy cogship-396 is LIVE — its gatehouse worktree ...``. That is
+    the system working, not a Quest failure — a new convoy cannot be packed
+    until the live one promotes. Retrying on the short backoff just burns the
+    per-tick action budget and inflates per-Quest failure counters (the
+    2026-11-01 cogship-396 retry storm: five attempts in sixteen minutes), so
+    the convoy waits out the gate window instead."""
+    text = (result.get("stderr_tail") or "") + "\n" + (result.get("stdout_tail") or "")
+    match = _LIVE_CONVOY_RE.search(text)
+    return match.group(1) if match else ""
+
+
+
+def _heal_stale_convoys(state: dict) -> None:
+    """Clear a stale-convoy hold once its gatehouse worktree is gone (the
+    operator tore it down), so the next tick can re-collect immediately instead
+    of waiting out the long stale backoff."""
+    for convoy in (state.get("convoys") or {}).values():
+        if not isinstance(convoy, dict):
+            continue
+        stale = convoy.get("stale")
+        if not stale:
+            continue
+        wt = (stale or {}).get("worktree") if isinstance(stale, dict) else ""
+        if not wt or not Path(wt).is_dir():
+            convoy.pop("stale", None)
+            convoy["retry_at"] = 0
+
+
 def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, repo: Optional[Path] = None) -> None:
     """Record the consequences of an ATTEMPT (success or failure).
 
@@ -979,6 +1143,7 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
     clear any pending retry."""
     backoff = float(action.meta.get("retry_backoff") or 0)
     ok = bool(result.get("ok"))
+    live_convoy = "" if ok else _live_convoy_name(result)
     qstate = state.setdefault("quests", {})
 
     if action.kind == "vigil":
@@ -1010,6 +1175,21 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
             st["coins"] = int(st.get("coins") or 0) + 1
             if ok:
                 st["last_coin_ts"] = now
+    elif action.kind == "raze":
+        # Opt-in destructive help: a successful raze frees the worktree; the
+        # Quest leaves READY_TO_RAZE so it simply stops being planned.
+        if ok:
+            for qid in action.quest_ids:
+                st = qstate.setdefault(qid, {})
+                st["last_raze_ts"] = now
+    elif action.kind == "teardown":
+        # A successful teardown clears the stale-convoy hold so collect can
+        # re-pack the convoy on the next tick.
+        if ok:
+            key = action.meta.get("convoy") or "new"
+            convoy = state.setdefault("convoys", {}).setdefault(key, {})
+            convoy.pop("stale", None)
+            convoy["retry_at"] = 0
     elif action.kind == "steward":
         # Muster bookkeeping lives on its own state key: it is a board-level
         # action, not a Quest action. A failed muster retries on the short
@@ -1031,9 +1211,26 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
     elif action.kind == "collect":
         key = action.meta.get("convoy") or action.cogship or "new"
         convoy = state.setdefault("convoys", {}).setdefault(key, {})
+        stale_wt = "" if ok else _stale_convoy_worktree(result)
         if ok and _collect_packed(result):
             convoy["last_ts"] = now
             convoy["retry_at"] = 0
+            convoy["fails"] = 0
+            convoy.pop("stale", None)
+        elif stale_wt:
+            # The convoy stamped but could not re-create its gatehouse worktree:
+            # a prior convoy died mid-integration. This is a human-fixable
+            # condition, NOT a transient failure — hold the convoy (escalated
+            # once by plan) instead of re-stamping/retrying every few minutes.
+            convoy["stale"] = {
+                "ts": now,
+                "worktree": stale_wt,
+                "reason": "gatehouse worktree already exists (prior convoy died mid-integration)",
+            }
+            convoy["fails"] = int(convoy.get("fails") or 0) + 1
+            convoy["last_error"] = "gatehouse worktree already exists"
+            stale_backoff = float(action.meta.get("stale_backoff") or DEFAULT_STALE_CONVOY_BACKOFF)
+            convoy["retry_at"] = now + stale_backoff
         elif ok:
             # exit 0 but nothing packed (PENDING UI review, dirty tree, charter
             # violations) is NOT progress. Back the convoy off hard so a blocked
@@ -1041,9 +1238,19 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
             # starve every other quest (the cogship-382 starvation).
             noop = float(action.meta.get("noop_backoff") or DEFAULT_COLLECT_NOOP_BACKOFF)
             convoy["retry_at"] = now + noop
+        elif live_convoy:
+            # Another convoy owns the gatehouse right now. This is a busy
+            # signal, not a failure: wait out the gate window and leave the
+            # Quest counters untouched so a healthy convoy cannot look sick.
+            live_backoff = float(action.meta.get("live_backoff") or DEFAULT_LIVE_CONVOY_BACKOFF)
+            convoy["live"] = {"ts": now, "convoy": live_convoy}
+            convoy["last_error"] = f"convoy {live_convoy} is LIVE"
+            convoy["retry_at"] = now + live_backoff
         elif backoff:
             # A hard failure (argparse slip, busy lock) retries quickly rather
             # than burning the long noop backoff.
+            convoy["fails"] = int(convoy.get("fails") or 0) + 1
+            convoy["last_error"] = (result.get("stderr_tail") or result.get("stdout_tail") or "")[-300:]
             convoy["retry_at"] = now + backoff
 
     for qid in action.quest_ids:
@@ -1054,6 +1261,8 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
             st["last_error"] = ""
             st["last_kind"] = action.kind
             st["retry_at"] = 0
+        elif live_convoy:
+            st["last_error"] = f"convoy {live_convoy} is LIVE — collect deferred"
         else:
             st["fails"] = int(st.get("fails") or 0) + 1
             st["last_error"] = (result.get("stderr_tail") or result.get("stdout_tail") or "")[-400:]
@@ -1079,6 +1288,7 @@ def _record_escalations(state: dict, notes: list, now: float) -> None:
 def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=print) -> dict:
     now = time.time()
     spawns = _prune_spawns(state, now)
+    _heal_stale_convoys(state)
     workers = live_kilo_workers(repo)
     # A Steward triage session runs on the trunk (repo root), where the
     # worktree scan cannot see it. Surface its lease so `plan` never musters a
@@ -1228,33 +1438,105 @@ def render_digest(repo: Path, journal: Optional[list] = None) -> str:
                  f"{len(snaps)} snapshot failures")
     if snaps:
         lines.append(f"  ⚠️ last snapshot failure: {snaps[-1].get('ts')} — {str(snaps[-1].get('error'))[:160]}")
+    last_tick = next((r for r in reversed(rows) if r.get("event") == "tick"), None)
+    if last_tick:
+        cap = policy.get("max_workers") or "?"
+        lines.append(f"capacity: {last_tick.get('workers', 0)}/{cap} live workers · "
+                     f"{last_tick.get('rss_mb', 0)} MB RSS")
 
-    # --- Livelock: collects that packed nothing ---------------------------------
-    def _packed(r):
-        return "Stamped" in (r["result"].get("stdout_tail") or "")
-    noops: dict[str, dict] = {}
+    # The Steward↔Watch hand-off: active dispatch vigils are the work queue.
+    try:
+        active_vigils = vigils.load_all(repo)
+    except Exception:  # noqa: BLE001
+        active_vigils = []
+    dispatch_q = [v for v in active_vigils
+                  if str(v.get("then") or "").startswith("dispatch:")]
+    if dispatch_q:
+        lines.append("")
+        lines.append(f"dispatch queue: {len(dispatch_q)} hand-off(s) waiting for capacity")
+        for v in dispatch_q[:12]:
+            fires = len(v.get("fires") or [])
+            lines.append(f"  🧵 {v['id']}: {v.get('then')} "
+                         f"(fires {fires}/{v.get('max_fires', 1)}, expires {v.get('expires_at')})")
+        if len(dispatch_q) > 12:
+            lines.append(f"  … {len(dispatch_q) - 12} more")
+
+    # --- Collect outcomes, grouped by the convoy they actually touched --------
+    def _convoy_key(r):
+        a = r["action"]
+        key = a.get("cogship") or ""
+        meta_convoy = (a.get("meta") or {}).get("convoy") or ""
+        if not key and meta_convoy and meta_convoy != "new":
+            key = meta_convoy
+        if not key:
+            blob = (r["result"].get("stdout_tail") or "") + (r["result"].get("stderr_tail") or "")
+            found = re.search(r"cogship-\d+", blob)
+            key = found.group(0) if found else ""
+        return key or "unassigned"
+
+    groups: dict[str, dict] = {}
+    stale_wts: dict[str, str] = {}
     for r in actions:
         if r["action"]["kind"] != "collect":
             continue
-        key = r["action"].get("cogship") or r["action"]["meta"].get("convoy") or "new"
-        rec = noops.setdefault(key, {"count": 0, "ok": 0, "quests": set(), "first": None, "last": None, "reasons": set()})
-        rec["count"] += 1
-        rec["quests"].update(r["action"]["quest_ids"])
-        rec["first"] = rec["first"] or r["ts"]
-        rec["last"] = r["ts"]
-        out = (r["result"].get("stdout_tail") or "")
-        if r["result"].get("ok") and not _packed(r):
-            rec["ok"] += 1
+        key = _convoy_key(r)
+        g = groups.setdefault(key, {"packed": 0, "noop": 0, "failed": 0, "quests": set(),
+                                    "first": None, "last": None, "reasons": set()})
+        g["quests"].update(r["action"]["quest_ids"])
+        g["first"] = g["first"] or r["ts"]
+        g["last"] = r["ts"]
+        out = r["result"].get("stdout_tail") or ""
+        if r["result"].get("ok") and "Stamped" in out:
+            g["packed"] += 1
+        elif r["result"].get("ok"):
+            g["noop"] += 1
             for line in out.splitlines():
                 if "not ready to pack" in line or "UI Review is PENDING" in line:
-                    rec["reasons"].add(line.strip()[:120])
-    fragile = {k: v for k, v in noops.items() if v["ok"] >= 2}
-    if fragile:
+                    g["reasons"].add(line.strip()[:120])
+        else:
+            g["failed"] += 1
+            wt = _stale_convoy_worktree(r["result"])
+            if wt:
+                stale_wts[key] = wt
+                g["reasons"].add("gatehouse worktree already exists (prior convoy died mid-integration)")
+
+    # --- Stuck convoys: the authoritative view is the current state -----------
+    stuck = dict(stale_wts)
+    for key, convoy in (state.get("convoys") or {}).items():
+        stale = (convoy or {}).get("stale") if isinstance(convoy, dict) else None
+        if isinstance(stale, dict) and stale.get("worktree"):
+            stuck[key] = stale["worktree"]
+    if stuck:
         lines.append("")
-        lines.append("livelock — collects that packed nothing (candidate fix: Court Artist / unblock):")
-        for key, v in sorted(fragile.items(), key=lambda kv: -kv[1]["ok"]):
+        lines.append("stuck convoys — gatehouse worktree left by a dead convoy (tear down or regate):")
+        for key, wt in sorted(stuck.items()):
+            g = groups.get(key) or {}
+            extra = (f" · {g.get('failed')} failed collect(s), {g.get('first')} → {g.get('last')}"
+                     if g.get("failed") else "")
+            lines.append(f"  ⛔ {key}: {wt}{extra}")
+            lines.append(f"     clear with: git -C {repo} worktree remove --force {wt}")
+
+    # --- READY_TO_RAZE awaiting a raze ---------------------------------------
+    statuses = {}
+    for r in reversed(rows):
+        if r.get("event") == "tick" and isinstance(r.get("statuses"), dict):
+            statuses = r["statuses"]
+            break
+    raze_ready = sorted(qid for qid, s in statuses.items() if s == "READY_TO_RAZE")
+    if raze_ready:
+        lines.append("")
+        lines.append("ready to raze — promotion verified (`court raze <id>`; opt in with `--enable ...,raze`):")
+        for qid in raze_ready:
+            lines.append(f"  🪦 {qid}")
+
+    # --- Livelock: collects that exit 0 but pack nothing ----------------------
+    livelocks = {k: v for k, v in groups.items() if v["noop"] >= 2}
+    if livelocks:
+        lines.append("")
+        lines.append("livelock — collects that exit 0 but pack nothing (candidate fix: Court Artist / unblock):")
+        for key, v in sorted(livelocks.items(), key=lambda kv: -kv[1]["noop"]):
             qs = ",".join(sorted(v["quests"]))
-            lines.append(f"  ✗ convoy {key}: {v['ok']}/{v['count']} no-op collects, {v['first']} → {v['last']}")
+            lines.append(f"  ✗ convoy {key}: {v['noop']} no-op collect(s), {v['first']} → {v['last']}")
             lines.append(f"     quests: {qs}")
             for reason in sorted(v["reasons"]):
                 lines.append(f"     reason: {reason}")
@@ -1315,7 +1597,7 @@ def render_digest(repo: Path, journal: Optional[list] = None) -> str:
         if steward.get("fails"):
             lines.append(f"  failed musters: {steward['fails']} — {str(steward.get('last_error') or '')[:160]}")
 
-    if not fragile and not notified and not spent and not fails:
+    if not stuck and not livelocks and not raze_ready and not notified and not spent and not fails:
         lines.append("")
         lines.append("✅ no live issues detected in the journal/state window.")
     return "\n".join(lines)

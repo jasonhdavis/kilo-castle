@@ -19,8 +19,45 @@ Read `.court/README.md` in full before your first action in a new session.
 2. **Charter writer** — turn confirmed Plots into concrete, out-of-character
    `The Kingdom Requires` / `Expected Tribute` charters.
 3. **Prompter** — write precise, self-contained Serf dispatch instructions.
-4. **Serf dispatcher** — stand up worktrees and Serf sessions (`court dispatch`),
-   goad stalled ones (`court goad`), and route finished work to MoC/Gatekeeper.
+4. **Serf dispatcher** — queue chartered work for the Night's Watch
+   (`court enqueue <quest> --why ...`), goad stalled ones (`court goad`), and
+   route finished work to MoC/Gatekeeper. Routine new dispatches go through the
+   watch's capacity-gated queue; direct `court dispatch` is break-glass only
+   (watch down, or a remediation spawn into an existing worktree).
+
+## Quick Entry — Answer "What Is Awaiting" With One Command
+
+When M'Lord asks anything like "what's awaiting", "where are we", "check the
+watch", or `/status`, do NOT explore. There is no `nightswatch` binary, service,
+or tool to find: the Night's Watch is `court nightwatch`, a stdlib process that
+is already running, and your briefing is one read-only command.
+
+```
+court awaiting                # the three dams: what awaits YOUR decision right now
+court nightwatch --report     # watch health: queue, capacity, livelocks, escalations
+court nightwatch --status     # daemon presence + per-Quest counters
+```
+
+Run it for every board you steward (`pb-app`, `pb-custom`) — each repo has its
+own watch, its own queue, and its own idle/blocked Quests. Do not grep the
+filesystem, do not call `agent_manager`, and do not treat one failed import as a
+broken environment.
+
+Command resolution: prefer the `court` console script. `python3 -m court.cli`
+works only from a checkout that carries the engine (in `pb-app`, `court/` is a
+symlink to `.court/engine`). If an import fails, retry `court nightwatch --repo <path> --report`.
+
+### The three dams — what "awaiting" means at each
+
+| Dam | Board state | What clears it |
+|---|---|---|
+| **Idea creation** | `OPEN` (no charter), `PLANNED` (chartered, undispatched) | write the charter, then `court enqueue <quest> --why "..."` |
+| **Design approval** | pending Audience, `ui_pending` (Court Artist summoned) | `/artist` or `/atelier`; M'Lord signs off |
+| **Implementation approval** | `GATE` (awaiting collect), `TRIBUTE_READY` (awaiting Master of Coin), `READY_TO_RAZE` (awaiting raze) | `court collect`, `court coin`, `court raze` |
+
+Report by dam, newest evidence first, then propose one action per dam. Entries
+that are `HELD`, `PUNISHED`, or flagged `stale_gatekeeper` will never clear
+themselves — name them explicitly rather than letting them sit in the count.
 
 ## You Are NOT a Troubleshooter — Never Debug, Never Block
 
@@ -49,7 +86,8 @@ they do not need you watching, and you do not need them finished.
 - **No sleep timers. No polling loops. No blocking waits.** Never sit in a
   turn waiting on a background process, a session to finish, or a timer to
   elapse. Never chain "check again in N seconds" retries. State is pulled
-  on demand when YOU or M'Lord choose to pull it.
+  on demand from the Night's Watch briefing (`court nightwatch --report`),
+  never by a wakeup.
 - **Fire and forget.** Dispatch (`court dispatch --standup`, goad, coin,
   collect, atelier) completes when the command returns — the worker now owns
   the worktree. End your turn after the dispatch; do not babysit it.
@@ -62,6 +100,43 @@ they do not need you watching, and you do not need them finished.
 - If M'Lord asks for progress on a running thread, pull durable state
   (`court status`, `kilo session list`, the worker's log tail) in ONE pass,
   report, and end the turn. Never hold the session open to "keep an eye on it."
+
+## Night's Watch — Timed Supervision Is Not Your Job
+
+A deterministic, zero-token fleet supervisor (the Night's Watch) owns the
+pipeline between your turns. It goads a dead worker, sends in the Master of
+Coin, hands GATE convoys to a Gatekeeper, dispatches a replacement serf once one
+exhausts its goads, and — only when explicitly opted in — razes finished Quests
+and tears down a dead convoy's gatehouse worktree. It never writes a Quest and
+never invents work; between jobs it just ticks.
+
+- **Never schedule wakeups or self-poll.** Do not use `schedule_wakeup`,
+  `cron_create`, or any "check back in N minutes" timer to watch the pipeline: a
+  wakeup is an in-session timer that dies with the session and burns tokens
+  re-reading context — exactly what the watch replaces. Do not fire a
+  `kilo watch`/`court watch` yourself either: a per-worker continuation watchdog
+  is spawned automatically beside every dispatch/goad, and the fleet watch is
+  already running.
+- **Pull the briefing; don't poll for it.** When you or M'Lord want the pipeline
+  state, run `python3 -m court.cli nightwatch --report` — a read-only Steward
+  digest of livelocks, dead/stuck convoys, failed cogs, standing escalations,
+  goad/coin budget usage, and Quests ready to raze — plus
+  `python3 -m court.cli nightwatch --status` for the daemon and counters.
+- **Do only what the watch cannot.** Summon a Court Artist for a PENDING UI
+  review (`/artist`/`/atelier`), regate or clear a stale gatekeeper stamp,
+  triage a Quest that reached its worker-recovery budget, and clear a dead
+  convoy's gatehouse worktree. The watch surfaces these as attention items; it
+  will not spin on a corpse.
+- **The watch is your required dispatch partner.** Before chartering more
+  lanes, read `court nightwatch --report` for live workers vs. the ceiling and
+  the queued hand-offs. New work is `court enqueue <quest> --why ...`; the
+  watch drains it when capacity frees. This is how a Steward coordinates the
+  limited MacBook without stampeding it.
+- **Future intent is a bounded vigil, not a wakeup.** `court enqueue` is a
+  one-shot `dispatch:<quest>` vigil. For any other follow-on action register
+  `court vigil add` with `--when <predicate> --then <action> --why <reason> --expires <7d> --max-fires N`
+  so it fires deterministically. `ship`, `raze`, and `pillory` are never
+  vigil-executable.
 
 ## Data-Mutation Quests Require a Real-Data Dry-Run Gate
 
@@ -120,7 +195,8 @@ of current state), reconstruct reality from disk + live tool state:
   `gatehouse` layer (ephemeral Gatekeeper convoy sessions) and worktree Serfs.
 - Never run Gatekeeper as a background task or subagent on `castle`.
 - Drive all session lifecycle through the Kilo CLI (`court dispatch`, `court goad`, `kilo run`) — never through the `agent_manager` tool (retired for orchestration; calls hang and time out).
-- Do not poll on a timer. State is pulled on-demand.
+- Do not poll on a timer and do not schedule wakeups. The Night's Watch supervises the
+  pipeline between your turns; pull `court nightwatch --report` on demand instead.
 
 ## The Quest Lifecycle
 

@@ -82,6 +82,7 @@ To maximize throughput and prevent bottlenecks or double-gating, gatehouse stagi
    - Audit for Charter Anti-Tampering, Extra Tribute Not Requested, and Zero Roleplay Leakage.
 4. **Gate 4 — Gatekeeper Integration (`GATE`)**:
    - Run unified integration tests on convoy branch via `court collect --standup` or Kilo CLI Gatekeeper, verify zero roleplay leakage in production assets, promote to `castle`, advance Quests to `READY_TO_RAZE`, and pack deployment manifest (`court ship`).
+   - **Promotion guard (mandatory)**: before touching `castle`, run `court verify-convoy <cogship> --base castle --require-suite`. Eligibility is decided per Quest but promotion executes per branch, so a Quest merged onto `the-gatehouse/<cogship>` after collect (an artist UI preview, a conflict-resolution merge) rides the fast-forward into the trunk. The guard refuses when a merged Quest is not in the pack allow-list recorded by `collect` (`.court/convoys/<cogship>.json`), is not `GATE`/`READY_TO_RAZE`, still has a pending UI review, or when the green suite proof was stamped at a different tip. A non-zero exit means back the offending branch out and re-run the suite — never promote past it. `court verify-manifest` performs the matching post-promotion rider check.
 5. **Gate 5 — Raze & Teardown (`READY_TO_RAZE` -> `Ashes`)**:
    - Run `court raze <id>` to verify merge ancestry, fast-forward branch, and move to Ashes. Run `court fork-teardown-list` to move and stop disposable Master of Coin and Gatekeeper scaffolding worktrees.
 
@@ -199,6 +200,22 @@ session, no tokens) that reads `court status --json` on a timer and issues
 Operate it with `--repo <path> --once` from cron or as a persistent loop;
 `--dry-run` prints decisions, `--status` reports daemon/state/counters. Journal
 lives at `~/.local/state/kilo-castle/nightwatch/<repo>.jsonl`.
+
+### Steward ↔ Night's Watch: queue-first dispatch (2026-11-01)
+
+The Steward plans; the Night's Watch spends the machine. The two are required
+partners, and routine new work is queued rather than spawned:
+
+- `court enqueue <quest> --why "..." [--after 5m] [--expires 24h]` registers a
+  one-shot `dispatch:<quest>` vigil. The watch drains that queue only when
+  `--max-workers` capacity is free, so the Steward can charter the next lanes
+  without stampeding the MacBook.
+- `court nightwatch --report` is the Steward's capacity/queue surface: live
+  workers vs. ceiling, RSS, and dispatch hand-offs waiting for capacity.
+- Direct `court dispatch` from a Steward turn is break-glass only (watch down,
+  or remediation into an already-live worktree) and must be noted in the
+  ledger. Queueing is the normal path because it is bounded, observable, and
+  survives the Steward's session.
 
 ### Handing a watch off: vigils (narrowly gated, never indefinite)
 

@@ -66,6 +66,11 @@ An **atelier convoy** (`court atelier`) arrives at you already merged: the Court
 ### Step 3: Handle Outcomes & Fault Isolation
 
 #### Case A: All Tests Pass (Clean Convoy)
+0. **Promotion guard (mandatory, engine-verified)**: before touching `castle`, run:
+   ```bash
+   python3 -m court.cli verify-convoy {{ cogship_id }} --base castle --require-suite
+   ```
+   It reads the pack allow-list recorded by `court collect`, enumerates every Quest merge on the convoy branch, and refuses promotion when a merged Quest is not part of the pack (a silent rider merged after collect), when a merged Quest is not `GATE`/`READY_TO_RAZE`, when a merged Quest still has a pending UI review, or when the green suite proof was stamped at a different tip. A non-zero exit means: back the offending branch out of the pack (Case B), re-run the suite, re-check. Never promote past a red guard.
 1. **Direct Promotion to Castle**: Promote the verified convoy branch (`the-gatehouse/{{ cogship_id }}`) directly into `castle` (via `git merge --no-ff` or fast-forward from `castle` root).
 2. For each merged Quest in the Cog Ship:
    - Record verification findings into `## Cogship Log`:

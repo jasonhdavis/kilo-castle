@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import store
+from . import convoy_guard
 from .models import Quest, STATUSES, SECTIONS, KINDS, now_iso, validate_branch_name, status_label, DEFAULT_BODY_SECTIONS, is_valid_section_name
 from . import git_ops
 from . import ward
@@ -4605,6 +4606,47 @@ def _code_presence_check(quest: Quest, trunk: str = "castle") -> dict:
     return git_ops.verify_quest_promotion(quest_branch, trunk=trunk)
 
 
+def cmd_verify_convoy(args):
+    """Pre-promotion guard: refuse a convoy whose branch would carry Code into
+    the trunk that this pack did not authorise.
+
+    The failure this closes (2026-11-01, cogship-382): eligibility is decided
+    per Quest, promotion executes per branch, so a Quest merged onto the convoy
+    branch after collect — for an artist UI preview — rode the fast-forward into
+    castle while its charter still said GATE. The Gatekeeper must run this
+    before promoting; a non-zero exit means back the offending branch out first.
+    """
+    repo_root = git_ops.get_repo_root()
+    cogship = convoy_guard.normalize_cogship_id(getattr(args, "cogship", "") or "")
+    if not cogship:
+        print("ERROR: verify-convoy needs a cogship id (positional or --cogship)", file=sys.stderr)
+        sys.exit(1)
+    base = getattr(args, "base", "castle") or "castle"
+    expected = [s.strip() for s in (getattr(args, "expect", "") or "").split(",") if s.strip()]
+    findings = convoy_guard.audit_promotion(
+        repo_root,
+        cogship,
+        base=base,
+        expected_quest_ids=expected or None,
+        allow_ui_pending=bool(getattr(args, "allow_ui_pending", False)),
+        allow_stale_suite=bool(getattr(args, "allow_stale_suite", False)),
+        require_suite=bool(getattr(args, "require_suite", False)),
+    )
+    errors = [f for f in findings if f.level == "error"]
+    print(f"🛡️  CONVOY PROMOTION GUARD — {cogship} against '{base}'")
+    if not findings:
+        print("  ✅ No findings: every merged Quest is in the pack, promotable, and the suite proof matches the tip.")
+    for finding in findings:
+        print(f"  {finding.render()}")
+    if errors:
+        print(
+            f"\n❌ {len(errors)} blocking finding(s) — do NOT promote. Back the offending "
+            f"branch out of the pack (Case B), re-run the unified suite, then re-check."
+        )
+        sys.exit(1)
+    print(f"\n✅ {cogship} is safe to promote into '{base}'.")
+
+
 def cmd_verify_manifest(args):
     """cogship-077 fix: after any convoy promotion, deterministically assert each
     manifest Quest's BRANCH TIP is an ancestor of the promoted trunk AND carries
@@ -4636,6 +4678,28 @@ def cmd_verify_manifest(args):
     if failures:
         print(f"\n❌ {len(failures)}/{len(quests)} manifest Quest(s) FAILED promotion verification — the trunk does not actually contain this convoy's code.")
         sys.exit(1)
+
+    # Silent-rider detection: code can reach the trunk through the convoy branch
+    # without ever being a manifest Quest (cogship-382/Q1013). Every Quest merge
+    # into a convoy that is already an ancestor of the trunk must be accounted
+    # for by the manifest.
+    repo_root = git_ops.get_repo_root()
+    manifest_ids = {q.id for q in quests}
+    rider_findings = []
+    for cid in sorted({store.normalize_cogship_id(q.cogship_id) for q in quests if q.cogship_id}):
+        rider_findings.extend(
+            convoy_guard.riders_in_trunk(repo_root, cid, trunk=trunk, manifest_quest_ids=manifest_ids)
+        )
+    if rider_findings:
+        print("\n🕵️  Silent riders detected — code in the trunk with no promotion decision:")
+        for finding in rider_findings:
+            print(f"  {finding.render()}")
+        print(
+            "\n❌ Silent rider(s) present. Reconcile each Quest (complete its review and "
+            "advance it, or revert its convoy merge out of the trunk) before razing or shipping."
+        )
+        sys.exit(1)
+
     print(f"\n✅ All {len(quests)} manifest Quest(s) verified: branch tips reachable from {trunk} with production content present.")
 
 
@@ -5162,6 +5226,26 @@ def cmd_collect(args):
         sys.exit(1)
     accepted = repackable
     print(f"🚢 Stamped {len(accepted)} Quest(s) onto {cogship_id}.")
+
+    # Record the pack this collect authorised. Promotion is per-branch, so the
+    # allow-list has to live on disk: the Gatekeeper's fast-forward promotes
+    # every merge on the convoy branch, including one that landed after this
+    # pack (cogship-382: Q1013 merged for a UI preview rode into castle).
+    try:
+        pack_path = convoy_guard.record_pack(
+            repo_root,
+            cogship_id,
+            [q.id for q in accepted],
+            base=base_branch,
+        )
+        if pack_path is not None and auto_commit:
+            git_ops._run(["git", "add", str(pack_path)], cwd=repo_root)
+            git_ops._run(
+                ["git", "commit", "-m", f"court: record {cogship_id} pack allow-list ({len(accepted)} quest(s))"],
+                cwd=repo_root,
+            )
+    except Exception as e:  # never block a pack on bookkeeping
+        print(f"⚠️  Could not record the {cogship_id} pack allow-list: {e}")
 
     # A re-minted convoy is a FRESH integration: prior promotion/session stamps
     # describe the old convoy and would make `collect --standup` skip the
@@ -6901,6 +6985,8 @@ def cmd_nightwatch(args):
         goads_per_serf=getattr(args, "goads_per_serf", None) or nightwatch.DEFAULT_GOADS_PER_SERF,
         serf_slots=getattr(args, "serf_slots", None) or nightwatch.DEFAULT_SERF_SLOTS,
         collect_noop_backoff=getattr(args, "collect_noop_backoff", None) or nightwatch.DEFAULT_COLLECT_NOOP_BACKOFF,
+        stale_convoy_backoff=getattr(args, "stale_convoy_backoff", None) or nightwatch.DEFAULT_STALE_CONVOY_BACKOFF,
+        raze_cooldown=int(getattr(args, "raze_cooldown", 0) or 0) or 1800,
         retry_backoff=int(getattr(args, "retry_backoff", 0) or 0),
         steward_stale_after=int(getattr(args, "steward_stale_after", 0) or nightwatch.DEFAULT_STEWARD_STALE_AFTER),
         steward_cooldown=int(getattr(args, "steward_cooldown", 0) or nightwatch.DEFAULT_STEWARD_COOLDOWN),
@@ -6920,6 +7006,84 @@ def cmd_nightwatch(args):
         dry_run=bool(args.dry_run),
         quiet=bool(args.quiet),
     ))
+
+
+def _awaiting_buckets(quests, ui_pending_ids=frozenset()):
+    """Group the board into the three human-decision dams.
+
+    Pure: Quests in, buckets out. "Awaiting" means awaiting a DECISION, not a
+    worker — everything between decisions belongs to the Night's Watch, so
+    TRIBUTE_READY/GATE are reported as in-flight rather than as dams.
+    """
+    buckets = {
+        "idea": [],      # dam 1: idea creation / chartering / dispatch approval
+        "design": [],    # dam 2: design approval (Audience, UI review sign-off)
+        "impl": [],      # dam 3: implementation approval (promotion verified, raze)
+        "watch": [],     # automated: the Night's Watch is already on it
+        "blocked": [],   # royal side-state: never clears itself
+    }
+    for quest in quests:
+        if getattr(quest, "kind", "") == "epic":
+            continue
+        status = (quest.status or "").upper()
+        qid = quest.id
+        if status in ("HELD", "PUNISHED"):
+            buckets["blocked"].append((qid, status, "royal side-state — M'Lord must rule"))
+        elif status in ("OPEN", "PLANNED", "CHARTERED", "DISPATCHED"):
+            nxt = "write the charter" if status == "OPEN" else "court enqueue <quest> --why ..."
+            buckets["idea"].append((qid, status, nxt))
+        elif getattr(quest, "has_pending_audience", lambda: False)() or qid in ui_pending_ids:
+            buckets["design"].append((qid, status, "/artist or /atelier — M'Lord signs off"))
+        elif status == "READY_TO_RAZE":
+            buckets["impl"].append((qid, status, "court raze <id>"))
+        elif status in ("TRIBUTE_READY", "GATE", "WORKING", "CHARTERED"):
+            nxt = {"TRIBUTE_READY": "Master of Coin (`court coin`)",
+                   "GATE": "Gatekeeper (`court collect`)",
+                   "WORKING": "Serf toiling"}.get(status, "in flight")
+            buckets["watch"].append((qid, status, nxt))
+    return buckets
+
+
+def cmd_awaiting(args):
+    """One-command answer to "what is awaiting?" — the Steward's quick entry.
+
+    Deterministic: reads the board from disk, no model calls, no watch tick.
+    Three dams (idea creation, design approval, implementation approval) plus
+    what the Night's Watch already owns and what will never clear itself.
+    """
+    repo_root = git_ops.get_repo_root()
+    quests = store.list_all(include_archive=False)
+    ui_ids = {q.id for q in quests if convoy_guard.ui_review_pending(repo_root, q.id)}
+    buckets = _awaiting_buckets(quests, ui_pending_ids=ui_ids)
+    if getattr(args, "json", False):
+        print(json.dumps(
+            {key: [{"id": qid, "status": status, "next": nxt} for qid, status, nxt in rows]
+             for key, rows in buckets.items()},
+            indent=2,
+        ))
+        return
+    limit = max(1, int(getattr(args, "limit", 10) or 10))
+    print(f"⏳ AWAITING — {repo_root.name}")
+    human = sum(len(buckets[k]) for k in ("idea", "design", "impl", "blocked"))
+    print(f"   {human} decision(s), {len(buckets['watch'])} item(s) already with the Night's Watch")
+    titles = (
+        ("idea", "DAM 1 · idea creation — charter, then queue"),
+        ("design", "DAM 2 · design approval — Audience / Court Artist"),
+        ("impl", "DAM 3 · implementation approval — promotion verified"),
+        ("blocked", "BLOCKED · royal side-state (will never clear itself)"),
+        ("watch", "IN FLIGHT · the Night's Watch owns these"),
+    )
+    for key, title in titles:
+        rows = buckets[key]
+        print(f"\n{title} — {len(rows)}")
+        if not rows:
+            print("   (none)")
+            continue
+        for qid, status, nxt in rows[:limit]:
+            short = qid.split("-", 1)[-1] if "-" in qid else qid
+            print(f"   • {qid.split('-')[0]:<6} {status:<15} {short[:46]:<46} → {nxt}")
+        if len(rows) > limit:
+            print(f"   … +{len(rows) - limit} more")
 
 
 def cmd_vigil(args):
@@ -7012,6 +7176,62 @@ def cmd_vigil(args):
 
     print(f"ERROR: unknown vigil action {action!r} (add|list|remove|check|run)", file=sys.stderr)
     sys.exit(1)
+
+def cmd_enqueue(args):
+    """Queue a chartered Quest for dispatch by the Night's Watch.
+
+    This is sugar over the vigil contract: it registers a one-shot
+    `dispatch:<QID>` vigil with a reason and expiry. The watch drains it when
+    worker capacity is available, so the Steward plans and the fleet supervisor
+    spends the machine (Steward -> queue -> Nightwatch -> worker).
+    """
+    repo = Path(getattr(args, "repo", None) or git_ops.get_repo_root()).resolve()
+    try:
+        quest = store.load(args.quest, court_root=repo / ".court")
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    if quest.status not in ("PLANNED", "CHARTERED"):
+        print(f"ERROR: {quest.id} is {quest.status}; enqueue only PLANNED/CHARTERED "
+              f"work (charter it first)", file=sys.stderr)
+        sys.exit(1)
+
+    short = quest.id.split("-")[0].lower()
+    vid = f"dispatch-{short}"
+    active = vigils.load_all(repo)
+    if any(v.get("id") == vid for v in active):
+        print(f"Already queued: {vid} (queued; the Night's Watch owns it)")
+        return
+
+    now = vigils.now_utc()
+    delay = vigils.parse_duration(getattr(args, "after", "0s") or "0s")
+    if delay is None:
+        print("ERROR: --after must be a span like 30s/5m/2h", file=sys.stderr)
+        sys.exit(1)
+    when = [f"after:{vigils.iso(now + delay)}"]
+    try:
+        spec = vigils.build(
+            id=vid,
+            when=when,
+            then=f"dispatch:{quest.id}",
+            reason=args.why,
+            expires=args.expires,
+            max_fires=1,
+            created_by="steward",
+        )
+    except vigils.VigilError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    p = vigils.save(repo, spec)
+    depth = len([v for v in active if str(v.get("then") or "").startswith("dispatch:")])
+    print(f"🧵 Queued for the Night's Watch: {quest.id}")
+    print(f"   id:      {vid}")
+    print(f"   then:    dispatch:{quest.id} (when capacity allows)")
+    print(f"   expires: {spec['expires_at']}")
+    print(f"   queue:   {depth + 1} dispatch hand-off(s) active")
+    print(f"   file:    {p}")
+    print("   Inspect with `court vigil list` / `court nightwatch --report`.")
+
 
 
 def cmd_teardown_list(args):
@@ -8883,6 +9103,8 @@ def build_parser():
     p_nightwatch.add_argument("--goads-per-serf", dest="goads_per_serf", type=int, default=nightwatch.DEFAULT_GOADS_PER_SERF, help=f"Alias of --max-goads (default {nightwatch.DEFAULT_GOADS_PER_SERF})")
     p_nightwatch.add_argument("--serf-slots", dest="serf_slots", type=int, default=nightwatch.DEFAULT_SERF_SLOTS, help=f"Serfs per Quest before bubbling up to a Steward (goad budget = serf_slots x goads_per_serf; default {nightwatch.DEFAULT_SERF_SLOTS})")
     p_nightwatch.add_argument("--collect-noop-backoff", dest="collect_noop_backoff", type=int, default=nightwatch.DEFAULT_COLLECT_NOOP_BACKOFF, help=f"Seconds to back a convoy off after a collect that packed nothing (default {nightwatch.DEFAULT_COLLECT_NOOP_BACKOFF})")
+    p_nightwatch.add_argument("--stale-convoy-backoff", dest="stale_convoy_backoff", type=int, default=nightwatch.DEFAULT_STALE_CONVOY_BACKOFF, help=f"Seconds to hold a convoy whose gatehouse worktree already exists from a prior mid-integration death (default {nightwatch.DEFAULT_STALE_CONVOY_BACKOFF})")
+    p_nightwatch.add_argument("--raze-cooldown", dest="raze_cooldown", type=int, default=1800, help="Seconds between opt-in `raze` attempts on a READY_TO_RAZE Quest (default 1800)")
     p_nightwatch.add_argument("--report", action="store_true", help="Roll up where the Night's Watch is stuck (livelocks, stale holds, goad/budget ceilings, failures) from the journal + state, then exit")
     p_nightwatch.add_argument("--context-soft", dest="context_soft", type=int, default=0, help="Cull line (tokens) at which a live watchdog re-prompting a session is flagged (0 = manifest context.cull_soft)")
     p_nightwatch.add_argument("--context-hard", dest="context_hard", type=int, default=0, help="Red zone (tokens) past which a live watchdog's same-session re-prompt is unacceptable (0 = manifest context.hard_red_zone)")
@@ -8893,10 +9115,19 @@ def build_parser():
     p_nightwatch.add_argument("--steward-stale-after", dest="steward_stale_after", type=int, default=nightwatch.DEFAULT_STEWARD_STALE_AFTER, help=f"Seconds an unchanged board with no live worker must sit before a Steward may be mustered (default {nightwatch.DEFAULT_STEWARD_STALE_AFTER})")
     p_nightwatch.add_argument("--steward-cooldown", dest="steward_cooldown", type=int, default=nightwatch.DEFAULT_STEWARD_COOLDOWN, help=f"Seconds between Steward musters (default {nightwatch.DEFAULT_STEWARD_COOLDOWN})")
     p_nightwatch.add_argument("--max-stewards-per-day", dest="max_stewards_per_day", type=int, default=nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY, help=f"Rolling 24-hour Steward muster cap (default {nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY})")
-    p_nightwatch.add_argument("--enable", default="goad,coin,collect,dispatch", help="Comma list of permitted actions (goad,coin,collect,dispatch,steward). `steward` is OPT-IN: it spends a full reasoning worker to triage a stale board.")
+    p_nightwatch.add_argument("--enable", default="goad,coin,collect,dispatch", help="Comma list of permitted actions (goad,coin,collect,dispatch,steward,raze,teardown). `steward`, `raze`, and `teardown` are OPT-IN: steward spends a reasoning worker; raze/teardown are destructive.")
     p_nightwatch.add_argument("--allow-force-goad", dest="allow_force_goad", action="store_true", help="Permit --force goads (supersedes a live worker). Off by default.")
     p_nightwatch.add_argument("--quiet", action="store_true", help="Journal only; suppress per-tick console output")
     p_nightwatch.set_defaults(func=cmd_nightwatch)
+
+    p_awaiting = sub.add_parser(
+        "awaiting",
+        aliases=["pending"],
+        help="One-command digest of what is awaiting a human decision, grouped by the three dams",
+    )
+    p_awaiting.add_argument("--json", action="store_true", help="Print machine-readable buckets")
+    p_awaiting.add_argument("--limit", type=int, default=10, help="Rows shown per bucket (default 10)")
+    p_awaiting.set_defaults(func=cmd_awaiting)
 
     p_vigil = sub.add_parser(
         "vigil",
@@ -8912,6 +9143,17 @@ def build_parser():
     p_vigil.add_argument("--max-fires", dest="max_fires", type=int, default=vigils.DEFAULT_MAX_FIRES, help=f"How many times it may fire before retiring (1..{vigils.MAX_FIRES_CEILING}, default {vigils.DEFAULT_MAX_FIRES})")
     p_vigil.add_argument("--all", action="store_true", help="list: include retired/expired vigils")
     p_vigil.set_defaults(func=cmd_vigil)
+    p_enqueue = sub.add_parser(
+        "enqueue",
+        help="Queue a PLANNED/CHARTERED Quest for dispatch by the Night's Watch (a one-shot dispatch vigil) — the Steward plans, the watch spends the machine",
+    )
+    p_enqueue.add_argument("quest", help="Quest ID to queue (must be PLANNED or CHARTERED)")
+    p_enqueue.add_argument("--why", required=True, help="Why this dispatch is queued (min 12 chars)")
+    p_enqueue.add_argument("--expires", default="24h", help="How long the queue entry stays live (span or ISO; default 24h)")
+    p_enqueue.add_argument("--after", default="0s", help="Earliest dispatch delay, e.g. 30s/5m/2h (default 0s)")
+    p_enqueue.add_argument("--repo", default=None, help="Court repository (default: this repo)")
+    p_enqueue.set_defaults(func=cmd_enqueue)
+
 
     p_verify_manifest = sub.add_parser(
         "verify-manifest",
@@ -8921,6 +9163,30 @@ def build_parser():
     p_verify_manifest.add_argument("--trunk", default="castle", help="Promoted trunk branch to verify against (default: castle)")
     add_quest_selector(p_verify_manifest, batchable=True)
     p_verify_manifest.set_defaults(func=cmd_verify_manifest)
+
+    p_verify_convoy = sub.add_parser(
+        "verify-convoy",
+        help="Pre-promotion guard: refuse a convoy branch carrying Quest merges the pack did not authorise",
+    )
+    p_verify_convoy.add_argument("cogship", help="Cog Ship convoy to verify (for example cogship-382)")
+    p_verify_convoy.add_argument("--base", default="castle", help="Trunk the convoy is about to promote into (default: castle)")
+    p_verify_convoy.add_argument(
+        "--expect", default="",
+        help="Comma-separated Quest ids overriding the recorded pack allow-list",
+    )
+    p_verify_convoy.add_argument(
+        "--allow-ui-pending", dest="allow_ui_pending", action="store_true", default=False,
+        help="Permit a merged Quest whose UI review is still pending (deliberate override only)",
+    )
+    p_verify_convoy.add_argument(
+        "--allow-stale-suite", dest="allow_stale_suite", action="store_true", default=False,
+        help="Permit promotion when the green suite proof was stamped at a different convoy tip",
+    )
+    p_verify_convoy.add_argument(
+        "--require-suite", dest="require_suite", action="store_true", default=False,
+        help="Fail when no suite proof exists for this convoy at all",
+    )
+    p_verify_convoy.set_defaults(func=cmd_verify_convoy)
 
     p_diff = sub.add_parser("diff", help="Display structured worktree diff and file statistics vs base")
     p_diff.add_argument("quest_id", help="Quest ID to diff")
@@ -8972,7 +9238,8 @@ def build_parser():
 # checkout's index / dirty tree. Read-only reporting commands never take it.
 _READ_ONLY_COMMANDS = {
     "status", "show", "list", "tally", "metrics", "ward", "ship", "diff", "timber",
-    "model", "verify-merged", "verify-manifest", "runsuite", "browser",
+    "model", "verify-merged", "verify-manifest", "verify-convoy", "runsuite", "browser",
+    "awaiting", "pending",
     # `watch` only observes durable state and re-prompts sessions; it never
     # commits, so it must not serialize behind the write lock (a watchdog
     # blocking on a busy castle would delay continuations). `monitor` runs

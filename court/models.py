@@ -175,6 +175,7 @@ FRONTMATTER_FIELDS = (
     "vassal_session_id",
     "created_at",
     "updated_at",
+    "razed_at",
 )
 
 # Declarative, thematic, in fixed reading order. Every section is short
@@ -348,6 +349,12 @@ class Quest:
     vassal_session_id: str = ""
     created_at: str = ""
     updated_at: str = ""
+    # Durable raze marker. `court raze` keeps a Quest at READY_TO_RAZE so
+    # `court teardown-list` can still queue its worktree for manual deletion;
+    # without this marker the watch could not tell "promotion verified, awaiting
+    # raze" from "already razed, awaiting prune" and re-razed every cooldown
+    # (Q006/Q014/Q016/Q018 hourly no-op loop, 2026-11-02).
+    razed_at: str = ""
     body_sections: dict = field(default_factory=dict)
     _dirty_sections: set = field(default_factory=set, repr=False, compare=False)
 
@@ -808,8 +815,46 @@ class Quest:
         self.updated_at = now_iso()
         return entry
 
+    def ui_approval_is_signed(self, status_text: str = "") -> bool:
+        """True when an APPROVED UI review carries real sign-off evidence.
+
+        An "APPROVED via Court Artist (Session …)" line records that an Artist
+        WORKED on the UI; it is not evidence that M'Lord/the studio signed off.
+        Approval is accepted only when the text names an approver
+        (``by M'Lord`` / ``royal sign-off`` / ``signed off by`` / ``Court Artist
+        sign-off``) or a quest section carries an explicit
+        ``**UI Sign-off:** <who> <when>`` line. This closes the Q1049 gap where
+        annotations were promoted as if they were approval."""
+        text = status_text or ""
+        if re.search(
+            r"(?i)\b(by\s+m'lord|m'lord\s+approved|royal\s+sign[\s-]?off|"
+            r"signed\s+off\s+by|court\s+artist\s+sign[\s-]?off)\b",
+            text,
+        ):
+            return True
+        for name in (
+            "Tally",
+            "Tally (Production & UI Verification Runbook)",
+            "Royal Addendum",
+            "Master of Coin's Audit",
+            "Master of Coin Review",
+        ):
+            section = self.body_sections.get(name, "")
+            m = re.search(
+                r"(?im)^\s*[-*]?\s*\**\s*(?:ui\s+)?sign[\s-]?off\s*\**\s*:\s*\**\s*(.+)$",
+                section,
+            )
+            if m:
+                value = m.group(1).strip().strip("*").strip()
+                if value and not _is_placeholder(value) and value.lower() not in ("pending", "tbd", "none"):
+                    return True
+        return False
+
     def extract_ui_review_status(self) -> str:
-        """Extract the UI Review status from Master of Coin's Audit or Tribute Rendered."""
+        """Extract the UI Review status from Master of Coin's Audit or Tribute Rendered.
+
+        An APPROVED result that carries no sign-off evidence is downgraded to
+        PENDING so `collect`/the Night's Watch refuse to promote it."""
         moc = (
             self.body_sections.get("Master of Coin's Audit", "").strip()
             or self.body_sections.get("Master of Coin Review", "").strip()
@@ -817,7 +862,14 @@ class Quest:
         if moc:
             m = re.search(r"(?:^|\n)\s*[-*]\s+\*\*UI\s+Review(?:\s+Status)?:\*\*\s*(.+?)(?=\n\s*[-*]\s+\*\*|\Z)", moc, re.DOTALL | re.IGNORECASE)
             if m:
-                return m.group(1).strip()
+                status = m.group(1).strip()
+                if status.upper().startswith("APPROVED") and not self.ui_approval_is_signed(status):
+                    return (
+                        "PENDING (APPROVED asserted without a recorded sign-off — add an "
+                        "explicit `**UI Sign-off:**` line to the Tally/Royal Addendum, or an "
+                        "approver such as `by M'Lord` / `royal sign-off`)"
+                    )
+                return status
         return ""
 
 

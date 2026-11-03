@@ -24,6 +24,9 @@ Scope of authority (deliberately narrow):
                                            replacement serf for a spent Quest)
   * READY_TO_RAZE                       -> report only by default; opt-in `raze`
                                            (`--enable ...,raze`) runs `court raze`
+  * dead convoy (stale gatehouse)       -> `teardown` the provably-dead gatehouse
+                                           worktree so `collect` can re-create it
+                                           (default-on; `raze` stays opt-in)
   * stale board, nobody running         -> `muster` ONE bounded Steward triage
                                            session (opt-in; see below)
 
@@ -52,6 +55,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -89,6 +93,14 @@ DEFAULT_COLLECT_NOOP_BACKOFF = 60 * 60
 # to re-create the worktree and exits 1. Re-stamping every tick is pure churn,
 # so hold the convoy (escalate once) until the worktree is torn down.
 DEFAULT_STALE_CONVOY_BACKOFF = 60 * 60
+# A stale gatehouse teardown that keeps failing is not going to fix itself on
+# the next tick: after this many failed `git worktree remove` attempts the watch
+# stops retrying and escalates the exact manual-removal commands instead.
+DEFAULT_MAX_TEARDOWN_FAILS = 2
+# A brand-new gatehouse worktree has no session for a few seconds while
+# `collect` creates it and stands up the Gatekeeper. The proactive dead-gatehouse
+# sweep must not race that window, so a worktree younger than this is ignored.
+DEFAULT_GATEHOUSE_GRACE = 10 * 60
 # A new convoy cannot be packed while another is mid-integration (`court
 # collect` reports "convoy <id> is LIVE"). That is a busy signal, not a Quest
 # failure: wait out the gate window instead of retrying on the short backoff.
@@ -160,14 +172,20 @@ class Policy:
     serf_slots: int = DEFAULT_SERF_SLOTS
     collect_noop_backoff: int = DEFAULT_COLLECT_NOOP_BACKOFF
     stale_convoy_backoff: int = DEFAULT_STALE_CONVOY_BACKOFF
+    max_teardown_fails: int = DEFAULT_MAX_TEARDOWN_FAILS
+    gatehouse_grace: int = DEFAULT_GATEHOUSE_GRACE
     retry_backoff: int = DEFAULT_RETRY_BACKOFF
     # Steward muster (last resort). See DEFAULT_STEWARD_* above.
     steward_stale_after: int = DEFAULT_STEWARD_STALE_AFTER
     steward_cooldown: int = DEFAULT_STEWARD_COOLDOWN
     max_stewards_per_day: int = DEFAULT_MAX_STEWARDS_PER_DAY
-    # Raze/teardown help (opt-in, destructive): the watch may clear a
-    # READY_TO_RAZE Quest (`court raze` verifies merge ancestry first) and a dead
-    # convoy's gatehouse worktree, but only when explicitly enabled.
+    # Raze/teardown help (destructive): a `raze` stays opt-in because it deletes
+    # a branch ref; a `teardown` is default-on because a dead gatehouse worktree
+    # is a very common failure mode that otherwise blocks every collect for
+    # that convoy forever. Teardown is still tightly gated: it only ever fires
+    # for a stale convoy whose gatehouse worktree is proven dead (no lease, no
+    # process, no fresh session) and whose path matches `.kilo/worktrees/
+    # the-gatehouse-*`.
     raze_cooldown: int = 1800
     cull_soft: int = DEFAULT_CULL_SOFT
     hard_red_zone: int = DEFAULT_HARD_RED_ZONE
@@ -176,10 +194,12 @@ class Policy:
     # vigil (which carries its own reason, expiry, and fire cap) — the watch
     # never invents new work on its own.
     allow_dispatch: bool = True
-    # Default to the safe mechanical set. `steward`, `raze`, and `teardown` are
-    # deliberate opt-ins: steward spends a reasoning worker; raze/teardown are
-    # destructive. ENABLED_ACTIONS is the full vocabulary for `--enable`.
-    enabled: tuple = ("goad", "coin", "collect", "dispatch")
+    # Default to the safe mechanical set plus dead-gatehouse teardown (a common
+    # blocking failure the watch must be able to clear unattended). `steward`
+    # and `raze` remain deliberate opt-ins: steward spends a reasoning worker;
+    # raze deletes a branch ref. ENABLED_ACTIONS is the full `--enable`
+    # vocabulary.
+    enabled: tuple = ("goad", "coin", "collect", "dispatch", "teardown")
     allow_force_goad: bool = False
     status_timeout: int = DEFAULT_STATUS_TIMEOUT
 
@@ -358,13 +378,18 @@ def _iso_from_epoch(ts) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _court(repo: Path, *argv: str, timeout: int = DEFAULT_ACTION_TIMEOUT) -> subprocess.CompletedProcess:
+def _court(repo: Path, *argv: str, timeout: int = DEFAULT_ACTION_TIMEOUT,
+           env: Optional[dict] = None) -> subprocess.CompletedProcess:
+    full_env = {**os.environ}
+    if env:
+        full_env.update(env)
     return subprocess.run(
         [sys.executable, "-m", "court.cli", *argv],
         cwd=str(repo),
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=full_env,
     )
 
 
@@ -665,12 +690,39 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
         role = role_state(q.get("worktree"), "gatekeeper")
         if role["state"] in ("live", "stalled", "watching"):
             continue
-        if q.get("gatekeeper_session_id"):
-            note(q["id"], "human",
-                 f"GATE with recorded Gatekeeper {q['gatekeeper_session_id']} but no live worker — "
-                 f"triage by hand (regate or clear the session stamp)",
-                 key="stale_gatekeeper")
-            continue
+        recorded = (q.get("gatekeeper_session_id") or "").strip()
+        if recorded:
+            promoted = (q.get("cogship_promoted_commit") or "").strip()
+            try:
+                ahead = int((q.get("git_status") or {}).get("ahead"))
+            except (TypeError, ValueError):
+                ahead = None
+            # A Quest can ship more than once. Once a shipment is promoted, the
+            # Quest keeps the old Gatekeeper session (and cogship id) while new
+            # work lands on its branch. When that work reaches GATE again, the
+            # recorded session belongs to the FINISHED shipment — it is not a
+            # duplicate-Gatekeeper risk, so pack a fresh convoy. Only a GATE
+            # Quest carrying a recorded session with no verified prior shipment,
+            # or whose branch is already fully merged, needs a human.
+            if promoted and ahead is not None and ahead > 0:
+                note(q["id"], "report",
+                     f"GATE carries Gatekeeper {recorded} from the previous shipment "
+                     f"({q.get('cogship_id') or 'prior convoy'}), but {ahead} commit(s) are not "
+                     f"in castle — re-shipping in a fresh convoy",
+                     key="reship_gate")
+            elif promoted and ahead == 0:
+                note(q["id"], "human",
+                     f"GATE with recorded Gatekeeper {recorded} and the branch is already merged "
+                     f"into castle — the prior shipment promoted; advance to READY_TO_RAZE instead "
+                     f"of packing a duplicate convoy",
+                     key="gate_merged_stuck")
+                continue
+            else:
+                note(q["id"], "human",
+                     f"GATE with recorded Gatekeeper {recorded} but no live worker — "
+                     f"triage by hand (regate or clear the session stamp)",
+                     key="stale_gatekeeper")
+                continue
         cog = q.get("cogship_id") or ""
         key = cog or "new"
         convoy = convoys.get(key, {})
@@ -681,15 +733,16 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
         stale = convoy.get("stale") if isinstance(convoy.get("stale"), dict) else {}
         if stale:
             wt = stale.get("worktree") or ""
+            td_fails = int(convoy.get("teardown_fails") or 0)
             # Opt-in help: if the gatehouse worktree is provably dead (no live
             # process or lease), tear it down so the convoy can be re-collected.
+            # Default-on, but never retried forever: after
+            # `max_teardown_fails` the convoy is escalated with the exact
+            # manual-removal commands instead of looping on a broken git state.
             if (policy.allows("teardown") and wt and key not in teardown_keys
+                    and td_fails < policy.max_teardown_fails
+                    and now >= float(convoy.get("teardown_retry_at") or 0)
                     and not occupied(wt) and not process_in(wt)):
-                if capacity <= 0:
-                    note(q["id"], "skip",
-                         f"stale convoy {key} ready to tear down but worker ceiling "
-                         f"reached ({busy_workers}/{policy.max_workers})")
-                    continue
                 teardown_keys.add(key)
                 actions.append(Action(
                     kind="teardown", quest_ids=[q["id"]],
@@ -697,13 +750,21 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                             f"down so the convoy can re-collect"),
                     meta={"convoy": key, "worktree": wt, "branch": f"the-gatehouse/{key}",
                           "retry_backoff": policy.retry_backoff}))
-                capacity -= 1
+                continue
+            if policy.allows("teardown") and td_fails >= policy.max_teardown_fails:
+                note(q["id"], "human",
+                     f"convoy {key} stale gatehouse {wt} could not be torn down automatically "
+                     f"after {td_fails} attempt(s) ({str(convoy.get('teardown_error') or '')[:140]}) — "
+                     f"remove it by hand: `court fork-teardown-list`, then "
+                     f"`git -C <repo> worktree remove --force {wt}` and "
+                     f"`git branch -D the-gatehouse/{key}`",
+                     key="stale_convoy_teardown_failed")
                 continue
             note(q["id"], "human",
                  f"convoy {key} is stuck on a stale gatehouse worktree"
                  f"{(' ' + wt) if wt else ''} — a prior convoy died mid-integration; "
                  f"tear it down (or regate) and the watch will re-collect "
-                 f"(opt in with `--enable ...,teardown` to let it clear them)",
+                 f"(`court fork-teardown-list`; enable teardown with `--enable ...,teardown`)",
                  key="stale_convoy")
             continue
         if int(convoy.get("fails") or 0) >= 3:
@@ -735,6 +796,47 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                   "live_backoff": policy.gate_cooldown},
         ))
         capacity -= 1
+
+    # --- Dead gatehouse sweep (independent of any GATE Quest) ---------------
+    # A dead `the-gatehouse/*` worktree blocks future collects whose allocated
+    # cogship id collides with it, and it silently fills the disk. The stale
+    # hold above only exists after a collect has already failed; this sweep
+    # revives the common case proactively. A worktree is only eligible when
+    # `court status --json` reported no fresh session AND no lease/process owns
+    # it, so a live Gatekeeper is never torn down.
+    planned_teardowns = {a.meta.get("worktree") for a in actions if a.kind == "teardown"}
+    if policy.allows("teardown"):
+        for gh in snap.get("gatehouses") or []:
+            wt = gh.get("path") or ""
+            key = gh.get("cogship_id") or "new"
+            if not wt or wt in planned_teardowns or gh.get("fresh_session"):
+                continue
+            if int(gh.get("age_seconds") or 0) < policy.gatehouse_grace:
+                continue
+            if occupied(wt) or process_in(wt):
+                continue
+            convoy = convoys.get(key) or {}
+            fails = int(convoy.get("teardown_fails") or 0)
+            if fails >= policy.max_teardown_fails:
+                note(key, "human",
+                     f"dead gatehouse {wt} could not be torn down automatically after "
+                     f"{fails} attempt(s) ({str(convoy.get('teardown_error') or '')[:140]}) — remove "
+                     f"it by hand: `git -C <repo> worktree remove --force {wt}`",
+                     key="gatehouse_teardown_failed")
+                continue
+            if now < float(convoy.get("teardown_retry_at") or 0):
+                continue
+            # Teardown is a local git operation, not a model worker: it must not
+            # be starved by the live-worker ceiling. It is still bounded by
+            # `max_spawns_per_tick` with every other action at the end of plan().
+            actions.append(Action(
+                kind="teardown", quest_ids=[],
+                reason=(f"gatehouse {key} has no fresh session and no live worker — "
+                        f"reviving the convoy lane by removing {wt}"),
+                meta={"convoy": key, "worktree": wt,
+                      "branch": gh.get("branch") or f"the-gatehouse/{key}",
+                      "retry_backoff": policy.retry_backoff}))
+            planned_teardowns.add(wt)
 
     # --- TRIBUTE_READY: send in the Master of Coin -------------------------
     for q in quests.values():
@@ -946,6 +1048,12 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
         if status in ("PLANNED", "CHARTERED", "DISPATCHED"):
             note(q["id"], "report", f"{status} — waiting on a Steward dispatch decision")
         elif status == "READY_TO_RAZE":
+            if q.get("razed_at"):
+                note(q["id"], "report",
+                     f"READY_TO_RAZE but already razed at {q['razed_at']} — worktree "
+                     f"awaits manual prune (`court teardown-list`); not re-razing",
+                     key="razed_pruned")
+                continue
             if not policy.allows("raze"):
                 note(q["id"], "report",
                      "READY_TO_RAZE — promotion verified; `court raze` is a human/Steward call "
@@ -989,9 +1097,16 @@ def _execute_teardown(repo: Path, action: Action, timeout: int = 120) -> dict:
     """Remove a dead convoy's gatehouse worktree so `collect` can re-create it.
 
     Destructive but tightly scoped: only ever called for a worktree plan() has
-    proven stale AND has confirmed has no live worker/lease (and only when the
-    operator opted in with `--enable ...,teardown`). Removes the git worktree
-    and deletes its `the-gatehouse/<cogship>` branch."""
+    proven stale AND has confirmed has no live worker/lease (and only for a
+    path under `<repo>/.kilo/worktrees/the-gatehouse-*`). Removes the git
+    worktree and deletes its `the-gatehouse/<cogship>` branch.
+
+    Revival ladder: `git worktree remove --force`, then `git worktree prune`
+    (a half-deleted registration is the usual reason a remove fails), then a
+    guarded directory delete when the worktree registration is gone but the
+    directory survived. `collect` only checks that the directory does not
+    exist, so leaving an unregistered directory behind blocks the convoy
+    forever — exactly the cogship-381/399 class."""
     wt = str(action.meta.get("worktree") or "")
     branch = str(action.meta.get("branch") or "")
     started = time.time()
@@ -999,23 +1114,76 @@ def _execute_teardown(repo: Path, action: Action, timeout: int = 120) -> dict:
         return {"ok": True, "exit": 0, "argv": [],
                 "stdout_tail": "gatehouse worktree already gone", "stderr_tail": "",
                 "seconds": 0.0}
-    cmds = [["git", "-C", str(repo), "worktree", "remove", "--force", wt]]
-    if branch:
-        cmds.append(["git", "-C", str(repo), "branch", "-D", branch])
+
+    gatehouse_root = (Path(repo) / ".kilo" / "worktrees").resolve()
+    try:
+        wt_path = Path(wt).resolve()
+    except OSError:
+        wt_path = Path(wt)
+    if gatehouse_root not in wt_path.parents or not wt_path.name.startswith("the-gatehouse-"):
+        return {"ok": False, "exit": -1, "argv": [],
+                "stdout_tail": "",
+                "stderr_tail": f"refusing to tear down non-gatehouse path {wt}",
+                "seconds": round(time.time() - started, 1)}
+
     outs = []
-    for cmd in cmds:
+    remove_cmd = ["git", "-C", str(repo), "worktree", "remove", "--force", wt]
+    try:
+        res = subprocess.run(remove_cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "exit": -1, "argv": remove_cmd, "stdout_tail": "",
+                "stderr_tail": str(e)[:500], "seconds": round(time.time() - started, 1)}
+    if res.returncode != 0:
+        # A stale registration (the directory was already replaced/partially
+        # deleted by hand) makes `worktree remove` refuse. Prune the stale
+        # metadata, then clear the directory if it survived.
+        prune_cmd = ["git", "-C", str(repo), "worktree", "prune"]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            subprocess.run(prune_cmd, capture_output=True, text=True, timeout=timeout)
+        except Exception:  # noqa: BLE001
+            pass
+        if Path(wt).is_dir():
+            try:
+                shutil.rmtree(Path(wt))
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "exit": res.returncode, "argv": remove_cmd,
+                        "stdout_tail": (res.stdout or "")[-1200:],
+                        "stderr_tail": ((res.stderr or "") + f"\nrmtree failed: {e}")[-1200:],
+                        "seconds": round(time.time() - started, 1)}
+        outs.append(f"pruned stale registration and removed {wt}")
+    else:
+        outs.append((res.stdout or "").strip())
+
+    # Belt-and-suspenders: `worktree remove` can return 0 yet leave the
+    # directory (e.g. a partially-removed registration). `collect` only checks
+    # that the directory doesn't exist, so clear any survivor.
+    if Path(wt).is_dir():
+        try:
+            subprocess.run(["git", "-C", str(repo), "worktree", "prune"],
+                           capture_output=True, text=True, timeout=timeout)
+            shutil.rmtree(Path(wt))
+            outs.append(f"removed surviving gatehouse directory {wt}")
         except Exception as e:  # noqa: BLE001
-            return {"ok": False, "exit": -1, "argv": cmd, "stdout_tail": "",
+            return {"ok": False, "exit": -1, "argv": remove_cmd,
+                    "stdout_tail": "\n".join(outs)[-1200:],
+                    "stderr_tail": f"directory survived remove and could not be cleared: {e}"[:1200],
+                    "seconds": round(time.time() - started, 1)}
+
+    if branch:
+        del_cmd = ["git", "-C", str(repo), "branch", "-D", branch]
+        try:
+            res = subprocess.run(del_cmd, capture_output=True, text=True, timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "exit": -1, "argv": del_cmd, "stdout_tail": "",
                     "stderr_tail": str(e)[:500], "seconds": round(time.time() - started, 1)}
-        if res.returncode != 0:
-            return {"ok": False, "exit": res.returncode, "argv": cmd,
+        if res.returncode != 0 and Path(wt).is_dir():
+            return {"ok": False, "exit": res.returncode, "argv": del_cmd,
                     "stdout_tail": (res.stdout or "")[-1200:],
                     "stderr_tail": (res.stderr or "")[-1200:],
                     "seconds": round(time.time() - started, 1)}
         outs.append((res.stdout or "").strip())
-    return {"ok": True, "exit": 0, "argv": cmds[-1], "stdout_tail": "\n".join(outs)[-1200:],
+    return {"ok": not Path(wt).is_dir(), "exit": 0,
+            "argv": [remove_cmd[-1]], "stdout_tail": "\n".join(outs)[-1200:],
             "stderr_tail": "", "seconds": round(time.time() - started, 1)}
 
 
@@ -1052,9 +1220,14 @@ def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -
         argv.append("--standup")
     if action.force:
         argv.append("--force")
+    # A dispatch the watch runs is the queue drain (vigil or replacement),
+    # already capacity-gated — mark it so the dispatch guard does not refuse it.
+    court_env = {"COURT_WATCH_DISPATCH": "1"} if argv and argv[0] == "dispatch" else None
     started = time.time()
     try:
-        res = _court(repo, *argv, timeout=COLLECT_TIMEOUT if action.kind == "collect" else timeout)
+        res = _court(repo, *argv,
+                     timeout=COLLECT_TIMEOUT if action.kind == "collect" else timeout,
+                     env=court_env)
         out = (res.stdout or "").strip()
         err = (res.stderr or "").strip()
         return {
@@ -1199,12 +1372,24 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
                 st["last_raze_ts"] = now
     elif action.kind == "teardown":
         # A successful teardown clears the stale-convoy hold so collect can
-        # re-pack the convoy on the next tick.
+        # re-pack the convoy on the next tick. A failed one is remembered and
+        # retried on the short backoff, then escalated to a human rather than
+        # looping forever (see plan's max_teardown_fails gate).
+        key = action.meta.get("convoy") or "new"
+        convoy = state.setdefault("convoys", {}).setdefault(key, {})
         if ok:
-            key = action.meta.get("convoy") or "new"
-            convoy = state.setdefault("convoys", {}).setdefault(key, {})
             convoy.pop("stale", None)
+            convoy.pop("teardown_fails", None)
+            convoy.pop("teardown_error", None)
+            convoy.pop("teardown_retry_at", None)
             convoy["retry_at"] = 0
+        else:
+            convoy["teardown_fails"] = int(convoy.get("teardown_fails") or 0) + 1
+            convoy["teardown_error"] = (
+                result.get("stderr_tail") or result.get("stdout_tail") or ""
+            )[-400:]
+            if backoff:
+                convoy["teardown_retry_at"] = now + backoff
     elif action.kind == "steward":
         # Muster bookkeeping lives on its own state key: it is a board-level
         # action, not a Quest action. A failed muster retries on the short
@@ -1384,6 +1569,8 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
         "human": [n["quest"] for n in notes if n["level"] == "human"],
         "human_new": [n["quest"] for n in notes if n["level"] == "human" and n.get("new")],
         "statuses": {q["id"]: q["status"] for q in snap.get("quests", []) if q.get("kind") != "epic"},
+        "razed": [q["id"] for q in snap.get("quests", [])
+                  if q.get("kind") != "epic" and q.get("razed_at")],
     })
     return {"actions": executed, "notes": notes, "workers": workers, "snapshot": snap,
             "vigils_active": len(vigils.load_all(repo))}
@@ -1472,6 +1659,41 @@ def dispatch_compliance(repo: Path, hours: int = 24) -> dict:
                 else:
                     direct.append((qid, ts))
     return {"queued": queued, "direct": direct}
+
+
+def _bucket_raze(repo: Path, qids: list) -> tuple[list, list]:
+    """Split READY_TO_RAZE quests into (raze-ready, raze-refuses-other).
+
+    Mirrors `court raze`'s exact gate: the quest BRANCH TIP must be reachable
+    from castle (`git merge-base --is-ancestor`). Content may be present in the
+    trunk while the branch tip is SHA-diverged (squash/merge), which raze
+    refuses — those belong to a regate pass, not the raze sweep. Unknown/errored
+    quests are kept on the raze-ready list (conservative; never hide one).
+    """
+    if not qids:
+        return [], []
+    try:
+        from . import git_ops as _g
+        from . import store as _s
+    except Exception:
+        return list(qids), []
+    ready, regate = [], []
+    quest_root = Path(repo) / ".court"
+    for qid in qids:
+        try:
+            qp = _s.find_path(qid, quest_root)
+            text = qp.read_text(encoding="utf-8") if qp and qp.exists() else ""
+            m = re.search(r"^branch:\s*(\S+)", text, re.MULTILINE)
+            branch = m.group(1) if m else ""
+            if not branch:
+                ready.append(qid)
+                continue
+            st = _g.check_merged_status(branch, target_ref="castle", base_ref="castle")
+            merged = bool(st.get("is_merged_target") or st.get("is_merged_base"))
+            (ready if merged else regate).append(qid)
+        except Exception:
+            ready.append(qid)  # conservative on any error
+    return ready, regate
 
 
 def render_digest(repo: Path, journal: Optional[list] = None) -> str:
@@ -1592,16 +1814,37 @@ def render_digest(repo: Path, journal: Optional[list] = None) -> str:
 
     # --- READY_TO_RAZE awaiting a raze ---------------------------------------
     statuses = {}
+    razed = set()
     for r in reversed(rows):
         if r.get("event") == "tick" and isinstance(r.get("statuses"), dict):
             statuses = r["statuses"]
+            razed = set(r.get("razed") or [])
             break
-    raze_ready = sorted(qid for qid, s in statuses.items() if s == "READY_TO_RAZE")
+    awaiting_raze = sorted(qid for qid, s in statuses.items()
+                           if s == "READY_TO_RAZE" and qid not in razed)
+    awaiting_prune = sorted(qid for qid, s in statuses.items()
+                            if s == "READY_TO_RAZE" and qid in razed)
+    # `court raze` demands the branch TIP be an ancestor of castle, not just
+    # that content landed (a squash/merge leaves the quest branch SHA-diverged
+    # from the promoted trunk, so raze refuses). Split the roster so the digest
+    # never claims "promotion verified" for a quest raze will refuse —
+    # Q1058/Q1083/Q1095/Q270/Q914 were listed raze-ready and refused 2026-11-03.
+    raze_ready, raze_regate = _bucket_raze(repo, awaiting_raze)
     if raze_ready:
         lines.append("")
-        lines.append("ready to raze — promotion verified (`court raze <id>`; opt in with `--enable ...,raze`):")
+        lines.append("ready to raze — branch tip verified as an ancestor of castle (`court raze <id>`; opt in with `--enable ...,raze`):")
         for qid in raze_ready:
             lines.append(f"  🪦 {qid}")
+    if raze_regate:
+        lines.append("")
+        lines.append("⚠️ ready to raze but raze will refuse — content is in castle but the branch tip is NOT an ancestor (squash/merge history):")
+        for qid in raze_regate:
+            lines.append(f"  🔁 {qid} — `court collect {qid} --regate --standup`, then raze")
+    if awaiting_prune:
+        lines.append("")
+        lines.append("already razed — worktree awaiting M'Lord's manual prune (`court teardown-list`):")
+        for qid in awaiting_prune:
+            lines.append(f"  📦 {qid}")
 
     # --- Livelock: collects that exit 0 but pack nothing ----------------------
     livelocks = {k: v for k, v in groups.items() if v["noop"] >= 2}
@@ -1681,7 +1924,7 @@ def render_digest(repo: Path, journal: Optional[list] = None) -> str:
     else:
         lines.append(f"dispatch contract (24h): {len(compliance['queued'])} via queue · 0 direct ✅")
 
-    if not stuck and not livelocks and not raze_ready and not notified and not spent and not fails:
+    if not stuck and not livelocks and not awaiting_raze and not awaiting_prune and not notified and not spent and not fails:
         lines.append("")
         lines.append("✅ no live issues detected in the journal/state window.")
     return "\n".join(lines)

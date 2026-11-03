@@ -206,6 +206,9 @@ nav h2::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
 .scard:hover{border-color:var(--blue)}
 .scard.on{border-color:rgba(88,166,255,.55);background:rgba(88,166,255,.06)}
 .scard .sc1{display:flex;align-items:center;gap:8px}
+.scard .sstat{flex:none;width:9px;display:inline-flex;align-items:center;justify-content:center;
+ line-height:1}
+.scard .readdot.static,.scard .stalledot.static{cursor:inherit}
 .scard .sagent{font-weight:700;font-size:10.5px;color:var(--primary);
  text-transform:uppercase;letter-spacing:.08em}
 .scard .swhen{margin-left:auto;color:var(--faint);font-size:10px;
@@ -878,6 +881,22 @@ window.addEventListener('popstate',()=>{
   if(t==='done')return `<span class="readdot" data-bread="${esc(st.key)}" title="turn completed — click, or “mark read”, to clear">✓</span>`;
   if(t==='stalled')return `<span class="stalledot" data-bread="${esc(st.key)}" title="stalled — ${esc(st.why)} — click, or “mark read”, to clear">!</span>`;
   return `<span class="idledot" title="${esc(st.why||'idle')}"></span>`;}
+ // Session-menu status glyph. The newest session of a worktree inherits the
+ // live per-directory state above (process + tail heuristics); every older
+ // session is judged from its own last-message tail, already shipped by the
+ // /api/session/starts call the menu makes — no extra fetch, no new timer.
+ function turnGlyph(tail,live){
+  let t=(live&&live.state)||'',why=(live&&live.why)||'';
+  if(!t&&tail){
+   if(tail.role==='assistant'&&tail.finish!=null){t='done';why='turn completed';}
+   else if(tail.role==='assistant'){t='stalled';why='turn ended without completing';}
+   else if(tail.role==='user'){t='idle';why='prompt queued — no reply yet';}
+  }
+  if(t==='working')return `<span class="sstat"><span class="livedot" title="working — ${esc(why||'emitting')}"></span></span>`;
+  if(t==='done')return `<span class="sstat"><span class="readdot static" title="${esc(why||'turn completed')}">✓</span></span>`;
+  if(t==='stalled')return `<span class="sstat"><span class="stalledot static" title="interrupted — ${esc(why)}">!</span></span>`;
+  if(t==='idle')return `<span class="sstat"><span class="idledot" title="${esc(why||'idle')}"></span></span>`;
+  return '<span class="sstat"></span>';}
  function renderNav(){
    const r=repo(); if(!r){$('nav').innerHTML='';return;}
    let h=`<div class="appswitch">`+S.repos.map(x=>
@@ -1050,11 +1069,13 @@ async function fillSessMenu(){
   starts=await (await fetch('/api/session/starts?ids='+sess.map(s=>s.id).join(','))).json();
  }catch(e){}
  if(seq!==sessMenuSeq)return;
+ const newest=sess.reduce((a,s)=>!a||(s.time_updated||0)>(a.time_updated||0)?s:a,null);
+ const liveFor=(s)=>(newest&&newest.id===s.id)?stateFor(selWt):null;
  m.innerHTML=head+sess.map(s=>{
   const st=starts[s.id]||{};
   const snip=String(st.start||s.title||s.id);
   return `<div class="scard ${selSess===s.id?'on':''}" data-sid="${esc(s.id)}" title="${esc(s.title||s.id)}">
-   <div class="sc1"><span class="sagent">${esc(s.agent||'?')}</span><span class="swhen">${esc(fmtWhen(s.time_updated))}</span></div>
+   <div class="sc1">${turnGlyph(st,liveFor(s))}<span class="sagent">${esc(s.agent||'?')}</span><span class="swhen">${esc(fmtWhen(s.time_updated))}</span></div>
    <div class="ssnip">${esc(snip.length>120?snip.slice(0,120)+'…':snip)}</div>
    <div class="smeta">${esc(sessMeta(s))}${s.model?' · '+esc(s.model.split('/').pop()):''}</div>
    <span class="sx" data-act="del" data-sid="${esc(s.id)}" title="delete session">✕</span></div>`;
@@ -3901,8 +3922,12 @@ def _session_messages(sid, limit=60):
 
 
 def _session_starts(sids, limit=200):
-    """First user text snippet per session id, for the session-menu cards.
-    Bounded: max 12 ids, oldest 6 messages scanned per id."""
+    """First user text snippet + last-message turn tail per session id, for the
+    session-menu cards. The tail is the per-session completion signal the
+    directory-level `_turn_tails` cannot give (it keeps only the newest session
+    of a worktree): an assistant `finish` means the turn ended cleanly, a `user`
+    tail means a prompt is still unanswered. Bounded: max 12 ids, oldest 6
+    messages scanned per id plus one newest-message probe per id."""
     sids = [s for s in (sids or [])
             if isinstance(s, str) and re.fullmatch(r"[\w-]+", s)][:12]
     if not sids or not os.path.exists(KILO_DB):
@@ -3934,6 +3959,15 @@ def _session_starts(sids, limit=200):
                 if roles.get(mid) == "user" and mid in texts:
                     out[sid] = {"start": texts[mid][:limit]}
                     break
+            last = db.execute(
+                "select json_extract(data,'$.role'),"
+                " json_extract(data,'$.finish') from message"
+                " where session_id=? order by time_created desc limit 1",
+                (sid,)).fetchone()
+            if last:
+                card = out.setdefault(sid, {})
+                card["role"] = last[0] or ""
+                card["finish"] = last[1]
         db.close()
     except Exception:
         return out

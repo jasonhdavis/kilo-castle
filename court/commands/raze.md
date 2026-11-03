@@ -15,7 +15,7 @@ Follow the Raze Protocol:
    - This deterministic CLI command:
      a) Verifies the Quest branch is merged into `castle` (or completed Scout report is stored).
      b) Fast-forwards / syncs the worktree branch with `castle` (`git merge castle --ff-only`) and confirms `git status --porcelain` is clean so that `ahead: 0, behind: 0` (zero drift, no warning triangles in UI).
-     c) Advances Quest status to `READY_TO_RAZE`. (A `PUNISHED` Quest is never razed alone — its joint teardown with its successor happens automatically once the successor reaches `READY_TO_RAZE`/`DONE`; see `/pillory`.)
+     c) Advances Quest status to `READY_TO_RAZE` and writes the durable `razed_at` marker. The marker is what makes re-runs idempotent: a Quest already razed is skipped with a hint to prune its worktree, instead of being re-razed every cooldown. The status intentionally stays `READY_TO_RAZE` so `teardown-list` still queues the worktree. (A `PUNISHED` Quest is never razed alone — its joint teardown with its successor happens automatically once the successor reaches `READY_TO_RAZE`/`DONE`; see `/pillory`.)
      d) Auto-archives any Quests whose worktrees were already deleted/pruned from disk (`court archive <id>`).
 
 2. **Park the Worktree (Ashes)**:

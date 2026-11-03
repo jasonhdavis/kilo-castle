@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from court.cli import main
 from court import store
+from court import vigils
 
 
 def test_cli_new_show_advance_status(tmp_path, monkeypatch, capsys):
@@ -364,3 +365,43 @@ def test_cli_commute_marks_commutation_done(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     stored = store.load(quest_id, court_root=tmp_path / ".court")
     assert len(stored.commutation_log_entries()) == 2
+
+def test_cli_enqueue_queues_a_dispatch_handoff(tmp_path, monkeypatch, capsys):
+    """`court enqueue` is sugar over the vigil contract: a PLANNED/CHARTERED
+    Quest becomes a one-shot dispatch hand-off the Night's Watch drains when
+    worker capacity allows."""
+    _init_git_repo(tmp_path, branch="castle")
+    monkeypatch.setenv("COURT_DIR", str(tmp_path / ".court"))
+    monkeypatch.chdir(tmp_path)
+
+    main(["init"])
+    capsys.readouterr()
+    main([
+        "new", "--app", "core", "--concern", "queue-test", "--title", "Queue test",
+        "--section", "Bug fix", "--goal", "Exercise enqueue", "--tribute", "- [ ] pass",
+    ])
+    capsys.readouterr()
+    qid = store.list_all(court_root=tmp_path / ".court")[0].id
+    main(["advance", qid, "PLANNED"])
+    capsys.readouterr()
+
+    why = "queue this for the night watch when capacity frees"
+    main(["enqueue", qid, "--why", why])
+    out = capsys.readouterr().out
+    assert "Queued for the Night's Watch" in out
+    assert "dispatch:" + qid in out
+
+    specs = vigils.load_all(tmp_path)
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec["id"] == "dispatch-" + qid.split("-")[0].lower()
+    assert spec["then"] == "dispatch:" + qid
+    assert spec["max_fires"] == 1
+    assert spec["reason"] == why
+
+    # Idempotent: a second enqueue must not stack another dispatch hand-off.
+    main(["enqueue", qid, "--why", why])
+    out = capsys.readouterr().out
+    assert "Already queued" in out
+    assert len(vigils.load_all(tmp_path)) == 1
+

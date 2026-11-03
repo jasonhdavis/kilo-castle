@@ -145,6 +145,59 @@ def test_ready_vigils_fires_once_then_retires(tmp_path):
     assert len(done[0]["fires"]) == 1
 
 
+def test_after_span_is_resolved_to_absolute_iso_at_registration(tmp_path):
+    repo = _repo(tmp_path)
+    spec = _spec(when=["after:2h"])
+    saved = spec["when"][0]
+    when = vigils._parse_iso(saved[len("after:"):])
+    assert when is not None
+    delta = (when - vigils.now_utc()).total_seconds()
+    assert 6900 <= delta <= 7590   # ~2h ahead, resolved at registration
+
+
+def test_after_unreadable_value_is_rejected_at_registration(tmp_path):
+    repo = _repo(tmp_path)
+    with pytest.raises(vigils.VigilError):
+        vigils.build(id="q234-after-q123", when=["after:notatime"],
+                     then="dispatch:Q234", reason="Q234 needs Q123's schema on castle.",
+                     expires="6h")
+
+
+def test_after_absolute_iso_is_kept_verbatim(tmp_path):
+    repo = _repo(tmp_path)
+    ts = vigils.iso(vigils.now_utc() + timedelta(minutes=5))
+    spec = _spec(when=[f"after:{ts}"])
+    assert spec["when"] == [f"after:{ts}"]
+
+
+def test_unparseable_condition_is_surfaced_as_malformed_note(tmp_path):
+    import json as _json
+    from court.vigils import path_for
+    repo = _repo(tmp_path)
+    vigils.save(repo, vigils.build(id="qX-bad", when=["after:1h"],
+                                   then="goad:Q1", reason="surfaces a malformed watch instead of hiding it.",
+                                   expires="6h"))
+    # Build rejects unreadable after values, so simulate a legacy raw vigil on
+    # disk (the pre-hardening shape the 2026-11-02 queue entries actually had).
+    loaded = [s for s in vigils.load_all(repo) if s["id"] == "qX-bad"][0]
+    loaded["when"] = ["after:zzz"]
+    _json.dump(loaded, open(path_for(repo, "qX-bad"), "w"))
+    ready, notes = vigils.ready_vigils(repo, {})
+    assert ready == []
+    assert any(n["level"] == "malformed" for n in notes)
+
+
+def test_failed_vigil_at_max_fires_retires_to_terminal_status(tmp_path):
+    repo = _repo(tmp_path)
+    spec = _spec()
+    vigils.save(repo, spec)
+    vigils.mark_fired(repo, spec, {"ok": False, "exit": 1, "seconds": 0.5})
+    assert vigils.load_all(repo) == []                       # no longer fireable
+    done = vigils.load_all(repo, include_finished=True)
+    assert done and done[0]["status"] == "failed"           # terminal, never "active"
+    assert len(done[0]["fires"]) == 1 and done[0]["fires"][0]["ok"] is False
+
+
 def test_expired_vigil_is_retired_not_fired(tmp_path):
     repo = _repo(tmp_path)
     spec = _spec(expires="6h")

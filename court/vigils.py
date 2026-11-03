@@ -223,13 +223,49 @@ def validate(spec: dict) -> None:
         raise VigilError("expires_at is already in the past")
 
 
+def _resolve_when(when: list, now: Optional[datetime] = None) -> list:
+    """Normalize a vigil's `when` list at registration.
+
+    Checks every condition is parseable and, for `after:`, accepts either an
+    absolute ISO timestamp OR a relative span (5m/2h/3d), which is resolved to
+    an absolute ISO at registration time. A bare span can never be evaluated by
+    `check_condition` (it has no registration-time anchor), so storing raw
+    `after:2h` silently dead-locked a queue — dispatch-q1093/1094 fired 15+
+    times against max_fires 1 on 2026-11-02 because the condition never matched
+    and the old retirement bug kept it 'active'. Rejects unreadable values so a
+    never-true vigil cannot be registered.
+    """
+    now = now or now_utc()
+    out: list[str] = []
+    for cond in when or []:
+        cond = (cond or "").strip()
+        if not cond:
+            continue
+        m = re.fullmatch(r"after:(.+)", cond)
+        if m:
+            raw = m.group(1).strip()
+            parsed = _parse_iso(raw)
+            if parsed is not None:
+                cond = f"after:{iso(parsed)}"
+            else:
+                delta = parse_duration(raw)
+                if delta is None:
+                    raise VigilError(
+                        f"unreadable after: value {raw!r} — use an ISO timestamp "
+                        f"or a span like 5m/2h/3d (resolved to an absolute time at registration)"
+                    )
+                cond = f"after:{iso(now + delta)}"
+        out.append(cond)
+    return out
+
+
 def build(id: str, when: list, then: str, reason: str, expires: str,
           max_fires: int = DEFAULT_MAX_FIRES, created_by: str = "steward") -> dict:
     spec = {
         "version": 1,
         "id": id.strip(),
         "reason": reason.strip(),
-        "when": [c.strip() for c in when if c and c.strip()],
+        "when": _resolve_when(when, now_utc()),
         "then": then.strip(),
         "expires_at": iso(parse_expiry(expires)),
         "max_fires": int(max_fires),
@@ -304,7 +340,12 @@ def mark_fired(repo: Path, spec: dict, result: dict) -> None:
         "seconds": result.get("seconds"),
     })
     if len(spec["fires"]) >= int(spec.get("max_fires") or 1):
-        retire(repo, spec, "fired" if result.get("ok") else "active")
+        # A failed action at max_fires is TERMINAL. Retiring it as "active"
+        # left status gate open and the watch re-fired a failing dispatch every
+        # tick forever (dispatch-q1093: 16 fires vs max 1, 2026-11-02), while
+        # the failing pair consumed both per-tick spawn slots and starved every
+        # queued vigil behind it (Q1095/Q1096: 0 fires).
+        retire(repo, spec, "fired" if result.get("ok") else "failed")
     else:
         save(repo, spec)
 
@@ -388,12 +429,21 @@ def ready_vigils(repo: Path, quests: dict, now: Optional[datetime] = None) -> tu
             continue
         reasons = []
         satisfied = True
+        malformed: list[str] = []
         for cond in spec.get("when") or []:
             ok, why = check_condition(cond, repo, quests, now=now)
             reasons.append(f"{cond}: {why}")
+            if (why.startswith("unknown condition") or "unreadable" in why
+                    or why.startswith("path escapes")):
+                malformed.append(f"{cond}: {why}")
             if not ok:
                 satisfied = False
-                break
+        # A never-true watch is a foot-gun, not a wait: surface it loudly (it
+        # registers as active but cannot ever fire), instead of letting it sit
+        # in the "waiting on capacity/condition" shadow indefinitely.
+        if malformed:
+            notes.append({"id": spec["id"], "level": "malformed",
+                          "text": "; ".join(malformed)})
         if satisfied:
             ready.append((spec, "; ".join(reasons)))
     return ready, notes

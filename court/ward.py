@@ -31,6 +31,15 @@ SCOUT_REQUIRED_SECTIONS = ("survey", "map", "dangers", "tribute", "plot")
 
 WARDEN_REPORT_SECTIONS = ("survey", "stack_trace", "impact", "root_cause", "proposed_fix")
 
+# Checklist parsing runs once per candidate markdown file (hundreds per
+# worktree, dozens of worktrees), so keep these compiled: an uncompiled
+# re.match per line was re-compiling the same patterns millions of times and
+# made `court status --json` spend most of its wall clock here.
+_PHASE_RE = re.compile(r"^#{1,3}\s+(.+)$")
+_CHECKED_RE = re.compile(r"^[-*]\s+\[[xX]\]")
+_UNCHECKED_RE = re.compile(r"^[-*]\s+\[\s\]")
+_CANCELLED_RE = re.compile(r"^[-*]\s+\[[~-]\]")
+
 
 @dataclass(frozen=True)
 class WardViolation(str):
@@ -122,21 +131,29 @@ def parse_markdown_checklist(markdown_content: str, filepath: Optional[str] = No
 
     for line in markdown_content.splitlines():
         line_s = line.strip()
-        m_phase = re.match(r"^#{1,3}\s+(.+)$", line_s)
-        if m_phase:
-            header_text = m_phase.group(1).strip()
-            if "phase" in header_text.lower():
-                current_phase = header_text
-                if not active_phase:
-                    active_phase = current_phase
+        if not line_s:
+            continue
+        if line_s.startswith("#"):
+            m_phase = _PHASE_RE.match(line_s)
+            if m_phase:
+                header_text = m_phase.group(1).strip()
+                if "phase" in header_text.lower():
+                    current_phase = header_text
+                    if not active_phase:
+                        active_phase = current_phase
+            continue
+        # Every checklist marker starts with "- [" or "* ["; skip everything
+        # else before touching a regex.
+        if "[" not in line_s or line_s[0] not in "-*":
+            continue
 
-        if re.match(r"^[-*]\s+\[[xX]\]", line_s):
+        if _CHECKED_RE.match(line_s):
             checked += 1
-        elif re.match(r"^[-*]\s+\[\s\]", line_s):
+        elif _UNCHECKED_RE.match(line_s):
             unchecked += 1
             if current_phase and not active_phase:
                 active_phase = current_phase
-        elif re.match(r"^[-*]\s+\[[~-]\]", line_s):
+        elif _CANCELLED_RE.match(line_s):
             cancelled += 1
 
     total = checked + unchecked + cancelled
@@ -178,6 +195,7 @@ def parse_worktree_task_progress(
     task_file_rel: Optional[str] = None,
     app: Optional[str] = None,
     quest_id: Optional[str] = None,
+    modified_files: Optional[list[str]] = None,
     **kwargs,
 ) -> dict:
     """Discover and parse task checklist progress within a worktree."""
@@ -257,18 +275,29 @@ def parse_worktree_task_progress(
                 for p in court_quests.glob(f"{short_qid.upper()}*.md"):
                     _add(p)
 
-        # 2. Check git status for recently modified markdown files
-        status_res = git_ops._run(["git", "status", "--porcelain=v1", "-uall"], wt)
-        modified_files: list[str] = []
-        if status_res.get("ok"):
-            for line in status_res.get("stdout", "").splitlines():
-                if len(line) >= 3:
-                    f_rel = line[3:].strip()
-                    if f_rel.endswith(".md"):
-                        modified_files.append(f_rel)
-                        p = wt / f_rel
-                        if p.is_file():
-                            _add(p)
+        # 2. Check git status for recently modified markdown files. audit_quest
+        # already ran `git status` for this worktree, so accept its file list
+        # instead of paying for the same scan twice.
+        recent_md: list[str] = []
+        if modified_files is None:
+            status_res = git_ops._run(["git", "status", "--porcelain=v1", "-uall"], wt)
+            status_files = []
+            if status_res.get("ok"):
+                for line in status_res.get("stdout", "").splitlines():
+                    if len(line) >= 3:
+                        f_rel = line[3:].strip()
+                        if " -> " in f_rel:
+                            f_rel = f_rel.split(" -> ")[1].strip()
+                        status_files.append(f_rel)
+        else:
+            status_files = list(modified_files)
+        for f_rel in status_files:
+            if not f_rel.endswith(".md"):
+                continue
+            recent_md.append(f_rel)
+            p = wt / f_rel
+            if p.is_file():
+                _add(p)
 
         # 3. App-specific task plans in tasks/apps/<app>/
         if app_name:
@@ -317,19 +346,12 @@ def parse_worktree_task_progress(
             if parsed["total"] == 0:
                 continue
 
-            is_specific_match = False
-            if short_qid and short_qid in cf.stem.lower():
-                is_specific_match = True
-            elif concern_slug and (concern_slug in cf.stem.lower() or concern_slug.replace("_", "-") in cf.stem.lower()):
-                is_specific_match = True
-            elif rel_path in modified_files:
-                is_specific_match = True
-
-            if not plan_checklist or plan_checklist.get("total", 0) == 0 or (is_specific_match and not matched_plan):
-                matched_plan = rel_path
-                plan_checklist = parsed
-                if is_specific_match:
-                    break
+            # Candidate order is the priority order: the first file with any
+            # checklist items is the answer (later candidates could never
+            # replace it), so stop reading the remaining plan files.
+            matched_plan = rel_path
+            plan_checklist = parsed
+            break
 
     if plan_checklist and plan_checklist["total"] > 0:
         return {
@@ -590,7 +612,14 @@ def audit_quest(
     # 4. Task Progress
     task_prog = {}
     if wt_p:
-        task_prog = parse_worktree_task_progress(wt_p, quest=quest, task_file_rel=quest.task_file)
+        changed = (
+            git_stat.get("untracked", []) + git_stat.get("modified", [])
+            + git_stat.get("staged", []) + git_stat.get("deleted", [])
+        ) if git_stat else None
+        task_prog = parse_worktree_task_progress(
+            wt_p, quest=quest, task_file_rel=quest.task_file,
+            modified_files=changed,
+        )
     else:
         task_prog = {
             "task_file": None,

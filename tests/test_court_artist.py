@@ -371,5 +371,33 @@ class TestCourtArtist(unittest.TestCase):
         mock_stamp.assert_called_once()
 
 
+def test_ui_review_approved_without_signoff_is_downgraded_to_pending():
+    """An APPROVED line that merely records an Artist session (no approver, no
+    sign-off) is NOT an approved UI studio — Q1049 promoted on this gap."""
+    q = Quest(
+        id="Q1049",
+        title="Timeline",
+        body_sections={
+            "Master of Coin's Audit": (
+                "- **UI Review:** APPROVED via Court Artist "
+                "(Session: ses_e7067b817ffe, Model: openrouter/x, Port: 8279)\n"
+            ),
+        },
+    )
+    assert q.extract_ui_review_status().upper().startswith("PENDING")
+
+
+def test_ui_review_approved_with_explicit_signoff_line_is_accepted():
+    q = Quest(
+        id="Q1",
+        title="Timeline",
+        body_sections={
+            "Master of Coin's Audit": "- **UI Review:** APPROVED via Court Artist (Session: ses_abc)\n",
+            "Tally": "- **UI Sign-off:** Court Artist ses_abc — 2026-10-31\n",
+        },
+    )
+    assert q.extract_ui_review_status().upper().startswith("APPROVED")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -522,6 +522,40 @@ def gatehouse_convoy_is_live(cogship_id: str, repo_root: Optional[Path] = None) 
     return False, "no gatehouse worktree or branch found"
 
 
+def _stale_gatehouse_escalation(cogship_id: str, wt_path: Path, repo_root: Path) -> None:
+    """Name a dead gatehouse as a first-class escalation, not a retry failure.
+
+    This condition is deterministic and human-fixable: `collect` re-stamps the
+    convoy, then cannot create its worktree because a prior convoy died
+    mid-integration. Retrying on the short backoff only re-stamps the ledger and
+    burns a Night's Watch slot (cogship-381/399: ones convoy blocked three
+    Quests for ten collect attempts). The Night's Watch now recognises this
+    text and tears the dead worktree down automatically (teardown is on by
+    default), so the escalation names that path first and the manual commands
+    second.
+    """
+    norm = store.normalize_cogship_id(cogship_id) or cogship_id
+    print(
+        f"ERROR: Gatehouse worktree {wt_path} already exists (no fresh session — a prior "
+        f"convoy likely died mid-integration). Refusing to re-create it: resume the "
+        f"existing worktree by hand or tear it down first: git -C {wt_path} status",
+        file=sys.stderr,
+    )
+    print(
+        "\n⚠️  ESCALATION — STALE GATEHOUSE (not a retryable failure)\n"
+        f"   convoy:   the-gatehouse/{norm}\n"
+        f"   worktree: {wt_path}\n"
+        "   cause:    a prior convoy died mid-integration; its gatehouse was never torn down\n"
+        "   revive:   the Night's Watch clears this automatically (teardown is on by default):\n"
+        f"             court nightwatch --repo {repo_root} --once\n"
+        "   manual:   court fork-teardown-list\n"
+        f"             git -C {repo_root} worktree remove --force {wt_path}\n"
+        f"             git -C {repo_root} branch -D the-gatehouse/{norm}\n"
+        "   then rerun: court collect <quest ids>",
+        file=sys.stderr,
+    )
+
+
 _OP_LOCK_DIR = Path("/tmp") / "kilo-castle-op-locks"
 
 
@@ -1266,6 +1300,56 @@ def _push_file_to_branch(repo: Path, branch: str, rel_path: str, content: str) -
     return True, commit_sha[:12]
 
 
+_LEDGER_BULLET_RE = re.compile(r"^- \*\*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\*\*")
+
+
+def _last_ledger_ts(quest) -> str:
+    """Newest timestamped Castle Ledger bullet on a charter, or ''.
+
+    Used to detect a STALE castle side-state: if the branch's last recorded
+    transition is newer than the castle stamp, pushing the stamp down would
+    delete work the castle checkout never folded up (Q1049, 2026-11-02)."""
+    if quest is None:
+        return ""
+    ledger = quest.body_sections.get("Castle Ledger", "")
+    stamps = [m.group(1) for m in (_LEDGER_BULLET_RE.match(ln) for ln in ledger.splitlines()) if m]
+    return max(stamps) if stamps else (quest.updated_at or "")
+
+
+def _stamp_side_state(branch_md: str, castle_quest) -> str:
+    """Carry ONLY a castle side-state stamp (HELD/PUNISHED) onto a branch charter.
+
+    The branch can hold newer Tribute text that the castle checkout never saw
+    (an annotation pass rendered in the worktree). Replacing the whole file with
+    the castle copy destroyed that work — Q1049 lost 410 lines of Tribute
+    Rendered to a stale HELD push-down on 2026-11-02. Rewrite status/updated_at
+    in the frontmatter and append the castle's missing ledger bullets; every
+    other line stays the branch's own.
+    """
+    m = re.match(r"^---\n(.*?)\n---\n", branch_md, re.DOTALL)
+    if not m:
+        return branch_md
+    fm = re.sub(r"^status:\s*.*$", f"status: {castle_quest.status}",
+                m.group(1), count=1, flags=re.MULTILINE)
+    fm = re.sub(r"^updated_at:\s*.*$", f"updated_at: {castle_quest.updated_at}",
+                fm, count=1, flags=re.MULTILINE)
+    stamped = f"---\n{fm}\n---\n" + branch_md[m.end():]
+    castle_ledger = castle_quest.body_sections.get("Castle Ledger", "")
+    missing = [ln for ln in castle_ledger.splitlines()
+               if ln.startswith("- **") and ln not in stamped]
+    if not missing:
+        return stamped
+    heading = "## Castle Ledger"
+    if heading not in stamped:
+        return stamped.rstrip("\n") + "\n\n" + heading + "\n\n" + "\n".join(missing) + "\n"
+    start = stamped.index(heading) + len(heading)
+    nxt = stamped.find("\n## ", start)
+    if nxt == -1:
+        return stamped.rstrip("\n") + "\n" + "\n".join(missing) + "\n"
+    body = stamped[start:nxt].rstrip("\n")
+    return stamped[:start] + body + "\n" + "\n".join(missing) + "\n" + stamped[nxt:]
+
+
 def _union_events(branch_text: str, castle_text: str) -> str:
     """Union two diverged .events.jsonl streams: keep every line from both
     (deduped), stably ordered by ts so the fold's last-by-ts rule resolves
@@ -1409,17 +1493,30 @@ def cmd_sync(args):
             castle_quest = None
         if castle_quest is not None and castle_quest.status in ("PUNISHED", "HELD"):
             b_show = _git_out(repo, "show", f"{branch}:{rel}")
+            branch_quest = None
             try:
-                b_status = Quest.from_markdown(b_show).status if b_show else ""
+                branch_quest = Quest.from_markdown(b_show) if b_show else None
+                b_status = branch_quest.status if branch_quest else ""
             except ValueError:
                 b_status = ""
             if b_show and b_status != castle_quest.status:
-                ok, detail = _push_file_to_branch(repo, branch, rel, qpath.read_text(encoding="utf-8"))
-                if ok:
-                    pushed.append(qpath.stem)
-                    print(f"  ⚓ {qpath.stem}: castle side-state [{castle_quest.status}] is royal — branch NOT folded; ruling committed to {branch}")
+                castle_ts = _last_ledger_ts(castle_quest)
+                branch_ts = _last_ledger_ts(branch_quest)
+                if branch_ts and castle_ts and branch_ts > castle_ts:
+                    print(
+                        f"  🛑 {qpath.stem}: castle side-state [{castle_quest.status}] stamped "
+                        f"{castle_ts} is OLDER than the branch's last transition ({b_status} at "
+                        f"{branch_ts}) — refusing the push-down (it would delete newer Tribute). "
+                        f"Fold the branch ruling up onto castle first, then re-run sync."
+                    )
                 else:
-                    print(f"  ⚓ {qpath.stem}: castle side-state [{castle_quest.status}] kept (branch fold refused); push-down failed: {detail}")
+                    stamped = _stamp_side_state(b_show, castle_quest)
+                    ok, detail = _push_file_to_branch(repo, branch, rel, stamped)
+                    if ok:
+                        pushed.append(qpath.stem)
+                        print(f"  ⚓ {qpath.stem}: castle side-state [{castle_quest.status}] is royal — branch NOT folded; side-state stamp committed to {branch} (Tribute content preserved)")
+                    else:
+                        print(f"  ⚓ {qpath.stem}: castle side-state [{castle_quest.status}] kept (branch fold refused); push-down failed: {detail}")
             else:
                 print(f"  ⚓ {qpath.stem}: castle side-state [{castle_quest.status}] is royal — nothing to fold")
             frozen.append(qpath.stem)
@@ -2008,6 +2105,7 @@ def cmd_status(args):
                 "section": q.section,
                 "tags": q.tags,
                 "status": q.status,
+                "razed_at": getattr(q, "razed_at", ""),
                 "branch": q.branch,
                 "worktree": audit.worktree_path,
                 "serf_session_id": q.serf_session_id,
@@ -2017,6 +2115,7 @@ def cmd_status(args):
                 "parent_epic": q.parent_epic,
                 "scout_of": getattr(q, "scout_of", ""),
                 "cogship_id": q.cogship_id or "",
+                "cogship_promoted_commit": q.cogship_promoted_commit or "",
                 "is_compliant": audit.is_compliant,
                 "git_status": audit.git_status,
                 "task_progress": audit.task_progress,
@@ -2033,8 +2132,30 @@ def cmd_status(args):
                 "worker": _worker_verdict_for_quest(q, audit.worktree_path),
             }
             results.append(q_dict)
+        gatehouses = []
+        try:
+            gh_root = git_ops.get_repo_root() / ".kilo" / "worktrees"
+            for wt in sorted(gh_root.glob("the-gatehouse-*")):
+                m = re.match(r"the-gatehouse-(cogship-\d+)$", wt.name)
+                if not m or not wt.is_dir():
+                    continue
+                try:
+                    age_seconds = max(0, int(time.time() - wt.stat().st_mtime))
+                except OSError:
+                    continue
+                gatehouses.append({
+                    "cogship_id": m.group(1),
+                    "branch": f"the-gatehouse/{m.group(1)}",
+                    "path": str(wt),
+                    "fresh_session": session_is_fresh(wt),
+                    "age_seconds": age_seconds,
+                })
+        except Exception:
+            gatehouses = []
+
         out = {
             "quests": results,
+            "gatehouses": gatehouses,
             "summary": {
                 "total": len(quests),
                 "by_status": {s: len([q for q in quests if q.status == s]) for s in STATUSES},
@@ -2902,6 +3023,11 @@ def _watch_dispatch_block(repo: Path, quest) -> str:
     watch, which the caller records with --break-glass.
     """
     if (quest.status or "").upper() not in ("OPEN", "PLANNED", "CHARTERED"):
+        return ""
+    # The Night's Watch's OWN queue drain (a `dispatch:<quest>` vigil firing)
+    # is already capacity-gated — it must not be refused by the very guard that
+    # routes new work to it (dispatch-q1095/1096 failed 30 min straight this way).
+    if os.environ.get("COURT_WATCH_DISPATCH") == "1":
         return ""
     state = nightwatch.load_state(repo)
     last = state.get("last_tick")
@@ -4743,6 +4869,23 @@ def cmd_verify_manifest(args):
     print(f"\n✅ All {len(quests)} manifest Quest(s) verified: branch tips reachable from {trunk} with production content present.")
 
 
+def _mark_quest_razed(quest: Quest, note: str = "") -> None:
+    """Write the durable razed marker and keep the Quest at READY_TO_RAZE.
+
+    Why the status is deliberately NOT advanced: `court teardown-list` selects
+    on READY_TO_RAZE to queue the (still existing) worktree for M'Lord's manual
+    prune. Advancing to DONE would hide it from that queue. The marker is what
+    distinguishes "promotion verified, awaiting raze" from "already razed,
+    awaiting prune" so the Night's Watch cannot re-raze the same Quest every
+    cooldown (the Q006/Q014/Q016/Q018 hourly no-op loop).
+    """
+    if quest.razed_at:
+        return
+    quest.razed_at = now_iso()
+    quest.log_ledger(quest.status, quest.status, note or "Razed: durable razed_at marker written.")
+    store.save(quest, commit_msg=f"court: mark {quest.id} razed")
+
+
 def cmd_raze(args):
     import json
     am_path = agent_manager_json_path()
@@ -4809,7 +4952,10 @@ def cmd_raze(args):
             if quest.status != "READY_TO_RAZE":
                 quest.log_ledger(quest.status, "READY_TO_RAZE", f"Razed alongside completed successor {successor_id}: pillory lineage closed out.")
                 quest.status = "READY_TO_RAZE"
-                store.save(quest)
+            _mark_quest_razed(
+                quest,
+                f"Razed alongside completed successor {successor_id}: pillory lineage closed out.",
+            )
             print(f"🔥🔒 Razed pilloried {quest.id} alongside completed successor {successor_id}.")
             return
 
@@ -4856,6 +5002,7 @@ def cmd_raze(args):
         # If worktree does not exist anywhere and was already deleted
         if not wt_exists and not found_wt_id:
             if quest.status == "READY_TO_RAZE" and args.archive_pruned:
+                _mark_quest_razed(quest)
                 try:
                     dst = store.archive(quest.id)
                     print(f"🪦 {quest.id}: Worktree already pruned from disk/AM -> Archived to {dst}")
@@ -4863,8 +5010,23 @@ def cmd_raze(args):
                     print(f"🪦 {quest.id}: Worktree pruned and quest already in archive.")
                 return
             elif quest.status == "READY_TO_RAZE":
+                if not quest.razed_at:
+                    _mark_quest_razed(quest)
                 print(f"ℹ️ {quest.id}: Worktree already pruned from disk/AM (ready to archive: python3 -m court.cli archive {quest.id})")
                 return
+
+        # Durable loop guard: a Quest that already carries the razed marker has
+        # completed the raze verification. Re-running only repeats the same
+        # destructive checks (and, before this marker existed, the Night's
+        # Watch re-razed Q006/Q014/Q016/Q018 every cooldown indefinitely).
+        # Its worktree is still on disk and remains queued by teardown-list for
+        # M'Lord's manual prune.
+        if quest.razed_at:
+            print(
+                f"⏭️  {quest.id}: already razed at {quest.razed_at} — skipping "
+                f"(worktree still queued in `court teardown-list` for manual prune)."
+            )
+            return
 
         # Check merge status. Scouts are non-merging by design (Investigation
         # lane): their branch never enters gatehouse/castle, so the merge gate
@@ -4940,6 +5102,11 @@ def cmd_raze(args):
         print(f"   - Ashes Section ID: {ashes_section_id}")
         if found_session_id and ashes_section_id:
             print(f"   👉 Stop the idle session via Kilo CLI: kilo session delete {found_session_id} (Ashes section: {ashes_section_id}; M'Lord prunes the directory by hand)")
+
+        # Durable marker: the worktree is still present, so the Quest stays at
+        # READY_TO_RAZE for teardown-list, but every later `court raze` and the
+        # Night's Watch planner now see that this raze already happened.
+        _mark_quest_razed(quest)
 
         # This Quest is a pillory successor: raze its frozen predecessor
         # together with it, in the same pass, per the Pillory protocol.
@@ -5251,6 +5418,17 @@ def cmd_collect(args):
     if live_skipped and not repackable:
         print("(all candidates belong to live prior convoys — nothing packed)")
         return
+    # Preflight the gatehouse collision BEFORE stamping. `stamp_cogship` is
+    # durable ledger state: re-stamping a convoy every watch tick and only then
+    # discovering its dead worktree is pure churn and inflates cogship ids.
+    # A convoy of size 1 needs no gatehouse, so this only applies to packs > 1.
+    if len(repackable) > 1:
+        prospective = store.normalize_cogship_id(requested_cogship) or store.next_cogship_id()
+        prospective_wt = repo_root / ".kilo" / "worktrees" / f"the-gatehouse-{prospective}"
+        if (prospective_wt.is_dir() and not session_is_fresh(prospective_wt)
+                and not convoy_branch_promoted(prospective, repo_root=repo_root)[0]):
+            _stale_gatehouse_escalation(prospective, prospective_wt, repo_root)
+            sys.exit(1)
     # force=True is required whenever any candidate carries a prior stamp from
     # a dead convoy (deliberate re-pack); fresh quests take the guarded path.
     repack_force = any(q.cogship_id for q in repackable)
@@ -5406,12 +5584,7 @@ def cmd_collect(args):
                             file=sys.stderr,
                         )
                         sys.exit(1)
-                    print(
-                        f"ERROR: Gatehouse worktree {wt_path} already exists (no fresh session — a prior "
-                        f"convoy likely died mid-integration). Refusing to re-create it: resume the "
-                        f"existing worktree by hand or tear it down first: git -C {wt_path} status",
-                        file=sys.stderr,
-                    )
+                    _stale_gatehouse_escalation(cogship_id, wt_path, root)
                     sys.exit(1)
                 try:
                     # Timeouts are mandatory here: `kilo worktree create` used to
@@ -7003,8 +7176,9 @@ def cmd_nightwatch(args):
                 pass
         print(f"🧹 Cleared Night's Watch state for {repo}")
 
+    default_enable = ",".join(nightwatch.Policy().enabled)
     enabled = tuple(
-        s.strip() for s in (getattr(args, "enable", None) or "goad,coin,collect,dispatch").split(",") if s.strip()
+        s.strip() for s in (getattr(args, "enable", None) or default_enable).split(",") if s.strip()
     )
     bad = [k for k in enabled if k not in nightwatch.ENABLED_ACTIONS]
     if bad:
@@ -7077,7 +7251,10 @@ def _awaiting_buckets(quests, ui_pending_ids=frozenset()):
         elif getattr(quest, "has_pending_audience", lambda: False)() or qid in ui_pending_ids:
             buckets["design"].append((qid, status, "/artist or /atelier — M'Lord signs off"))
         elif status == "READY_TO_RAZE":
-            buckets["impl"].append((qid, status, "court raze <id>"))
+            if getattr(quest, "razed_at", ""):
+                buckets["impl"].append((qid, status, "already razed — prune the worktree (`court teardown-list`)"))
+            else:
+                buckets["impl"].append((qid, status, "court raze <id>"))
         elif status in ("TRIBUTE_READY", "GATE", "WORKING", "CHARTERED"):
             nxt = {"TRIBUTE_READY": "Master of Coin (`court coin`)",
                    "GATE": "Gatekeeper (`court collect`)",
@@ -7360,13 +7537,15 @@ def cmd_teardown_list(args):
         for item in active_in_ashes:
             q = item["quest"]
             aligned = "✅ Aligned (0 drift)" if item["behind"] == "0" and item["ahead"] == "0" and item["dirty_count"] == 0 else f"⚠️ Drift (behind={item['behind']}, ahead={item['ahead']}, dirty={item['dirty_count']})"
-            print(f"   * {q.id}: {item['wt_id']} ({item['path']}) [{aligned}]")
+            razed_note = f" [razed {q.razed_at}]" if getattr(q, "razed_at", "") else " [NOT YET RAZED]"
+            print(f"   * {q.id}: {item['wt_id']} ({item['path']}) [{aligned}]{razed_note}")
 
     if active_other_lane:
         print(f"\n⚠️ In READY_TO_RAZE but not yet moved to Ashes ({len(active_other_lane)}):")
         for item in active_other_lane:
             q = item["quest"]
-            print(f"   * {q.id}: {item['wt_id']} ({item['path']}) [Section: {item['sec_id']}]")
+            razed_note = f" [razed {q.razed_at}]" if getattr(q, "razed_at", "") else ""
+            print(f"   * {q.id}: {item['wt_id']} ({item['path']}) [Section: {item['sec_id']}]{razed_note}")
 
     if already_pruned:
         print(f"\n📦 Already Pruned from Disk ({len(already_pruned)} Quests ready to archive):")
@@ -9307,7 +9486,7 @@ def build_parser():
     p_nightwatch.add_argument("--steward-stale-after", dest="steward_stale_after", type=int, default=nightwatch.DEFAULT_STEWARD_STALE_AFTER, help=f"Seconds an unchanged board with no live worker must sit before a Steward may be mustered (default {nightwatch.DEFAULT_STEWARD_STALE_AFTER})")
     p_nightwatch.add_argument("--steward-cooldown", dest="steward_cooldown", type=int, default=nightwatch.DEFAULT_STEWARD_COOLDOWN, help=f"Seconds between Steward musters (default {nightwatch.DEFAULT_STEWARD_COOLDOWN})")
     p_nightwatch.add_argument("--max-stewards-per-day", dest="max_stewards_per_day", type=int, default=nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY, help=f"Rolling 24-hour Steward muster cap (default {nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY})")
-    p_nightwatch.add_argument("--enable", default="goad,coin,collect,dispatch", help="Comma list of permitted actions (goad,coin,collect,dispatch,steward,raze,teardown). `steward`, `raze`, and `teardown` are OPT-IN: steward spends a reasoning worker; raze/teardown are destructive.")
+    p_nightwatch.add_argument("--enable", default=",".join(nightwatch.Policy().enabled), help="Comma list of permitted actions (goad,coin,collect,dispatch,steward,raze,teardown). `teardown` (clearing a provably-dead gatehouse worktree so collect can re-run) is ON by default because it is a common blocking failure. `steward` and `raze` are OPT-IN: steward spends a reasoning worker; raze deletes a branch ref.")
     p_nightwatch.add_argument("--allow-force-goad", dest="allow_force_goad", action="store_true", help="Permit --force goads (supersedes a live worker). Off by default.")
     p_nightwatch.add_argument("--quiet", action="store_true", help="Journal only; suppress per-tick console output")
     p_nightwatch.set_defaults(func=cmd_nightwatch)

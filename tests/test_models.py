@@ -286,3 +286,37 @@ def test_validate_branch_name():
     ok, err = validate_branch_name("totally-unrecognized")
     assert ok is False
     assert "organizational folder prefix" in err
+
+
+def test_razed_at_is_a_durable_frontmatter_marker():
+    q = Quest(id="Q099-Test-Razed", title="Razed Marker", app="test", concern="razed")
+    assert q.razed_at == ""
+    q.status = "READY_TO_RAZE"
+    q.razed_at = "2026-11-02T16:00:00Z"
+
+    md = q.to_markdown()
+    assert "razed_at: 2026-11-02T16:00:00Z" in md
+    parsed = Quest.from_markdown(md)
+    assert parsed.status == "READY_TO_RAZE"
+    assert parsed.razed_at == "2026-11-02T16:00:00Z"
+
+
+def test_mark_quest_razed_is_durable_and_idempotent(monkeypatch):
+    from pathlib import Path
+
+    from court import cli
+
+    q = Quest(id="Q098-Test-Raze", title="Raze Marker", app="test", concern="raze")
+    q.status = "READY_TO_RAZE"
+    saved = []
+    monkeypatch.setattr(cli.store, "save",
+                        lambda quest, **kw: saved.append(quest.razed_at) or Path("/tmp/x"))
+
+    cli._mark_quest_razed(q)
+    first = q.razed_at
+    assert first
+    assert saved == [first]
+
+    cli._mark_quest_razed(q)
+    assert q.razed_at == first
+    assert saved == [first]

@@ -438,6 +438,13 @@ def resolve_quest(
             chosen = max(cv, ov)  # ISO-8601 Z strings sort lexically == chronologically
             setattr(rq, f, chosen)
             reasons[f"field:{f}"] = f"max(castle={cv}, branch={ov})"
+        elif f == "razed_at":
+            # Raze is monotonic: once either side carries the durable marker,
+            # the Quest has completed raze verification. Never let a castle
+            # copy that predates the marker erase it during reconciliation.
+            chosen = cv or ov
+            setattr(rq, f, chosen)
+            reasons[f"field:{f}"] = f"non-empty razed marker wins (castle={cv!r}, branch={ov!r})"
         elif f in _CASTLE_ALWAYS_WINS_FIELDS:
             reasons[f"field:{f}"] = f"castle wins (Court-bookkeeping/identity field; castle={cv!r}, branch={ov!r})"
         elif f in _PATH_FIELDS:

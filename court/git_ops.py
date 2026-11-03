@@ -342,8 +342,10 @@ def get_worktree_git_status(
             "error": f"path does not exist or is not a directory: {worktree_path}",
         }
 
-    branch_res = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], p)
-    head_res = _run(["git", "rev-parse", "HEAD"], p)
+    rev_res = _run(["git", "rev-parse", "--abbrev-ref", "HEAD", "HEAD"], p)
+    rev_lines = rev_res.get("stdout", "").splitlines() if rev_res.get("ok") else []
+    branch = rev_lines[0].strip() if rev_lines else ""
+    head_sha = rev_lines[1].strip() if len(rev_lines) > 1 else ""
     status_res = _run(["git", "status", "--porcelain=v1", "-uall"], p)
 
     untracked: list[str] = []
@@ -392,8 +394,8 @@ def get_worktree_git_status(
         "ok": True,
         "exists": True,
         "path": str(p),
-        "branch": branch_res.get("stdout", "").strip(),
-        "head_sha": head_res.get("stdout", "").strip(),
+        "branch": branch,
+        "head_sha": head_sha,
         "dirty": dirty,
         "untracked": untracked,
         "modified": modified,

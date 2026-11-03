@@ -59,3 +59,47 @@ def test_union_events_no_castle_extras_returns_branch():
     b = '{"target": "field:status", "ts": "2026-09-26T10:00:00Z", "value": "WORKING"}'
     assert _union_events(b, b) == b
     assert _union_events(b, "") == b
+
+
+def _stamped_charter(status, updated_at, ledger_bullet, tribute=""):
+    q = Quest(id="Q1049-Stamp", title="Stamp", app="crm", concern="stamp", status=status)
+    q.updated_at = updated_at
+    q.set_section("Castle Ledger", ledger_bullet)
+    if tribute:
+        q.set_section("Tribute Rendered", tribute)
+    return q
+
+
+def test_stamp_side_state_keeps_branch_tribute_and_takes_only_status():
+    from court.cli import _stamp_side_state
+
+    castle = _stamped_charter(
+        "HELD", "2026-10-31T19:48:01Z",
+        "- **2026-10-31T19:48:01Z** — GATE → HELD: UI studio not approved",
+    )
+    branch = _stamped_charter(
+        "TRIBUTE_READY", "2026-11-02T14:02:45Z",
+        "- **2026-11-02T14:02:45Z** — HELD → TRIBUTE_READY: UI approved by M'Lord",
+        tribute="### Tribute Rendered — annotation pass 10\n\n**Ballad.** Enrichment preview.",
+    ).to_markdown()
+
+    stamped = _stamp_side_state(branch, castle)
+
+    assert "status: HELD" in stamped                      # royal side-state applied
+    assert "annotation pass 10" in stamped                # branch Tribute survives
+    assert "UI approved by M'Lord" in stamped             # branch transition record survives
+    assert "UI studio not approved" in stamped            # castle ledger bullet carried over
+
+
+def test_last_ledger_ts_detects_stale_side_state():
+    from court.cli import _last_ledger_ts
+
+    stale = _stamped_charter(
+        "HELD", "2026-10-31T19:48:01Z",
+        "- **2026-10-31T19:48:01Z** — GATE → HELD: UI studio not approved",
+    )
+    newer = _stamped_charter(
+        "TRIBUTE_READY", "2026-11-02T14:02:45Z",
+        "- **2026-11-02T14:02:45Z** — HELD → TRIBUTE_READY: UI approved by M'Lord",
+    )
+    assert _last_ledger_ts(newer) > _last_ledger_ts(stale)

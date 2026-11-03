@@ -161,6 +161,41 @@ def test_gate_with_a_dead_recorded_gatekeeper_is_flagged_not_respawned(tmp_path)
     assert any(n["level"] == "human" for n in notes)
 
 
+def test_a_reshipment_is_recollected_despite_the_old_gatekeeper_stamp(tmp_path):
+    """Q1049 class: the Quest shipped once, new work landed after the promotion,
+    and the old gatekeeper/session stamps are still on the charter. At the next
+    GATE the watch must mint a fresh convoy, not dead-end on `stale_gatekeeper`."""
+    wt = _free(tmp_path)
+    snap = _snap(_q(
+        "Q1", "GATE", wt,
+        cogship_id="cogship-9",
+        gatekeeper_session_id="ses_old_shipment",
+        cogship_promoted_commit="abc1234",
+        git_status={"ahead": 45, "behind": 1},
+    ))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(max_workers=4), _workers())
+    assert [a.kind for a in actions] == ["collect"]
+    assert actions[0].quest_ids == ["Q1"]
+    assert any(n.get("key") == "reship_gate" for n in notes)
+    assert not any(n.get("key") == "stale_gatekeeper" for n in notes)
+
+
+def test_gate_already_merged_with_an_old_stamp_is_not_repacked(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q(
+        "Q1", "GATE", wt,
+        cogship_id="cogship-9",
+        gatekeeper_session_id="ses_old_shipment",
+        cogship_promoted_commit="abc1234",
+        git_status={"ahead": 0, "behind": 0},
+    ))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(max_workers=4), _workers())
+    assert actions == []
+    (note,) = [n for n in notes if n.get("key") == "gate_merged_stuck"]
+    assert note["level"] == "human"
+    assert "READY_TO_RAZE" in note["text"]
+
+
 def test_pending_audience_parks_everything(tmp_path):
     wt = _free(tmp_path)
     snap = _snap(
@@ -271,6 +306,56 @@ def test_a_note_vigil_is_not_gated_by_the_worker_ceiling(tmp_path):
                          _workers(count=9), ready_vigils=[(spec, "ready")])
     assert [a.kind for a in actions] == ["vigil"]
     assert actions[0].meta["spawns"] is False
+
+
+def test_raze_bucket_splits_ancestor_from_content_merged_only(tmp_path, monkeypatch):
+    from court import nightwatch as _nw
+    # Two READY_TO_RAZE quest files; one branch is an ancestor of castle, the
+    # other SHA-diverged (content merged but tip not reachable).
+    quest_root = tmp_path / ".court" / "quests"
+    quest_root.mkdir(parents=True)
+    (quest_root / "Q100-Raized.md").write_text(
+        "---\nid: Q100-Raized\nstatus: READY_TO_RAZE\nbranch: quest/q100-raized\n---\n", encoding="utf-8")
+    (quest_root / "Q101-Regate.md").write_text(
+        "---\nid: Q101-Regate\nstatus: READY_TO_RAZE\nbranch: quest/q101-regate\n---\n", encoding="utf-8")
+
+    def fake_find(qid, root):
+        p = root / "quests" / f"{qid}.md"
+        return p if p.exists() else None
+
+    def fake_merged(branch, target_ref=None, base_ref=None, cwd=None):
+        return {"is_merged_target": branch == "quest/q100-raized",
+                "is_merged_base": branch == "quest/q100-raized"}
+
+    import court.git_ops as _g
+    import court.store as _store
+    monkeypatch.setattr(_g, "check_merged_status", fake_merged)
+    monkeypatch.setattr(_store, "find_path", fake_find)
+    ready, regate = nw._bucket_raze(tmp_path, ["Q100-Raized", "Q101-Regate"])
+    assert ready == ["Q100-Raized"]
+    assert regate == ["Q101-Regate"]
+
+
+def test_vigil_dispatch_runs_with_the_watch_dispatch_marker(tmp_path, monkeypatch):
+    from court import vigils
+    spec = _vigil(then="dispatch:Q234")
+    called = {}
+
+    def fake_court(repo, *argv, timeout=None, env=None):
+        called["argv"], called["env"] = argv, env
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(nw, "_court", fake_court)
+    from court.nightwatch import Action
+    res = nw.execute(tmp_path, Action("vigil", quest_ids=["Q234"],
+                                      meta={"then": "dispatch:Q234", "spawns": True}))
+    assert res["ok"]
+    assert called["argv"][0] == "dispatch"
+    assert called["env"].get("COURT_WATCH_DISPATCH") == "1"
 
 
 def test_a_vigil_for_a_disabled_action_is_skipped(tmp_path):
@@ -666,14 +751,16 @@ def test_a_stale_convoy_is_held_and_escalated_once(tmp_path):
     state = nw.load_state(tmp_path)
     state["convoys"]["cogship-9"] = {"stale": {"worktree": gate, "reason": "died"}}
     snap = _snap(_q("Q1", "GATE", wt, cogship_id="cogship-9"))
-    actions, notes = nw.plan(snap, state, _policy(), _workers())
+    # Teardown deliberately disabled: the watch may only report/escalate.
+    held = _policy(enabled=("goad", "coin", "collect", "dispatch"))
+    actions, notes = nw.plan(snap, state, held, _workers())
     assert actions == []
     (note,) = [n for n in notes if n.get("key") == "stale_convoy"]
     assert note["level"] == "human" and note["new"] is True
     assert "already exists" in note["text"] or "stale gatehouse" in note["text"]
 
     nw._record_escalations(state, notes, 1000.0)
-    _, notes2 = nw.plan(snap, state, _policy(), _workers())
+    _, notes2 = nw.plan(snap, state, held, _workers())
     (note2,) = [n for n in notes2 if n.get("key") == "stale_convoy"]
     assert note2["new"] is False
 
@@ -771,23 +858,55 @@ def test_raze_action_runs_court_raze(tmp_path, monkeypatch):
     assert seen["argv"] == ["raze", "Q7"]
 
 
-def test_teardown_is_opt_in_and_planned_when_the_convoy_is_dead(tmp_path):
+def test_a_razed_quest_is_never_re_razed(tmp_path):
+    """The durable razed_at marker distinguishes 'awaiting raze' from
+    'already razed, awaiting manual prune' (the Q006/Q014 hourly no-op loop)."""
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt, worker="idle",
+                    razed_at="2026-11-02T16:00:00Z"))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path),
+                             _policy(enabled=("raze",), max_workers=4), _workers())
+    assert actions == []
+    (note,) = [n for n in notes if n.get("key") == "razed_pruned"]
+    assert "already razed" in note["text"]
+    assert "teardown-list" in note["text"]
+
+
+def test_teardown_is_on_by_default_and_planned_when_the_convoy_is_dead(tmp_path):
     gate = _free(tmp_path, "the-gatehouse-cogship-9")
     wt = _free(tmp_path, "q1")
     state = nw.load_state(tmp_path)
     state["convoys"]["cogship-9"] = {"stale": {"worktree": gate}}
     snap = _snap(_q("Q1", "GATE", wt, cogship_id="cogship-9"))
 
-    # default: report only, no teardown
-    actions, notes = nw.plan(snap, state, _policy(), _workers())
+    # disabled: report only, no teardown
+    held = _policy(enabled=("goad", "coin", "collect", "dispatch"))
+    actions, notes = nw.plan(snap, state, held, _workers())
     assert actions == []
     assert any(n.get("key") == "stale_convoy" for n in notes)
 
-    # opt-in: plan a teardown of the dead worktree
-    actions, _ = nw.plan(snap, state, _policy(enabled=("teardown",), max_workers=4), _workers())
+    # default policy: revive the dead gatehouse so collect can re-run
+    actions, _ = nw.plan(snap, state, _policy(max_workers=4), _workers())
     assert [a.kind for a in actions] == ["teardown"]
     assert actions[0].meta["worktree"] == gate
     assert actions[0].meta["branch"] == "the-gatehouse/cogship-9"
+
+
+def test_a_repeatedly_unremovable_gatehouse_escalates_instead_of_looping(tmp_path):
+    gate = _free(tmp_path, "the-gatehouse-cogship-9")
+    wt = _free(tmp_path, "q1")
+    state = nw.load_state(tmp_path)
+    state["convoys"]["cogship-9"] = {
+        "stale": {"worktree": gate},
+        "teardown_fails": 2,
+        "teardown_error": "permission denied",
+    }
+    snap = _snap(_q("Q1", "GATE", wt, cogship_id="cogship-9"))
+    actions, notes = nw.plan(snap, state, _policy(max_workers=4), _workers())
+    assert actions == []
+    (note,) = [n for n in notes if n.get("key") == "stale_convoy_teardown_failed"]
+    assert note["level"] == "human"
+    assert "worktree remove --force" in note["text"]
 
 
 def test_teardown_action_removes_worktree_and_branch(tmp_path, monkeypatch):
@@ -797,14 +916,89 @@ def test_teardown_action_removes_worktree_and_branch(tmp_path, monkeypatch):
         def __init__(self, rc=0, out="", err=""):
             self.returncode = rc; self.stdout = out; self.stderr = err
 
-    monkeypatch.setattr(nw.subprocess, "run", lambda cmd, **kw: (calls.append(list(cmd)) or R()))
-    gate = _free(tmp_path, "the-gatehouse-cogship-9")
+    def _run(cmd, **kw):
+        calls.append(list(cmd))
+        if "remove" in cmd:
+            import shutil
+            shutil.rmtree(cmd[-1], ignore_errors=True)
+        return R()
+
+    monkeypatch.setattr(nw.subprocess, "run", _run)
+    gate = tmp_path / ".kilo" / "worktrees" / "the-gatehouse-cogship-9"
+    gate.mkdir(parents=True)
     res = nw.execute(tmp_path, nw.Action(kind="teardown", quest_ids=["Q1"],
-                                         meta={"worktree": gate, "branch": "the-gatehouse/cogship-9"}))
+                                         meta={"worktree": str(gate), "branch": "the-gatehouse/cogship-9"}))
     assert res["ok"] is True
     assert calls[0][:5] == ["git", "-C", str(tmp_path), "worktree", "remove"]
     assert calls[1][:5] == ["git", "-C", str(tmp_path), "branch", "-D"]
     assert calls[1][-1] == "the-gatehouse/cogship-9"
+
+
+def test_teardown_refuses_a_non_gatehouse_path(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(nw.subprocess, "run", lambda cmd, **kw: calls.append(list(cmd)))
+    outside = _free(tmp_path, "some-quest-worktree")
+    res = nw.execute(tmp_path, nw.Action(kind="teardown", quest_ids=["Q1"],
+                                         meta={"worktree": outside, "branch": "the-gatehouse/cogship-9"}))
+    assert res["ok"] is False
+    assert "refusing" in res["stderr_tail"]
+    assert calls == []
+
+
+def test_a_dead_gatehouse_is_revived_without_any_gate_quest(tmp_path):
+    gate = _free(tmp_path, "the-gatehouse-cogship-9")
+    snap = {"quests": [], "gatehouses": [{
+        "cogship_id": "cogship-9",
+        "branch": "the-gatehouse/cogship-9",
+        "path": gate,
+        "fresh_session": False,
+        "age_seconds": 3600,
+    }]}
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path), _policy(max_workers=4), _workers())
+    assert [a.kind for a in actions] == ["teardown"]
+    assert actions[0].meta["worktree"] == gate
+    assert actions[0].meta["branch"] == "the-gatehouse/cogship-9"
+
+
+def test_a_brand_new_gatehouse_is_not_torn_down_before_it_can_be_used(tmp_path):
+    gate = _free(tmp_path, "the-gatehouse-cogship-9")
+    snap = {"quests": [], "gatehouses": [{
+        "cogship_id": "cogship-9",
+        "branch": "the-gatehouse/cogship-9",
+        "path": gate,
+        "fresh_session": False,
+        "age_seconds": 5,
+    }]}
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path), _policy(max_workers=4), _workers())
+    assert actions == []
+
+
+def test_dead_gatehouse_teardown_is_not_starved_by_the_worker_ceiling(tmp_path):
+    """Teardown is a local git operation, not a model worker. A saturated fleet
+    must still be able to clear the dead gatehouse blocking collect."""
+    gate = _free(tmp_path, "the-gatehouse-cogship-9")
+    snap = {"quests": [], "gatehouses": [{
+        "cogship_id": "cogship-9",
+        "branch": "the-gatehouse/cogship-9",
+        "path": gate,
+        "fresh_session": False,
+        "age_seconds": 3600,
+    }]}
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path),
+                         _policy(max_workers=4, max_spawns_per_tick=2), _workers(count=10))
+    assert [a.kind for a in actions] == ["teardown"]
+
+
+def test_a_gatehouse_with_a_fresh_session_is_never_torn_down(tmp_path):
+    gate = _free(tmp_path, "the-gatehouse-cogship-9")
+    snap = {"quests": [], "gatehouses": [{
+        "cogship_id": "cogship-9",
+        "branch": "the-gatehouse/cogship-9",
+        "path": gate,
+        "fresh_session": True,
+    }]}
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path), _policy(max_workers=4), _workers())
+    assert actions == []
 
 
 def test_teardown_bookkeeping_clears_the_hold(tmp_path):
@@ -821,6 +1015,16 @@ def test_digest_lists_ready_to_raze(tmp_path, monkeypatch):
     journal = [{"ts": "t1", "event": "tick", "statuses": {"Q1": "READY_TO_RAZE", "Q2": "GATE"}}]
     out = nw.render_digest(tmp_path, journal=journal)
     assert "ready to raze" in out and "Q1" in out
+
+
+def test_digest_separates_already_razed_quests_awaiting_prune(tmp_path, monkeypatch):
+    journal = [{"ts": "t1", "event": "tick",
+                "statuses": {"Q1": "READY_TO_RAZE", "Q2": "READY_TO_RAZE"},
+                "razed": ["Q2"]}]
+    out = nw.render_digest(tmp_path, journal=journal)
+    assert "already razed" in out and "Q2" in out
+    pending = out.split("already razed", 1)[0]
+    assert "Q1" in pending and "Q2" not in pending.split("ready to raze", 1)[-1]
 
 
 def test_digest_reports_capacity_and_the_dispatch_queue(tmp_path):

@@ -15,10 +15,11 @@
 7. [The Scout Reconnaissance Pipeline](#the-scout-reconnaissance-pipeline)
 8. [The Tribute Contract & Intelligence Rollups](#the-tribute-contract--intelligence-rollups)
 9. [Commutation — The Post-Deployment Pass](#commutation--the-post-deployment-pass)
-10. [Protocol Guardrails](#protocol-guardrails)
-11. [Quickstart](#quickstart)
-12. [Command Reference](#command-reference)
-13. [License](#license)
+10. [The Night's Watch — Deterministic Fleet Supervision](#the-nights-watch--deterministic-fleet-supervision)
+11. [Protocol Guardrails](#protocol-guardrails)
+12. [Quickstart](#quickstart)
+13. [Command Reference](#command-reference)
+14. [License](#license)
 
 ---
 
@@ -35,6 +36,7 @@ The framework's design pillars:
 5. **Deterministic Lifecycle Gates** — five enforced gates from charter to teardown, each with a clean-tree rule, an audit pass, and an explicit promotion.
 6. **Protocol Guardrails** — Castle Guard branch protections, Charter Immutability (anti-tampering), and Zero Roleplay Leakage enforcement keep both the repo and the agents honest.
 7. **Commutation Completion Tracking** — post-deploy activation steps are recorded once with `court commute`, then drop out of the outstanding list into a durable done state.
+8. **The Night's Watch** — a token-free supervisor that polls durable quest state and rolls the mechanical pipeline verbs (`goad`, `coin`, `collect`) under hard caps — no LLM polling, no session, no tokens wasted on supervision.
 
 ---
 
@@ -261,6 +263,57 @@ Once logged, the Quest **drops out** of the outstanding lists:
 
 ---
 
+## The Night's Watch — Deterministic Fleet Supervision
+
+The **Night's Watch** is the Court's token-free supervisor. Where an agent handed "check back in 15 minutes, then goad it" tends to spin on in-memory wakeups that die with its session, the Watch is a small stdlib process with **no model calls, no session, no token burn**. It polls durable quest state (`court status --json`) on a timer and issues the mechanical pipeline verbs — `goad`, `coin`, `collect --standup` — under hard caps.
+
+```bash
+court nightwatch --repo <path> --once    # one tick — cron-friendly
+court nightwatch --repo <path>           # persistent loop (default 300s interval)
+court nightwatch --dry-run               # decide + print, act on nothing
+```
+
+**Caps & guards** (every spawn decision is a deterministic predicate, never a model call):
+
+- **RAM guard** — `--max-workers` live `kilo` worker ceiling; no spawns above it.
+- **Budgets** — `--max-spawns-per-tick` and rolling `--max-spawns-per-hour`.
+- **Cooldowns & escalation** — per-quest goad/coin/gate cooldowns plus a goad ceiling that escalates to "needs a human" instead of looping endlessly.
+- **Single-writer** — one instance per repo (single-instance lock), and worktree occupancy checks refuse to stack a worker beneath any live `kilo run`.
+- **Report-only** — `PLANNED`/`CHARTERED`/`DISPATCHED`/`READY_TO_RAZE` and pending-Audience quests are surfaced but never touched.
+
+**Read surfaces:**
+
+- `court nightwatch --report` — a digest from the journal + state: livelock collects that packed nothing, standing escalations (stale gatekeeper stamps, pending UI review), goad/coin budget usage, failed actions, steward musters, snapshot failures/restarts.
+- `court nightwatch --status` — daemon presence, last tick, per-Quest counters, and the 24-hour Steward muster tally.
+- The journal lives at `~/.local/state/kilo-castle/nightwatch/<repo>.jsonl`; watch/lease state self-ignores in `.kilo/watch/.gitignore`.
+
+### Queue-first dispatch (`court enqueue`)
+
+The Steward plans; the Watch spends the machine. Routine new work is **queued** rather than spawned directly: `court enqueue <quest> --why "..." [--after 5m] [--expires 24h]` registers a one-shot `dispatch:<quest>` vigil that the Watch drains only when capacity is free. `court nightwatch --report` is the capacity/queue surface (live workers vs. ceiling, RSS, dispatch hand-offs waiting). Direct `court dispatch` from a Steward turn is break-glass only.
+
+### Vigils (`court vigil`)
+
+Bounded watch hand-offs — never a free-form "keep checking". Every vigil **requires** a `--why` reason, a mandatory `--expires` (7-day ceiling), a bounded `--max-fires`, and an action from an allow-list (`dispatch`, `goad`, `coin`, `collect`, `advance`, `note`):
+
+```bash
+court vigil add q234-after-q123 \
+  --when "quest-status:Q123=READY_TO_RAZE" \
+  --then "dispatch:Q234" \
+  --why "Q234 needs Q123 promoted to castle" --expires 6h
+```
+
+Conditions are deterministic predicates (`quest-status:Q123=READY_TO_RAZE`, `quest-merged:Q123`, `branch-merged:<branch>`, `file-exists:<path>`, `after:<iso>`), so the Watch evaluates them with no model call. `court vigil check` previews, `run` fires ready vigils now, `list` shows fires/expiry. An un-renewed vigil expires silently — that is the point.
+
+### Opt-in steward muster
+
+By default the Watch never makes Steward judgments. Opt in explicitly with `court nightwatch --enable goad,coin,collect,dispatch,steward`, and only when a stale board sits with **no live worker at all**, an unchanged board fingerprint for `--steward-stale-after` (45m default), and a standing blocker does it summon ONE single-turn Steward triage session on the trunk (`court muster`). It is cooldown-capped (`--steward-cooldown`, 6h default), daily-capped (`--max-stewards-per-day`, default 2), and never re-prompts. Preview without spawning: `court muster --why "manual check" --print-prompt`.
+
+### Context discipline
+
+The Watch reports each worker's true context usage (last `step-finish` `tokens.total`) and prefers a FRESH session over a bloated one. It cold-starts a fresh session once a session crosses `--context-soft` (default ~350k) **and the worktree is committed** (uncommitted work keeps the session so a fresh start can't discard edits), and never re-prompts a session past `--context-hard` (default ~750k).
+
+---
+
 ## Protocol Guardrails
 
 ### Zero Roleplay Leakage
@@ -342,6 +395,10 @@ Agents are defined in `kilo.json` (`mode: primary`, pinned model, full prompt). 
 | `/reject_tribute` | Isolate a failing Quest from a convoy and dispatch Serf remediation |
 | `/ship [--confirm]` | Compile the deployment convoy summary + Commutation manifest; `--confirm` deploys |
 | `court commute <id> --note "..."` | Record a post-deploy commutation as done (Cogship Log entry) |
+| `court nightwatch --repo <path>` | Deterministic fleet supervisor: polls quest state, rolls `goad`/`coin`/`collect` under caps; `--once` for cron, `--report`/`--status`/`--dry-run` surfaces |
+| `court enqueue <quest> --why "..."` | Queue a PLANNED/CHARTERED Quest for dispatch by the Watch (queue-first dispatch) |
+| `court vigil add <id> --when ... --then ...` | Register a bounded watch hand-off (reason + expiry + fire cap required) |
+| `court muster --why "..."` | Opt-in one-shot Steward triage turn for a stale, blocker-stuck board |
 | `/pillory <id>` | Freeze a Quest as `PUNISHED` with Decrees for a successor |
 | `/raze <id>` | Verify merge, fast-forward branch, move worktree to Ashes |
 | `/teardown` | List worktrees ready for M'Lord to prune |
@@ -353,16 +410,16 @@ Agents are defined in `kilo.json` (`mode: primary`, pinned model, full prompt). 
 
 ## Command Reference
 
-**Slash commands** (`.kilo/commands/`, run inside Kilo): `artist` `atone` `audience` `bard` `bear-tribute` `charter` `close` `coffers` `cog` `collect` `dismiss` `edict` `epic` `goad` `hold` `levy` `murmur` `pillory` `plot` `quest` `raze` `reject_tribute` `report-to-the-king` `resume` `return` `scout` `ship` `status` `tally` `teardown` `ward`
+**Slash commands** (`.kilo/commands/`, run inside Kilo): `artist` `atone` `audience` `bard` `bear-tribute` `charter` `close` `coffers` `cog` `collect` `dismiss` `edict` `epic` `goad` `hold` `levy` `murmur` `nightwatch` `pillory` `plot` `quest` `raze` `reject_tribute` `report-to-the-king` `resume` `return` `scout` `ship` `status` `tally` `teardown` `ward`
 
 **CLI verbs** (`court <verb>` / `python3 -m court.cli <verb>`):
 
 ```
 advance archive artist audit charter collect commute diff dispatch
-dispatch-complete edict fix-branches fork-teardown-list init levy list
-log new pillory punish raze realign-branches rebase rollup set-field
-set-section ship show stamp status tally teardown-list timber tree update
-verify verify-merged ward worktree-doc
+dispatch-complete edict enqueue fix-branches fork-teardown-list init levy
+list log muster new nightwatch pillory punish raze realign-branches rebase
+rollup set-field set-section ship show stamp status tally teardown-list
+timber tree update verify verify-merged vigil ward worktree-doc
 ```
 
 Highlights: `verify` / `verify-merged` deterministic worktree checks · `rebase` zero-turn branch convergence · `diff` structured worktree diff · `rollup` extract any tribute pillar · `stamp` allocate a Cog Ship id · `timber` cross-reference worktrees ↔ sections ↔ Quests · `archive` shelve closed records · `update` vendor the latest engine.

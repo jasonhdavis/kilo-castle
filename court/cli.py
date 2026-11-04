@@ -51,6 +51,7 @@ from . import lease as worker_lease
 from . import handoff
 from . import vigils
 from . import nightwatch
+from . import pickup
 from . import metrics as quest_metrics
 
 # The Ward's durable workspace: patrol ledger + Warden Report queue.
@@ -2129,6 +2130,7 @@ def cmd_status(args):
                 "commutation_done": q.commutation_complete(),
                 "pending_audience": q.has_pending_audience(),
                 "ui_review": ui_review,
+                "prerequisites": q.prerequisites(),
                 "worker": _worker_verdict_for_quest(q, audit.worktree_path),
             }
             results.append(q_dict)
@@ -5291,14 +5293,6 @@ def cmd_collect(args):
                     "pack unaudited tribute into a convoy (dispatch `/levy <id>` first)",
                 ))
                 continue
-        ui_status = effective_quest.extract_ui_review_status() or quest.extract_ui_review_status()
-        if ui_status.upper().startswith("PENDING") and not getattr(args, "skip_ui_review", False) and not is_hotfix:
-            skipped.append((
-                quest.id,
-                f"UI Review is PENDING ({ui_status}) — royal review required before collection "
-                f"(recommend `/artist {quest.id}` or pass `--skip-ui-review`)",
-            ))
-            continue
         audit = ward.audit_quest(quest, base_branch=base_branch)
         if audit.git_status.get("dirty"):
             skipped.append((quest.id, "dirty working tree"))
@@ -5445,6 +5439,20 @@ def cmd_collect(args):
     accepted = repackable
     print(f"🚢 Stamped {len(accepted)} Quest(s) onto {cogship_id}.")
 
+    # UI review is tracked debt, never a convoy poison pill: pack the Quest,
+    # report the outstanding/deferred state loudly, and record it in the pack
+    # record so the Court Artist lane can close it later (Royal Addendum).
+    ui_debt: list[str] = []
+    for q in accepted:
+        state, _detail = convoy_guard.ui_assent_state(repo_root, q.id)
+        if state in ("signed", "not_required"):
+            continue
+        ui_debt.append(f"{q.id}: {state}")
+        print(f"⚠️ UI debt: {q.id} — {state}")
+    if ui_debt:
+        print(f"   → {len(ui_debt)} UI debt item(s) carried in the pack record; UI review does "
+              "NOT block this convoy (closes later via a Court Artist Royal Addendum)")
+
     # Record the pack this collect authorised. Promotion is per-branch, so the
     # allow-list has to live on disk: the Gatekeeper's fast-forward promotes
     # every merge on the convoy branch, including one that landed after this
@@ -5455,6 +5463,7 @@ def cmd_collect(args):
             cogship_id,
             [q.id for q in accepted],
             base=base_branch,
+            extra={"ui_debt": ui_debt} if ui_debt else None,
         )
         if pack_path is not None and auto_commit:
             git_ops._run(["git", "add", str(pack_path)], cwd=repo_root)
@@ -6086,10 +6095,10 @@ def cmd_atelier(args):
             ))
             continue
         ui_status = effective_quest.extract_ui_review_status() or quest.extract_ui_review_status()
-        if not ui_status.upper().startswith("PENDING"):
+        if not ui_status.upper().startswith(("PENDING", "DEFERRED")):
             skipped.append((
                 quest.id,
-                f"UI Review is not PENDING ('{ui_status or 'not recorded'}') -- nothing for the "
+                f"UI Review is not PENDING/DEFERRED ('{ui_status or 'not recorded'}') -- nothing for the "
                 "artist to review; route through /collect instead",
             ))
             continue
@@ -6435,10 +6444,10 @@ def cmd_studio(args):
             ))
             continue
         ui_status = effective_quest.extract_ui_review_status() or quest.extract_ui_review_status()
-        if not ui_status.upper().startswith("PENDING"):
+        if not ui_status.upper().startswith(("PENDING", "DEFERRED")):
             skipped.append((
                 quest.id,
-                f"UI Review is not PENDING ('{ui_status or 'not recorded'}') -- nothing for the "
+                f"UI Review is not PENDING/DEFERRED ('{ui_status or 'not recorded'}') -- nothing for the "
                 "artist to review; route through /collect instead",
             ))
             continue
@@ -7224,6 +7233,36 @@ def cmd_nightwatch(args):
     ))
 
 
+def cmd_pickup(args):
+    """Pleasance pickup: fetch the remote-steward paperwork branch, validate
+    every changed `.court` quest/vigil file, merge the valid ones into castle
+    in ONE atomic commit, and push the trunk back (best-effort).
+
+    A rejection (out-of-lane path, dirty tree, invalid/commissioned charter,
+    invalid or colliding vigil) exits nonzero with nothing merged; a normal
+    no-op (no pleasance branch / nothing new) exits zero.
+    """
+    repo = Path(getattr(args, "repo", None) or git_ops.get_repo_root()).resolve()
+    if not (repo / ".court").is_dir():
+        print(f"ERROR: {repo} has no .court/ — not a Court repository", file=sys.stderr)
+        sys.exit(1)
+    result = pickup.run(
+        repo,
+        fetch=not bool(getattr(args, "no_fetch", False)),
+        base=getattr(args, "base", "castle"),
+        branch=getattr(args, "branch", pickup.PICKUP_BRANCH),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    if result.get("rejected"):
+        print(f"REJECTED: {result['rejected']}")
+        sys.exit(1)
+    if result.get("skipped"):
+        print(result["skipped"])
+        return
+    picked = len(result.get("picked") or [])
+    print(f"picked {picked} file(s) — committed {result.get('committed')}")
+
+
 def _awaiting_buckets(quests, ui_pending_ids=frozenset()):
     """Group the board into the three human-decision dams.
 
@@ -7941,7 +7980,10 @@ def cmd_ui_signoff(args):
     note = (args.note or "").strip()
     stamp = now_iso()
     suffix = f" — {note}" if note else ""
-    if args.waive:
+    if getattr(args, "defer", False):
+        review_line = f"- **UI Review:** DEFERRED — {by} — {stamp}{suffix}"
+        kind = "deferral"
+    elif args.waive:
         review_line = f"- **UI Review:** WAIVED by {by} — {stamp}{suffix}"
         kind = "waiver"
     elif args.none_required:
@@ -7961,7 +8003,10 @@ def cmd_ui_signoff(args):
             replaced = True
     if not replaced:
         lines.append(review_line)
-    lines.append(f"- **UI Sign-off:** {by} — {stamp}{suffix}")
+    if getattr(args, "defer", False):
+        lines.append(f"- **UI Sign-off:** {by} — deferred ({stamp} UTC){suffix}")
+    else:
+        lines.append(f"- **UI Sign-off:** {by} — {stamp}{suffix}")
     quest.body_sections[section_name] = "\n".join(line for line in lines if line is not None).strip()
     quest.log_ledger(quest.status, quest.status, f"UI {kind} recorded by {by}{suffix}")
     store.save(quest, auto_commit=not getattr(args, "no_commit", False))
@@ -7973,11 +8018,11 @@ def cmd_ui_signoff(args):
 def _ship_interrogation(args, quests, trunk: str) -> tuple[list[str], list[str]]:
     """Pre-confirm interrogation of what `ship --confirm` would carry.
 
-    Returns ``(integrity, ui)`` problems. Integrity findings always block:
-    they mean the trunk itself is wrong (code merged with no promotion decision,
-    or a convoy rider). UI findings block unless --skip-ui-review was passed,
-    and the waiver is named in the report so it is never silent.
-    """
+    Returns ``(integrity, ui)``. Integrity findings always block: they mean
+    the trunk itself is wrong (code merged with no promotion decision, or a
+    convoy rider). UI review never blocks this ship — outstanding/deferred
+    review is reported as debt and closed later by a Court Artist pass, so
+    ``ui`` is always empty."""
     repo_root = git_ops.get_repo_root()
     integrity: list[str] = []
     ui: list[str] = []
@@ -8007,31 +8052,26 @@ def _ship_interrogation(args, quests, trunk: str) -> tuple[list[str], list[str]]
     if not rider_findings:
         print("   ✅ every convoy member is in the manifest")
 
-    print("\n3. UI review — written assent per Quest (chat approval must be recorded)")
+    print("\n3. UI review — outstanding/deferred (does NOT block this ship; Court Artist addendum closes it later)")
     skip_ui = bool(getattr(args, "skip_ui_review", False))
+    ui_debt: list[tuple[str, str]] = []
     for quest in quests:
         state, detail = convoy_guard.ui_assent_state(repo_root, quest.id)
-        if state in ("signed", "waived", "not_required"):
+        if state in ("signed", "waived", "not_required", "deferred"):
             print(f"   ✅ {quest.id}: UI {state} — {detail[:90]}")
             continue
-        ui.append(
-            f"{quest.id}: UI review {state}"
-            + (f" — {detail[:120]}" if detail else " (no UI record in the charter)")
-            + f" → court ui-signoff {quest.id.split('-')[0]} --by \"M'Lord\""
-        )
-        print(f"   🔴 {quest.id}: UI {state}" + (f" — {detail[:110]}" if detail else " — no charter record"))
-    waived: list[str] = []
-    if skip_ui and ui:
-        print(f"\n   ⚠️  --skip-ui-review passed: waiving {len(ui)} UI finding(s) for this ship.")
-        waived, ui = ui, []
+        ui_debt.append((quest.id, state + (f" — {detail[:120]}" if detail else " (no UI record in the charter)")))
+        print(f"   ⚠️ {quest.id}: UI {state}" + (f" — {detail[:110]}" if detail else " — no charter record"))
+    if skip_ui:
+        print("   UI review is non-blocking this ship; --skip-ui-review is a noop")
 
     print("\n" + "-" * 76)
-    if not integrity and not ui:
+    if not integrity:
         print("✅ INTERROGATION PASSED")
     else:
-        print(f"❌ INTERROGATION: {len(integrity)} integrity + {len(ui)} UI blocking finding(s)")
-        if waived:
-            print(f"   (UI waived by --skip-ui-review: {len(waived)})")
+        print(f"❌ INTERROGATION: {len(integrity)} integrity blocking finding(s)")
+    if ui_debt:
+        print(f"   (⚠️ {len(ui_debt)} UI debt item(s) tracked for the Court Artist lane — non-blocking)")
     print("-" * 76)
     return integrity, ui
 
@@ -8055,6 +8095,12 @@ def cmd_ship(args):
         ]
     manifest = store.rollup_ship_manifest(quests=target_quests)
     quests = manifest["quests"]
+    repo_root = git_ops.get_repo_root()
+    ui_debt_roster = []
+    for q in quests:
+        state, _detail = convoy_guard.ui_assent_state(repo_root, q.id)
+        if state not in ("signed", "waived", "not_required", "deferred"):
+            ui_debt_roster.append((q.id, state))
 
     ab = git_ops.get_ahead_behind(base_branch, head_branch)
     log_res = git_ops.get_branch_log(base_branch, head_branch, max_count=30)
@@ -8169,6 +8215,15 @@ def cmd_ship(args):
         print(f"\n✅ Commutations Done ({len(manifest['commutations_done'])}) — already executed and logged in Cogship Log: {done_ids}")
         print("   (steer them with `court` /status — they are no longer outstanding post-deploy actions)")
 
+    # 6c. UI Debt Roster: outstanding/deferred UI review that does not block this
+    # ship — the Court Artist lane (Royal Addendum) closes it after deploy.
+    if ui_debt_roster:
+        print("\n" + "-" * 76)
+        print(f"⚠️ UI DEBT ROSTER — outstanding/deferred UI review ({len(ui_debt_roster)} Quest(s))")
+        print("   UI review does NOT block this ship; the Court Artist lane closes these later.")
+        for qid, state in ui_debt_roster:
+            print(f"   * {qid} -> {state}")
+
     # 7. Extra Tribute Not Requested (Scope Smuggling / Over-Delivery Intelligence)
     if manifest.get("extra_tributes"):
         print("\n" + "-" * 76)
@@ -8185,17 +8240,14 @@ def cmd_ship(args):
     # Q147: `--confirm` promotes the staged convoy into production. Everything
     # above stays a read-only report; only this branch mutates git/remote/Fly.
     if getattr(args, "confirm", False):
-        integrity, ui = _ship_interrogation(args, quests or [], head_branch)
-        if integrity or ui:
+        integrity, _ui = _ship_interrogation(args, quests or [], head_branch)
+        if integrity:
             print(
-                f"\n❌ SHIP REFUSED — {len(integrity)} integrity finding(s), {len(ui)} UI finding(s). "
+                f"\n❌ SHIP REFUSED — {len(integrity)} integrity finding(s). "
                 f"Nothing was merged or pushed."
             )
-            for problem in integrity + ui:
+            for problem in integrity:
                 print(f"   - {problem}")
-            if ui:
-                print("   Record the decision (`court ui-signoff <quest> --by \"M'Lord\"`), or pass")
-                print("   --skip-ui-review to waive ONLY the UI segment (named in the report).")
             sys.exit(1)
         rc = _execute_ship_deployment(args, base_branch, head_branch, quests=quests)
         sys.exit(rc)
@@ -9375,6 +9427,7 @@ def build_parser():
     p_ui_signoff.add_argument("--by", required=True, help="Who assented (for example M'Lord)")
     p_ui_signoff.add_argument("--note", default="", help="Provenance: which session/chat the assent came from")
     p_ui_signoff.add_argument("--waive", action="store_true", help="Record an explicit UI review waiver instead of approval")
+    p_ui_signoff.add_argument("--defer", action="store_true", help="Record the UI review as DEFERRED (tracked debt closed later by a Court Artist pass)")
     p_ui_signoff.add_argument("--none-required", dest="none_required", action="store_true", help="Declare no UI surface was touched")
     p_ui_signoff.add_argument("--no-commit", dest="no_commit", action="store_true", help="Write the charter without committing")
     p_ui_signoff.set_defaults(func=cmd_ui_signoff)
@@ -9490,6 +9543,19 @@ def build_parser():
     p_nightwatch.add_argument("--allow-force-goad", dest="allow_force_goad", action="store_true", help="Permit --force goads (supersedes a live worker). Off by default.")
     p_nightwatch.add_argument("--quiet", action="store_true", help="Journal only; suppress per-tick console output")
     p_nightwatch.set_defaults(func=cmd_nightwatch)
+
+    p_pickup = sub.add_parser(
+        "pickup",
+        help="Pleasance lane: fetch and validate the remote-steward paperwork branch (pleasance), then merge the valid .court quest/vigil files into castle in ONE atomic commit",
+    )
+    p_pickup.add_argument("--repo", default=None, help="Court repository (default: this repo)")
+    p_pickup.add_argument("--no-fetch", dest="no_fetch", action="store_true",
+                          help="Skip `git fetch origin pleasance` (use the existing local refs)")
+    p_pickup.add_argument("--dry-run", action="store_true", help="Validate and print; change nothing")
+    p_pickup.add_argument("--base", default="castle", help="Trunk to apply onto and compare against (default: castle)")
+    p_pickup.add_argument("--branch", default=pickup.PICKUP_BRANCH,
+                          help=f"Pleasance branch name (default: {pickup.PICKUP_BRANCH})")
+    p_pickup.set_defaults(func=cmd_pickup)
 
     p_awaiting = sub.add_parser(
         "awaiting",

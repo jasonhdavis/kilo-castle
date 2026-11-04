@@ -5,6 +5,7 @@ import pytest
 from court.cli import main
 from court import store
 from court import vigils
+from court import cli
 
 
 def test_cli_new_show_advance_status(tmp_path, monkeypatch, capsys):
@@ -404,4 +405,74 @@ def test_cli_enqueue_queues_a_dispatch_handoff(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Already queued" in out
     assert len(vigils.load_all(tmp_path)) == 1
+
+
+def _ship_args(skip_ui_review=False):
+    return type("Args", (), {"skip_ui_review": skip_ui_review})()
+
+
+def test_ship_interrogation_missing_ui_review_returns_empty_ui(tmp_path, monkeypatch, capsys):
+    _init_git_repo(tmp_path, branch="castle")
+    monkeypatch.setenv("COURT_DIR", str(tmp_path / ".court"))
+    monkeypatch.chdir(tmp_path)
+    main(["init"])
+    capsys.readouterr()
+    main([
+        "new", "--app", "core", "--concern", "ship-ui", "--title", "Ship UI Quest",
+        "--section", "Feature",
+    ])
+    capsys.readouterr()
+    quest = store.load(store.list_all(court_root=tmp_path / ".court")[0].id, court_root=tmp_path / ".court")
+
+    integrity, ui = cli._ship_interrogation(_ship_args(), [quest], "castle")
+    assert ui == []
+    assert integrity == []
+    out = capsys.readouterr().out
+    assert "UI missing" in out
+    assert "does NOT block this ship" in out
+    assert "UI debt item(s)" in out
+
+
+def test_ship_interrogation_integrity_findings_still_block(tmp_path, monkeypatch, capsys):
+    _init_git_repo(tmp_path, branch="castle")
+    monkeypatch.setenv("COURT_DIR", str(tmp_path / ".court"))
+    monkeypatch.chdir(tmp_path)
+    main(["init"])
+    capsys.readouterr()
+    quests_dir = tmp_path / ".court" / "quests"
+    quests_dir.mkdir(parents=True, exist_ok=True)
+    (quests_dir / "Q501-Hidden-In-Trunk.md").write_text(
+        "id: Q501-Hidden-In-Trunk\nstatus: GATE\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "checkout", "-q", "-b", "quest/q501-hidden-in-trunk"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "-m", "work"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "checkout", "-q", "castle"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "merge", "-q", "--no-ff", "-m", "promote", "quest/q501-hidden-in-trunk"], check=True)
+
+    integrity, ui = cli._ship_interrogation(_ship_args(), [], "castle")
+    assert ui == []
+    assert any("already merged into castle" in msg for msg in integrity)
+    out = capsys.readouterr().out
+    assert "integrity blocking finding(s)" in out
+
+
+def test_ship_interrogation_skip_ui_review_is_a_noop(tmp_path, monkeypatch, capsys):
+    _init_git_repo(tmp_path, branch="castle")
+    monkeypatch.setenv("COURT_DIR", str(tmp_path / ".court"))
+    monkeypatch.chdir(tmp_path)
+    main(["init"])
+    capsys.readouterr()
+    main([
+        "new", "--app", "core", "--concern", "ship-ui-noop", "--title", "Ship UI Noop Quest",
+        "--section", "Feature",
+    ])
+    capsys.readouterr()
+    quest = store.load(store.list_all(court_root=tmp_path / ".court")[0].id, court_root=tmp_path / ".court")
+
+    integrity, ui = cli._ship_interrogation(_ship_args(skip_ui_review=True), [quest], "castle")
+    assert ui == []
+    assert integrity == []
+    out = capsys.readouterr().out
+    assert "--skip-ui-review is a noop" in out
 

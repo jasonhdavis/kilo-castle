@@ -1,6 +1,38 @@
 from court.models import Quest, STATUSES, SECTIONS, KINDS, DEFAULT_BODY_SECTIONS, LEGACY_SECTION_ALIASES, now_iso
 
 
+def test_quest_prerequisites_parsing():
+    q = Quest(id="Q900-Pickup", title="Pickup lane", status="CHARTERED")
+    q.set_section("Prerequisites", "- branch-merged:castle\n- [ ] quest-status:Q1=GATE\n\n- [x] file-exists:artifact.txt\n")
+    assert q.prerequisites() == [
+        "branch-merged:castle",
+        "quest-status:Q1=GATE",
+        "file-exists:artifact.txt",
+    ]
+    empty = Quest(id="Q901-Pickup", title="No prereqs")
+    assert empty.prerequisites() == []
+
+
+def test_quest_prerequisites_parsed_from_markdown():
+    md = """---
+id: Q900-Pickup
+title: Pickup lane
+status: CHARTERED
+---
+
+# Q900-Pickup — Pickup lane
+
+## Prerequisites
+- quest-status:Q123=GATE
+- [x] branch-merged:castle
+
+## The Kingdom Requires
+The thing.
+"""
+    q = Quest.from_markdown(md)
+    assert q.prerequisites() == ["quest-status:Q123=GATE", "branch-merged:castle"]
+
+
 def test_quest_initialization_defaults():
     q = Quest(id="Q001-Platform-Test", title="Test Quest", app="platform", concern="test")
     assert q.status == "OPEN"

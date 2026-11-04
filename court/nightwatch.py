@@ -589,8 +589,42 @@ def _within(ts: Optional[float], window: int, now: float) -> bool:
     return bool(ts) and (now - float(ts)) < window
 
 
+def _charter_ready(repo: Path, qmap: dict, now: Optional[datetime] = None) -> list:
+    """Ids of CHARTERED quests (no worktree) whose castle charter's
+    ``## Prerequisites`` predicates are ALL satisfied — the pleasance
+    charter-driven dispatch lane. Empty prerequisites = satisfied. An
+    unreadable/unparseable charter is conservatively NOT ready (it would have
+    been rejected by the pleasance pickup anyway)."""
+    from .models import Quest
+    from . import store
+
+    now = now or vigils.now_utc()
+    ready: list = []
+    for q in qmap.values():
+        if (q.get("status") or "").upper() != "CHARTERED":
+            continue
+        if q.get("worktree"):
+            continue
+        p = store.find_path(q["id"], court_root=Path(repo) / ".court")
+        if p is None:
+            continue
+        try:
+            quest = Quest.from_markdown(p.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        satisfied = True
+        for cond in quest.prerequisites():
+            ok, _why = vigils.check_condition(cond, repo, qmap, now=now)
+            if not ok:
+                satisfied = False
+                break
+        if satisfied:
+            ready.append(q["id"])
+    return ready
+
+
 def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[float] = None,
-         ready_vigils: Optional[list] = None) -> tuple[list, list]:
+         ready_vigils: Optional[list] = None, charter_ready: Optional[list] = None) -> tuple[list, list]:
     """Decide this tick's actions. Returns (actions, notes).
 
     Pure function: no I/O beyond the already-collected inputs, so the policy
@@ -619,6 +653,36 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
     capacity = max(0, policy.max_workers - busy_workers)
     busy_dirs = workers.get("dirs") or {}
     ready_vigils = ready_vigils or []
+
+    # --- Charter lane: CHARTERED quest whose prerequisites are satisfied -----
+    # The pleasance pickup lane: a charter with `status: CHARTERED` whose
+    # `## Prerequisites` predicates are all satisfied is dispatched by the
+    # watch — the charter itself is the authority, no synthesized vigil file.
+    # The satisfaction is computed in tick() (repo I/O); plan only consumes
+    # the id list, staying pure. Fresh dispatch = a NEW worktree (--standup).
+    for qid in charter_ready or []:
+        q = quests.get(qid)
+        if not q or (q.get("status") or "").upper() != "CHARTERED":
+            continue
+        if q.get("worktree"):
+            note(qid, "skip", "charter CHARTERED and prereqs satisfied but a worktree already exists")
+            continue
+        st = qstate.get(qid) or {}
+        if now < float(st.get("retry_at") or 0):
+            continue
+        if not policy.allow_dispatch:
+            note(qid, "skip", "charter CHARTERED ready but dispatch is disabled")
+            continue
+        if capacity <= 0:
+            note(qid, "skip",
+                 f"charter CHARTERED ready but worker ceiling reached ({busy_workers}/{policy.max_workers})")
+            continue
+        actions.append(Action(
+            kind="dispatch", quest_ids=[qid],
+            reason="charter CHARTERED with prerequisites satisfied — pickup lane",
+            meta={"fresh": True, "serf_index": 0, "retry_backoff": policy.retry_backoff},
+        ))
+        capacity -= 1
 
     # --- Vigils first: an explicit Steward hand-off beats the heuristics ---
     for spec, why in ready_vigils:
@@ -674,18 +738,6 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
             continue
         if q.get("pending_audience"):
             note(q["id"], "skip", "GATE but pending Audience — parked")
-            continue
-        # A PENDING UI review is a Court Artist gate the watch cannot clear.
-        # `court collect` will refuse the convoy, so planning a collect here
-        # would burn the per-tick action budget on a guaranteed no-op (the
-        # cogship-382 starvation: one UI-pending convoy ate the single slot
-        # every tick, so nothing else was ever reached). Escalate once instead.
-        ui = (q.get("ui_review") or "").strip()
-        if ui.upper().startswith("PENDING"):
-            note(q["id"], "human",
-                 f"GATE blocked on PENDING UI review ({ui[:70]}) — needs a Court Artist "
-                 f"(`/artist {q['id']}` or `/atelier`); withholding from collect",
-                 key="ui_pending")
             continue
         role = role_state(q.get("worktree"), "gatekeeper")
         if role["state"] in ("live", "stalled", "watching"):
@@ -1203,9 +1255,15 @@ def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -
         # every multi-quest convoy the watch tried to pack.
         argv = ["collect"] + ([",".join(action.quest_ids)] if action.quest_ids else [])
     elif action.kind == "dispatch":
-        # Bounded replacement dispatch: a spent serf is replaced by a fresh one
-        # in the SAME worktree (`--replace`), inheriting the committed prior art.
-        argv = ["dispatch", *action.quest_ids, "--replace"]
+        # A fresh dispatch (the charter pickup lane) spawns a NEW worktree from
+        # the castle tip (`--standup`); a bounded replacement dispatch replaces
+        # a spent serf in the SAME worktree (`--replace`), inheriting the
+        # committed prior art. `court dispatch --standup` is the default shape
+        # for fresh work, so the fresh path is just the verb + ids.
+        if action.meta.get("fresh"):
+            argv = ["dispatch", *action.quest_ids, "--standup"]
+        else:
+            argv = ["dispatch", *action.quest_ids, "--replace"]
     elif action.kind == "steward":
         # One bounded triage session on the trunk. The reason is forwarded so
         # the Steward's prompt names the exact stall the watch observed.
@@ -1352,11 +1410,17 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
     elif action.kind == "dispatch":
         # A replacement dispatch advances to the next serf slot; it spends no
         # goad, and clears the goad cooldown so the new serf can be prompted.
-        if ok:
-            for qid in action.quest_ids:
-                st = qstate.setdefault(qid, {})
+        # A FRESH dispatch (the charter pickup lane) has no prior serf to
+        # advance: success moves the Quest to WORKING upstream so it never
+        # re-triggers; a failure backs the Quest off so the watch does not
+        # re-dispatch it on the very next tick.
+        for qid in action.quest_ids:
+            st = qstate.setdefault(qid, {})
+            if ok and not action.meta.get("fresh"):
                 st["serf_index"] = int(action.meta.get("serf_index") or 0) + 1
                 st["last_goad_ts"] = 0
+            elif not ok and action.meta.get("fresh") and backoff:
+                st["retry_at"] = now + backoff
     elif action.kind == "coin":
         for qid in action.quest_ids:
             st = qstate.setdefault(qid, {})
@@ -1505,14 +1569,18 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
         return {"actions": [], "notes": [], "workers": workers, "error": str(e)}
 
     try:
-        ready, vigil_notes = vigils.ready_vigils(repo, _quest_map(snap), now=datetime.now(timezone.utc))
+        now_dt = datetime.now(timezone.utc)
+        qmap = _quest_map(snap)
+        ready, vigil_notes = vigils.ready_vigils(repo, qmap, now=now_dt)
+        charter_ready = _charter_ready(repo, qmap, now=now_dt)
     except Exception as e:  # noqa: BLE001
-        ready, vigil_notes = [], []
+        ready, vigil_notes, charter_ready = [], [], []
         say(f"⚠️  vigil evaluation failed: {e}")
     vigil_notice: list[dict] = []
     for vn in vigil_notes:
         vigil_notice.append({"quest": vn["id"], "level": "vigil", "text": vn["text"]})
-    actions, notes = plan(snap, state, policy, workers, now=now, ready_vigils=ready)
+    actions, notes = plan(snap, state, policy, workers, now=now, ready_vigils=ready,
+                          charter_ready=charter_ready)
     notes = vigil_notice + notes
     _record_escalations(state, notes, now)
     # Board fingerprint: only re-stamp the "observed since" timestamp when the

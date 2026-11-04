@@ -224,6 +224,8 @@ def ui_review_pending(repo_root: Path, quest_id: str) -> bool:
         quest = store.load(quest_id, court_root=Path(repo_root) / ".court")
         status = quest.extract_ui_review_status()
         if status:
+            if "defer" in status.strip().lower():
+                return False
             return status.strip().upper().startswith("PENDING")
     except Exception:
         pass
@@ -239,6 +241,8 @@ def ui_review_pending(repo_root: Path, quest_id: str) -> bool:
         match = _UI_REVIEW_RE.match(line)
         if match:
             last = match.group(1)
+    if "defer" in last.lower():
+        return False
     return "pending" in last.lower()
 
 
@@ -253,6 +257,8 @@ def ui_assent_state(repo_root: Path, quest_id: str) -> tuple[str, str]:
     Returns ``(state, detail)`` where state is one of:
 
     * ``signed``       — an explicit ``**UI Sign-off:** <who> <when>`` line;
+    * ``deferred``     — the review or sign-off text carries ``defer`` (tracked debt,
+                         closed later by a Court Artist pass);
     * ``waived``       — ``UI Review: WAIVED …`` (the explicit --skip-ui-review trail);
     * ``not_required`` — ``UI Review: None required`` / ``not required``;
     * ``pending``      — any other outstanding review text;
@@ -275,6 +281,8 @@ def ui_assent_state(repo_root: Path, quest_id: str) -> tuple[str, str]:
         if value and not _PLACEHOLDER_RE.match(value):
             signoff = value
     if signoff:
+        if "defer" in signoff.lower():
+            return "deferred", signoff
         return "signed", signoff
 
     review = ""
@@ -284,6 +292,8 @@ def ui_assent_state(repo_root: Path, quest_id: str) -> tuple[str, str]:
         return "missing", ""
 
     lowered = review.lower()
+    if "defer" in lowered:
+        return "deferred", review
     if "waived" in lowered:
         return "waived", review
     if "not required" in lowered or "none required" in lowered or "no ui" in lowered:
@@ -421,9 +431,10 @@ def audit_promotion(
             ))
         if not allow_ui_pending and ui_review_pending(repo_root, qid):
             findings.append(Finding(
-                "error",
-                f"{qid} still has a pending UI review — its code must not enter {base} "
-                f"until the artist signs off (or pass --allow-ui-pending deliberately).",
+                "warn",
+                f"{qid} carries a pending UI review — tracked debt, not a block: the Court "
+                f"Artist lane closes it later (Royal Addendum); promotion proceeds without it. "
+                f"(--allow-ui-pending silences this warning.)",
                 quest=qid,
                 branch=source,
             ))

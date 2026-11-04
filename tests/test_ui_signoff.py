@@ -70,3 +70,19 @@ def test_none_required_declaration_is_recorded(tmp_path, monkeypatch):
 
     state, detail = cg.ui_assent_state(tmp_path, "Q1-Core-Assent")
     assert state == "signed", detail
+
+
+def test_defer_records_a_deferred_review_that_classifies_as_deferred(tmp_path, monkeypatch):
+    court_dir = _court_dir(tmp_path)
+    monkeypatch.setenv("COURT_DIR", str(court_dir))
+    _quest(court_dir)
+
+    cmd_ui_signoff(_args(defer=True, note="M'Lord away until the 12th"))
+
+    loaded = store.load("Q1-Core-Assent", court_root=court_dir)
+    audit = loaded.body_sections["Master of Coin's Audit"]
+    assert "UI Review:** DEFERRED" in audit
+    assert "**UI Sign-off:**" in audit and "deferred" in audit
+    state, detail = cg.ui_assent_state(tmp_path, "Q1-Core-Assent")
+    assert state == "deferred", detail
+    assert "deferred" in detail

@@ -495,30 +495,39 @@ def test_a_failed_convoy_pack_does_not_burn_the_gate_cooldown(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# UI-review hold, no-op collect backoff, one-shot escalation
+# UI review is tracked debt, never a GATE hold
 # ---------------------------------------------------------------------------
 
 def _ui_pending(qid, wt, **kw):
     return _q(qid, "GATE", wt, cogship_id="cogship-382", ui_review="PENDING (Recommend Court Artist)", **kw)
 
 
-def test_a_ui_pending_convoy_is_escalated_and_never_collected(tmp_path):
+def test_a_ui_pending_gate_quest_proceeds_to_collect(tmp_path):
     wt = _free(tmp_path)
     snap = _snap(_ui_pending("Q1", wt))
     actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers())
-    assert actions == []
-    assert any(n["level"] == "human" and "Court Artist" in n["text"] for n in notes)
+    assert [a.kind for a in actions] == ["collect"]
+    assert not any(n.get("key") == "ui_pending" for n in notes)
 
 
-def test_a_ui_pending_convoy_does_not_starve_another_collect(tmp_path):
-    """The cogship-382 starvation: the UI-pending convoy must not consume the
-    only action slot, so a ready convoy still gets packed."""
+def test_a_ui_pending_convoy_takes_a_regular_collect_slot(tmp_path):
+    """The cogship-382 starvation is gone: a PENDING-UI convoy plans collect
+    like any other GATE quest instead of eating the escalation slot."""
     blocked = _free(tmp_path, "blocked")
     ready = _free(tmp_path, "ready")
     snap = _snap(_ui_pending("Q1", blocked), _q("Q2", "GATE", ready, cogship_id="cogship-999"))
-    actions, _ = nw.plan(snap, nw.load_state(tmp_path), _policy(max_spawns_per_tick=1), _workers())
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(max_spawns_per_tick=1), _workers())
     assert [a.kind for a in actions] == ["collect"]
-    assert actions[0].quest_ids == ["Q2"]
+    assert actions[0].quest_ids == ["Q1"]
+    assert not any(n.get("key") == "ui_pending" for n in notes)
+
+
+def test_a_gate_quest_with_pending_audience_is_still_parked(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_ui_pending("Q1", wt, pending_audience=True))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers())
+    assert actions == []
+    assert any(n.get("level") == "skip" and "Audience" in n.get("text", "") for n in notes)
 
 
 def test_a_noop_collect_backs_the_convoy_off_hard(tmp_path):
@@ -1083,3 +1092,155 @@ def test_policy_describe_names_the_effective_levers():
     assert "workers<=2" in line
     assert "spawns=1/tick,8/h" in line
     assert "enable=goad,coin,collect,dispatch" in line
+
+
+# ---------------------------------------------------------------------------
+# Charter lane — the pleasance pickup drives dispatch (no vigil file)
+# ---------------------------------------------------------------------------
+
+def test_charter_ready_quest_is_dispatched_fresh(tmp_path):
+    snap = _snap(_q("Q234", "CHARTERED", worktree=""))
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers(),
+                         charter_ready=["Q234"])
+    assert [(a.kind, a.quest_ids) for a in actions] == [("dispatch", ["Q234"])]
+    assert actions[0].meta["fresh"] is True
+    assert actions[0].meta["serf_index"] == 0
+    assert "pickup lane" in actions[0].reason
+
+
+def test_charter_ready_a_non_chartered_quest_is_ignored(tmp_path):
+    snap = _snap(_q("Q234", "PLANNED", worktree=""))
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers(),
+                         charter_ready=["Q234"])
+    assert actions == []
+
+
+def test_charter_ready_skips_a_quest_that_already_has_a_worktree(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q234", "CHARTERED", wt))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers(),
+                             charter_ready=["Q234"])
+    assert actions == []
+    assert any(n["level"] == "skip" and "worktree" in n["text"] for n in notes)
+
+
+def test_charter_ready_respects_the_worker_ceiling(tmp_path):
+    snap = _snap(_q("Q234", "CHARTERED", worktree=""))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(max_workers=3),
+                             _workers(count=3), charter_ready=["Q234"])
+    assert actions == []
+    assert any("ceiling" in n["text"] for n in notes)
+
+
+def test_charter_ready_takes_one_capacity_slot(tmp_path):
+    snap = _snap(_q("Q1", "CHARTERED", worktree=""), _q("Q2", "CHARTERED", worktree=""))
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path),
+                         _policy(max_spawns_per_tick=1, max_workers=4),
+                         _workers(), charter_ready=["Q1", "Q2"])
+    assert [(a.kind, a.quest_ids) for a in actions] == [("dispatch", ["Q1"])]
+
+
+def test_charter_ready_a_dispatch_is_disabled_is_skipped(tmp_path):
+    snap = _snap(_q("Q234", "CHARTERED", worktree=""))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path),
+                             _policy(allow_dispatch=False), _workers(),
+                             charter_ready=["Q234"])
+    assert actions == []
+    assert any(n["level"] == "skip" and "dispatch is disabled" in n["text"] for n in notes)
+
+
+def test_charter_ready_honours_the_backoff_from_a_failed_dispatch(tmp_path):
+    state = nw.load_state(tmp_path)
+    state["quests"]["Q234"] = {"retry_at": time.time() + 3600}
+    snap = _snap(_q("Q234", "CHARTERED", worktree=""))
+    actions, _ = nw.plan(snap, state, _policy(), _workers(), charter_ready=["Q234"])
+    assert actions == []
+
+
+def test_failed_fresh_dispatch_sets_a_backoff_but_no_serf_index(tmp_path):
+    state = nw.load_state(tmp_path)
+    action = nw.Action(kind="dispatch", quest_ids=["Q234"],
+                       meta={"fresh": True, "retry_backoff": 300})
+    nw._apply_bookkeeping(state, action, {"ok": False, "stderr_tail": "boom"}, 1000.0)
+    assert state["quests"]["Q234"]["retry_at"] == 1300.0
+    # a successful fresh dispatch records nothing (the Quest moves to WORKING
+    # upstream, so it never re-triggers); it must not advance a serf index that
+    # does not exist
+    nw._apply_bookkeeping(state, action, {"ok": True, "stderr_tail": ""}, 2000.0)
+    assert "serf_index" not in state["quests"]["Q234"]
+    assert state["quests"]["Q234"]["retry_at"] == 0
+
+
+def test_fresh_dispatch_runs_with_standup(tmp_path, monkeypatch):
+    from court.nightwatch import Action
+    called = {}
+
+    def fake_court(repo, *argv, timeout=None, env=None):
+        called["argv"], called["env"] = argv, env
+
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(nw, "_court", fake_court)
+    res = nw.execute(tmp_path, Action("dispatch", quest_ids=["Q7"], meta={"fresh": True}))
+    assert res["ok"]
+    assert list(called["argv"]) == ["dispatch", "Q7", "--standup"]
+    assert called["env"].get("COURT_WATCH_DISPATCH") == "1"
+
+
+def _charter_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".court" / "quests").mkdir(parents=True)
+    return repo
+
+
+def _charter_md(qid, status, prereqs=()):
+    lines = ["---", f"id: {qid}", f"title: {qid}", f"status: {status}", "---", "",
+             f"# {qid}", "", "## The Kingdom Requires", "x"]
+    if prereqs:
+        lines += ["", "## Prerequisites"] + [f"- {p}" for p in prereqs]
+    return "\n".join(lines) + "\n"
+
+
+def test_charter_ready_empty_prereqs_are_satisfied(tmp_path):
+    repo = _charter_repo(tmp_path)
+    (repo / ".court" / "quests" / "Q234-New.md").write_text(
+        _charter_md("Q234-New", "CHARTERED"), encoding="utf-8")
+    qmap = {"Q234-New": {"id": "Q234-New", "status": "CHARTERED", "worktree": ""}}
+    assert nw._charter_ready(repo, qmap) == ["Q234-New"]
+
+
+def test_charter_ready_requires_every_prereq_to_hold(tmp_path):
+    repo = _charter_repo(tmp_path)
+    (repo / ".court" / "quests" / "Q234-New.md").write_text(
+        _charter_md("Q234-New", "CHARTERED", prereqs=["quest-status:Q999=GATE"]),
+        encoding="utf-8")
+    qmap = {"Q234-New": {"id": "Q234-New", "status": "CHARTERED", "worktree": ""}}
+    assert nw._charter_ready(repo, qmap) == []
+    # the condition names a short-id prefix; once the dependency reaches GATE
+    # the quest becomes dispatch-ready
+    qmap["Q999-Old"] = {"id": "Q999-Old", "status": "GATE", "worktree": None}
+    assert nw._charter_ready(repo, qmap) == ["Q234-New"]
+
+
+def test_charter_ready_skips_working_occupied_broken(tmp_path):
+    repo = _charter_repo(tmp_path)
+    (repo / ".court" / "quests" / "Q5-Char.md").write_text(
+        _charter_md("Q5-Char", "CHARTERED"), encoding="utf-8")
+    (repo / ".court" / "quests" / "Q6-Work.md").write_text(
+        _charter_md("Q6-Work", "WORKING"), encoding="utf-8")
+    (repo / ".court" / "quests" / "Q7-Broken.md").write_text(
+        "garbage, not a charter", encoding="utf-8")
+    qmap = {
+        # has a worktree -> not eligible
+        "Q5-Char": {"id": "Q5-Char", "status": "CHARTERED", "worktree": "/wt"},
+        # not CHARTERED
+        "Q6-Work": {"id": "Q6-Work", "status": "WORKING", "worktree": ""},
+        # unparseable -> conservatively not ready (pickup would have rejected it)
+        "Q7-Broken": {"id": "Q7-Broken", "status": "CHARTERED", "worktree": ""},
+    }
+    assert nw._charter_ready(repo, qmap) == []

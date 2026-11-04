@@ -276,8 +276,9 @@ class TestCourtArtist(unittest.TestCase):
     @patch("court.store.stamp_cogship")
     @patch("court.store.save")
     @patch("court.cli.resolve_quest_selection")
-    def test_cmd_collect_skips_pending_ui_review(self, mock_resolve, mock_save, mock_stamp, mock_save_many, mock_audit):
-        """Test that court collect refuses to pack a Quest whose UI Review is PENDING."""
+    def test_cmd_collect_packs_pending_ui_quest_and_reports_debt(self, mock_resolve, mock_save, mock_stamp, mock_save_many, mock_audit):
+        """A pending UI review no longer blocks collection — it is tracked debt
+        reported in collect output and carried in the pack record."""
         q = Quest(
             id="Q907",
             title="Quest with Pending UI Review",
@@ -296,6 +297,7 @@ class TestCourtArtist(unittest.TestCase):
         mock_audit_res.git_status = {"dirty": False}
         mock_audit_res.violations = []
         mock_audit.return_value = mock_audit_res
+        mock_stamp.return_value = "cogship-998"
 
         args = MagicMock()
         args.base = "castle"
@@ -311,9 +313,10 @@ class TestCourtArtist(unittest.TestCase):
             cli.cmd_collect(args)
 
         output = buf.getvalue()
-        self.assertIn("UI Review is PENDING", output)
-        self.assertIn("/artist Q907", output)
-        mock_stamp.assert_not_called()
+        self.assertIn("Stamped 1 Quest(s) onto cogship-998", output)
+        self.assertIn("UI debt: Q907", output)
+        self.assertNotIn("UI Review is PENDING", output)
+        mock_stamp.assert_called_once()
 
     @patch("court.ward.audit_quest")
     @patch("court.store.save_many")

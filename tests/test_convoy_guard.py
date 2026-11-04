@@ -116,7 +116,7 @@ def test_a_stale_suite_proof_blocks_promotion(tmp_path):
     assert [f for f in allowed if f.level == "error"] == []
 
 
-def test_a_pending_ui_review_blocks_promotion_unless_overridden(tmp_path):
+def test_a_pending_ui_review_is_non_blocking_warn_not_an_error(tmp_path):
     repo = _repo(tmp_path)
     _charter(repo, "Q1009", "GATE", ui_review="PENDING — await the Court Artist")
     _quest_branch(repo, "quest/q1009-orders-fulfillment")
@@ -125,10 +125,11 @@ def test_a_pending_ui_review_blocks_promotion_unless_overridden(tmp_path):
     cg.record_pack(repo, "cogship-382", ["Q1009-Orders-Fulfillment"])
 
     findings = cg.audit_promotion(repo, "cogship-382")
-    assert any("pending UI review" in f.message for f in findings if f.level == "error")
+    assert not any(f.level == "error" for f in findings if "ui review" in f.message.lower())
+    assert any(f.level == "warn" and "pending UI review" in f.message for f in findings)
 
     overridden = cg.audit_promotion(repo, "cogship-382", allow_ui_pending=True)
-    assert [f for f in overridden if f.level == "error"] == []
+    assert not any("pending UI review" in f.message for f in overridden)
 
 
 def test_a_non_promotable_status_blocks_promotion(tmp_path):
@@ -232,6 +233,25 @@ def test_a_charter_with_no_ui_record_is_missing_not_approved(tmp_path):
     repo = _repo(tmp_path)
     _charter(repo, "Q1", "GATE")
     assert cg.ui_assent_state(repo, "Q1")[0] == "missing"
+
+
+def test_a_deferred_ui_review_classifies_as_deferred(tmp_path):
+    repo = _repo(tmp_path)
+    _charter(repo, "Q1", "GATE", ui_review="PENDING — deferred while M'Lord is away")
+    state, detail = cg.ui_assent_state(repo, "Q1")
+    assert state == "deferred"
+    assert "deferred" in detail
+    assert cg.ui_review_pending(repo, "Q1") is False
+
+
+def test_a_deferred_signoff_line_classifies_as_deferred(tmp_path):
+    repo = _repo(tmp_path)
+    _charter(repo, "Q1", "GATE", ui_review="PENDING")
+    charter = repo / ".court" / "quests" / "Q1-Test.md"
+    charter.write_text(charter.read_text() + "\n- **UI Sign-off:** M'Lord — deferred (2026-11-04T..Z)\n")
+    state, detail = cg.ui_assent_state(repo, "Q1")
+    assert state == "deferred"
+    assert "deferred" in detail
 
 
 def test_the_trunk_invariant_flags_code_merged_without_a_decision(tmp_path):

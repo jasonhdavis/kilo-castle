@@ -8,6 +8,7 @@ convoy was live. A bare `kilo run --agent gatekeeper` also died (missing
 `--auto`). These tests cover the engine fixes.
 """
 import io
+import json
 import subprocess
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -178,3 +179,32 @@ def test_collect_new_cogship_keyword_allocates(tmp_path, monkeypatch):
     # Printed Gatekeeper instructions must be headless-safe: a bare
     # `kilo run --agent gatekeeper` dies on an auto-rejected permission.
     assert "kilo run --auto --agent gatekeeper" in out
+
+
+def test_collect_packs_a_pending_ui_quest_and_records_ui_debt(tmp_path, monkeypatch):
+    quest = Quest(
+        id="Q902-Pending-UI",
+        title="Pending UI",
+        app="web",
+        concern="ui",
+        status="TRIBUTE_READY",
+        branch="quest/q902-pending-ui",
+        body_sections={
+            "The Kingdom Requires": "Do it.",
+            "Expected Tribute": "- [x] Done",
+            "Master of Coin's Audit": "- **Verdict:** PASS\n- **UI Review:** PENDING — deferred while M'Lord is away",
+        },
+    )
+    quests_dir = tmp_path / ".court" / "quests"
+    quests_dir.mkdir(parents=True)
+    (quests_dir / f"{quest.id}.md").write_text(quest.to_markdown(), encoding="utf-8")
+    monkeypatch.setattr(store, "stamp_cogship", lambda *a, **k: "cogship-013")
+
+    out = _run_collect(quest, _collect_args(), tmp_path, monkeypatch)
+
+    assert "Stamped 1 Quest(s) onto cogship-013." in out
+    assert "⚠️ UI debt: Q902-Pending-UI — deferred" in out
+    pack_path = tmp_path / ".court" / "convoys" / "cogship-013.json"
+    assert pack_path.is_file()
+    pack = json.loads(pack_path.read_text(encoding="utf-8"))
+    assert pack.get("ui_debt") == ["Q902-Pending-UI: deferred"]

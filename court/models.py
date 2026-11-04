@@ -68,6 +68,11 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Optional
 
+# Prerequisites-parsing expressions shared by the pleasance pickup lane
+# (court.pickup) and the Night's Watch charter-driven dispatch.
+_PREREQUISITES_HEADER_RE = re.compile(r"^#{2,3}\s+Prerequisites:?\s*$", re.MULTILINE)
+_PREREQ_LINE_RE = re.compile(r"^-\s*(?:\[[ xX]\])?\s*")
+
 # Canonical pipeline stages. Failures at TRIBUTE_READY/GATE return to an earlier
 # stage (QUESTING/WORKING or CHARTERED/DISPATCHED) rather than inventing new states.
 STATUSES = (
@@ -129,7 +134,7 @@ def validate_branch_name(branch: str) -> tuple[bool, str]:
     """Validate that branch follows organizational folder hierarchy with slashes."""
     if not branch:
         return True, ""
-    if branch in ("main", "castle", "the-gatehouse"):
+    if branch in ("main", "castle", "the-gatehouse", "pleasance"):
         return True, ""
     if branch.startswith(("epic/", "quest/", "scout/", "ward/", "the-gatehouse/", "artist/")):
         return True, ""
@@ -772,6 +777,37 @@ class Quest:
             return False
         return True
 
+    def prerequisites(self) -> list[str]:
+        """Deterministic dispatch prerequisites from the charter's
+        ``## Prerequisites`` body section (the pleasance charter-driven
+        dispatch lane). One predicate per line; a leading ``- `` bullet and an
+        optional markdown checkbox (``- [ ] `` / ``- [x] ``) are stripped and
+        blank lines dropped. An empty section is an empty list = satisfied.
+
+        A ``## Prerequisites`` header written directly after a free-text
+        section (``## The Kingdom Requires``, ``## Expected Tribute``, ...) is
+        carried as that section's CONTENT by the section parser, so the
+        dedicated body_section can come back empty; the body is scanned for
+        the header so the pickup lane reads the same predicates regardless of
+        where the author placed them."""
+        raw = self.body_sections.get("Prerequisites") or self.body_sections.get("Prerequisites:") or ""
+        if not raw.strip():
+            for content in self.body_sections.values():
+                m = _PREREQUISITES_HEADER_RE.search(content or "")
+                if m:
+                    raw = content[m.end():]
+                    break
+        out: list[str] = []
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            stripped = _PREREQ_LINE_RE.sub("", stripped).strip()
+            if not stripped:
+                continue
+            out.append(stripped)
+        return out
+
     def commutation_required(self) -> bool:
         """True when the Quest carries a non-empty, non-'none' Commutation
         instruction: a post-deployment action the Steward must execute."""
@@ -854,7 +890,8 @@ class Quest:
         """Extract the UI Review status from Master of Coin's Audit or Tribute Rendered.
 
         An APPROVED result that carries no sign-off evidence is downgraded to
-        PENDING so `collect`/the Night's Watch refuse to promote it."""
+        PENDING for non-deferred text. A record carrying ``defer`` surfaces as
+        DEFERRED so status UIs show the tracked debt."""
         moc = (
             self.body_sections.get("Master of Coin's Audit", "").strip()
             or self.body_sections.get("Master of Coin Review", "").strip()
@@ -863,12 +900,14 @@ class Quest:
             m = re.search(r"(?:^|\n)\s*[-*]\s+\*\*UI\s+Review(?:\s+Status)?:\*\*\s*(.+?)(?=\n\s*[-*]\s+\*\*|\Z)", moc, re.DOTALL | re.IGNORECASE)
             if m:
                 status = m.group(1).strip()
-                if status.upper().startswith("APPROVED") and not self.ui_approval_is_signed(status):
+                if status.upper().startswith("APPROVED") and not self.ui_approval_is_signed(status) and "defer" not in status.lower():
                     return (
                         "PENDING (APPROVED asserted without a recorded sign-off — add an "
                         "explicit `**UI Sign-off:**` line to the Tally/Royal Addendum, or an "
                         "approver such as `by M'Lord` / `royal sign-off`)"
                     )
+                if "defer" in status.lower():
+                    return status if status.upper().startswith("DEFERRED") else f"DEFERRED — {status}"
                 return status
         return ""
 

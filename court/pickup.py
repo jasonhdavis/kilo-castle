@@ -14,7 +14,9 @@ The lane is deliberately surgical:
   * every changed path in the range must be a quest charter or a vigil spec —
     anything else anywhere rejects the WHOLE batch (journaled once);
   * a dirty `castle` working tree rejects the whole batch — pickup refuses to
-    mix its commit with unrelated local edits;
+    mix its commit with unrelated local edits (only a conflicting dirty path
+    refuses; uncommitted `.court` paperwork the pickup is not touching is
+    normal pipeline churn and does not block the lane);
   * a changed charter must parse, carry a valid branch name, a status still
     pre-commission (``OPEN``/``PLANNED``/``CHARTERED``), and valid
     ``## Prerequisites`` predicates;

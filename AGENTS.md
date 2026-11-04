@@ -36,6 +36,7 @@ castle                  (staging root trunk for main; attached to localhost)
 | **Scout Spike (POC)** | `scout/<quest_id>-<slug>` | `scout/q074-shops-product-runbook-workflow-spike` |
 | **Combined Artist Studio** | `artist/<quest_ids>-ui-studio` | `artist/q617-q627-q628-ui-studio` |
 | **Core Trunks** | Root names (no folder) | `main`, `castle` |
+| **Pleasance Lane** | Root trunk (no folder) | `pleasance` — remote-Steward paperwork pickup lane (see Pleasance section below) |
 | **Gatehouse Convoy** | `the-gatehouse/<cogship_id>` | `the-gatehouse/cogship-042` (ephemeral — one brand-new branch per convoy, torn down after promotion; never a fixed/reused name) |
 
 **FORBIDDEN**: Flat hyphens like `quest-q062-...`. Every Quest, Epic, Scout, and Gatehouse branch must begin with its proper folder prefix (`epic/`, `quest/`, `scout/`, or `the-gatehouse/`).
@@ -48,6 +49,47 @@ To maximize throughput and prevent bottlenecks or double-gating, gatehouse stagi
 
 1. **Convoy of size 1**: run the Gatekeeper role directly inside that one Quest's own existing worktree/session — nothing to batch, so no separate integration point is spawned.
 2. **Convoy of size > 1**: spawn **one brand-new ephemeral Agent Manager worktree** scoped to just that convoy, on branch `the-gatehouse/<cogship_id>`, cut from `castle`'s current tip. The Gatekeeper packs the convoy's Quest branches into it, runs the unified integration suite once across the pack, isolates/rejects any failing Quest, then promotes the clean remainder directly into `castle`. The worktree is torn down (Ashes/stop) once promoted — **never** attach to an old/idle named station and never reuse a convoy branch name.
+
+---
+
+## Pleasance — Remote Steward Paperwork Lane
+
+The Pleasance is the **away-mode interface** between a remote Steward (M'Lord,
+voice-chatting with an LLM connected to this repo's origin) and the Court
+pipeline. It makes one promise: **no human at the wheel while M'Lord is away** —
+an away steward delivers paperwork, the watch validates and schedules it, and
+the pipeline runs to shipping with UI review treated as tracked debt rather
+than a gate.
+
+- **One root trunk, `pleasance`** (origin-based, like `castle`), carrying
+  **paperwork commits only**: `.court/quests/<Full-Id>.md` charters and
+  `.court/vigils/<id>.json` vigil specs. Anything else in a commit rejects the
+  whole batch. Rebase on the current `origin/castle` tip before pushing.
+- **Charter form**: frontmatter `id` == file stem, `kind: quest`,
+  `branch: quest/<id>-<slug>`, `status` in `OPEN`/`PLANNED`/`CHARTERED`.
+  `PLANNED` = held/report-only; `CHARTERED` = committed and dispatched the
+  moment its `## Prerequisites` predicates are satisfied (empty section =
+  immediate). Committed quests' charters are FROZEN — never amend beyond
+  `CHARTERED`.
+- **Prereq grammar** (one predicate per `## Prerequisites` line, vigils
+  grammar verbatim): `quest-status:<id>=<STATUS>`, `quest-status:<id>!=<STATUS>`,
+  `branch-merged:<branch>`, `quest-merged:<id>`, `file-exists:<path>`,
+  `after:<iso>`.
+- **Pickup**: the Night's Watch fetches origin, fast-forwards `castle`,
+  runs `court pickup` (per-batch validation; rejections journaled to
+  `.court/LEDGER.md` and pushed up for the remote agent to read), merges
+  accepted `.court` files onto `castle`, and mirrors state back to origin.
+  Dispatch comes from the castle charter directly — **no synthesized vigil
+  files** for this lane.
+- **UI review is non-blocking debt**: pending/missing UI never withholds
+  collect/promotion/ship; the collect report, pre-ship interrogation, and ship
+  manifest list `ui_debt` / a UI Debt Roster for the Court Artist lane to close
+  later via Royal Addendum. `court ui-signoff --defer` records a deferral.
+- **Full contract for remote authors**: `PLEASANCE.md` in each app repo
+  (pb-app etc.), which the pickup lane mirrors to origin.
+- Evidence/state (which pleasance tip is applied, last rejection) lives in the
+  Night's Watch state dir, never in the git tree; `court pickup` is the only
+  entry point.
 
 ---
 

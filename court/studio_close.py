@@ -393,32 +393,67 @@ def write_union_brief(
 # Teardown
 # ---------------------------------------------------------------------------
 
+def _port_listeners(repo_root: Path, port: int) -> list[str]:
+    """Live PIDs bound to ``port`` (empty when the port is free)."""
+    return _git_out(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"], repo_root).split()
+
+
+def _kill_listeners(repo_root: Path, port: int, tag: str) -> str:
+    """SIGTERM then, after a grace check, SIGKILL every listener on the port.
+    Verifies the port actually frees; returns a status line either way."""
+    pids = _port_listeners(repo_root, port)
+    killed: list[str] = []
+    for pid in pids:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            killed.append(pid)
+        except (OSError, ValueError, ProcessLookupError):
+            pass
+    for _ in range(5):
+        if not _port_listeners(repo_root, port):
+            return f"{tag}: stopped listener(s) on port {port} ({','.join(killed) or 'none'})"
+        time.sleep(0.5)
+    survivors = _port_listeners(repo_root, port)
+    for pid in survivors:
+        try:
+            os.kill(int(pid), signal.SIGKILL)
+        except (OSError, ValueError, ProcessLookupError):
+            pass
+    time.sleep(0.3)
+    if not _port_listeners(repo_root, port):
+        return f"{tag}: SIGKILL escalation freed port {port}"
+    return f"{tag}: ERROR — port {port} STILL listening after stop"
+
+
 def stop_studio_server(repo_root: Path, wt_path: Path) -> str:
     """Kill the studio runserver: manage_servers.sh stop when the project
-    supplies the script, else kill the listener on the worktree's port file."""
+    supplies the script (then verify against the actual port), else kill the
+    listener on the worktree's port file directly with escalation."""
+    port = None
+    try:
+        port = int((wt_path / ".worktree-port").read_text().strip())
+    except (OSError, ValueError):
+        pass
+
     script = repo_root / ".kilo" / "manage_servers.sh"
     if script.exists():
         res = subprocess.run(
             ["bash", str(script), "stop", str(wt_path)],
             capture_output=True, text=True, timeout=30, check=False,
         )
+        # The script may still report success while the reloader child lives.
+        if port is not None:
+            if _port_listeners(repo_root, port):
+                return _kill_listeners(repo_root, port,
+                                       "manage_servers.sh stop returned 0 but port stayed bound — fallback")
+            return "runserver stopped via manage_servers.sh (port verified free)"
         if res.returncode == 0:
             return "runserver stopped via manage_servers.sh"
         return f"manage_servers.sh stop exited {res.returncode}: {(res.stderr or res.stdout).strip()[:160]}"
-    port_file = wt_path / ".worktree-port"
-    try:
-        port = int(port_file.read_text().strip())
-    except (OSError, ValueError):
+
+    if port is None:
         return "no .worktree-port — no runserver record to stop"
-    pids = _git_out(["lsof", "-ti", f"tcp:{port}"], repo_root).split()
-    killed = []
-    for pid in pids:
-        try:
-            os.kill(int(pid), signal.SIGTERM)
-            killed.append(pid)
-        except (OSError, ValueError):
-            pass
-    return f"stopped listener(s) on port {port}: {','.join(killed) or 'none'}"
+    return _kill_listeners(repo_root, port, "direct port kill")
 
 
 def stop_cli_artist_session(wt_path: Path) -> list[int]:

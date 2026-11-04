@@ -16,8 +16,12 @@ The lane is deliberately surgical:
     taken against the fork point (``merge-base``), never the dramatically
     newer local `castle` tip, so unrelated drift never pollutes the batch;
   * every changed path in that range must be a quest charter, a quest event
-    journal, or a vigil spec — anything else anywhere rejects the WHOLE batch
-    (journaled once);
+    journal, a vigil spec, or one of the two root-level branch-surface docs
+    (``AGENTS.md`` / ``PLEASANCE.md``) — anything else anywhere rejects the
+    WHOLE batch (journaled once). Surface docs ride the branch so the
+    GitHub-facing checkout is oriented, but they are NEVER merged onto castle
+    (which keeps its own internal `AGENTS.md`); a batch that touches only them
+    advances the applied marker without creating a trunk commit;
   * a dirty `castle` working tree rejects the whole batch — pickup refuses to
     mix its commit with unrelated local edits (only a conflicting dirty path
     refuses; uncommitted `.court` paperwork the pickup is not touching is
@@ -59,9 +63,14 @@ STATE_VERSION = 1
 # The only paths a pleasance batch may touch. Anything else under .court/
 # (LEDGER.md, config, ...) or outside it rejects the whole pickup. A quest's
 # sibling `<id>.events.jsonl` (append-only event journal, the project's
-# standard charter companion) is in-lane alongside the charter.
+# standard charter companion) is in-lane alongside the charter. The two
+# root-level branch-surface docs (AGENTS.md, PLEASANCE.md) may ALSO ride the
+# branch so an external agent reading the pleasance checkout in GitHub gets the
+# correct orientation; they are validated for presence only and are NEVER
+# merged onto castle (which keeps its own internal AGENTS.md).
 _QUEST_CHARTER_RE = re.compile(r"^\.court/quests/[^/]+\.(?:md|events\.jsonl)$")
 _VIGIL_FILE_RE = re.compile(r"^\.court/vigils/[^/]+\.json$")
+_SURFACE_DOC_RE = re.compile(r"^(?:AGENTS\.md|PLEASANCE\.md)$")
 # Statuses still open to Steward-driven dispatch. Anything past CHARTERED
 # (DISPATCHED/WORKING/GATE/...) means the quest is commissioned and its
 # charter is FROZEN — a remote LLM must never amend commissioned paperwork.
@@ -360,13 +369,18 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
         return {"picked": [], "rejected": None, "skipped": "no new pleasance work"}
     changed = _changed_paths(repo, base_rev, tip)
 
-    # Global gate 1: the lane is surgical — only charters and vigil specs.
+    # Global gate 1: the lane is surgical — only charters, vigil specs, and
+    # the two branch-surface docs (which ride the branch but are never merged).
     reason: Optional[str] = None
+    surface_docs: list[str] = []
     for path in changed:
+        if _SURFACE_DOC_RE.match(path):
+            surface_docs.append(path)
+            continue
         if not (_QUEST_CHARTER_RE.match(path) or _VIGIL_FILE_RE.match(path)):
             reason = (f"out-of-lane path {path} in pleasance batch — only "
-                      f".court/quests/<id>.md, .court/quests/<id>.events.jsonl and "
-                      f".court/vigils/<id>.json may be picked up")
+                      f".court/quests/<id>.md, .court/quests/<id>.events.jsonl, "
+                      f".court/vigils/<id>.json, AGENTS.md and PLEASANCE.md may be picked up")
             break
     # Global gate 2: never mix the pickup commit with a dirty tree the
     # pickup would collide with. Uncommitted `.court` paperwork written by
@@ -444,9 +458,12 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
     if dry_run:
         for p in accepted:
             say(f"would accept: {p}")
+        for p in surface_docs:
+            say(f"would accept: {p} (branch-surface doc — kept on pleasance, never merged)")
         if reason:
             say(f"REJECT: {reason}")
-        return {"picked": accepted, "rejected": reason, "dry_run": True}
+        return {"picked": accepted, "rejected": reason, "dry_run": True,
+                "surface_docs": surface_docs}
 
     if reason:
         last = state.get("last_attempt") or {}
@@ -459,6 +476,25 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
         save_state(repo, state)
         say(f"REJECT: {reason}")
         return {"picked": [], "rejected": reason}
+
+    # A batch carrying ONLY the branch-surface docs changes nothing on castle:
+    # advance the applied marker so the next scrape diffs cleanly, journal the
+    # touch, but never create a trunk commit for a non-.court file.
+    if not accepted and surface_docs:
+        _append_ledger(
+            repo,
+            f"- **{_iso()}** — pleasance surface docs updated at {tip[:12]}: "
+            f"{', '.join(surface_docs)} (kept on the branch; nothing merged onto castle)\n",
+        )
+        _commit(repo, [".court/LEDGER.md"], "court: record pleasance surface-doc update")
+        _push_best_effort(repo, base, say)
+        state["applied_tip"] = tip
+        state["last_attempt"] = {"tip": tip, "reason": ""}
+        save_state(repo, state)
+        say(f"✅ pleasance surface docs updated {tip[:12]}: "
+            f"{', '.join(surface_docs)} (kept on the branch, not merged onto castle)")
+        return {"picked": accepted, "rejected": None, "skipped": "surface docs only",
+                "surface_docs": surface_docs}
 
     try:
         for p in accepted:

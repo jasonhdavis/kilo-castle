@@ -53,6 +53,9 @@ from . import vigils
 from . import nightwatch
 from . import pickup
 from . import metrics as quest_metrics
+from . import index as court_index
+from . import schedule as court_schedule
+from . import punished_audit
 
 # The Ward's durable workspace: patrol ledger + Warden Report queue.
 WARD_DIR = Path(__file__).resolve().parent.parent / "ward"
@@ -9557,6 +9560,34 @@ def build_parser():
                           help=f"Pleasance branch name (default: {pickup.PICKUP_BRANCH})")
     p_pickup.set_defaults(func=cmd_pickup)
 
+    p_index = sub.add_parser(
+        "index",
+        help="Deterministic AI-orienting snapshot: emit docs/AI_INDEX.md + docs/AI_INDEX.json (branch tips, quest board, worktrees, punished+successors, bottlenecks)",
+    )
+    p_index.add_argument("--repo", default=None, help="Court repository to snapshot (default: this repo)")
+    p_index.add_argument("--out", default=None, help="Output directory (default: <repo>/docs)")
+    p_index.set_defaults(func=court_index.cmd_index)
+
+    p_schedule = sub.add_parser(
+        "schedule",
+        help="Why is this quest waiting? Surface the Night's Watch planner's eligibility verdicts on demand (ACTION_NEEDED / QUEUED_AUTO / HELD) with constraint class",
+    )
+    p_schedule.add_argument("quest_id", nargs="?", default=None, help="Quest ID for a single verdict (default: all in-flight stages)")
+    p_schedule.add_argument("--status", dest="status_filter", default=None, help="Comma-separated statuses to diagnose (default: PLANNED,CHARTERED,DISPATCHED,WORKING,QUESTING,TRIBUTE_READY,GATE)")
+    p_schedule.add_argument("--json", action="store_true", help="Output JSON verdicts")
+    p_schedule.add_argument("--limit", type=int, default=60, help="Max verdict rows printed (default 60)")
+    p_schedule.add_argument("--repo", default=None, help="Court repository (default: this repo)")
+    p_schedule.set_defaults(func=court_schedule.cmd_schedule)
+
+    p_punished_audit = sub.add_parser(
+        "punished-audit",
+        help="Deterministic successor audit of PUNISHED quests: read Judgement/pilloried_by/pillory_of from real charters, flag no-successor and not-advanced successors; writes docs/PUNISHED_AUDIT.md",
+    )
+    p_punished_audit.add_argument("--repo", default=None, help="Court repository (default: this repo)")
+    p_punished_audit.add_argument("--out", default=None, help="Output directory for docs/PUNISHED_AUDIT.md (default: <repo>/docs)")
+    p_punished_audit.add_argument("--json", action="store_true", help="Print JSON instead of the report file")
+    p_punished_audit.set_defaults(func=punished_audit.cmd_punished_audit)
+
     p_awaiting = sub.add_parser(
         "awaiting",
         aliases=["pending"],
@@ -9677,6 +9708,10 @@ _READ_ONLY_COMMANDS = {
     "status", "show", "list", "tally", "metrics", "ward", "ship", "diff", "timber",
     "model", "verify-merged", "verify-manifest", "verify-convoy", "runsuite", "browser",
     "awaiting", "pending",
+    # `index`, `schedule` and `punished-audit` are pure read-only diagnostics:
+    # they snapshot/plan against durable state and write reports to an out dir
+    # (never the court tree), so they must not serialize behind the write lock.
+    "index", "schedule", "punished-audit",
     # `watch` only observes durable state and re-prompts sessions; it never
     # commits, so it must not serialize behind the write lock (a watchdog
     # blocking on a busy castle would delay continuations). `monitor` runs

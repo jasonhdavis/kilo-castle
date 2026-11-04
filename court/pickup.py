@@ -2,7 +2,8 @@
 
 The Pleasance lane is where an away Steward's voice-chat LLM delivers
 paperwork: a SINGLE root branch named ``pleasance`` on origin carries ONLY
-quest charters (``.court/quests/<id>.md``) and vigil specs
+quest charters (``.court/quests/<id>.md``, plus their standard sibling
+``.court/quests/<id>.events.jsonl`` journals) and vigil specs
 (``.court/vigils/<id>.json``), committed directly by the LLM without ever
 touching code. The Night's Watch "picks up" that paperwork on the local
 `castle` trunk: fetch it, validate it, merge only the valid ``.court`` files
@@ -11,8 +12,12 @@ in ONE atomic commit, journal the outcome to ``.court/LEDGER.md``, and push
 
 The lane is deliberately surgical:
 
-  * every changed path in the range must be a quest charter or a vigil spec —
-    anything else anywhere rejects the WHOLE batch (journaled once);
+  * the changed-path range is the remote author's OWN commits — the diff is
+    taken against the fork point (``merge-base``), never the dramatically
+    newer local `castle` tip, so unrelated drift never pollutes the batch;
+  * every changed path in that range must be a quest charter, a quest event
+    journal, or a vigil spec — anything else anywhere rejects the WHOLE batch
+    (journaled once);
   * a dirty `castle` working tree rejects the whole batch — pickup refuses to
     mix its commit with unrelated local edits (only a conflicting dirty path
     refuses; uncommitted `.court` paperwork the pickup is not touching is
@@ -52,8 +57,10 @@ PICKUP_BRANCH = "pleasance"
 STATE_VERSION = 1
 
 # The only paths a pleasance batch may touch. Anything else under .court/
-# (LEDGER.md, config, ...) or outside it rejects the whole pickup.
-_QUEST_CHARTER_RE = re.compile(r"^\.court/quests/[^/]+\.md$")
+# (LEDGER.md, config, ...) or outside it rejects the whole pickup. A quest's
+# sibling `<id>.events.jsonl` (append-only event journal, the project's
+# standard charter companion) is in-lane alongside the charter.
+_QUEST_CHARTER_RE = re.compile(r"^\.court/quests/[^/]+\.(?:md|events\.jsonl)$")
 _VIGIL_FILE_RE = re.compile(r"^\.court/vigils/[^/]+\.json$")
 # Statuses still open to Steward-driven dispatch. Anything past CHARTERED
 # (DISPATCHED/WORKING/GATE/...) means the quest is commissioned and its
@@ -214,6 +221,23 @@ def validate_vigil(blob_text: str, repo: Path) -> tuple[bool, str]:
         return False, str(e)
 
 
+def validate_events_log(blob_text: str) -> tuple[bool, str]:
+    """A quest's append-only event journal must be line-broken JSON records
+    (the engine's fold_events shape). Empty/blank lines are tolerated; anything
+    that is not a JSON object per line is foreign and rejected."""
+    for lineno, raw in enumerate(blob_text.splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            return False, f"events journal line {lineno} is not JSON"
+        if not isinstance(record, dict):
+            return False, f"events journal line {lineno} is not a JSON object"
+    return True, ""
+
+
 # ---------------------------------------------------------------------------
 # The pickup
 # ---------------------------------------------------------------------------
@@ -316,6 +340,20 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
         return {"picked": [], "rejected": None, "skipped": "already applied"}
 
     base_rev = applied_tip or base
+    if not applied_tip:
+        # Diff against the FORK POINT (merge-base), not the castle tip: castle
+        # lives far ahead of pleasance's lineage and `diff castle..tip` would
+        # surface hundreds of unrelated reverse changes (the 2026-11-04 Q1141
+        # false rejection). The lane must only ever see what the remote author
+        # actually added.
+        mb = _run(repo, ["merge-base", base_rev, tip]).stdout.strip()
+        base_rev = mb or base_rev
+    elif not _show(repo, f"{applied_tip}^{{commit}}") \
+            or not _run(repo, ["merge-base", "--is-ancestor", applied_tip, tip]).returncode == 0:
+        # The applied marker no longer sits in the branch's ancestry (a remote
+        # rebase happened) — fall back to the fork point rather than erroring.
+        mb = _run(repo, ["merge-base", base, tip]).stdout.strip()
+        base_rev = mb or base
     revs = _run(repo, ["rev-list", f"{base_rev}..{tip}"]).stdout.split()
     if not revs:
         say("no new pleasance work")
@@ -327,7 +365,8 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
     for path in changed:
         if not (_QUEST_CHARTER_RE.match(path) or _VIGIL_FILE_RE.match(path)):
             reason = (f"out-of-lane path {path} in pleasance batch — only "
-                      f".court/quests/<id>.md and .court/vigils/<id>.json may be picked up")
+                      f".court/quests/<id>.md, .court/quests/<id>.events.jsonl and "
+                      f".court/vigils/<id>.json may be picked up")
             break
     # Global gate 2: never mix the pickup commit with a dirty tree the
     # pickup would collide with. Uncommitted `.court` paperwork written by
@@ -355,6 +394,13 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
                 if text is None:
                     reason = f"cannot read {path} at pleasance tip (deletion is not a pickup)"
                     break
+                if path.endswith(".events.jsonl"):
+                    ok, why = validate_events_log(text)
+                    if not ok:
+                        reason = f"invalid events log {path}: {why}"
+                        break
+                    charters.append(path)
+                    continue
                 ok, why = validate_charter(text, repo)
                 if not ok:
                     reason = f"invalid charter {path}: {why}"

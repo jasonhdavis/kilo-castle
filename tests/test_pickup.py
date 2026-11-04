@@ -341,3 +341,70 @@ def test_incremental_second_pickup_and_idempotence(tmp_path):
     assert res2["picked"] == [".court/quests/Q998-Second.md"]
     tip2 = _git(repo, "rev-parse", "pleasance").stdout.strip()
     assert pickup.load_state(repo)["applied_tip"] == tip2
+
+def test_accepts_charter_with_its_sibling_events_journal(tmp_path):
+    """A charter and the quest's standard `<id>.events.jsonl` journal are one
+    in-lane batch (the Q1141 shape); both land on castle together, and no
+    synthesized vigil file is created."""
+    repo = _repo(tmp_path)
+
+    def builder(r):
+        (r / ".court" / "quests").mkdir(parents=True, exist_ok=True)
+        (r / ".court" / "quests" / "Q999-Pickup-Lane.md").write_text(
+            _charter("Q999-Pickup-Lane", "Events sibling demo",
+                     status="CHARTERED", branch="quest/q999-pickup-lane"),
+            encoding="utf-8")
+        (r / ".court" / "quests" / "Q999-Pickup-Lane.events.jsonl").write_text(
+            '{"target":"field:id","ts":"2026-11-04T19:27:00Z","value":"Q999-Pickup-Lane"}\n'
+            '{"target":"field:title","ts":"2026-11-04T19:27:00Z","value":"Events sibling demo"}\n',
+            encoding="utf-8")
+
+    _please(repo, builder)
+    res = pickup.run(repo, say=_silent())
+    assert res.get("rejected") is None, res
+    assert ".court/quests/Q999-Pickup-Lane.md" in res.get("picked", [])
+    # the sibling journal rides the same atomic commit
+    assert ".court/quests/Q999-Pickup-Lane.events.jsonl" in res.get("picked", [])
+    assert (repo / ".court" / "quests" / "Q999-Pickup-Lane.md").exists()
+    assert (repo / ".court" / "quests" / "Q999-Pickup-Lane.events.jsonl").exists()
+    # charter-driven lane: no vigil file for this quest
+    assert not (repo / ".court" / "vigils" / "dispatch-q999.json").exists()
+
+
+def test_events_journal_must_be_json_lines(tmp_path):
+    """A malformed events journal rejects the batch (no laundering junk)."""
+    repo = _repo(tmp_path)
+
+    def builder(r):
+        (r / ".court" / "quests").mkdir(parents=True, exist_ok=True)
+        (r / ".court" / "quests" / "Q999-Pickup-Lane.md").write_text(
+            _charter("Q999-Pickup-Lane", "Events sibling demo"),
+            encoding="utf-8")
+        (r / ".court" / "quests" / "Q999-Pickup-Lane.events.jsonl").write_text(
+            "this is not json at all\n", encoding="utf-8")
+
+    _please(repo, builder)
+    res = pickup.run(repo, say=_silent())
+    assert res.get("rejected") and "events journal" in res.get("rejected", "")
+
+
+def test_diff_is_taken_against_the_fork_point_not_castle_tip(tmp_path):
+    """A pleasance batch is judged on the remote author's OWN commits: castle
+    racing dozens of commits ahead (the real-world 1062-deep lead) must not
+    leak hundreds of unrelated 'reverse' paths into the lane."""
+    repo = _repo(tmp_path)
+    _please(repo, _valid_builder)
+
+    # Castle races far ahead with unrelated work AFTER the fork point.
+    for i in range(6):
+        (repo / f"unrelated-{i}.py").write_text(f"x = {i}\n", encoding="utf-8")
+        (repo / ".court" / "EDICTS.md").write_text(
+            f"- **edict {i}**\n", encoding="utf-8")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", f"castle races ahead {i}")
+
+    res = pickup.run(repo, say=_silent())
+    assert res.get("rejected") is None, res
+    assert res.get("picked") == [".court/quests/Q999-Pickup-Lane.md"]
+    # the far-ahead castle churn was never part of the batch
+    assert (repo / ".court" / "quests" / "Q999-Pickup-Lane.md").exists()

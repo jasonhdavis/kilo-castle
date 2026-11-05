@@ -18,13 +18,25 @@ never adopted it. This module is the worker-spawn analog:
 - log-liveness: a worker's stdout is teed into `.kilo/<role>.log`; the log
   mtime age classifies live vs silent, feeding both the dashboard and the
   watchdog's stall referee (kill a hung worker, then re-prompt its session)
+- monotonic fence epoch: every lease payload carries `epoch`, incremented
+  whenever the holder changes (a stale steal or a `--force` supersession).
+  A self-reclaim in the same process preserves the epoch. Engine-stamped
+  suite proofs record `(epoch, holder, pid, session_id)` so a proof produced
+  by a worker generation that has since been superseded can be rejected at
+  promotion instead of trusted (the fencing pattern: a replaced worker's
+  side effects must not outlive its lease).
 
 Design limits, stated honestly: a lease holder is verified alive via
 os.kill(pid, 0) plus a `ps` command-line check (guards against pid reuse);
 neither is airtight on a machine churning through pids, and the `--force`
 path is the documented escape hatch for any wedged state. There is no
 in-worker heartbeat — a worker that streams nothing is indistinguishable
-from a hung one, which is exactly the definition the referee uses.
+from a hung one, which is exactly the definition the referee uses. Fencing
+is likewise not an exactly-once guarantee: it orders worker generations on
+one worktree, but it cannot stop a superseded process from finishing
+side effects it already started, and a proof written with no current holder
+is accepted (manual/`--resume` runs are legitimate). Older lease files with
+no `epoch` read as epoch 0.
 """
 import json
 import os
@@ -60,6 +72,67 @@ def read_lease(worktree: Path, role: str) -> Optional[dict]:
         return payload if isinstance(payload, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def _coerce_epoch(value) -> int:
+    """Lease epochs are non-negative ints; anything unreadable is 0 (legacy)."""
+    if isinstance(value, bool):
+        return 0
+    try:
+        epoch = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return epoch if epoch >= 0 else 0
+
+
+def lease_epoch(worktree: Path, role: str) -> int:
+    """Current fence epoch for (worktree, role); 0 when unleased/unreadable."""
+    payload = read_lease(worktree, role)
+    if not payload:
+        return 0
+    return _coerce_epoch(payload.get("epoch"))
+
+
+def holder_fence(worktree: Path, role: str) -> dict:
+    """Read-only fence summary for stamping proofs and explaining refusals.
+
+    `live` is the existing pid/log-independent holder liveness probe; the
+    epoch is what a suite proof is fenced to.
+    """
+    payload = read_lease(worktree, role)
+    if not payload:
+        return {
+            "epoch": 0,
+            "holder": "",
+            "pid": None,
+            "session_id": "",
+            "live": False,
+            "why": "no lease",
+        }
+    live, why = holder_is_live(payload)
+    return {
+        "epoch": _coerce_epoch(payload.get("epoch")),
+        "holder": payload.get("holder") or "",
+        "pid": payload.get("pid"),
+        "session_id": payload.get("session_id") or "",
+        "live": bool(live),
+        "why": why,
+    }
+
+
+def fence_is_current(fence: Optional[dict], current_epoch) -> bool:
+    """Is a recorded fence still current?
+
+    A fence is current when its epoch equals the current epoch. When there is
+    no current epoch (0) no worker is holding the worktree — an absent holder
+    must never invalidate a proof, because manual and `--resume` suite runs are
+    legitimate. A legacy fence (epoch 0) is only current in that unleased case.
+    """
+    fenced = _coerce_epoch((fence or {}).get("epoch"))
+    current = _coerce_epoch(current_epoch)
+    if current == 0:
+        return True
+    return fenced == current
 
 
 def _now_iso() -> str:
@@ -183,7 +256,7 @@ def _write_lease(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def _base_payload(holder: str, model: str, pending: bool, now: float) -> dict:
+def _base_payload(holder: str, model: str, pending: bool, now: float, epoch: int = 1) -> dict:
     return {
         "v": 1,
         "pending": bool(pending),
@@ -193,6 +266,7 @@ def _base_payload(holder: str, model: str, pending: bool, now: float) -> dict:
         "watchdog_pid": None,
         "holder": holder or "unknown",
         "model": model or "",
+        "epoch": _coerce_epoch(epoch) or 1,
         "started": now,
         "started_iso": _now_iso(),
         "heartbeat": now,
@@ -220,6 +294,10 @@ def claim(
     duplicate worker; the owner finalizes via update() once the pid is known.
     Returns (ok, reason, previous_payload). reason: claimed | stolen-stale |
     stolen-expired-pending | refused-live | refused-force | contended | error.
+
+    Fence epoch: a fresh claim starts at 1; stealing a stale/expired lease or
+    force-superseding a live one increments the previous epoch; a self-reclaim
+    by the same process keeps the epoch (the holder did not change).
     """
     now_ts = time.time() if now is None else now
     lp = lease_path(worktree, role)
@@ -227,16 +305,20 @@ def claim(
     ensure_self_ignored(worktree)
     previous = read_lease(worktree, role)
     reason = "claimed"
+    next_epoch = 0
     for _attempt in range(3):
         previous = read_lease(worktree, role)
         if previous:
+            prev_epoch = _coerce_epoch(previous.get("epoch"))
             live, why = holder_is_live(previous, now=now_ts)
             if live:
                 if previous.get("pid") == os.getpid():
                     # Self-held lease (e.g. a sync run re-claiming after an
-                    # earlier claim in the same process): ours, no kill.
+                    # earlier claim in the same process): ours, no kill, and
+                    # the generation has not changed — do not bump the fence.
                     release(worktree, role)
                     reason = "self-reclaimed"
+                    next_epoch = prev_epoch
                 elif not force:
                     return False, f"refused-live ({why})", previous
                 else:
@@ -247,16 +329,18 @@ def claim(
                         return False, f"refused-force ({kdetail})", previous
                     release(worktree, role)
                     reason = "force-superseded"
+                    next_epoch = prev_epoch + 1
             else:
                 release(worktree, role)
                 reason = "stolen-stale" if not previous.get("pending") else "stolen-expired-pending"
+                next_epoch = prev_epoch + 1
         try:
             fd = os.open(lp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             continue  # lost a steal race; re-read and decide again
         except OSError as e:
             return False, f"error ({e})", previous
-        payload = _base_payload(holder, model, pending, now_ts)
+        payload = _base_payload(holder, model, pending, now_ts, epoch=next_epoch)
         payload.update({"pid": pid, "pgid": pgid, "session_id": session_id})
         with os.fdopen(fd, "w") as f:
             f.write(json.dumps(payload, indent=2))

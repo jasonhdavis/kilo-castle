@@ -1244,3 +1244,19 @@ def test_charter_ready_skips_working_occupied_broken(tmp_path):
         "Q7-Broken": {"id": "Q7-Broken", "status": "CHARTERED", "worktree": ""},
     }
     assert nw._charter_ready(repo, qmap) == []
+
+
+def test_tick_folds_branch_paperwork_before_planning(tmp_path, monkeypatch):
+    folded = []
+    monkeypatch.setattr(nw, "fold_ledger", lambda repo, say=print: folded.append(Path(repo)) or True)
+    monkeypatch.setattr(nw, "snapshot", lambda repo, timeout=None: {"quests": []})
+    nw.tick(tmp_path, _policy(), nw.load_state(tmp_path), say=lambda *a, **k: None)
+    assert folded == [tmp_path]
+
+
+def test_tick_dry_run_does_not_fold_the_ledger(tmp_path, monkeypatch):
+    folded = []
+    monkeypatch.setattr(nw, "fold_ledger", lambda repo, say=print: folded.append(Path(repo)) or True)
+    monkeypatch.setattr(nw, "snapshot", lambda repo, timeout=None: {"quests": []})
+    nw.tick(tmp_path, _policy(), nw.load_state(tmp_path), dry_run=True, say=lambda *a, **k: None)
+    assert folded == []

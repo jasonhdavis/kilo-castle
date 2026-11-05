@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from . import migration_graph
+from . import lease, migration_graph
 from .config import get_suite_command
 
 # Short-TTL process-level cache for the two most repeated git lookups
@@ -49,11 +49,24 @@ def clear_git_cache() -> None:
         _GIT_CACHE.clear()
 
 _CONFLICT_BLOCK_RE = re.compile(
-    r"<<<<<<< [^\n]*\n(?P<ours>.*?)\n=======\n(?P<theirs>.*?)\n>>>>>>> [^\n]*",
+    # A side emptied by the merge (`razed_at:` deleted on one branch) leaves no
+    # line between the markers, so both inner newlines must be optional.
+    r"<<<<<<< [^\n]*\n(?P<ours>.*?)\n?=======\n(?P<theirs>.*?)\n?>>>>>>> [^\n]*",
     re.DOTALL,
 )
 _HISTORY_ROW_RE = re.compile(r"^\|\s*([0-9T:\-Z]+)\s*\|.*\|\s*$")
 _LEDGER_BULLET_ROW_RE = re.compile(r"^[-*]\s+\*\*\[?\(?([0-9T:\-Z]+)\)?\]?\*\*\s*[—:-]")
+_FRONTMATTER_SCALAR_RE = re.compile(r"^(?P<key>[A-Za-z_][\w-]*):[ \t]*(?P<value>.*)$")
+# Generated per-worktree agent prompts. The engine rewrites these on every
+# dispatch/goad/coin, so a long-lived Quest branch and the trunk always carry
+# different copies and every `git merge castle` conflicts on them. They are
+# scaffolding, never deliverable: the worktree's own copy is the live prompt
+# and wins unconditionally.
+_SCAFFOLDING_TASK_RE = re.compile(r"^\.kilo/TASK(?:[_-][^/]*)?\.md$")
+
+
+def _is_generated_scaffolding(rel_path: str) -> bool:
+    return bool(_SCAFFOLDING_TASK_RE.match(rel_path.replace("\\", "/")))
 
 
 def _ledger_row_timestamp(line: str) -> Optional[str]:
@@ -72,9 +85,10 @@ def _is_ledger_row(line: str) -> bool:
 
 def _reconcile_history_only_conflict(path: Path) -> bool:
     """For a Quest/Epic ledger file conflicted *only* in its History-table
-    rows / bulleted Castle Ledger rows and/or its `updated_at:` frontmatter
-    line, resolve by taking the union of both sides' rows (deduped, sorted by
-    timestamp) and the later `updated_at`."""
+    rows / bulleted Castle Ledger rows, a single frontmatter scalar, and/or its
+    `updated_at:` frontmatter line, resolve by taking the union of both sides'
+    rows (deduped, sorted by timestamp), the populated scalar, and the later
+    `updated_at`."""
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -100,6 +114,28 @@ def _reconcile_history_only_conflict(path: Path) -> bool:
             merged = list(dict.fromkeys(ours_lines + theirs_lines))
             merged.sort(key=lambda l: _ledger_row_timestamp(l) or "")
             return "\n".join(merged)
+
+        # A single frontmatter scalar (a `razed_at:` emptied on one side, a
+        # status flip) is bookkeeping, not scope: keep the side that carries a
+        # value. Two different non-empty values stay a real conflict, except
+        # `status:`, where the trunk's decision wins.
+        mo = _FRONTMATTER_SCALAR_RE.match(ours_lines[0]) if len(ours_lines) == 1 else None
+        mt = _FRONTMATTER_SCALAR_RE.match(theirs_lines[0]) if len(theirs_lines) == 1 else None
+        if mo and mt and mo.group("key") == mt.group("key"):
+            key = mo.group("key")
+            ov, tv = mo.group("value").strip(), mt.group("value").strip()
+            if ov and not tv:
+                return ours_lines[0]
+            if tv and not ov:
+                return theirs_lines[0]
+            if ov == tv:
+                return theirs_lines[0]
+            if key == "status":
+                return theirs_lines[0]
+        if not ours_lines and mt:
+            return theirs_lines[0]
+        if not theirs_lines and mo:
+            return ours_lines[0]
 
         return None
 
@@ -916,6 +952,15 @@ def rebase_worktree_onto_base(
                     auto_resolved.append(f)
                 else:
                     remaining_conflicts.append(f)
+            elif _is_generated_scaffolding(norm):
+                # Generated worker prompt: the worktree's own copy is the live
+                # one, so take ours and keep the merge moving.
+                chk_res = _run(["git", "checkout", f"--ours", f], p)
+                add_res = _run(["git", "add", f], p)
+                if chk_res.get("ok") and add_res.get("ok"):
+                    auto_resolved.append(f + " (scaffolding)")
+                else:
+                    remaining_conflicts.append(f)
             else:
                 remaining_conflicts.append(f)
 
@@ -1489,6 +1534,70 @@ def _detect_suite_command(worktree_path: Path) -> str:
     return "python3 -m pytest -q"
 
 
+def _suite_lease_role(worktree: Path | str, cogship_id: str = "") -> str:
+    """Which role's lease fences a suite run in this worktree.
+
+    A convoy worktree runs under the Gatekeeper's lease; everything else
+    (Quest/scout worktrees) runs under a Serf's lease.
+    """
+    posix = Path(str(worktree or "")).as_posix()
+    if "the-gatehouse/" in posix:
+        return "gatekeeper"
+    if (cogship_id or "").strip() and "/.kilo/worktrees/" in posix:
+        return "gatekeeper"
+    return "serf"
+
+
+def _suite_lease_fields(worktree: Path | str, cogship_id: str = "") -> dict:
+    """Fence fields stamped into a suite proof (absent lease -> epoch 0)."""
+    role = _suite_lease_role(worktree, cogship_id)
+    try:
+        fence = lease.holder_fence(Path(worktree), role)
+    except Exception:
+        fence = {}
+    return {
+        "lease_epoch": int(fence.get("epoch") or 0),
+        "lease_role": role,
+        "lease_holder": fence.get("holder") or "",
+        "lease_session_id": fence.get("session_id") or "",
+    }
+
+
+def _stale_lease_fence_reason(proof: dict, cwd: Optional[Path | str] = None) -> str:
+    """Why this proof's worker fence is stale ("" when current or unfenced).
+
+    Proofs written before the fence existed carry no `lease_epoch`; they are
+    legacy and accepted exactly as before. When a proof IS fenced, its epoch
+    is compared with the current epoch of the same (worktree, role): a lower
+    recorded epoch means a newer worker generation has taken the lease, so
+    the proof belongs to a superseded worker and must not be promoted.
+    """
+    raw_epoch = proof.get("lease_epoch")
+    if raw_epoch is None:
+        return ""
+    try:
+        recorded = int(raw_epoch)
+    except (TypeError, ValueError):
+        return ""
+    role = str(proof.get("lease_role") or "")
+    if not role:
+        return ""
+    worktree = str(proof.get("worktree") or "")
+    base = Path(worktree) if worktree else get_repo_root(cwd)
+    try:
+        current = lease.lease_epoch(base, role)
+    except Exception:
+        current = 0
+    if lease.fence_is_current({"epoch": recorded}, current):
+        return ""
+    return (
+        f"suite proof is fenced to a superseded {role} worker: proof lease epoch "
+        f"{recorded} but the current epoch {current} applies to {base} — a replaced "
+        f"worker's proof cannot be promoted; re-run `court runsuite` under the "
+        f"current holder"
+    )
+
+
 def _primary_repo_root_for(worktree: Path) -> Optional[Path]:
     """Resolve the PRIMARY checkout root for a linked worktree (the directory
     holding the primary .git), or None when unresolvable."""
@@ -1606,6 +1715,7 @@ def run_unified_suite(
                 "finished": finished,
                 "output_tail": graph.get("output_tail", "")[-4000:],
             }
+            proof.update(_suite_lease_fields(p, cogship_id))
             proof_path = _suite_proof_path(cwd, cogship_id=cogship_id, quest_id=quest_id)
             if proof_path:
                 proof_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1688,6 +1798,7 @@ def run_unified_suite(
         "finished": finished,
         "output_tail": output[-4000:],
     }
+    proof.update(_suite_lease_fields(p, cogship_id))
 
     proof_path = _suite_proof_path(cwd, cogship_id=cogship_id, quest_id=quest_id)
     if proof_path:
@@ -1714,7 +1825,15 @@ def check_suite_proof(
 ) -> dict:
     """Independently verify a stamped suite proof: exit code 0, a real test
     count, and a head_sha that is either the branch tip being promoted or an
-    ancestor of `castle` (i.e. the run covered the code that actually landed)."""
+    ancestor of `castle` (i.e. the run covered the code that actually landed).
+
+    Fencing: a proof stamped by the engine records `lease_epoch`/`lease_role`
+    from the worktree's worker lease. When that epoch is older than the
+    current epoch for the same (worktree, role), the proof belongs to a
+    worker generation that was killed/superseded and is rejected. Proofs with
+    no `lease_epoch` are legacy/unfenced and validate exactly as before; a
+    proof whose worktree has no current holder (epoch 0) is also accepted,
+    because manual and `--resume` suite runs are legitimate."""
     fail = {"ok": False, "valid": False, "reason": None, "proof": None}
     candidates = []
     for name in (cogship_id, quest_id):
@@ -1736,7 +1855,10 @@ def check_suite_proof(
     except Exception as e:
         fail["reason"] = f"suite proof unreadable/corrupt: {e}"
         return fail
-    fail["proof"] = {k: proof.get(k) for k in ("command", "head_sha", "exit_code", "ran_tests", "finished")}
+    fail["proof"] = {k: proof.get(k) for k in (
+        "command", "head_sha", "exit_code", "ran_tests", "finished",
+        "lease_epoch", "lease_role", "lease_holder",
+    )}
 
     if proof.get("exit_code") != 0:
         fail["reason"] = f"suite proof shows exit_code={proof.get('exit_code')} (not a pass)"
@@ -1746,6 +1868,12 @@ def check_suite_proof(
         return fail
     if not proof.get("head_sha"):
         fail["reason"] = "suite proof has no HEAD sha — cannot tie the run to any code"
+        return fail
+
+    stale_fence = _stale_lease_fence_reason(proof, cwd)
+    if stale_fence:
+        fail["reason"] = stale_fence
+        fail["fence_stale"] = True
         return fail
 
     if head_sha and proof["head_sha"] == head_sha:

@@ -50,12 +50,15 @@ from . import studio_close
 from . import lease as worker_lease
 from . import handoff
 from . import vigils
+from . import proofs
 from . import nightwatch
 from . import pickup
 from . import metrics as quest_metrics
 from . import index as court_index
 from . import schedule as court_schedule
 from . import punished_audit
+from . import pulse as court_pulse
+from . import decisions as court_decisions
 
 # The Ward's durable workspace: patrol ledger + Warden Report queue.
 WARD_DIR = Path(__file__).resolve().parent.parent / "ward"
@@ -4650,6 +4653,90 @@ def cmd_verify(args):
     print("\n".join(report_lines))
 
 
+def _proof_command_tokens(raw) -> list:
+    """Strip the conventional leading ``--`` from a captured command token list."""
+    tokens = list(raw or [])
+    if tokens and tokens[0] == "--":
+        tokens = tokens[1:]
+    return tokens
+
+
+def _item_probe_matches(probe: str, items: list) -> bool:
+    probe = (probe or "").strip()
+    for item in items:
+        if probe == str(item["index"]):
+            return True
+        if len(probe) >= proofs.MIN_PREFIX_CHARS and item["text"].lower().startswith(probe.lower()):
+            return True
+        if probe == item["text"].strip():
+            return True
+    return False
+
+
+def cmd_prove(args):
+    tokens = _proof_command_tokens(args.command)
+    if not tokens:
+        print(
+            "ERROR: no command given; use `court prove <quest> --item <ITEM> -- <command ...>`",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    quest = store.load(args.quest_id)
+    items = proofs.expected_items(quest)
+    probe = str(args.item).strip()
+    if not items:
+        print(f"ERROR: {quest.id} has no Expected Tribute checklist items", file=sys.stderr)
+        sys.exit(2)
+    if not _item_probe_matches(probe, items):
+        print(
+            f"ERROR: --item {probe!r} matches no Expected Tribute item on {quest.id}; "
+            "use a 1-based item index or a text prefix of at least 8 characters",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    command = shlex.join(tokens)
+    entry = proofs.record(quest, probe, command, timeout=args.timeout)
+    print(f"item:        {entry['item']}")
+    print(f"command:     {entry['command']}")
+    print(f"cwd:         {entry['cwd']}")
+    print(f"exit_code:   {entry['exit_code']}")
+    print(f"duration:    {entry['seconds']}s")
+    print(f"head:        {entry['head_sha'] or '-'} ({entry['branch'] or '-'})")
+    print(f"output_sha:  {entry['output_sha256']}")
+    print(f"proof:       {proofs.proof_path(store.get_court_root().parent, quest.id)}")
+    if not entry["ok"]:
+        sys.exit(1)
+
+
+def cmd_proofs(args):
+    quest = store.load(args.quest_id)
+    result = proofs.coverage(quest)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(proofs.format_report(result))
+
+
+def cmd_verify_tribute(args):
+    quest = store.load(args.quest_id)
+    result = proofs.verify(quest)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(proofs.format_report(proofs.coverage(quest)))
+        if not result["ok"]:
+            for item in result["checked_unproven"]:
+                print(f"UNPROVEN item {item['index']}: {item['text']}")
+            for item in result["stale"]:
+                print(f"STALE-ONLY item {item['index']}: {item['text']} (proof recorded at an older HEAD)")
+            for item in result["missing"]:
+                print(f"NO-PROOF item {item['index']}: {item['text']}")
+    if not result["ok"]:
+        sys.exit(1)
+
+
 def _format_merge_status_card(target_label: str, status: dict) -> str:
     lines = [
         "=" * 72,
@@ -7174,6 +7261,16 @@ def cmd_nightwatch(args):
             print(f"\nsteward musters (24h): {len(recent)} · "
                   f"last session {steward.get('last_session') or '(none)'} · "
                   f"failed {int(steward.get('fails') or 0)}")
+        last_pickup = state.get("last_pickup") or {}
+        if last_pickup:
+            verdict = (f"REJECTED — {last_pickup.get('rejected')}"
+                       if last_pickup.get("rejected")
+                       else (f"picked {len(last_pickup.get('picked') or [])}"
+                             if last_pickup.get("picked") else "no-op"))
+            print(f"last pickup ({last_pickup.get('ts')}): {verdict}")
+        from . import pulse as _pulse
+        md_path, _js = _pulse.local_paths(repo)
+        print(f"pulse file: {md_path}")
         return
 
     if getattr(args, "report", False):
@@ -7225,6 +7322,9 @@ def cmd_nightwatch(args):
         allow_dispatch=not bool(getattr(args, "no_dispatch", False)),
         enabled=enabled,
         allow_force_goad=bool(args.allow_force_goad),
+        pickup=not bool(getattr(args, "no_pickup", False)),
+        publish_pulse=not bool(getattr(args, "no_publish_pulse", False)),
+        pulse_branch=getattr(args, "pulse_branch", None) or "status/pleasance",
     )
     sys.exit(nightwatch.run_loop(
         repo,
@@ -9205,6 +9305,34 @@ def build_parser():
     p_verify.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_verify.set_defaults(func=cmd_verify)
 
+    p_prove = sub.add_parser(
+        "prove",
+        help="Run a command in the Quest worktree and record its result as proof for one Expected Tribute item",
+    )
+    p_prove.add_argument("quest_id")
+    p_prove.add_argument("--item", required=True, help="1-based Expected Tribute item index, or a text prefix of at least 8 characters")
+    p_prove.add_argument("--timeout", type=int, default=1800, help="Command timeout in seconds (default: 1800)")
+    # `nargs="*"` (not REMAINDER): REMAINDER would swallow a `--item` written
+    # after the quest id, which is the documented invocation order. With `*`,
+    # argparse handles `prove <quest> --item N -- <cmd>` and `prove --item N
+    # <quest> -- <cmd>` identically and drops the `--` separator itself; a
+    # leading `--` is still stripped defensively in cmd_prove.
+    p_prove.add_argument("command", nargs="*", help="Command to run; separate it from options with --")
+    p_prove.set_defaults(func=cmd_prove)
+
+    p_proofs = sub.add_parser("proofs", help="Report recorded proof coverage for a Quest's Expected Tribute items")
+    p_proofs.add_argument("quest_id")
+    p_proofs.add_argument("--json", action="store_true", help="Output JSON")
+    p_proofs.set_defaults(func=cmd_proofs)
+
+    p_verify_tribute = sub.add_parser(
+        "verify-tribute",
+        help="Fail when a checked Expected Tribute item has no passing proof at the current HEAD",
+    )
+    p_verify_tribute.add_argument("quest_id")
+    p_verify_tribute.add_argument("--json", action="store_true", help="Output JSON")
+    p_verify_tribute.set_defaults(func=cmd_verify_tribute)
+
     p_verify_merged = sub.add_parser("verify-merged", help="Verify if Quest branch is merged into gatehouse and castle")
     p_verify_merged.add_argument("quest_id", nargs="?", default=None, help="Quest ID, branch name, or worktree path")
     p_verify_merged.add_argument("--include-archived", dest="include_archived", action="store_true", help="Also verify archived Quests, not just active ones")
@@ -9544,6 +9672,10 @@ def build_parser():
     p_nightwatch.add_argument("--max-stewards-per-day", dest="max_stewards_per_day", type=int, default=nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY, help=f"Rolling 24-hour Steward muster cap (default {nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY})")
     p_nightwatch.add_argument("--enable", default=",".join(nightwatch.Policy().enabled), help="Comma list of permitted actions (goad,coin,collect,dispatch,steward,raze,teardown). `teardown` (clearing a provably-dead gatehouse worktree so collect can re-run) is ON by default because it is a common blocking failure. `steward` and `raze` are OPT-IN: steward spends a reasoning worker; raze deletes a branch ref.")
     p_nightwatch.add_argument("--allow-force-goad", dest="allow_force_goad", action="store_true", help="Permit --force goads (supersedes a live worker). Off by default.")
+    p_nightwatch.add_argument("--no-pickup", dest="no_pickup", action="store_true", help="Do not fetch/apply Pleasance paperwork at the top of each tick (default: pickup ON when the checkout is on castle)")
+    p_nightwatch.add_argument("--publish-pulse", dest="publish_pulse", action="store_true", help="Publish the per-tick steward pulse to the read-only status branch (ON by default)")
+    p_nightwatch.add_argument("--no-publish-pulse", dest="no_publish_pulse", action="store_true", help="Keep the steward pulse local-only; do not push PULSE.md/PULSE.json")
+    p_nightwatch.add_argument("--pulse-branch", dest="pulse_branch", default="status/pleasance", help="Branch that receives PULSE.md/PULSE.json (default: status/pleasance)")
     p_nightwatch.add_argument("--quiet", action="store_true", help="Journal only; suppress per-tick console output")
     p_nightwatch.set_defaults(func=cmd_nightwatch)
 
@@ -9596,6 +9728,40 @@ def build_parser():
     p_awaiting.add_argument("--json", action="store_true", help="Print machine-readable buckets")
     p_awaiting.add_argument("--limit", type=int, default=10, help="Rows shown per bucket (default 10)")
     p_awaiting.set_defaults(func=cmd_awaiting)
+
+    p_decisions = sub.add_parser(
+        "decisions",
+        help="List the Audience frontier: every decision awaiting M'Lord, with a decree-packet skeleton for each (answers land on the pleasance branch)",
+    )
+    p_decisions.add_argument("--repo", default=None, help="Court repository (default: this repo)")
+    p_decisions.add_argument("--json", action="store_true", help="Print the frontier as JSON")
+    p_decisions.add_argument("--limit", type=int, default=20, help="Decisions shown (default 20)")
+    p_decisions.set_defaults(func=court_decisions.cmd_decisions)
+
+    p_decree = sub.add_parser(
+        "decree",
+        help="Author a royal decree packet (answers to pending Audiences) as .court/decrees/<id>.json for the pleasance lane",
+    )
+    p_decree.add_argument("--quest", required=True, help="Quest/Epic id the ruling names")
+    p_decree.add_argument("--ruling", required=True, help="M'Lord's ruling, in words")
+    p_decree.add_argument("--question", default="", help="The question being answered (Audience Log context)")
+    p_decree.add_argument("--status", default="", help="Optional target status: " + ", ".join(court_decisions.SAFE_STATUSES))
+    p_decree.add_argument("--id", default="", help="Decree packet id (default: time-stamped)")
+    p_decree.add_argument("--by", default="M'Lord", help="Who ruled (default: M'Lord)")
+    p_decree.add_argument("--repo", default=None, help="Court repository (default: this repo)")
+    p_decree.add_argument("--no-commit", action="store_true", help="Write the packet without committing")
+    p_decree.set_defaults(func=court_decisions.cmd_decree)
+
+    p_pulse = sub.add_parser(
+        "pulse",
+        help="One short steward-readable status file: is the machine running, what landed, what is queued, what needs attention (optionally publish to the read-only status branch)",
+    )
+    p_pulse.add_argument("--repo", default=None, help="Court repository (default: this repo)")
+    p_pulse.add_argument("--json", action="store_true", help="Print the machine-readable payload instead of Markdown")
+    p_pulse.add_argument("--limit", type=int, default=court_pulse.DEFAULT_LIMIT, help=f"Meaningful events to show (default {court_pulse.DEFAULT_LIMIT})")
+    p_pulse.add_argument("--publish", action="store_true", help="Publish PULSE.md/PULSE.json to the status branch via git plumbing (working tree untouched)")
+    p_pulse.add_argument("--branch", default=court_pulse.PULSE_BRANCH, help=f"Status branch for --publish (default: {court_pulse.PULSE_BRANCH})")
+    p_pulse.set_defaults(func=court_pulse.cmd_pulse)
 
     p_vigil = sub.add_parser(
         "vigil",
@@ -9707,11 +9873,16 @@ def build_parser():
 _READ_ONLY_COMMANDS = {
     "status", "show", "list", "tally", "metrics", "ward", "ship", "diff", "timber",
     "model", "verify-merged", "verify-manifest", "verify-convoy", "runsuite", "browser",
-    "awaiting", "pending",
+    "awaiting", "pending", "decisions",
     # `index`, `schedule` and `punished-audit` are pure read-only diagnostics:
     # they snapshot/plan against durable state and write reports to an out dir
     # (never the court tree), so they must not serialize behind the write lock.
     "index", "schedule", "punished-audit",
+    # `proofs` and `verify-tribute` only read `.court/proofs/*` and the
+    # worktree's HEAD; they never write, so an audit must not queue behind a
+    # long-running writer. `prove` DOES write (it records a run), so it keeps
+    # the write lock.
+    "proofs", "verify-tribute",
     # `watch` only observes durable state and re-prompts sessions; it never
     # commits, so it must not serialize behind the write lock (a watchdog
     # blocking on a busy castle would delay continuations). `monitor` runs

@@ -9,6 +9,7 @@ for all Quests and Epics — surviving across ephemeral agent sessions.
 ├── README.md              Canonical court architecture doc.
 ├── LEDGER.md              Steward's standing decisions and notes.
 ├── EDICTS.md              Royal decrees and strategic priorities.
+├── decrees/               Royal decree packets answering pending Audiences (pleasance lane).
 ├── quests/                 Active and completed Quests (Q0NN-App-Concern.md).
 ├── epics/                  Multi-quest Epic initiatives.
 ├── archive/                Archived Quests and Epics.
@@ -164,6 +165,8 @@ court rollup --section <type>       # Siphon tribute sections across fleet
 court ship                          # Cog Ship: deployment convoy summary (Bard/Coffers/Atone/Murmur + castle..main vector)
 court ward                          # Compliance/patrol dashboard: last survey, pending Warden Reports, realm health
 court nightwatch --repo <path>      # Night's Watch: deterministic supervisor (goad/coin/collect under RAM + attempt caps)
+court pulse                         # One short steward-readable status file (running / landed / queued / attention)
+court pulse --publish               # Publish PULSE.md + PULSE.json to origin/status/pleasance
 court vigil list|add|check          # Bounded Steward hand-offs the Night's Watch executes (when <condition> then <action>)
 court teardown-list                 # View worktrees ready to prune
 ```
@@ -192,6 +195,13 @@ in the same worktree. Run `--once` from cron or leave it as a loop; `--status`
 reports the daemon, state file, and per-quest counters; `--dry-run` prints the
 decision without acting. Journal:
 `~/.local/state/kilo-castle/nightwatch/<repo>.jsonl`.
+
+Each tick also (a) runs `court pickup` when the checkout is on `castle`, so
+remote Pleasance paperwork lands without a separate cron, and (b) refreshes and
+publishes the `court pulse` file to `origin/status/pleasance` (`PULSE.md` +
+`PULSE.json`), the away steward's read-only view of liveness, recent events,
+queue, and attention. Use `--no-publish-pulse` to keep it local-only and
+`--no-pickup` to disable the pickup.
 
 ### Vigils — the Steward's bounded hand-off
 

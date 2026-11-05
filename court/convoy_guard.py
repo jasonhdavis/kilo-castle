@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
+from . import git_ops
+
 PROMOTABLE_STATUSES = {"GATE", "READY_TO_RAZE"}
 
 _BRANCH_MERGE_RE = re.compile(r"^Merge branch '([^']+)' into (\S+)$")
@@ -42,16 +44,22 @@ _STATUS_RE = re.compile(r"^status:\s*(\S+)", re.MULTILINE)
 
 @dataclass
 class Finding:
-    """One guard observation. ``error`` blocks promotion; ``warn`` does not."""
+    """One guard observation. ``error`` blocks promotion; ``warn`` does not.
+
+    ``code`` is an optional stable label for programmatic/UI distinction
+    (empty for the pre-existing findings, whose messages are unchanged).
+    """
 
     level: str
     message: str
     quest: str = ""
     branch: str = ""
+    code: str = ""
 
     def render(self) -> str:
         mark = "🔴" if self.level == "error" else "⚠️ "
-        return f"{mark} {self.message}"
+        label = f"[{self.code}] " if self.code else ""
+        return f"{mark} {label}{self.message}"
 
 
 def normalize_cogship_id(value: str) -> str:
@@ -343,11 +351,22 @@ def unpromoted_quests_in_trunk(
 
 
 def suite_proof(repo_root: Path, cogship_id: str) -> dict:
+    """The stamped suite proof, with the lease-fence fields always present.
+
+    ``lease_epoch`` 0 (and empty holder/role) means the proof predates fencing
+    or no worker held the worktree when it ran; both are legacy-valid.
+    """
     path = Path(repo_root) / ".court" / "suites" / f"{normalize_cogship_id(cogship_id)}.json"
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    if not isinstance(payload, dict):
+        return {}
+    payload.setdefault("lease_epoch", 0)
+    payload.setdefault("lease_role", "")
+    payload.setdefault("lease_holder", "")
+    return payload
 
 
 def audit_promotion(
@@ -456,6 +475,15 @@ def audit_promotion(
             "error",
             f"no suite proof recorded for {cid} — run `court runsuite --cogship {cid}` first.",
         ))
+    if proof:
+        fence_check = git_ops.check_suite_proof(cogship_id=cid, head_sha=tip, cwd=repo_root)
+        if fence_check.get("fence_stale"):
+            findings.append(Finding(
+                "error",
+                f"the green suite proof for {cid} is fenced to a superseded worker — "
+                f"{fence_check.get('reason')}",
+                code="stale-lease-fence",
+            ))
     return findings
 
 

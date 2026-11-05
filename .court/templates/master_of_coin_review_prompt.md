@@ -115,6 +115,12 @@ Requires**, **Expected Tribute**, and the Serf's **Tribute Rendered**.
 12. **Commutation — What Does Production Still Need to Do?**
     - Concretely identify anything production still needs to activate this value (deploy commands, env var toggles, migrations, background schedules). State "none" if none.
 
+13. **Expected Tribute Proof Coverage (machine gate)**
+    - Run `python3 -m court.cli verify-tribute {{ quest_id }}` and read the report.
+    - A non-zero exit means at least one checked Expected Tribute item has no passing engine-observed proof recorded at the current HEAD (the item's checkbox is `[x]` but no command result backs it). Treat that as a Gate 3 finding.
+    - The only exception is an item explicitly marked cancelled as `[-]` in the charter with a stated justification; cancelled items are not required to carry proof.
+    - If a proof is stale (recorded at an older HEAD than the worktree now holds), re-run the recorded command in the worktree to refresh it, then re-run the gate.
+
 ## Outcomes — exactly two
 
 - **Pass:**

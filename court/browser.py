@@ -24,6 +24,7 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -128,13 +129,42 @@ def _remove_state() -> None:
         pass
 
 
-def load_annotator_source(endpoint: str, worktree: str) -> str:
-    """Read annotator.js and substitute its two placeholders."""
+def load_annotator_source(endpoint: str, worktree: str,
+                           signoff_token: str = "",
+                           signoff_endpoint: Optional[str] = None) -> str:
+    """Read annotator.js and substitute its placeholders. The sign-off sink
+    defaults to the sibling /api/signoff of the annotation endpoint; its token
+    (when present) is baked into the overlay's closure so only the court-owned
+    injector can arm the Approve affordance."""
     try:
         source = ANNOTATOR_JS_PATH.read_text(encoding="utf-8")
     except Exception as e:
         raise RuntimeError(f"annotator script not readable at {ANNOTATOR_JS_PATH}: {e}") from e
-    return source.replace("{{ANNOTATE_ENDPOINT}}", endpoint).replace("{{WORKTREE}}", worktree)
+    if not signoff_endpoint:
+        if "/api/annotation" in endpoint:
+            signoff_endpoint = endpoint.replace("/api/annotation", "/api/signoff", 1)
+        else:
+            signoff_endpoint = endpoint.rstrip("/") + "/api/signoff"
+    return (source
+            .replace("{{ANNOTATE_ENDPOINT}}", endpoint)
+            .replace("{{WORKTREE}}", worktree)
+            .replace("{{SIGNOFF_ENDPOINT}}", signoff_endpoint or "")
+            .replace("{{SIGNOFF_TOKEN}}", signoff_token or ""))
+
+
+def _fetch_signoff_token(worktree: str) -> str:
+    """Ask the loopback ui_server for this studio's signoff token (server side,
+    no CORS — a page under review can never CORS-read this). Returns '' when
+    the server is down or the worktree is not a signoff-capable studio."""
+    try:
+        url = (f"http://127.0.0.1:{_console_port()}/api/signoff/token"
+               f"?wt={urllib.parse.quote(worktree)}")
+        with urllib.request.urlopen(url, timeout=3.0) as resp:
+            data = json.loads(resp.read(8192).decode("utf-8", "replace"))
+        tok = data.get("token")
+        return str(tok) if isinstance(tok, str) else ""
+    except Exception:
+        return ""
 
 
 def _spawn_detached(cmd: list[str], cwd: Optional[Path] = None) -> int:
@@ -570,8 +600,13 @@ def _inject_worker(worktree: str) -> None:
     re-injects dead WS sessions, and drains open sessions (ping/pong keep-alive).
     """
     endpoint = f"http://127.0.0.1:{_console_port()}/api/annotation"
+    # Arm the "Approve" affordance only when the ui_server confirms this is a
+    # signoff-capable studio and hands back a token. Any failure degrades to a
+    # plain annotation overlay (token empty → button hidden).
+    signoff_token = _fetch_signoff_token(str(worktree))
     try:
-        script = load_annotator_source(endpoint, str(worktree))
+        script = load_annotator_source(endpoint, str(worktree),
+                                       signoff_token=signoff_token)
     except Exception as e:
         print(f"injector: cannot load annotator script: {e}", file=sys.stderr)
         return

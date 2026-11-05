@@ -107,6 +107,12 @@ def _commit_allowed_here(quest: Quest, court_root: Optional[Path] = None) -> boo
         return True
     if current in ("castle", "main"):
         return True
+    # The deterministic combined-studio integration branch (court studio):
+    # charter paperwork there already follows branch-wins and is later carried
+    # back into each Quest via `court studio --sync-back`. Auto-committing the
+    # Quest's own charter from it is the court-created intent, not pollution.
+    if re.fullmatch(r"artist/[A-Za-z0-9_,-]+-ui-studio", current):
+        return True
     return bool(quest.branch) and current == quest.branch
 
 

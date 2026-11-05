@@ -52,8 +52,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from . import decisions
 from . import git_ops
 from . import nightwatch
+from . import store
 from . import vigils
 from .models import Quest, validate_branch_name
 
@@ -70,6 +72,8 @@ STATE_VERSION = 1
 # merged onto castle (which keeps its own internal AGENTS.md).
 _QUEST_CHARTER_RE = re.compile(r"^\.court/quests/[^/]+\.(?:md|events\.jsonl)$")
 _VIGIL_FILE_RE = re.compile(r"^\.court/vigils/[^/]+\.json$")
+# A decree packet is M'Lord's answer to pending Audiences (see court.decisions).
+_DECREE_FILE_RE = re.compile(r"^\.court/decrees/[^/]+\.json$")
 _SURFACE_DOC_RE = re.compile(r"^(?:AGENTS\.md|PLEASANCE\.md)$")
 # Statuses still open to Steward-driven dispatch. Anything past CHARTERED
 # (DISPATCHED/WORKING/GATE/...) means the quest is commissioned and its
@@ -118,11 +122,13 @@ def load_state(repo: Path) -> dict:
         if isinstance(payload, dict) and payload.get("version") == STATE_VERSION:
             payload.setdefault("applied_tip", "")
             payload.setdefault("last_attempt", {"tip": "", "reason": ""})
+            payload.setdefault("applied_decrees", [])
             return payload
     except (OSError, ValueError):
         pass
     return {"version": STATE_VERSION, "repo": str(repo),
-            "applied_tip": "", "last_attempt": {"tip": "", "reason": ""}}
+            "applied_tip": "", "last_attempt": {"tip": "", "reason": ""},
+            "applied_decrees": []}
 
 
 def save_state(repo: Path, state: dict) -> None:
@@ -341,12 +347,15 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
     if not tip:
         if not applied_tip:
             say("no pleasance branch on origin; nothing to pick up")
-            return {"picked": [], "rejected": None, "skipped": "no pleasance branch"}
+            return {"picked": [], "rejected": None, "skipped": "no pleasance branch",
+                "decrees": []}
         say("pleasance branch is gone; nothing new to pick up")
-        return {"picked": [], "rejected": None, "skipped": "no pleasance branch"}
+        return {"picked": [], "rejected": None, "skipped": "no pleasance branch",
+                "decrees": []}
     if applied_tip and applied_tip == tip:
         say(f"pleasance already applied at {tip[:12]}")
-        return {"picked": [], "rejected": None, "skipped": "already applied"}
+        return {"picked": [], "rejected": None, "skipped": "already applied",
+                "decrees": []}
 
     base_rev = applied_tip or base
     if not applied_tip:
@@ -366,21 +375,48 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
     revs = _run(repo, ["rev-list", f"{base_rev}..{tip}"]).stdout.split()
     if not revs:
         say("no new pleasance work")
-        return {"picked": [], "rejected": None, "skipped": "no new pleasance work"}
+        return {"picked": [], "rejected": None, "skipped": "no new pleasance work",
+                "decrees": []}
     changed = _changed_paths(repo, base_rev, tip)
 
-    # Global gate 1: the lane is surgical — only charters, vigil specs, and
-    # the two branch-surface docs (which ride the branch but are never merged).
+    # Decree packets mutate existing quest charters, so resolve the target
+    # charters BEFORE the dirty-tree gate: an uncommitted edit on a charted
+    # Quest the ruling is about would otherwise be silently mixed into the
+    # pickup commit (or clobbered by it).
+    decree_target_paths: set[str] = set()
+    for path in changed:
+        if not _DECREE_FILE_RE.match(path):
+            continue
+        text = _content(repo, tip, path)
+        if text is None:
+            continue
+        try:
+            packet = decisions.parse_decree_packet(text)
+        except decisions.DecreeError:
+            continue  # the validation pass below reports it once, precisely
+        for item in packet["decisions"]:
+            qp = decisions.quest_path(repo, item["quest"])
+            if qp is not None:
+                try:
+                    decree_target_paths.add(qp.relative_to(repo).as_posix())
+                except ValueError:
+                    pass
+
+    # Global gate 1: the lane is surgical — only charters, vigil specs, decree
+    # packets, and the two branch-surface docs (which ride the branch but are
+    # never merged).
     reason: Optional[str] = None
     surface_docs: list[str] = []
     for path in changed:
         if _SURFACE_DOC_RE.match(path):
             surface_docs.append(path)
             continue
-        if not (_QUEST_CHARTER_RE.match(path) or _VIGIL_FILE_RE.match(path)):
+        if not (_QUEST_CHARTER_RE.match(path) or _VIGIL_FILE_RE.match(path)
+                or _DECREE_FILE_RE.match(path)):
             reason = (f"out-of-lane path {path} in pleasance batch — only "
                       f".court/quests/<id>.md, .court/quests/<id>.events.jsonl, "
-                      f".court/vigils/<id>.json, AGENTS.md and PLEASANCE.md may be picked up")
+                      f".court/vigils/<id>.json, .court/decrees/<id>.json, AGENTS.md "
+                      f"and PLEASANCE.md may be picked up")
             break
     # Global gate 2: never mix the pickup commit with a dirty tree the
     # pickup would collide with. Uncommitted `.court` paperwork written by
@@ -394,13 +430,23 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
         conflicts = [p for p in dirty_paths
                      if not p.startswith(".court/")
                      or p == ".court/LEDGER.md"
-                     or p in changed]
+                     or p in changed
+                     or p in decree_target_paths]
         if conflicts:
             reason = (f"castle working tree has conflicting dirty path(s) "
                       f"({conflicts[0][:120]}); refusing to mix the pickup commit")
 
     charters: list[str] = []
     vigils_to_apply: list[str] = []
+    decree_paths: list[str] = []
+    decree_packets: dict[str, dict] = {}
+    # Per-file supersession, NOT batch failure: a remote author may re-send a
+    # charter or vigil that the pipeline already owns (a commissioned quest's
+    # charter is frozen; a live vigil is already active). Those files are
+    # skipped with a recorded reason so the rest of the batch still lands.
+    # Only lane-integrity problems (out-of-lane paths, unreadable/deleted
+    # files, malformed paperwork, dirty collisions) reject the whole batch.
+    skipped_files: list[dict] = []
     if reason is None:
         for path in changed:
             if _QUEST_CHARTER_RE.match(path):
@@ -421,7 +467,8 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
                     break
                 # Freeze rule: the base status on castle is authoritative. A
                 # commissioned quest's charter is frozen — a remote LLM must
-                # not amend paperwork the pipeline already owns.
+                # not amend paperwork the pipeline already owns. Skip the file
+                # (the castle copy wins) instead of wedging the whole lane.
                 qid = Path(path).stem
                 base_text = _content(repo, base, path)
                 if base_text is not None:
@@ -430,8 +477,12 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
                     except ValueError:
                         base_quest = None
                     if base_quest is not None and (base_quest.status or "").strip().upper() not in _OPEN_STATUSES:
-                        reason = f"quest {qid} is commissioned on castle and its charter is frozen"
-                        break
+                        skip_why = (f"quest {qid} is commissioned on castle "
+                                    f"(status {(base_quest.status or '').strip().upper()}) "
+                                    f"and its charter is frozen")
+                        skipped_files.append({"path": path, "reason": skip_why})
+                        say(f"SKIP {path}: {skip_why} — castle copy kept")
+                        continue
                 charters.append(path)
             elif _VIGIL_FILE_RE.match(path):
                 text = _content(repo, tip, path)
@@ -450,20 +501,44 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
                     except ValueError:
                         base_vigil = None
                     if isinstance(base_vigil, dict) and base_vigil.get("status") == "active":
-                        reason = f"vigil {vid} is already active on castle"
-                        break
+                        skip_why = f"vigil {vid} is already active on castle (duplicate delivery)"
+                        skipped_files.append({"path": path, "reason": skip_why})
+                        say(f"SKIP {path}: {skip_why} — castle copy kept")
+                        continue
                 vigils_to_apply.append(path)
+            elif _DECREE_FILE_RE.match(path):
+                text = _content(repo, tip, path)
+                if text is None:
+                    reason = f"cannot read {path} at pleasance tip (deletion is not a pickup)"
+                    break
+                ok, why = decisions.validate_decree(text, repo)
+                if not ok:
+                    reason = f"invalid decree {path}: {why}"
+                    break
+                packet = decisions.parse_decree_packet(text)
+                if packet["id"] in set(state.get("applied_decrees") or []):
+                    skip_why = f"decree {packet['id']} was already applied"
+                    skipped_files.append({"path": path, "reason": skip_why})
+                    say(f"SKIP {path}: {skip_why} — castle copy kept")
+                    continue
+                decree_paths.append(path)
+                decree_packets[path] = packet
 
-    accepted = charters + vigils_to_apply
+    accepted = charters + vigils_to_apply + decree_paths
     if dry_run:
         for p in accepted:
-            say(f"would accept: {p}")
+            extra = (f" ({len(decree_packets[p]['decisions'])} royal decision(s))"
+                     if p in decree_packets else "")
+            say(f"would accept: {p}{extra}")
         for p in surface_docs:
             say(f"would accept: {p} (branch-surface doc — kept on pleasance, never merged)")
+        for item in skipped_files:
+            say(f"would skip: {item['path']} — {item['reason']}")
         if reason:
             say(f"REJECT: {reason}")
         return {"picked": accepted, "rejected": reason, "dry_run": True,
-                "surface_docs": surface_docs}
+                "surface_docs": surface_docs, "skipped_files": skipped_files,
+                "decrees": []}
 
     if reason:
         last = state.get("last_attempt") or {}
@@ -475,38 +550,67 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
         state["last_attempt"] = {"tip": tip, "reason": reason}
         save_state(repo, state)
         say(f"REJECT: {reason}")
-        return {"picked": [], "rejected": reason}
+        return {"picked": [], "rejected": reason, "decrees": []}
 
-    # A batch carrying ONLY the branch-surface docs changes nothing on castle:
-    # advance the applied marker so the next scrape diffs cleanly, journal the
-    # touch, but never create a trunk commit for a non-.court file.
-    if not accepted and surface_docs:
-        _append_ledger(
-            repo,
-            f"- **{_iso()}** — pleasance surface docs updated at {tip[:12]}: "
-            f"{', '.join(surface_docs)} (kept on the branch; nothing merged onto castle)\n",
-        )
-        _commit(repo, [".court/LEDGER.md"], "court: record pleasance surface-doc update")
+    # A batch carrying ONLY branch-surface docs and/or superseded files changes
+    # nothing on castle: advance the applied marker so the next scrape diffs
+    # cleanly, journal the touch/skip, but never create a trunk commit for a
+    # non-.court file.
+    if not accepted and (surface_docs or skipped_files):
+        ledger_bits = []
+        if surface_docs:
+            ledger_bits.append(
+                f"surface docs updated at {tip[:12]}: {', '.join(surface_docs)} "
+                f"(kept on the branch; nothing merged onto castle)")
+        if skipped_files:
+            detail = "; ".join(f"{i['path']} ({i['reason']})" for i in skipped_files)
+            ledger_bits.append(
+                f"skipped {len(skipped_files)} superseded file(s) at {tip[:12]}: {detail}")
+        _append_ledger(repo, f"- **{_iso()}** — pleasance pickup: {' | '.join(ledger_bits)}\n")
+        _commit(repo, [".court/LEDGER.md"], "court: record pleasance pickup skip")
         _push_best_effort(repo, base, say)
         state["applied_tip"] = tip
         state["last_attempt"] = {"tip": tip, "reason": ""}
         save_state(repo, state)
-        say(f"✅ pleasance surface docs updated {tip[:12]}: "
-            f"{', '.join(surface_docs)} (kept on the branch, not merged onto castle)")
-        return {"picked": accepted, "rejected": None, "skipped": "surface docs only",
-                "surface_docs": surface_docs}
+        say(f"✅ pleasance pickup advanced {tip[:12]}: nothing to merge "
+            f"({len(skipped_files)} skipped file(s), {len(surface_docs)} surface doc(s))")
+        return {"picked": [], "rejected": None, "decrees": [],
+                "skipped": ("superseded files only" if skipped_files else "surface docs only"),
+                "surface_docs": surface_docs, "skipped_files": skipped_files}
 
+    skip_note = ""
+    if skipped_files:
+        detail = "; ".join(f"{i['path']} ({i['reason']})" for i in skipped_files)
+        skip_note = f" — skipped {len(skipped_files)} superseded: {detail}"
+    decree_result = {"applied": [], "paths": [], "decree_ids": []}
     try:
         for p in accepted:
             _run(repo, ["checkout", tip, "--", p])
+        if decree_packets:
+            decree_result = decisions.apply_packets(
+                repo, [decree_packets[p] for p in decree_paths])
+        counts = [f"{len(charters)} charter(s)", f"{len(vigils_to_apply)} vigil(s)"]
+        if decree_result["applied"]:
+            counts.append(f"{len(decree_result['applied'])} decree ruling(s)")
         _append_ledger(
             repo,
             f"- **{_iso()}** — pleasance pickup applied {tip[:12]}: "
-            f"{len(charters)} charter(s), {len(vigils_to_apply)} vigil(s)\n",
+            f"{', '.join(counts)}{skip_note}\n",
         )
-        commit_paths = accepted + [".court/LEDGER.md"]
-        if not _commit(repo, commit_paths,
-                       f"court: pleasance pickup {len(charters)} charter(s), {len(vigils_to_apply)} vigil(s)"):
+        quest_files: list[str] = []
+        for qp in decree_result.get("paths") or []:
+            try:
+                rel = qp.relative_to(repo).as_posix()
+            except ValueError:
+                rel = str(qp)
+            if rel not in quest_files:
+                quest_files.append(rel)
+        commit_paths = accepted + quest_files + [".court/LEDGER.md"]
+        commit_subject = (f"court: pleasance pickup {len(charters)} charter(s), "
+                          f"{len(vigils_to_apply)} vigil(s)")
+        if decree_result["applied"]:
+            commit_subject += f", {len(decree_result['applied'])} decree ruling(s)"
+        if not _commit(repo, commit_paths, commit_subject):
             raise RuntimeError("git commit failed")
         head = _show(repo, "HEAD")
     except Exception as e:  # noqa: BLE001 — never leave the command half-applied
@@ -515,11 +619,19 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
         except Exception:  # noqa: BLE001
             pass
         say(f"REJECT: pickup could not be committed — {e}; tree restored to {base}")
-        return {"picked": [], "rejected": f"commit failed: {e}"}
+        return {"picked": [], "rejected": f"commit failed: {e}", "decrees": []}
 
     _push_best_effort(repo, base, say)
     state["applied_tip"] = tip
     state["last_attempt"] = {"tip": tip, "reason": ""}
+    if decree_result.get("decree_ids"):
+        applied_ids = list(dict.fromkeys(
+            list(state.get("applied_decrees") or []) + list(decree_result["decree_ids"])))
+        state["applied_decrees"] = applied_ids[-500:]
     save_state(repo, state)
-    say(f"✅ pleasance pickup applied {tip[:12]}: {len(charters)} charter(s), {len(vigils_to_apply)} vigil(s)")
-    return {"picked": accepted, "rejected": None, "committed": (head or tip)[:12]}
+    summary = (f"{len(charters)} charter(s), {len(vigils_to_apply)} vigil(s)")
+    if decree_result["applied"]:
+        summary += f", {len(decree_result['applied'])} decree ruling(s)"
+    say(f"✅ pleasance pickup applied {tip[:12]}: {summary}, {len(skipped_files)} skipped")
+    return {"picked": accepted, "rejected": None, "committed": (head or tip)[:12],
+            "skipped_files": skipped_files, "decrees": decree_result.get("applied") or []}

@@ -8,7 +8,10 @@ an inventoried MCP server in its own config file, with a .bak backup),
 presets/aliases, suite/harness/freshness commands, no_kilo_mode — atomic with
 a .bak), /api/annotation (appends one studio-annotation JSON line to the
 target worktree's .kilo/studio-annotations.jsonl; served CORS-open for the
-managed studio browser), and the /monitor actions (/api/monitor/kill —
+managed studio browser), /api/signoff (+ GET /api/signoff/token) — the studio
+overlay "Approve" path that records a git-committed `court ui-signoff` for
+every Quest in the studio (token-guarded), and the /monitor actions
+(/api/monitor/kill —
 SIGTERM->SIGKILL one target PID via a detached child, never the server's own
 ancestry; /api/monitor/schedule/delete — removes one schedule JSON file under
 the kilo cron/wakeup stores and logs it so reappearance is flagged).
@@ -21,6 +24,7 @@ import glob
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import sqlite3
@@ -582,6 +586,7 @@ html[data-theme="light"] .iconbtn .bcount{color:#fff}
      <button class="bread lg" id="markread_btn" style="display:none" title="clear the turn marker" onclick="markReadCur()">mark read</button>
      <div class="iconbtn" title="open quest charter in drawer" onclick="toggleDoc(event)">▤</div>
     <div class="iconbtn" id="browser_btn" title="launch studio chromium" style="display:none" onclick="launchBrowser(event)">▶</div>
+    <div class="iconbtn" id="approve_btn" style="display:none;color:var(--green)" title="approve this studio — records a git-committed court ui-signoff for every merged quest" onclick="approveStudio(event)">✓</div>
     <div class="iconbtn" title="settings — models, presets, suite, MCP" onclick="setView('settings')">⚙</div>
     <div class="iconbtn" id="sess_del" title="delete this session" style="display:none" onclick="delSess(selSess)">✕</div>
     <div class="iconbtn" id="sess_burger" title="sessions in this worktree" onclick="toggleSessMenu(event)">☰</div>
@@ -2126,6 +2131,64 @@ function syncBrowserBtn(){
  b.title=running?
   'studio chromium is up'+(port?' (CDP :'+port+')':'')+' — click to pin the annotation overlay to this worktree'
   :'launch shared studio chromium (headed, persistent login profile, CDP + annotation overlay for this worktree)';
+ syncApproveBtn();
+}
+
+// Combined-studio worktree on its deterministic integration branch.
+function isStudioWt(){
+ const w=selWt&&S?(S.worktrees||[]).find(x=>x.path===selWt):null;
+ return !!(w&&w.branch&&/^artist\/[A-Za-z0-9_,-]+-ui-studio$/.test(w.branch));
+}
+function syncApproveBtn(){
+ const b=$('approve_btn');if(!b)return;
+ b.style.display=isStudioWt()?'':'none';
+}
+async function approveStudio(ev){
+ if(ev)ev.stopPropagation();
+ const wt=selWt;if(!wt)return;
+ openModal('APPROVE STUDIO UI','<div id="arload" class="dim">loading quests…</div>');
+ let tok='',info=null;
+ try{
+  const t=await (await fetch('/api/signoff/token?wt='+encodeURIComponent(wt))).json();
+  if(t&&t.ok)tok=t.token;
+ }catch(e){}
+ try{info=await (await fetch('/api/signoff?wt='+encodeURIComponent(wt))).json();}catch(e){}
+ if(!tok||!info||!info.ok||!info.quests||!info.quests.length){
+  const el=$('arload');if(el)el.outerHTML='<div class="empty-note">no signoff-capable studio here — '+esc((info&&info.error)||'worktree is not on an artist/<ids>-ui-studio branch')+'</div>';
+  return;
+ }
+ window.__approveTok=tok;
+ const by=info.by||"M'Lord";
+ let h='<div class="dim" style="font-size:11.5px;margin-bottom:10px">records a git-committed <b>UI Review: APPROVED</b> + <b>UI Sign-off:</b> in each quest charter (same as <span class="mono">court ui-signoff</span>), on the studio branch — carried into each quest by <span class="mono">studio --sync-back</span>.</div>';
+ h+='<div id="ar_qlist" style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px">'+
+  info.quests.map(q=>`<label style="display:flex;gap:8px;align-items:center;font-size:13px"><input type="checkbox" value="${esc(q)}" checked> <b>${esc(q)}</b></label>`).join('')+'</div>';
+ h+='<input id="ar_note" placeholder="optional note — which pages were reviewed…" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--edge);border-radius:6px;padding:7px 9px;color:var(--ink);font:inherit">';
+ h+='<div class="dim" style="font-size:11px;margin:8px 0">signed as: <b>'+esc(by)+'</b> (recorded by the studio server)</div>';
+ h+='<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">'+
+  '<button onclick="closeModal()">Cancel</button>'+
+  '<button id="ar_go" onclick="confirmApprove(this)" style="background:#238636;color:#fff;border-color:#238636;font-weight:700">Record approval</button></div>';
+ const el=$('arload');if(el)el.outerHTML=h;
+ $('ar_note').addEventListener('keydown',e=>{if(e.key==='Enter'){e.stopPropagation();const g=$('ar_go');if(g)g.click();}});
+}
+async function confirmApprove(btn){
+ const wt=selWt;if(!wt)return;
+ const qids=[...document.querySelectorAll('#ar_qlist input:checked')].map(x=>x.value);
+ if(!qids.length){alert('select at least one quest');return;}
+ const note=$('ar_note')?$('ar_note').value.trim():'';
+ if(btn){btn.disabled=true;btn.textContent='recording…';}
+ let res=null;
+ try{
+  res=await (await fetch('/api/signoff',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({worktree:wt,by:"M'Lord",note:note,token:window.__approveTok||''})})).json();
+ }catch(e){}
+ closeModal();
+ if(!res||res.ok!==true){alert('approval refused — '+((res&&res.error)||'unknown error'));poll();return;}
+ const done=(res.results||[]).filter(r=>r.ok).length;
+ const failed=(res.failed||[]).length;
+ alert(failed
+  ?('approved '+done+' quest(s) — '+res.failed.join(', ')+' failed\n\nrun court ui-signoff manually or check the studio git log for errors')
+  :('approved '+done+' quest(s) — UI sign-off recorded on the studio branch'));
+ poll();
 }
 async function launchBrowser(ev){
  if(ev)ev.stopPropagation();
@@ -4985,6 +5048,99 @@ def _annotation_append(rec):
     return total
 
 
+# ---------------------------------------------------------------------------
+# Studio sign-off ("Approve" in the studio overlay).
+#
+# The studio browser overlay is court-injected into M'Lord's studio session and
+# posts to the same loopback ui_server as the annotation overlay. Approving is
+# a git-committed gate record (`court ui-signoff`), so it is guarded by a
+# per-studio token: the injector fetches a token from /api/signoff/token (a GET
+# with NO CORS), bakes it into the annotator's JS closure, and the overlay's
+# POST must carry it back. Page scripts under review share the overlay's origin
+# but cannot read the closure token and cannot CORS-read the token endpoint, so
+# the app under review cannot forge an approval.
+# ---------------------------------------------------------------------------
+_STUDIO_BRANCH_RE = re.compile(r"^artist/([A-Za-z0-9_,-]+)-ui-studio$")
+_QUEST_ID_SEG_RE = re.compile(r"^([A-Za-z]?\d+)$")
+_SIGNOFF_TOKENS: dict[str, str] = {}
+SIGNOFF_DEFAULT_BY = "M'Lord"
+
+
+def _studio_branch(wt):
+    """Active branch of a worktree path, or '' when path/branch unknown."""
+    if not isinstance(wt, str) or not wt:
+        return ""
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=wt, capture_output=True, text=True, timeout=10)
+    except Exception:
+        return ""
+    if res.returncode != 0:
+        return ""
+    return res.stdout.strip() or ""
+
+
+def _studio_quest_ids(wt) -> list[str]:
+    """Resolve the Quests governed by a combined-studio worktree from its
+    integration branch name (artist/<ids>-ui-studio). Returns normalized ids
+    (e.g. Q617) that actually have a charter file in the worktree's .court."""
+    branch = _studio_branch(wt)
+    m = _STUDIO_BRANCH_RE.match(branch) if branch else None
+    if not m:
+        return []
+    seen: dict[str, str] = {}
+
+    def norm(seg: str) -> str:
+        mm = _QUEST_ID_SEG_RE.match(seg)
+        if not mm:
+            return ""
+        head, tail = mm.group(1)[0], mm.group(1)[1:]
+        if head.isalpha():
+            return head.upper() + tail
+        return head + tail
+
+    for seg in m.group(1).split("-"):
+        qid = norm(seg)
+        if qid:
+            seen[qid] = qid
+    if not seen:
+        return []
+    # Keep only ids with a charter file in the worktree (the merged set).
+    quests_dir = os.path.join(os.path.normpath(wt), ".court", "quests")
+    out = []
+    if os.path.isdir(quests_dir):
+        for qid in sorted(seen):
+            qfile = next((f for f in os.listdir(quests_dir)
+                          if f.startswith(qid) and f.endswith(".md")), None)
+            if qfile:
+                out.append(qid)
+    return out
+
+
+def _signoff_token(wt) -> str:
+    """Stable per-worktree signoff token (issued lazily). Keyed by normalized
+    absolute path; survives the studio's lifetime only (in-memory)."""
+    key = os.path.normpath(wt)
+    tok = _SIGNOFF_TOKENS.get(key)
+    if not tok:
+        tok = secrets.token_urlsafe(32)
+        _SIGNOFF_TOKENS[key] = tok
+    return tok
+
+
+def _check_studio_signoff_ready(wt):
+    """(ok: bool, error: str) — is this worktree a signoff-capable studio?"""
+    if not isinstance(wt, str) or not wt:
+        return False, "worktree is required"
+    if not _annotation_wt_ok(wt):
+        return False, "worktree is not an existing git checkout"
+    qids = _studio_quest_ids(wt)
+    if not qids:
+        return False, "worktree is not a combined studio (no artist/<ids>-ui-studio branch)"
+    return True, ""
+
+
 MONITOR_PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Agent &amp; Process Monitor</title>
 <style>
@@ -5511,6 +5667,29 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 items, total = _annotation_rows(wt)
                 self._json({"ok": True, "items": items, "total": total})
+        elif self.path.startswith("/api/signoff/token"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            wt = qs.get("wt", [""])[0]
+            ok, err = _check_studio_signoff_ready(wt)
+            if not ok:
+                self._json({"ok": False, "error": err}, 403)
+            else:
+                # No CORS: only the court-injected injector (server-side urllib,
+                # no browser) may read this token, so the app under review can
+                # never read it.
+                self._json({"ok": True, "token": _signoff_token(wt)})
+        elif self.path.startswith("/api/signoff"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            wt = qs.get("wt", [""])[0]
+            ok, err = _check_studio_signoff_ready(wt)
+            if not ok:
+                self._json({"ok": False, "error": err}, 403, cors=True)
+            else:
+                self._json({"ok": True, "supported": True,
+                            "quests": _studio_quest_ids(wt),
+                            "by": SIGNOFF_DEFAULT_BY}, cors=True)
         elif self.path.startswith("/api/sessions"):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
@@ -5551,6 +5730,8 @@ class Handler(BaseHTTPRequestHandler):
             self._session_delete()
         elif self.path == "/api/annotation":
             self._annotation_add()
+        elif self.path == "/api/signoff":
+            self._signoff()
         elif self.path == "/api/monitor/kill":
             self._monitor_kill()
         elif self.path == "/api/monitor/schedule/delete":
@@ -5605,6 +5786,82 @@ class Handler(BaseHTTPRequestHandler):
                        500, cors=True)
             return
         self._json({"ok": True, "total": total}, cors=True)
+
+    def _signoff(self):
+        """Studio overlay "Approve" sink (CORS-open, token-guarded): records a
+        git-committed ``**UI Review:** APPROVED`` + ``**UI Sign-off:**`` line
+        in each governed Quest's charter via ``court ui-signoff`` run in the
+        studio worktree. The token proves the request came from the court-
+        injected overlay closure, not from the app under review."""
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            n = 0
+        if n > 32 * 1024:
+            self._json({"ok": False, "error": "signoff body too large"},
+                       413, cors=True)
+            return
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            self._json({"ok": False, "error": "malformed JSON body"},
+                       400, cors=True)
+            return
+        if not isinstance(body, dict):
+            self._json({"ok": False, "error": "body must be a JSON object"},
+                       400, cors=True)
+            return
+        wt = body.get("worktree")
+        ok, err = _check_studio_signoff_ready(wt)
+        if not ok:
+            self._json({"ok": False, "error": err}, 403, cors=True)
+            return
+        key = os.path.normpath(wt)
+        token = body.get("token")
+        if not isinstance(token, str) or not token \
+                or token != _SIGNOFF_TOKENS.get(key):
+            self._json({"ok": False,
+                        "error": "signoff token missing or invalid"},
+                       403, cors=True)
+            return
+        by = str(body.get("by") or SIGNOFF_DEFAULT_BY).strip() or SIGNOFF_DEFAULT_BY
+        note = str(body.get("note") or "").strip()
+        provenance = (f"via studio overlay approve — {wt}"
+                      + (f" — {note}" if note else ""))
+        qids = _studio_quest_ids(wt)
+        results = []
+        failed = []
+        for qid in qids:
+            note_arg = (f"via studio overlay approve — {wt}"
+                        if not note else f"via studio overlay approve — {wt} — {note}")
+            # Run against the studio's .court (cwd) while keeping the court
+            # package importable from wherever this server was launched.
+            env = dict(os.environ)
+            env["PYTHONPATH"] = os.pathsep.join(
+                p for p in (COURT_DIR, env.get("PYTHONPATH", "")) if p)
+            try:
+                res = subprocess.run(
+                    [sys.executable, "-m", "court.cli", "ui-signoff",
+                     qid, "--by", by, "--note", note_arg],
+                    cwd=wt, env=env, capture_output=True, text=True, timeout=120)
+                results.append({
+                    "id": qid,
+                    "ok": res.returncode == 0,
+                    "out": (res.stdout or res.stderr).strip()[:400],
+                })
+                if res.returncode != 0:
+                    failed.append(qid)
+            except Exception as exc:
+                results.append({"id": qid, "ok": False,
+                                "out": f"subprocess failed: {exc}"[:400]})
+                failed.append(qid)
+        error = ""
+        if failed:
+            error = "; ".join(
+                f"{r['id']}: {r['out']}" for r in results if not r["ok"])[:600]
+        self._json({"ok": not failed, "by": by, "provenance": provenance,
+                    "error": error,
+                    "results": results, "failed": failed}, cors=True)
 
     def _court(self):
         try:

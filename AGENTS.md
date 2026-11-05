@@ -37,9 +37,10 @@ castle                  (staging root trunk for main; attached to localhost)
 | **Combined Artist Studio** | `artist/<quest_ids>-ui-studio` | `artist/q617-q627-q628-ui-studio` |
 | **Core Trunks** | Root names (no folder) | `main`, `castle` |
 | **Pleasance Lane** | Root trunk (no folder) | `pleasance` — remote-Steward paperwork pickup lane (see Pleasance section below) |
+| **Status Mirror** | `status/<lane>` | `status/pleasance` — disposable, force-updated telemetry (`PULSE.md`/`PULSE.json`); never merged or picked up |
 | **Gatehouse Convoy** | `the-gatehouse/<cogship_id>` | `the-gatehouse/cogship-042` (ephemeral — one brand-new branch per convoy, torn down after promotion; never a fixed/reused name) |
 
-**FORBIDDEN**: Flat hyphens like `quest-q062-...`. Every Quest, Epic, Scout, and Gatehouse branch must begin with its proper folder prefix (`epic/`, `quest/`, `scout/`, or `the-gatehouse/`).
+**FORBIDDEN**: Flat hyphens like `quest-q062-...`. Every Quest, Epic, Scout, Gatehouse, and Status branch must begin with its proper folder prefix (`epic/`, `quest/`, `scout/`, `the-gatehouse/`, or `status/`).
 
 ---
 
@@ -62,9 +63,11 @@ the pipeline runs to shipping with UI review treated as tracked debt rather
 than a gate.
 
 - **One root trunk, `pleasance`** (origin-based, like `castle`), carrying
-  **paperwork commits only**: `.court/quests/<Full-Id>.md` charters and
-  `.court/vigils/<id>.json` vigil specs. Anything else in a commit rejects the
-  whole batch. Rebase on the current `origin/castle` tip before pushing.
+  **paperwork commits only**: `.court/quests/<Full-Id>.md` charters,
+  `.court/vigils/<id>.json` vigil specs, and `.court/decrees/<id>.json` royal
+  decree packets (M'Lord's answers to pending Audiences). Anything else in a
+  commit rejects the whole batch. Rebase on the current `origin/castle` tip
+  before pushing.
 - **Charter form**: frontmatter `id` == file stem, `kind: quest`,
   `branch: quest/<id>-<slug>`, `status` in `OPEN`/`PLANNED`/`CHARTERED`.
   `PLANNED` = held/report-only; `CHARTERED` = committed and dispatched the
@@ -80,7 +83,39 @@ than a gate.
   `.court/LEDGER.md` and pushed up for the remote agent to read), merges
   accepted `.court` files onto `castle`, and mirrors state back to origin.
   Dispatch comes from the castle charter directly — **no synthesized vigil
-  files** for this lane.
+  files** for this lane. A watch tick runs the pickup automatically (only on a
+  `castle` checkout; `--no-pickup` disables it).
+- **Read area for the remote steward**: never `castle` (it is local). Read the
+  read-only status mirror at `origin/status/pleasance`:
+  - `PULSE.md` — one short file answering *is the machine running*, *what
+    landed* (last 15 meaningful events), *what is queued*, *what needs
+    attention*, and **which decisions are awaiting M'Lord** (the Audience
+    frontier, with the question, the kind of decision, and what a ruling
+    unblocks). The local `court decisions` command prints the same frontier
+    with a ready-to-fill decree skeleton per item.
+  - `PULSE.json` — the same payload for tooling (including `decisions[]`).
+  `court pulse` writes the local copy; `court pulse --publish` (or a normal
+  `court nightwatch` tick, which publishes by default) force-updates the status
+  branch via git plumbing without touching the working tree. `--no-publish-pulse`
+  keeps it local-only. The status branch is single-writer telemetry: it is never
+  merged, picked up, or used to send work.
+- **Sending commands**: commit charters (`.court/quests/<id>.md`), vigil
+  specs (`.court/vigils/<id>.json`), or decree packets
+  (`.court/decrees/<id>.json`) to `pleasance`. Vigil actions are
+  allow-listed: `dispatch:<quest>`, `goad:<quest>`, `coin:<quest>`,
+  `collect[:<cogship>]`, `advance:<quest>=<STATUS>`, `note:<text>`.
+- **Answering decisions from the Pleasance**: a decree packet batches the
+  rulings from one voice session —
+  `{"id": "...", "by": "M'Lord", "decisions": [{"quest": "Q123-Slug",
+  "ruling": "...", "status": "WORKING"}]}`. `court pickup` validates the
+  packet, appends a dated `## Audience Log` entry to each named Quest, and
+  applies the status (a `HELD` Quest with no explicit status resumes at
+  `WORKING`). Safe targets only: `OPEN`, `PLANNED`, `CHARTERED`, `DISPATCHED`,
+  `QUESTING`, `WORKING`, `TRIBUTE_READY`, `GATE`, `HELD` — razing, shipping,
+  and the pillory remain human pipeline acts. Applied decree ids are recorded
+  outside the tree, so a re-delivered packet is skipped rather than duplicated.
+  `court decree --quest <id> --ruling "..." [--status WORKING]` authors the
+  same packet locally.
 - **UI review is non-blocking debt**: pending/missing UI never withholds
   collect/promotion/ship; the collect report, pre-ship interrogation, and ship
   manifest list `ui_debt` / a UI Debt Roster for the Court Artist lane to close

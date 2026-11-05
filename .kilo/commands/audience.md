@@ -8,6 +8,10 @@ Two modes, dispatched on the shape of `$ARGUMENTS`:
 
 ## Mode A — No arguments (or arguments that aren't `<quest_id> <question>`): List Pending Audiences
 
+Start with `python3 -m court.cli decisions` — the deterministic Audience
+frontier (HELD/PUNISHED quests, pending Serf Audiences, UI sign-offs) with a
+ready-to-fill decree packet per item.
+
 Scan `.court/quests/*.md` and `.court/epics/*.md` for status `HELD` and any
 "Audience Log" sections with unresolved entries, plus `.court/LEDGER.md`'s
 "Audience log (compressed)" section for anything not yet closed out.

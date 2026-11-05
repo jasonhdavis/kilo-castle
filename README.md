@@ -287,6 +287,22 @@ court nightwatch --dry-run               # decide + print, act on nothing
 - `court nightwatch --status` — daemon presence, last tick, per-Quest counters, and the 24-hour Steward muster tally.
 - The journal lives at `~/.local/state/kilo-castle/nightwatch/<repo>.jsonl`; watch/lease state self-ignores in `.kilo/watch/.gitignore`.
 
+### Remote steward pulse (`court pulse`)
+
+Away stewards read a single short file instead of the machine-oriented journal:
+
+```bash
+court pulse                          # print: running / landed / queued / attention
+court pulse --json                   # same payload for tooling
+court pulse --publish                # force-update origin/status/pleasance
+court nightwatch                     # refreshes/publishes the pulse every tick (default)
+court nightwatch --no-publish-pulse  # keep the pulse local-only
+```
+
+`PULSE.md` answers four questions: is the watch running (daemon pid, last-tick age, live workers), what landed (last ~15 status transitions, actions, pickups, and recent trunk commits), what is queued (TRIBUTE_READY, GATE, dispatch, vigils), and what needs a human. It is published to `status/pleasance`, a disposable single-commit mirror (force-updated, never merged or picked up). The local copy lives beside the Night's Watch state.
+
+Each watch tick also runs `court pickup` on a `castle` checkout, so charters and vigils committed to the remote `pleasance` lane land automatically. Use `--no-pickup` to disable it.
+
 ### Queue-first dispatch (`court enqueue`)
 
 The Steward plans; the Watch spends the machine. Routine new work is **queued** rather than spawned directly: `court enqueue <quest> --why "..." [--after 5m] [--expires 24h]` registers a one-shot `dispatch:<quest>` vigil that the Watch drains only when capacity is free. `court nightwatch --report` is the capacity/queue surface (live workers vs. ceiling, RSS, dispatch hand-offs waiting). Direct `court dispatch` from a Steward turn is break-glass only.
@@ -389,6 +405,7 @@ Agents are defined in `kilo.json` (`mode: primary`, pinned model, full prompt). 
 | `/goad <id>` | Nudge an idle/exited Serf, or diagnose whether it actually finished |
 | `/bear-tribute <id>` | Prompt an active Serf to render its 5-part completion report |
 | `/levy` | Triage worktrees, sync tribute, route rendered Tributes to the Master of Coin |
+| `/decisions` | List the Audience frontier (HELD/pending Audiences/UI sign-offs) with a decree packet per item |
 | `/audience <id> "..."` | Resolve a pending decision requiring M'Lord's judgment |
 | `/artist <id>` | Court Artist UI studio with live runserver (after MoC, before collection) |
 | `/collect` | Pack approved Quests (TRIBUTE_READY → GATE) into a Cog Ship convoy |
@@ -410,7 +427,7 @@ Agents are defined in `kilo.json` (`mode: primary`, pinned model, full prompt). 
 
 ## Command Reference
 
-**Slash commands** (`.kilo/commands/`, run inside Kilo): `artist` `atone` `audience` `bard` `bear-tribute` `charter` `close` `coffers` `cog` `collect` `dismiss` `edict` `epic` `goad` `hold` `levy` `murmur` `nightwatch` `pillory` `plot` `quest` `raze` `reject_tribute` `report-to-the-king` `resume` `return` `scout` `ship` `status` `tally` `teardown` `ward`
+**Slash commands** (`.kilo/commands/`, run inside Kilo): `artist` `atone` `audience` `bard` `bear-tribute` `charter` `close` `coffers` `decisions` `cog` `collect` `dismiss` `edict` `epic` `goad` `hold` `levy` `murmur` `nightwatch` `pillory` `plot` `quest` `raze` `reject_tribute` `report-to-the-king` `resume` `return` `scout` `ship` `status` `tally` `teardown` `ward`
 
 **CLI verbs** (`court <verb>` / `python3 -m court.cli <verb>`):
 

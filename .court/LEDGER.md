@@ -916,3 +916,15 @@ pb-app console restarted again: `bgp_1764da80f001Kxdp2LwjKfabwA` (pid 15405/1560
 `--smoke-test-only: …`): `agent connected - streaming`, session
 `ses_e89b08aa6ffe13uI2XOMrKjNGa`, `turn process exited (0)`. Both causes are now
 closed; the console dispatches dashed messages normally.
+
+## 2026-11-05 — Open Orchestrators Directory: Insights Adopted (Steward research)
+
+Surveyed https://openorchestrators.org (21 listed tools, 8 categories). Gaps vs. Castle:
+auditable decision trails, cost/token budgets as first-class constraints, deterministic
+policy layers kept outside the model, dead-letter/exhaustion semantics, agent discovery,
+shared memory contracts. Castle already beats the field on git-as-substrate, recovery
+budgets, context budgeting, convoy verification. Adopted four falsifiable experiments:
+(1) per-quest decision trace "why this worker this tick" incl. determinism digest,
+(2) `court cost <quest>` reporting token spend against a chartered budget,
+(3) `--dry-run` first-class on dispatch/goad/coin/collect,
+(4) dead-letter lane for exhausted quests in nightwatch report.

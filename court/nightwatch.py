@@ -202,6 +202,16 @@ class Policy:
     enabled: tuple = ("goad", "coin", "collect", "dispatch", "teardown")
     allow_force_goad: bool = False
     status_timeout: int = DEFAULT_STATUS_TIMEOUT
+    # Pleasance lane: each tick may fetch and apply remote paperwork (charters,
+    # vigils) before planning. Only the castle checkout may do this; the tick
+    # refuses on any other branch so a watch started on `main` cannot commit
+    # paperwork onto the wrong trunk. The pulse is written locally every tick
+    # and published to the disposable telemetry branch by default so an away
+    # steward can see liveness without extra flags; `--no-publish-pulse` keeps
+    # it local-only.
+    pickup: bool = True
+    publish_pulse: bool = True
+    pulse_branch: str = "status/pleasance"
 
     def allows(self, kind: str) -> bool:
         return kind in self.enabled
@@ -901,6 +911,25 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
             note(q["id"], "human", "TRIBUTE_READY with no usable worktree")
             continue
         st = qstate.get(q["id"]) or {}
+        mc = st.get("merge_conflict")
+        if isinstance(mc, dict):
+            # A spawn blocked by a rebase conflict is held for a Steward
+            # decision. Once the muster has gone out (escalated_ts), the hold
+            # becomes a PROBE: after the retry backoff the coin is attempted
+            # again — a Steward resolution (or a remediation branching) that
+            # lands makes it succeed, clearing the marker and resuming the
+            # pipeline; a still-conflicted attempt re-stamps the marker and
+            # holds again. Without this, a resolved conflict would stay held
+            # forever because the marker only clears on a successful spawn.
+            if not mc.get("escalated_ts") or now - float(mc.get("ts") or 0) < policy.retry_backoff:
+                files = ", ".join((mc.get("files") or [])[:6]) or "unknown files"
+                level = "wait" if policy.allows("steward") else "human"
+                note(q["id"], level,
+                     f"TRIBUTE_READY but `git merge castle` conflicts in {files} — held for a "
+                     f"{'Steward decision' if policy.allows('steward') else 'human/Steward resolution'}"
+                     + (" (probe pending after backoff)" if mc.get("escalated_ts") else ""),
+                     key="merge_conflict")
+                continue
         if now < float(st.get("retry_at") or 0):
             continue
         coins = int(st.get("coins") or 0)
@@ -957,6 +986,20 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
             note(q["id"], "wait", f"live {','.join(sorted(set(procs)))} process in this worktree — not goading beneath it")
             continue
         st = qstate.get(q["id"]) or {}
+        mc = st.get("merge_conflict")
+        if isinstance(mc, dict):
+            # Same probe semantics as the TRIBUTE_READY hold: held while the
+            # conflict is new; once the Steward muster has gone out, re-probe
+            # GOAD after the backoff so a resolved conflict clears the marker.
+            if not mc.get("escalated_ts") or now - float(mc.get("ts") or 0) < policy.retry_backoff:
+                files = ", ".join((mc.get("files") or [])[:6]) or "unknown files"
+                level = "wait" if policy.allows("steward") else "human"
+                note(q["id"], level,
+                     f"WORKING but `git merge castle` conflicts in {files} — held for a "
+                     f"{'Steward decision' if policy.allows('steward') else 'human/Steward resolution'}"
+                     + (" (probe pending after backoff)" if mc.get("escalated_ts") else ""),
+                     key="merge_conflict")
+                continue
         if now < float(st.get("retry_at") or 0):
             continue
         sid = (q.get("serf_session_id") or "").strip()
@@ -1047,6 +1090,52 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                               meta={"goads_before": goads, "prior_tokens": ctx or 0, "mode": mode,
                                     "retry_backoff": policy.retry_backoff}))
         capacity -= 1
+
+    # --- Merge-conflict escalation: a Steward picks the resolution course ----
+    # A coin/goad spawn blocked by `git merge castle` is a deterministic
+    # blocker — retrying cannot clear it. Those quests are held above; the
+    # Steward must decide the course (branch-wins charter vs. castle-wins
+    # ledger, a remediation Serf, or a human). Escalate PROMPTLY (not gated
+    # on board staleness or zero workers) but still bounded: one muster per
+    # conflict marker, steward cooldown and daily cap respected, and never
+    # stacked on a live steward session.
+    conflict_quests = [
+        (qid, st) for qid, st in qstate.items()
+        if isinstance(st.get("merge_conflict"), dict)
+        and not st["merge_conflict"].get("escalated_ts")
+        and qid in quests
+        and (quests[qid].get("status") or "").upper() in ("WORKING", "QUESTING", "TRIBUTE_READY")
+    ]
+    if conflict_quests and policy.allows("steward"):
+        steward_state = state.get("steward") or {}
+        recent = [float(t) for t in steward_state.get("spawns", [])
+                  if (now - float(t)) < 86400]
+        steward_live = bool((workers.get("by_role") or {}).get("steward")) or (
+            (workers.get("steward_lease") or {}).get("state") in ("live", "stalled", "watching"))
+        if not steward_live and not any(a.kind == "steward" for a in actions):
+            if now < float(steward_state.get("retry_at") or 0):
+                pass
+            elif _within(steward_state.get("last_ts"), policy.steward_cooldown, now):
+                note(",".join(qid for qid, _ in conflict_quests[:3]), "wait",
+                     "merge conflicts persist but a Steward was mustered recently")
+            elif len(recent) >= max(1, policy.max_stewards_per_day):
+                note(",".join(qid for qid, _ in conflict_quests[:3]), "human",
+                     f"{len(conflict_quests)} merge-conflict blocker(s) and the daily Steward "
+                     f"muster cap is spent ({len(recent)}/{policy.max_stewards_per_day}) — needs a human",
+                     key="merge_conflict_steward_cap")
+            elif capacity <= 0:
+                note(",".join(qid for qid, _ in conflict_quests[:3]), "skip",
+                     f"merge conflicts need a Steward but worker ceiling "
+                     f"reached ({busy_workers}/{policy.max_workers})")
+            else:
+                files = sorted({f for _, st in conflict_quests for f in (st["merge_conflict"].get("files") or [])})
+                actions.append(Action(
+                    kind="steward", quest_ids=[qid for qid, _ in conflict_quests],
+                    reason=(f"`git merge castle` conflicts block {'/'.join(qid for qid, _ in conflict_quests[:3])}"
+                            + (f" (+{len(conflict_quests) - 3} more)" if len(conflict_quests) > 3 else "")
+                            + f" in: {', '.join(files)[:240]} — Steward picks the resolution course"),
+                    meta={"retry_backoff": policy.retry_backoff, "merge_conflict": True}))
+                capacity -= 1
 
     # --- Last resort: muster ONE Steward triage session ---------------------
     # Everything above is a mechanical verb the watch can issue itself. When
@@ -1327,6 +1416,27 @@ def _muster_session(result: dict) -> str:
 
 _STALE_CONVOY_RE = re.compile(r"Gatehouse worktree (\S+) already exists")
 _LIVE_CONVOY_RE = re.compile(r"convoy (\S+) is LIVE")
+# `court coin` / `court goad` abort the spawn when the deferred rebase hits a
+# conflict (`_sync_base_before_spawn`) — a deterministic blocker that retrying
+# on the short backoff can never clear, so the watch must instead escalate to
+# a Steward who picks the resolution course. The capture runs to the sentence
+# end so dotted paths (".court/quests/...md") survive.
+_MERGE_CONFLICT_RE = re.compile(r"cannot spawn — `git merge \S+` conflicts in: (.*?)\. The merge")
+
+
+def _merge_conflict_files(result: dict) -> list:
+    """Return the conflicting files a failed coin/goad spawn named, or [].
+
+    ``ERROR: coin: cannot spawn — `git merge castle` conflicts in:
+    .court/quests/Q1046-....md, apps/foo/bar.py. The merge was aborted
+    cleanly; ...`` — the spawn probe aborts deterministically until a human
+    or Steward resolves the rebase, so the watch must not treat this as a
+    transient failure to retry on the short backoff."""
+    text = (result.get("stderr_tail") or "") + "\n" + (result.get("stdout_tail") or "")
+    match = _MERGE_CONFLICT_RE.search(text)
+    if not match:
+        return []
+    return [f.strip() for f in match.group(1).split(",") if f.strip()]
 
 
 def _stale_convoy_worktree(result: dict) -> str:
@@ -1404,9 +1514,23 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
     if action.kind == "goad":
         for qid in action.quest_ids:
             st = qstate.setdefault(qid, {})
-            st["goads"] = int(action.meta.get("goads_before") or 0) + 1
+            mc = _merge_conflict_files(result)
+            # A rebase conflict is a deterministic blocker, not a dead session:
+            # record it so plan() holds the quest and escalates to a Steward
+            # instead of burning the goad budget retrying. The goad counter is
+            # a per-attempt budget, so a conflict does NOT count as an attempt.
             if ok:
+                st["goads"] = int(action.meta.get("goads_before") or 0) + 1
                 st["last_goad_ts"] = now
+                st.pop("merge_conflict", None)
+            elif mc:
+                prev = st.get("merge_conflict") or {}
+                st["merge_conflict"] = {
+                    "files": mc, "ts": now,
+                    "escalated_ts": prev.get("escalated_ts"),
+                }
+            else:
+                st["goads"] = int(action.meta.get("goads_before") or 0) + 1
     elif action.kind == "dispatch":
         # A replacement dispatch advances to the next serf slot; it spends no
         # goad, and clears the goad cooldown so the new serf can be prompted.
@@ -1424,9 +1548,22 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
     elif action.kind == "coin":
         for qid in action.quest_ids:
             st = qstate.setdefault(qid, {})
-            st["coins"] = int(st.get("coins") or 0) + 1
+            mc = _merge_conflict_files(result)
+            # Same class as the goad branch above: a `git merge castle`
+            # conflict blocks the spawn deterministically. Hold the quest for
+            # a Steward decision — do not burn the coin ceiling on a blocker.
             if ok:
+                st["coins"] = int(st.get("coins") or 0) + 1
                 st["last_coin_ts"] = now
+                st.pop("merge_conflict", None)
+            elif mc:
+                prev = st.get("merge_conflict") or {}
+                st["merge_conflict"] = {
+                    "files": mc, "ts": now,
+                    "escalated_ts": prev.get("escalated_ts"),
+                }
+            else:
+                st["coins"] = int(st.get("coins") or 0) + 1
     elif action.kind == "raze":
         # Opt-in destructive help: a successful raze frees the worktree; the
         # Quest leaves READY_TO_RAZE so it simply stops being planned.
@@ -1464,6 +1601,19 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
         st["fails"] = int(st.get("fails") or 0) + 1
         st["last_error"] = (result.get("stderr_tail") or result.get("stdout_tail") or "")[-400:]
         if ok:
+            # Stamp every merge-conflict quest the muster carried so the same
+            # conflict is escalated once, not re-mustered on every cooldown.
+            # A FAILED muster (lease held, kilo missing) leaves the markers
+            # untouched so the same conflict remains eligible on the retry.
+            if action.meta.get("merge_conflict"):
+                for qid in action.quest_ids:
+                    qst = qstate.setdefault(qid, {})
+                    mc = qst.get("merge_conflict")
+                    if isinstance(mc, dict):
+                        mc["escalated_ts"] = now
+            st["fails"] = 0
+            st["last_error"] = ""
+            st["last_ts"] = now
             st["fails"] = 0
             st["last_error"] = ""
             st["last_ts"] = now
@@ -1527,6 +1677,14 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
             st["retry_at"] = 0
         elif live_convoy:
             st["last_error"] = f"convoy {live_convoy} is LIVE — collect deferred"
+        elif isinstance(st.get("merge_conflict"), dict):
+            # A held rebase conflict: do not inflate the fails counter the way
+            # a transient failure would — the quest is not broken, it is parked
+            # for a Steward. Keep a clear error and the probe cadence on
+            # `retry_at` so the marker/hold logic governs, not the fail count.
+            st["last_error"] = (result.get("stderr_tail") or result.get("stdout_tail") or "")[-400:]
+            if backoff:
+                st["retry_at"] = now + backoff
         else:
             st["fails"] = int(st.get("fails") or 0) + 1
             st["last_error"] = (result.get("stderr_tail") or result.get("stdout_tail") or "")[-400:]
@@ -1549,8 +1707,112 @@ def _record_escalations(state: dict, notes: list, now: float) -> None:
     state["notified"] = active
 
 
+def fold_ledger(repo: Path, say=print) -> bool:
+    """Fold branch-side quest paperwork onto the trunk before snapshotting.
+
+    A worker self-advances (`court advance`) on its own branch; the board and
+    the planner read the trunk ledger. Without this fold a finished Tribute
+    still reads `WORKING`, so the watch treats it as a dead worker and goads a
+    completed Quest instead of sending a Master of Coin. Deterministic and
+    fail-soft: a missing branch or an edit war is reported, never fatal.
+    """
+    repo = Path(repo)
+    if not (repo / ".court" / "LEDGER.md").exists():
+        return False
+    try:
+        if subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", "castle"],
+            cwd=str(repo), capture_output=True, timeout=30,
+        ).returncode != 0:
+            return False
+        res = subprocess.run(
+            [sys.executable, "-m", "court.cli", "sync", "--all"],
+            cwd=str(repo), capture_output=True, text=True, timeout=180,
+        )
+    except Exception as e:  # noqa: BLE001 — observation/mirroring must never kill a tick
+        say(f"⚠️  ledger sync failed: {e}")
+        return False
+    if res.returncode != 0:
+        say(f"⚠️  ledger sync reported a problem: {(res.stderr or res.stdout or '').strip()[:200]}")
+        return False
+    return True
+
+
+def _current_branch(repo: Path) -> str:
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(repo), capture_output=True, text=True, timeout=20,
+        )
+        return res.stdout.strip() if res.returncode == 0 else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _run_pickup(repo: Path, state: dict, dry_run: bool, say=print) -> dict:
+    """Apply remote Pleasance paperwork at the top of a tick.
+
+    The pickup lane commits onto the checked-out trunk, so it is only safe on
+    `castle`; a watch accidentally started on `main` (or a quest branch) must
+    never splice paperwork into that branch. A no-op (no pleasance branch) is
+    normal. The result is summarized into state so the pulse can surface a
+    rejection without re-fetching.
+    """
+    branch = _current_branch(repo)
+    if branch != "castle":
+        result = {"skipped": f"not on castle (on {branch or 'detached'})"}
+    else:
+        try:
+            from . import pickup as pickup_lane
+            result = pickup_lane.run(repo, fetch=True, base="castle",
+                                     dry_run=dry_run, say=say)
+        except Exception as e:  # noqa: BLE001 — pickups must never kill a tick
+            result = {"picked": [], "rejected": f"pickup error: {e}"}
+    state["last_pickup"] = {
+        "ts": _now_iso(),
+        "picked": list(result.get("picked") or []),
+        "rejected": result.get("rejected"),
+        "skipped": result.get("skipped"),
+    }
+    if result.get("rejected") or result.get("picked"):
+        _journal(repo, {
+            "ts": state["last_pickup"]["ts"],
+            "event": "pickup",
+            "picked": state["last_pickup"]["picked"],
+            "rejected": state["last_pickup"]["rejected"],
+        })
+    return result
+
+
+def _write_pulse(repo: Path, policy: "Policy", snap: dict, state: dict,
+                 workers: dict, notes: list, dry_run: bool, say=print) -> None:
+    """Write the compact steward pulse every tick (and optionally publish it)."""
+    try:
+        from . import pulse
+        payload = pulse.build(repo, snap=snap, workers=workers, state=state,
+                              notes=notes)
+        markdown = pulse.render_markdown(payload)
+        payload_json = json.dumps(payload, indent=2) + "\n"
+        pulse.write_local(repo, markdown, payload_json)
+        if policy.publish_pulse and not dry_run:
+            result = pulse.publish(repo, markdown, payload_json,
+                                   branch=policy.pulse_branch)
+            if result.get("published"):
+                say(f"📡 pulse published to {policy.pulse_branch} at {result['commit'][:12]}")
+            elif result.get("reason") not in ("unchanged", None):
+                say(f"⚠️  pulse publish failed: {result.get('reason')}")
+    except Exception as e:  # noqa: BLE001 — telemetry must never kill a tick
+        _journal(repo, {"ts": _now_iso(), "event": "pulse_failed", "error": str(e)[:500]})
+
+
 def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=print) -> dict:
     now = time.time()
+    # Fresh branch-side self-advances first: the snapshot below is the board
+    # the planner reasons over, and it reads the trunk ledger.
+    if not dry_run:
+        fold_ledger(repo, say=say)
+        if policy.pickup:
+            _run_pickup(repo, state, dry_run, say=say)
     spawns = _prune_spawns(state, now)
     _heal_stale_convoys(state)
     workers = live_kilo_workers(repo)
@@ -1640,6 +1902,7 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
         "razed": [q["id"] for q in snap.get("quests", [])
                   if q.get("kind") != "epic" and q.get("razed_at")],
     })
+    _write_pulse(repo, policy, snap, state, workers, notes, dry_run, say=say)
     return {"actions": executed, "notes": notes, "workers": workers, "snapshot": snap,
             "vigils_active": len(vigils.load_all(repo))}
 
@@ -1942,6 +2205,25 @@ def render_digest(repo: Path, journal: Optional[list] = None) -> str:
             for key in keys:
                 lines.append(f"  🔔 {qid}: {key}")
 
+    # --- Merge-conflict blockers ------------------------------------------------
+    # A coin/goad spawn blocked by `git merge castle` needs a STEWARD DECISION
+    # (the watch's mechanical verbs cannot clear a rebase conflict). Surfaced
+    # explicitly so the mustered Steward's prompt names the files.
+    conflicts = [
+        (qid, st["merge_conflict"]) for qid, st in (state.get("quests") or {}).items()
+        if isinstance(st.get("merge_conflict"), dict)
+    ]
+    if conflicts:
+        lines.append("")
+        lines.append("merge conflicts blocking a spawn (need a Steward to pick the resolution course):")
+        for qid, mc in sorted(conflicts)[:15]:
+            files = ", ".join((mc.get("files") or [])[:8])
+            since = _iso_from_epoch(float(mc.get("ts") or 0)) if mc.get("ts") else "(ts missing)"
+            esc = " · escalated" if mc.get("escalated_ts") else " · NOT yet escalated"
+            lines.append(f"  ⚔️ {qid}: {files} (since {since}{esc})")
+        if len(conflicts) > 15:
+            lines.append(f"  … and {len(conflicts) - 15} more")
+
     # --- Budgets / counters -----------------------------------------------------
     quests = state.get("quests") or {}
     lines.append("")
@@ -1992,7 +2274,8 @@ def render_digest(repo: Path, journal: Optional[list] = None) -> str:
     else:
         lines.append(f"dispatch contract (24h): {len(compliance['queued'])} via queue · 0 direct ✅")
 
-    if not stuck and not livelocks and not awaiting_raze and not awaiting_prune and not notified and not spent and not fails:
+    if not stuck and not livelocks and not awaiting_raze and not awaiting_prune and not notified \
+        and not conflicts and not spent and not fails:
         lines.append("")
         lines.append("✅ no live issues detected in the journal/state window.")
     return "\n".join(lines)

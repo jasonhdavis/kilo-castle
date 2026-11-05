@@ -174,7 +174,7 @@ def test_rejects_an_invalid_branch_frontmatter(tmp_path):
     assert pickup.load_state(repo)["applied_tip"] == ""
 
 
-def test_rejects_edits_to_a_commissioned_charter(tmp_path):
+def test_skips_edits_to_a_commissioned_charter(tmp_path):
     repo = _repo(tmp_path)
     quest_dir = repo / ".court" / "quests"
     quest_dir.mkdir(parents=True, exist_ok=True)
@@ -186,20 +186,55 @@ def test_rejects_edits_to_a_commissioned_charter(tmp_path):
     _git(repo, "commit", "-m", "commission Q101")
     _git(repo, "push", "-u", "origin", "castle")
 
-    # A remote LLM re-writes the commissioned charter (tampering attempt).
+    # A remote LLM re-writes the commissioned charter (tampering attempt). The
+    # file is superseded and skipped; the lane itself must not wedge.
     _please(repo, lambda r: (r / ".court" / "quests" / "Q101-Working.md").write_text(
         _charter("Q101-Working", "Already being worked (edited)", status="CHARTERED",
                  branch="quest/q101-working"),
         encoding="utf-8"))
     res = pickup.run(repo, say=_silent())
-    assert res["rejected"] and "commissioned" in res["rejected"] and "frozen" in res["rejected"]
-    assert pickup.load_state(repo)["applied_tip"] == ""
+    assert res["rejected"] is None
+    assert res["picked"] == []
+    assert any("Q101-Working.md" in i["path"] and "frozen" in i["reason"]
+               for i in res["skipped_files"])
+    assert pickup.load_state(repo)["applied_tip"] != ""
     # the base charter on castle is untouched
     on_disk = (repo / ".court" / "quests" / "Q101-Working.md").read_text(encoding="utf-8")
     assert "status: WORKING" in on_disk
 
 
-def test_rejects_a_vigil_colliding_with_an_active_one_on_castle(tmp_path):
+def test_skips_a_frozen_charter_but_accepts_the_rest_of_the_batch(tmp_path):
+    """The incident shape: a re-scoped commissioned charter shares a batch with
+    brand-new charters. The frozen file is skipped; the new work still lands."""
+    repo = _repo(tmp_path)
+    quest_dir = repo / ".court" / "quests"
+    quest_dir.mkdir(parents=True, exist_ok=True)
+    (quest_dir / "Q101-Working.md").write_text(
+        _charter("Q101-Working", "Already being worked", status="WORKING",
+                 branch="quest/q101-working"),
+        encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commission Q101")
+    _git(repo, "push", "-u", "origin", "castle")
+
+    def builder(r):
+        (r / ".court" / "quests" / "Q101-Working.md").write_text(
+            _charter("Q101-Working", "Already being worked (edited)", status="CHARTERED",
+                     branch="quest/q101-working"),
+            encoding="utf-8")
+        _valid_builder(r)
+
+    _please(repo, builder)
+    res = pickup.run(repo, say=_silent())
+    assert res["rejected"] is None
+    assert res["picked"] == [".court/quests/Q999-Pickup-Lane.md"]
+    assert any("Q101-Working.md" in i["path"] for i in res["skipped_files"])
+    on_disk = (repo / ".court" / "quests" / "Q101-Working.md").read_text(encoding="utf-8")
+    assert "status: WORKING" in on_disk
+    assert (repo / ".court" / "quests" / "Q999-Pickup-Lane.md").exists()
+
+
+def test_skips_a_vigil_colliding_with_an_active_one_on_castle(tmp_path):
     repo = _repo(tmp_path)
     (repo / ".court" / "vigils").mkdir(parents=True, exist_ok=True)
     spec = vigils.build(id="q900-after-q001", when=["after:2026-01-01T00:00:00Z"],
@@ -219,8 +254,13 @@ def test_rejects_a_vigil_colliding_with_an_active_one_on_castle(tmp_path):
             json.dumps(updated, indent=2), encoding="utf-8")
     _please(repo, builder)
     res = pickup.run(repo, say=_silent())
-    assert res["rejected"] and "already active" in res["rejected"]
-    assert pickup.load_state(repo)["applied_tip"] == ""
+    assert res["rejected"] is None
+    assert res["picked"] == []
+    assert any("already active" in i["reason"] for i in res["skipped_files"])
+    assert pickup.load_state(repo)["applied_tip"] != ""
+    # the active vigil on castle keeps its original reason
+    on_disk = json.loads((repo / ".court" / "vigils" / "q900-after-q001.json").read_text(encoding="utf-8"))
+    assert on_disk["reason"].startswith("Q900 needs")
 
 
 def test_dirty_working_tree_refuses_the_pickup(tmp_path):
@@ -408,3 +448,110 @@ def test_diff_is_taken_against_the_fork_point_not_castle_tip(tmp_path):
     assert res.get("picked") == [".court/quests/Q999-Pickup-Lane.md"]
     # the far-ahead castle churn was never part of the batch
     assert (repo / ".court" / "quests" / "Q999-Pickup-Lane.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# Royal decrees — M'Lord answers the Audience frontier from the pleasance lane
+# ---------------------------------------------------------------------------
+
+
+def _decree(decree_id="decree-1", quest="Q123-Held", ruling="Use session cookies.",
+            status="WORKING"):
+    decision = {"quest": quest, "ruling": ruling}
+    if status:
+        decision["status"] = status
+    return json.dumps({
+        "id": decree_id,
+        "by": "M'Lord",
+        "source": "voice via the Pleasance agent",
+        "decisions": [decision],
+    }, indent=2)
+
+
+def _held_quest(repo, qid="Q123-Held"):
+    quest_dir = repo / ".court" / "quests"
+    quest_dir.mkdir(parents=True, exist_ok=True)
+    (quest_dir / f"{qid}.md").write_text(
+        _charter(qid, "Held thing", status="HELD", branch="quest/q123-held"),
+        encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", f"charter {qid}")
+    _git(repo, "push", "-u", "origin", "castle")
+
+
+def _decree_builder(packet, name="decree-1"):
+    def builder(r):
+        d = r / ".court" / "decrees"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{name}.json").write_text(packet, encoding="utf-8")
+    return builder
+
+
+def test_applies_a_decree_packet_and_unblocks_the_quest(tmp_path):
+    repo = _repo(tmp_path)
+    _held_quest(repo)
+    _please(repo, _decree_builder(_decree()))
+
+    res = pickup.run(repo, say=_silent())
+    assert res["rejected"] is None
+    assert res["picked"] == [".court/decrees/decree-1.json"]
+    assert len(res["decrees"]) == 1
+    assert res["decrees"][0]["from"] == "HELD"
+    assert res["decrees"][0]["to"] == "WORKING"
+
+    charter = (repo / ".court" / "quests" / "Q123-Held.md").read_text(encoding="utf-8")
+    assert "status: WORKING" in charter
+    assert "Royal Decree `decree-1`" in charter
+    assert "Use session cookies." in charter
+    # the ruling is durable paperwork on castle, and the applied id is recorded
+    assert (repo / ".court" / "decrees" / "decree-1.json").exists()
+    assert "decree-1" in pickup.load_state(repo)["applied_decrees"]
+
+    ledger = (repo / ".court" / "LEDGER.md").read_text(encoding="utf-8")
+    assert "decree ruling(s)" in ledger
+    last = _git(repo, "log", "-1", "--format=%s").stdout.strip()
+    assert "decree ruling(s)" in last
+
+
+def test_skips_a_decree_packet_that_was_already_applied(tmp_path):
+    repo = _repo(tmp_path)
+    _held_quest(repo)
+    _please(repo, _decree_builder(_decree()))
+    assert pickup.run(repo, say=_silent())["decrees"]
+
+    # a re-delivery of the SAME decree id (a rebase or a duplicate commit)
+    def redo(r):
+        (r / ".court" / "decrees" / "decree-1.json").write_text(
+            _decree(ruling="Use session cookies, delivered again."), encoding="utf-8")
+    _please_again(repo, redo)
+
+    res = pickup.run(repo, say=_silent())
+    assert res["rejected"] is None
+    assert res["picked"] == []
+    assert res["decrees"] == []
+    assert any("already applied" in i["reason"] for i in res["skipped_files"])
+    # the original ruling is not duplicated into the Audience Log
+    charter = (repo / ".court" / "quests" / "Q123-Held.md").read_text(encoding="utf-8")
+    assert charter.count("Royal Decree `decree-1`") == 1
+
+
+def test_rejects_a_decree_for_an_unknown_quest(tmp_path):
+    repo = _repo(tmp_path)
+    _held_quest(repo)
+    _please(repo, _decree_builder(_decree(quest="Q999-Ghost")))
+    res = pickup.run(repo, say=_silent())
+    assert res["rejected"] and "unknown quest" in res["rejected"]
+    # the whole batch rejects: no decree file lands, the held quest stays held
+    assert not (repo / ".court" / "decrees" / "decree-1.json").exists()
+    charter = (repo / ".court" / "quests" / "Q123-Held.md").read_text(encoding="utf-8")
+    assert "status: HELD" in charter
+
+
+def test_rejects_a_decree_that_tries_to_raze(tmp_path):
+    repo = _repo(tmp_path)
+    _held_quest(repo)
+    _please(repo, _decree_builder(_decree(status="READY_TO_RAZE")))
+    res = pickup.run(repo, say=_silent())
+    assert res["rejected"] and "human acts" in res["rejected"]
+    charter = (repo / ".court" / "quests" / "Q123-Held.md").read_text(encoding="utf-8")
+    assert "status: HELD" in charter

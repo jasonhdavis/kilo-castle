@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from . import blockers
 from . import decisions
 from . import git_ops
 from . import nightwatch
@@ -278,7 +279,21 @@ def _attention(repo: Path, snap: dict, state: dict, workers: dict,
 
     pickup = state.get("last_pickup") or {}
     if pickup.get("rejected"):
-        add("human", "pleasance", f"last pickup rejected: {str(pickup['rejected'])[:180]}")
+        # Name the stable class and the streak so 26 identical ticks read as
+        # one growing blocker, and attach the mechanical remedy from the 3rd
+        # repeat onward. Bounded: the raw string is truncated, not repeated.
+        cls = pickup.get("rejection_class")
+        streak = pickup.get("streak_count")
+        label = "last pickup rejected"
+        if cls:
+            label += f" [{cls}"
+            if isinstance(streak, int) and streak > 1:
+                label += f" streak x{streak}"
+            label += "]"
+        text = f"{label}: {str(pickup['rejected'])[:150]}"
+        if pickup.get("remedy"):
+            text += f" — remedy: {str(pickup['remedy'])[:180]}"
+        add("human", "pleasance", text)
 
     return rows[:12]
 
@@ -377,6 +392,9 @@ def build(repo: Path, *, snap: Optional[dict] = None,
             "board": {"total": len(quests),
                       "by_status": dict(sorted(by_status.items(),
                                                key=lambda kv: -kv[1]))},
+            # Counts only, from the snapshot/state already in hand: the pulse
+            # never pays a second git pass for the blocker board.
+            "blockers": blockers.summary_from_snapshot(snap, state),
             "pleasance": state.get("last_pickup") or {},
             "trunk": trunk,
         },
@@ -438,9 +456,15 @@ def render_markdown(pulse: dict) -> str:
             verdict = "no-op (nothing new)"
         lines.append(f"- **Pleasance pickup:** {verdict} "
                      f"({pickup.get('ts') or 'not seen yet'})")
+    blockers_summary = run.get("blockers") or {}
     lines += [
         f"- **Board:** {board.get('total', 0)} active — "
         + (" · ".join(f"{k} {v}" for k, v in (board.get('by_status') or {}).items()) or "empty"),
+        f"- **Machine blockers:** {blockers_summary.get('parked', 0)} parked "
+        f"({blockers_summary.get('conflicts', 0)} conflict, "
+        f"{blockers_summary.get('drift', 0)} drift, "
+        f"{blockers_summary.get('decisions', 0)} decision) · "
+        f"`court blockers` for the full board",
         "",
         "## What landed (last meaningful events)",
         "",

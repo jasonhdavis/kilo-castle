@@ -284,6 +284,7 @@ court nightwatch --dry-run               # decide + print, act on nothing
 **Read surfaces:**
 
 - `court nightwatch --report` — a digest from the journal + state: livelock collects that packed nothing, standing escalations (stale gatekeeper stamps, pending UI review), goad/coin budget usage, failed actions, steward musters, snapshot failures/restarts.
+- `court blockers [--json]` — the deterministic blocker board: every non-terminal Quest with its class (`conflict:<files>`, `drift:<n>`, `decision`, `no-worktree`, `worker-stalled`, `ready`), worktree drift, and the single verb that clears it (`court rebase Q020`, `court coin Q021`, `await M'Lord ruling`, ...). Sorted worst-first; the same counts appear as one line in `court pulse`.
 - `court nightwatch --status` — daemon presence, last tick, per-Quest counters, and the 24-hour Steward muster tally.
 - The journal lives at `~/.local/state/kilo-castle/nightwatch/<repo>.jsonl`; watch/lease state self-ignores in `.kilo/watch/.gitignore`.
 
@@ -432,14 +433,14 @@ Agents are defined in `kilo.json` (`mode: primary`, pinned model, full prompt). 
 **CLI verbs** (`court <verb>` / `python3 -m court.cli <verb>`):
 
 ```
-advance archive artist audit charter collect commute diff dispatch
+advance archive artist audit blockers charter collect commute diff dispatch
 dispatch-complete edict enqueue fix-branches fork-teardown-list init levy
 list log muster new nightwatch pillory punish raze realign-branches rebase
 rollup set-field set-section ship show stamp status tally teardown-list
 timber tree update verify verify-merged vigil ward worktree-doc
 ```
 
-Highlights: `verify` / `verify-merged` deterministic worktree checks · `rebase` zero-turn branch convergence · `diff` structured worktree diff · `rollup` extract any tribute pillar · `stamp` allocate a Cog Ship id · `timber` cross-reference worktrees ↔ sections ↔ Quests · `archive` shelve closed records · `update` vendor the latest engine.
+Highlights: `blockers` every non-terminal Quest with its blocker and the one verb that clears it (`--json` for tooling) · `verify` / `verify-merged` deterministic worktree checks · `rebase` zero-turn branch convergence · `diff` structured worktree diff · `rollup` extract any tribute pillar · `stamp` allocate a Cog Ship id · `timber` cross-reference worktrees ↔ sections ↔ Quests · `archive` shelve closed records · `update` vendor the latest engine.
 
 ---
 

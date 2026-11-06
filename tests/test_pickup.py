@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from court import nightwatch
 from court import pickup
 from court import vigils
 
@@ -32,7 +33,7 @@ def _repo(tmp_path):
     a `main` branch, and a bare `origin` remote."""
 
     repo = tmp_path / "repo"
-    repo.mkdir()
+    repo.mkdir(parents=True)
     _git(repo, "init", "-b", "castle")
     _git(repo, "config", "user.email", "test@example.com")
     _git(repo, "config", "user.name", "Test Author")
@@ -555,3 +556,212 @@ def test_rejects_a_decree_that_tries_to_raze(tmp_path):
     assert res["rejected"] and "human acts" in res["rejected"]
     charter = (repo / ".court" / "quests" / "Q123-Held.md").read_text(encoding="utf-8")
     assert "status: HELD" in charter
+
+
+# ---------------------------------------------------------------------------
+# Rejection classification — stable machine-readable classes + path extraction
+# ---------------------------------------------------------------------------
+
+
+def test_out_of_lane_batch_classifies_as_non_paperwork_commit(tmp_path):
+    repo = _repo(tmp_path)
+    _please(repo, lambda r: (r / "README.md").write_text("touched\n", encoding="utf-8"))
+    res = pickup.run(repo, say=_silent())
+    assert res["rejection_class"] == "non-paperwork-commit"
+    assert res["rejection_paths"] == ["README.md"]
+    # the human text callers/tests assert on is unchanged
+    assert res["rejected"].startswith("out-of-lane path README.md in pleasance batch — only ")
+
+
+def test_invalid_charter_classes(tmp_path):
+    repo = _repo(tmp_path)
+
+    def builder(r):
+        (r / ".court" / "quests").mkdir(parents=True, exist_ok=True)
+        (r / ".court" / "quests" / "Q999-Broken.md").write_text(
+            "this is not a quest charter, no frontmatter at all\n", encoding="utf-8")
+    _please(repo, builder)
+    res = pickup.run(repo, say=_silent())
+    assert res["rejection_class"] == "invalid-charter"
+    assert res["rejection_paths"] == [".court/quests/Q999-Broken.md"]
+    assert "unparseable charter" in res["rejected"]
+
+
+def test_invalid_prereq_and_branch_are_invalid_charter(tmp_path):
+    repo = _repo(tmp_path)
+
+    def builder(r):
+        (r / ".court" / "quests").mkdir(parents=True, exist_ok=True)
+        (r / ".court" / "quests" / "Q999-Bad-Prereq.md").write_text(
+            _charter("Q999-Bad-Prereq", "Bad prereq", prereqs=["the vibes are good"]),
+            encoding="utf-8")
+    _please(repo, builder)
+    res = pickup.run(repo, say=_silent())
+    assert res["rejection_class"] == "invalid-charter"
+    assert "invalid prerequisite" in res["rejected"]
+
+    other = _repo(tmp_path / "branch-case")
+
+    def branch_builder(r):
+        (r / ".court" / "quests").mkdir(parents=True, exist_ok=True)
+        (r / ".court" / "quests" / "Q999-Flat-Branch.md").write_text(
+            _charter("Q999-Flat-Branch", "Flat branch", branch="quest-q999-flat-branch"),
+            encoding="utf-8")
+    _please(other, branch_builder)
+    res = pickup.run(other, say=_silent())
+    assert res["rejection_class"] == "invalid-charter"
+    assert res["rejection_paths"] == [".court/quests/Q999-Flat-Branch.md"]
+    assert "invalid branch" in res["rejected"]
+
+
+def test_events_journal_failure_is_invalid_charter(tmp_path):
+    repo = _repo(tmp_path)
+
+    def builder(r):
+        (r / ".court" / "quests").mkdir(parents=True, exist_ok=True)
+        (r / ".court" / "quests" / "Q999-Pickup-Lane.md").write_text(
+            _charter("Q999-Pickup-Lane", "Events sibling demo"), encoding="utf-8")
+        (r / ".court" / "quests" / "Q999-Pickup-Lane.events.jsonl").write_text(
+            "this is not json at all\n", encoding="utf-8")
+    _please(repo, builder)
+    res = pickup.run(repo, say=_silent())
+    assert res["rejection_class"] == "invalid-charter"
+    assert res["rejection_paths"] == [".court/quests/Q999-Pickup-Lane.events.jsonl"]
+
+
+def test_dirty_tracked_and_untracked_classes(tmp_path):
+    # tracked: the pickup itself appends to .court/LEDGER.md
+    tracked_repo = _repo(tmp_path / "tracked")
+    _please(tracked_repo, _valid_builder)
+    (tracked_repo / ".court" / "LEDGER.md").write_text("dirty edit\n", encoding="utf-8")
+    res = pickup.run(tracked_repo, say=_silent())
+    assert res["rejection_class"] == "dirty-tracked"
+    assert res["rejection_paths"] == [".court/LEDGER.md"]
+    assert res["rejected"] == (
+        "castle working tree has conflicting dirty path(s) (.court/LEDGER.md); "
+        "refusing to mix the pickup commit")
+
+    # untracked: the real incident shape (scripts/db/roq_prod.py)
+    untracked_repo = _repo(tmp_path / "untracked")
+    _please(untracked_repo, _valid_builder)
+    (untracked_repo / "scripts" / "db").mkdir(parents=True)
+    (untracked_repo / "scripts" / "db" / "roq_prod.py").write_text("x = 1\n", encoding="utf-8")
+    res = pickup.run(untracked_repo, say=_silent())
+    assert res["rejection_class"] == "dirty-untracked"
+    assert res["rejection_paths"] == ["scripts/db/roq_prod.py"]
+
+
+def test_invalid_vigil_and_decree_classes(tmp_path):
+    repo = _repo(tmp_path)
+
+    def vigil_builder(r):
+        (r / ".court" / "vigils").mkdir(parents=True, exist_ok=True)
+        (r / ".court" / "vigils" / "broken.json").write_text("{not json", encoding="utf-8")
+    _please(repo, vigil_builder)
+    res = pickup.run(repo, say=_silent())
+    assert res["rejection_class"] == "invalid-vigil"
+    assert res["rejection_paths"] == [".court/vigils/broken.json"]
+
+    decree_repo = _repo(tmp_path / "decree")
+    _held_quest(decree_repo)
+    _please(decree_repo, _decree_builder(_decree(quest="Q999-Ghost")))
+    res = pickup.run(decree_repo, say=_silent())
+    assert res["rejection_class"] == "decree-invalid"
+    assert res["rejection_paths"] == [".court/decrees/decree-1.json"]
+    assert "unknown quest" in res["rejected"]
+
+
+def test_pickup_remedy_is_pure_and_non_destructive():
+    text = pickup.pickup_remedy("dirty-untracked", ["scripts/db/roq_prod.py"])
+    assert "scripts/db/roq_prod.py" in text
+    assert "never `git clean`" in text
+    assert "git clean -" not in text.replace("never `git clean`", "")
+    assert "commit or stash" in pickup.pickup_remedy("dirty-tracked", ["x.py"])
+    assert "pleasance" in pickup.pickup_remedy("non-paperwork-commit", ["README.md"])
+    assert "branch" in pickup.pickup_remedy("invalid-charter", ["a.md"])
+    assert "immutable" in pickup.pickup_remedy("charter-tamper", ["a.md"])
+    assert "unknown" in pickup.pickup_remedy("not-a-class", [])
+
+
+# ---------------------------------------------------------------------------
+# Pickup streak — increment, reset, clear, and milestone-only journaling
+# ---------------------------------------------------------------------------
+
+
+def _pickup_events(repo):
+    path = nightwatch.journal_path(repo)
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("event") == "pickup":
+            out.append(event)
+    return out
+
+
+def _untracked_blocker(repo):
+    (repo / "scripts" / "db").mkdir(parents=True, exist_ok=True)
+    (repo / "scripts" / "db" / "roq_prod.py").write_text("x = 1\n", encoding="utf-8")
+
+
+def test_pickup_streak_increments_resets_and_clears(tmp_path):
+    repo = _repo(tmp_path)
+    _please(repo, _valid_builder)
+    _untracked_blocker(repo)
+    state = {}
+    for _ in range(5):
+        nightwatch._run_pickup(repo, state, dry_run=False, say=_silent())
+
+    streak = state["pickup_streak"]
+    assert streak["count"] == 5
+    assert streak["class"] == "dirty-untracked"
+    assert streak["paths"] == ["scripts/db/roq_prod.py"]
+    assert state["last_pickup"]["streak_count"] == 5
+    assert state["last_pickup"]["rejection_class"] == "dirty-untracked"
+    assert "never `git clean`" in state["last_pickup"]["remedy"]
+
+    # journal only at the streak start and the milestone, never every tick
+    assert [e["pickup_streak"] for e in _pickup_events(repo)] == [1, 3]
+
+    # class/paths change resets the streak to 1 with a fresh start
+    (repo / "scripts" / "db" / "roq_prod.py").unlink()
+    _please_again(repo, lambda r: (r / "README.md").write_text("touched\n", encoding="utf-8"))
+    nightwatch._run_pickup(repo, state, dry_run=False, say=_silent())
+    assert state["pickup_streak"]["count"] == 1
+    assert state["pickup_streak"]["class"] == "non-paperwork-commit"
+    assert state["pickup_streak"]["paths"] == ["README.md"]
+    assert "remedy" not in state["last_pickup"]
+
+    # resolving the lane (the out-of-lane path is deleted) clears the streak
+    _please_again(repo, lambda r: (r / "README.md").unlink())
+    result = nightwatch._run_pickup(repo, state, dry_run=False, say=_silent())
+    assert result.get("rejected") is None
+    assert "pickup_streak" not in state
+    assert state["last_pickup"]["rejected"] is None
+
+
+def test_pickup_streak_milestones_are_the_only_journal_lines(tmp_path):
+    repo = _repo(tmp_path)
+    _please(repo, _valid_builder)
+    _untracked_blocker(repo)
+    state = {}
+    for _ in range(12):
+        nightwatch._run_pickup(repo, state, dry_run=False, say=_silent())
+    assert state["pickup_streak"]["count"] == 12
+    assert [e["pickup_streak"] for e in _pickup_events(repo)] == [1, 3, 10]
+    # the milestone line carries the remedy for the remote reader
+    assert "never `git clean`" in _pickup_events(repo)[-1]["remedy"]
+
+
+def test_pickup_streak_no_op_and_off_trunk_clear_it(tmp_path):
+    repo = _repo(tmp_path)
+    state = {"pickup_streak": {"count": 4, "since": "x", "class": "dirty-untracked",
+                               "paths": ["a"], "last_ts": "x"}}
+    # no pleasance branch at all is a successful no-op
+    result = nightwatch._run_pickup(repo, state, dry_run=False, say=_silent())
+    assert result.get("rejected") is None
+    assert "pickup_streak" not in state

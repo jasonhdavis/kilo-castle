@@ -59,6 +59,7 @@ from . import schedule as court_schedule
 from . import punished_audit
 from . import pulse as court_pulse
 from . import decisions as court_decisions
+from . import blockers as court_blockers
 
 # The Ward's durable workspace: patrol ledger + Warden Report queue.
 WARD_DIR = Path(__file__).resolve().parent.parent / "ward"
@@ -2076,6 +2077,24 @@ def _last_ledger_entry_is_forced(quest: Quest) -> bool:
             continue
         return "(FORCED" in stripped
     return False
+
+
+def cmd_blockers(args):
+    """Show every non-terminal Quest with its blocker and the one verb that clears it.
+
+    Deterministic: reads the ledger, the watch state file, and (only for
+    non-terminal Quests with an existing worktree) one `git rev-list --count`
+    against the trunk. No model calls, no side effects.
+    """
+    repo = Path(getattr(args, "repo", None) or git_ops.get_repo_root()).resolve()
+    if not (repo / ".court").is_dir():
+        print(f"ERROR: {repo} has no .court/ — not a Court repository", file=sys.stderr)
+        sys.exit(1)
+    payload = court_blockers.collect(repo)
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2))
+        return
+    print(court_blockers.render_text(payload))
 
 
 def cmd_status(args):
@@ -9223,6 +9242,14 @@ def build_parser():
     p_status.add_argument("--json", action="store_true", help="Output dashboard in JSON format")
     p_status.add_argument("--scouts", action="store_true", help="Show only Scout spikes / Investigation-lane records")
     p_status.set_defaults(func=cmd_status)
+
+    p_blockers = sub.add_parser(
+        "blockers",
+        help="Deterministic blocker board: every non-terminal Quest, what is blocking it, and the one verb that clears it",
+    )
+    p_blockers.add_argument("--json", action="store_true", help="Output the board and summary as JSON")
+    p_blockers.add_argument("--repo", default=None, help="Court repository (default: this repo)")
+    p_blockers.set_defaults(func=cmd_blockers)
 
     p_tree = sub.add_parser("tree", help="Display hierarchical Quest and Epic tree")
     p_tree.add_argument("--include-archived", dest="include_archived", action="store_true", help="include archived Quests and Epics")

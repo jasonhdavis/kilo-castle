@@ -135,6 +135,10 @@ DEFAULT_ACTION_TIMEOUT = 600
 COLLECT_TIMEOUT = 900
 JOURNAL_MAX_BYTES = 2 * 1024 * 1024
 
+# A pickup rejection that repeats identically is journaled at the start of the
+# streak and at these counts only — never on every tick.
+PICKUP_STREAK_MILESTONES = (3, 10, 25, 100)
+
 # Worker log silence thresholds, mirroring court.lease.STALL_THRESHOLDS. Kept
 # local so the supervisor stays runnable against a repo whose engine version
 # differs from this one (pb-app and kilo-castle engines are separate copies).
@@ -1856,6 +1860,12 @@ def _run_pickup(repo: Path, state: dict, dry_run: bool, say=print) -> dict:
     never splice paperwork into that branch. A no-op (no pleasance branch) is
     normal. The result is summarized into state so the pulse can surface a
     rejection without re-fetching.
+
+    A rejection that repeats identically tick after tick is a STREAK: the same
+    class + the same paths. The journal records the start and the milestones
+    (3/10/25/100) rather than each tick, so a wedged lane reads as one growing
+    number instead of 26 indistinguishable lines; from the third repeat the
+    rejection also carries a mechanical remedy.
     """
     branch = _current_branch(repo)
     if branch != "castle":
@@ -1866,19 +1876,70 @@ def _run_pickup(repo: Path, state: dict, dry_run: bool, say=print) -> dict:
             result = pickup_lane.run(repo, fetch=True, base="castle",
                                      dry_run=dry_run, say=say)
         except Exception as e:  # noqa: BLE001 — pickups must never kill a tick
-            result = {"picked": [], "rejected": f"pickup error: {e}"}
+            result = {"picked": [], "rejected": f"pickup error: {e}",
+                      "rejection_class": "unknown", "rejection_paths": []}
+
+    ts = _now_iso()
+    rejected = result.get("rejected")
+    streak = None
+    if rejected:
+        cls = result.get("rejection_class") or "unknown"
+        paths = sorted({str(p) for p in (result.get("rejection_paths") or []) if str(p)})
+        prev = state.get("pickup_streak") or {}
+        same = (prev.get("class") == cls
+                and sorted(str(p) for p in (prev.get("paths") or [])) == paths)
+        count = int(prev.get("count") or 0) + 1 if same else 1
+        since = prev.get("since") if same and prev.get("since") else ts
+        streak = {"count": count, "since": since, "class": cls,
+                  "paths": paths, "last_ts": ts}
+        state["pickup_streak"] = streak
+    else:
+        # A successful pickup, a no-op, or an off-trunk skip ends the streak.
+        state.pop("pickup_streak", None)
+
     state["last_pickup"] = {
-        "ts": _now_iso(),
+        "ts": ts,
         "picked": list(result.get("picked") or []),
-        "rejected": result.get("rejected"),
+        "rejected": rejected,
         "skipped": result.get("skipped"),
+        "rejection_class": (streak or {}).get("class"),
+        "rejection_paths": list((streak or {}).get("paths") or []),
     }
-    if result.get("rejected") or result.get("picked"):
+    if streak:
+        state["last_pickup"]["streak_count"] = streak["count"]
+        state["last_pickup"]["streak_since"] = streak["since"]
+        if streak["count"] >= 3:
+            try:
+                from . import pickup as pickup_lane
+                remedy = pickup_lane.pickup_remedy(streak["class"], streak["paths"])
+            except Exception:  # noqa: BLE001 — telemetry must never kill a tick
+                remedy = ""
+            if remedy:
+                state["last_pickup"]["remedy"] = remedy
+
+    # Journal at streak start / class change (count == 1) and at milestones;
+    # a successful pickup is always worth one line.
+    if streak:
+        if streak["count"] == 1 or streak["count"] in PICKUP_STREAK_MILESTONES:
+            _journal(repo, {
+                "ts": ts,
+                "event": "pickup",
+                "picked": state["last_pickup"]["picked"],
+                "rejected": rejected,
+                "rejection_class": streak["class"],
+                "rejection_paths": streak["paths"],
+                "pickup_streak": streak["count"],
+                "streak_since": streak["since"],
+                "remedy": state["last_pickup"].get("remedy"),
+            })
+    elif result.get("picked"):
         _journal(repo, {
-            "ts": state["last_pickup"]["ts"],
+            "ts": ts,
             "event": "pickup",
             "picked": state["last_pickup"]["picked"],
-            "rejected": state["last_pickup"]["rejected"],
+            "rejected": None,
+            "rejection_class": None,
+            "rejection_paths": [],
         })
     return result
 

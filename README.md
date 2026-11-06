@@ -328,6 +328,41 @@ By default the Watch never makes Steward judgments. Opt in explicitly with `cour
 
 The Watch reports each worker's true context usage (last `step-finish` `tokens.total`) and prefers a FRESH session over a bloated one. It cold-starts a fresh session once a session crosses `--context-soft` (default ~350k) **and the worktree is committed** (uncommitted work keeps the session so a fresh start can't discard edits), and never re-prompts a session past `--context-hard` (default ~750k).
 
+### Slack bridge (`court slack`)
+
+The Slack bridge is a stdlib-only (`urllib.request`) mirror of the decision frontier. A cron/nightwatch tick posts new blockers and pending Audiences to a channel (or a DM), and a **reply in the message thread becomes a royal decree packet** — the bridge never applies a ruling itself; the packet + pleasance pickup lane remain the only path.
+
+Configuration is resolved most-specific first:
+
+1. env `COURT_SLACK_TOKEN`, `COURT_SLACK_CHANNEL`, `COURT_SLACK_NOTIFY_USER`, `COURT_SLACK_ENV_FILE`;
+2. a `slack` block in `.court/config.json`:
+   ```json
+   "slack": {"token_env": "SLACK_BOT_TOKEN", "channel": "", "notify_user": "U02MA74K9DY"}
+   ```
+3. for the token only, a sibling `pb-app/.env` found by searching upward from the repo root.
+
+```bash
+court slack status --probe     # configured? token present? target? last sync? auth.test team/user
+court slack post --quest Q123-Slug --kind decision --text "This needs a ruling on auth"
+court slack sync               # cron entry point: post new/changed items, then ingest replies
+court slack sync --dry-run     # report what would be posted/consumed; writes and sends nothing
+court slack sync --json        # machine-readable result for automation
+```
+
+`sync` builds a deterministic blocker digest from `court status --json` plus the Night's Watch state, filtering to blockers the watch **cannot** clear mechanically: escalated merge conflicts (or a TRIBUTE_READY/GATE quest whose last rebase/coin conflicted), a pickup rejection at streak ≥3 or with a remedy, and worker stalls after the goad/dispatch budget is spent. Plain base drift on a WORKING quest is left to the watch's own rebase and is not notified. It then adds the Audience frontier from `court decisions`. At most **5 individual messages** are posted per sync (each carries its own thread anchor); any overflow becomes **one bounded digest** listing the remainder as `quest: kind — summary` lines, with every included fingerprint recorded so it does not repeat. Dedupe is by a SHA-256 fingerprint of `(kind, quest id, normalized text)`, so an unchanged board posts nothing and a changed ruling posts once. Dedupe and consumed-reply state live outside the git tree at `~/.local/state/kilo-castle/slack/<repo-slug>.json` (`COURT_STATE_DIR` overrides the base).
+
+`--json` is a machine surface: `court slack sync [--dry-run] --json` prints one parseable document (`configured`, `would_post`/`posted`, `replies`, `error`) and suppresses the human lines.
+
+The reply loop is: post carries the quest id → a human replies in that thread → `sync` polls `conversations.replies`, strips Slack mrkdwn, and writes `.court/decrees/<id>.json` (`by: "M'Lord"`, `source: "slack reply in <channel>"`) validated by `decisions.validate_decree`. It then commits the packet (unless `--dry-run`) and prints the exact follow-up: deliver it on the `pleasance` lane for pickup, or run `court decree --quest <id> --ruling "..."` to apply locally now. Each reply is consumed once.
+
+Required Slack bot scopes: `chat:write`; `im:history` for DMs; `channels:history` for public channels; `groups:history` for private channels. A DM target is a user id (`U…`/`W…`); the bridge opens and remembers the DM channel. The bot token is never printed — error paths redact it.
+
+Cron every two minutes:
+
+```cron
+*/2 * * * * cd /path/to/kilo-castle && court slack sync >> ~/.local/state/kilo-castle/slack-sync.log 2>&1
+```
+
 ---
 
 ## Protocol Guardrails

@@ -161,3 +161,40 @@ def test_pulse_surfaces_the_decisions_awaiting_mlord(tmp_path):
     assert "## Decisions awaiting M'Lord" in md
     assert "Q102" in md
     assert ".court/decrees/<id>.json" in md
+
+
+def test_pulse_names_the_pickup_class_streak_and_remedy(tmp_path):
+    repo = _repo(tmp_path)
+    remedy = ("untracked file scripts/db/roq_prod.py blocks every pickup: commit it "
+              "on a quest branch or add it to .gitignore; never `git clean`")
+    state = {
+        "last_pickup": {
+            "ts": "2026-11-05T03:20:00Z",
+            "picked": [],
+            "rejected": "castle working tree has conflicting dirty path(s) "
+                        "(scripts/db/roq_prod.py); refusing to mix the pickup commit",
+            "rejection_class": "dirty-untracked",
+            "rejection_paths": ["scripts/db/roq_prod.py"],
+            "streak_count": 26,
+            "remedy": remedy,
+        },
+    }
+    payload = pulse.build(
+        repo, snap=_snap(), workers={"count": 0, "rss_mb": 0.0, "by_role": {}},
+        state=state, journal=[], notes=[], limit=15)
+
+    line = next(a for a in payload["attention"] if a["quest"] == "pleasance")
+    assert "last pickup rejected" in line["text"]
+    assert "dirty-untracked" in line["text"]
+    assert "x26" in line["text"]
+    assert "never `git clean`" in line["text"]
+    assert len(line["text"]) < 400
+
+    md = pulse.render_markdown(payload)
+    assert "Machine blockers" in md
+    assert "dirty-untracked" in md
+    # counts come from the snapshot already in hand: two decision/no-worktree
+    # quests (Q100/Q101 have no worktree; Q102 is a pending Audience)
+    blockers = payload["running"]["blockers"]
+    assert blockers["decisions"] == 1
+    assert blockers["parked"] >= 1

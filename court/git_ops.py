@@ -877,11 +877,240 @@ def can_fast_forward(worktree_path: str, base_branch: str = "castle") -> dict:
     return {"fetch_ok": fetch.get("ok"), "behind_base": behind}
 
 
+_OWN_CHARTER_TRIBUTE = "Tribute Rendered"
+_OWN_CHARTER_EXPECTED = "Expected Tribute"
+
+
+def _split_charter_document(text: str) -> Optional[dict]:
+    """Split a charter into frontmatter, preamble, and ordered `## ` sections.
+
+    Section boundaries mirror `court.models`: a known canonical/legacy section
+    name always starts a section; inside a free-text section (goal prose, a
+    checklist, a Tribute report) an unknown `## ` heading is content, never a
+    boundary; anywhere else an unknown heading starts a custom section.
+    """
+    if not text.startswith("---\n"):
+        return None
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return None
+    front = text[: end + len("\n---\n")]
+    body = text[end + len("\n---\n"):]
+    from . import models as _models
+
+    known = set(_models.DEFAULT_BODY_SECTIONS) | set(_models.LEGACY_SECTION_ALIASES)
+    freetext = set(getattr(_models, "_FREETEXT_SECTION_NAMES", ()))
+    preamble: list[str] = []
+    sections: list[tuple[str, str]] = []
+    cur_name: Optional[str] = None
+    cur_lines: list[str] = []
+    in_freetext = False
+    for line in body.splitlines(keepends=True):
+        m = re.match(r"^##[ \t]+(.+?)[ \t]*\r?\n?$", line)
+        if m:
+            name = m.group(1).strip()
+            if name in known or cur_name is None or not in_freetext:
+                if cur_name is None:
+                    preamble = cur_lines
+                else:
+                    sections.append((cur_name, "".join(cur_lines)))
+                cur_name = name
+                cur_lines = [line]
+                in_freetext = name in freetext
+                continue
+        cur_lines.append(line)
+    if cur_name is None:
+        preamble = cur_lines
+    else:
+        sections.append((cur_name, "".join(cur_lines)))
+    return {"front": front, "preamble": "".join(preamble), "sections": sections}
+
+
+_EXPECTED_ITEM_RE = re.compile(r"^(\s*[-*]\s+\[)([ xX])(\]\s*)(.*)$")
+
+
+def _expected_tribute_items(block: str) -> tuple[list[tuple[bool, str]], list[str]]:
+    """Return ([(checked, item text)], [non-item lines]) for an Expected
+    Tribute block. Item TEXT is the anti-tampering invariant: only the
+    checkbox may differ between the branch and castle."""
+    items: list[tuple[bool, str]] = []
+    others: list[str] = []
+    for line in block.splitlines():
+        m = _EXPECTED_ITEM_RE.match(line)
+        if m:
+            items.append((m.group(2).lower() == "x", m.group(4).strip()))
+        else:
+            others.append(line.rstrip())
+    while others and not others[0]:
+        others.pop(0)
+    while others and not others[-1]:
+        others.pop()
+    return items, others
+
+
+def _merge_expected_tribute(base_block: str, branch_items: list[tuple[bool, str]]) -> str:
+    """Castle's checklist order/text, with `[x]` kept if EITHER side checked it."""
+    out: list[str] = []
+    idx = 0
+    for line in base_block.splitlines(keepends=True):
+        raw = line.rstrip("\r\n")
+        ending = line[len(raw):]
+        m = _EXPECTED_ITEM_RE.match(raw)
+        if m and idx < len(branch_items):
+            checked = m.group(2).lower() == "x" or branch_items[idx][0]
+            out.append(
+                f"{m.group(1)}{'x' if checked else ' '}{m.group(3)}{m.group(4)}{ending}"
+            )
+            idx += 1
+        else:
+            out.append(line)
+    return "".join(out)
+
+
+def _section_body(block: str) -> str:
+    _heading, _, body = block.partition("\n")
+    return body
+
+
+def _tribute_insertion_index(castle_names: list[str]) -> int:
+    """Where a branch-only `## Tribute Rendered` lands when castle lacks one:
+    immediately after the last castle section that precedes it in canonical
+    order (Expected Tribute), else at the end."""
+    from . import models as _models
+
+    canonical = list(_models.DEFAULT_BODY_SECTIONS)
+    try:
+        target = canonical.index(_OWN_CHARTER_TRIBUTE)
+    except ValueError:
+        return len(castle_names)
+    last = -1
+    for i, name in enumerate(castle_names):
+        if name in canonical and canonical.index(name) < target:
+            last = i
+    return last + 1
+
+
+def _own_charter_stage_docs(p: Path, rel_path: str):
+    """The branch (stage 2) and castle (stage 3) parses of a conflicted charter."""
+    ours_res = _run(["git", "show", f":2:{rel_path}"], p)
+    theirs_res = _run(["git", "show", f":3:{rel_path}"], p)
+    if not ours_res.get("ok") or not theirs_res.get("ok"):
+        return None, None
+    return (
+        _split_charter_document(ours_res.get("stdout") or ""),
+        _split_charter_document(theirs_res.get("stdout") or ""),
+    )
+
+
+def _own_charter_structurally_diverged(p: Path, rel_path: str) -> bool:
+    """True when the branch carries a REAL structural divergence the section
+    merge refuses (a branch-only non-tribute section, or changed Expected
+    Tribute item text). Such a refusal must not be laundered away by the
+    ledger-union fallback, which only sees the conflict markers git chose to
+    emit and would silently keep the divergent section."""
+    branch, castle = _own_charter_stage_docs(p, rel_path)
+    if not branch or not castle:
+        return False
+    castle_map = dict(castle["sections"])
+    branch_map = dict(branch["sections"])
+    for name in branch_map:
+        if name not in castle_map and name != _OWN_CHARTER_TRIBUTE:
+            return True
+    if _OWN_CHARTER_EXPECTED in branch_map and _OWN_CHARTER_EXPECTED in castle_map:
+        base_items, _ = _expected_tribute_items(castle_map[_OWN_CHARTER_EXPECTED])
+        branch_items, _ = _expected_tribute_items(branch_map[_OWN_CHARTER_EXPECTED])
+        if [t for _, t in base_items] != [t for _, t in branch_items]:
+            return True
+    return False
+
+
+def _reconcile_own_charter_conflict(p: Path, rel_path: str, own_id: str) -> bool:
+    """Section-aware merge of a Quest's OWN charter conflict.
+
+    Castle (= the merge base side, stage 3) is authoritative for frontmatter
+    AND structure: every castle section is emitted in castle order, and a
+    castle-only section (the Pleasance pickup appends `## Audience Log`, a
+    Master of Coin adds `## Commutation`) is taken verbatim. On sections both
+    sides carry, `## Tribute Rendered` keeps the branch's real work and
+    `## Expected Tribute` unions checkbox state while requiring identical item
+    text. Any other shared-section drift, any changed Expected-Tribute item
+    text, or any branch-only section other than Tribute Rendered refuses the
+    merge rather than guessing.
+    """
+    branch, castle = _own_charter_stage_docs(p, rel_path)
+    if not branch or not castle:
+        return False
+    castle_names = [n for n, _ in castle["sections"]]
+    branch_map = dict(branch["sections"])
+    for name in branch_map:
+        if name not in castle_names and name != _OWN_CHARTER_TRIBUTE:
+            return False
+
+    merged: list[str] = []
+    for name, base_block in castle["sections"]:
+        branch_block = branch_map.get(name)
+        if branch_block is None:
+            merged.append(base_block)
+            continue
+        if name == _OWN_CHARTER_TRIBUTE:
+            merged.append(branch_block if _section_body(branch_block).strip() else base_block)
+            continue
+        if name == _OWN_CHARTER_EXPECTED:
+            base_items, base_others = _expected_tribute_items(base_block)
+            branch_items, branch_others = _expected_tribute_items(branch_block)
+            if [t for _, t in base_items] != [t for _, t in branch_items]:
+                return False
+            if base_others != branch_others:
+                return False
+            merged.append(_merge_expected_tribute(base_block, branch_items))
+            continue
+        if base_block.rstrip() != branch_block.rstrip():
+            return False
+        merged.append(base_block)
+
+    if _OWN_CHARTER_TRIBUTE in branch_map and _OWN_CHARTER_TRIBUTE not in castle_names:
+        branch_block = branch_map[_OWN_CHARTER_TRIBUTE]
+        if _section_body(branch_block).strip():
+            merged.insert(_tribute_insertion_index(castle_names), branch_block)
+
+    text = castle["front"] + castle["preamble"] + "".join(merged)
+    if not text.endswith("\n"):
+        text += "\n"
+    (p / rel_path).write_text(text, encoding="utf-8")
+    return True
+
+
+def _reconcile_own_events_conflict(p: Path, rel_path: str) -> bool:
+    """Union a Quest's OWN `.events.jsonl` conflict: dedupe exact lines and
+    order by `ts` (branch lines first on equal ts, matching the event fold)."""
+    ours_res = _run(["git", "show", f":2:{rel_path}"], p)
+    theirs_res = _run(["git", "show", f":3:{rel_path}"], p)
+    if not ours_res.get("ok") or not theirs_res.get("ok"):
+        return False
+    branch = [ln for ln in (ours_res.get("stdout") or "").splitlines() if ln.strip()]
+    castle = [ln for ln in (theirs_res.get("stdout") or "").splitlines() if ln.strip()]
+    seen = set(branch)
+    merged = branch + [ln for ln in castle if ln not in seen]
+
+    def _ts(line: str) -> str:
+        try:
+            return str(json.loads(line).get("ts", ""))
+        except Exception:
+            return ""
+
+    merged.sort(key=_ts)
+    (p / rel_path).write_text(
+        "\n".join(merged) + ("\n" if merged else ""), encoding="utf-8"
+    )
+    return True
+
+
 def rebase_worktree_onto_base(
     worktree_path: str | Path,
     base_branch: str = "castle",
     auto_resolve_foreign_ledger: bool = True,
     own_quest_id: Optional[str] = None,
+    auto_resolve_own_paperwork: bool = True,
 ) -> dict:
     """Mechanically converge a worktree onto `base_branch` via `git merge <base> --no-edit`."""
     p = Path(worktree_path)
@@ -991,10 +1220,37 @@ def rebase_worktree_onto_base(
                 and norm.endswith(".md")
                 and own_id in Path(f).stem.upper()
             )
-            if is_own_ledger and _reconcile_history_only_conflict(p / f):
+            is_own_charter = (
+                norm.startswith(".court/quests/")
+                and norm.endswith(".md")
+                and own_id in Path(f).stem.upper()
+            )
+            is_own_events = (
+                norm.startswith(".court/quests/")
+                and norm.endswith(".events.jsonl")
+                and own_id in Path(f).stem.upper()
+            )
+            marker = ""
+            if is_own_charter and auto_resolve_own_paperwork:
+                if _reconcile_own_charter_conflict(p, norm, own_id):
+                    marker = f + " (own charter)"
+                elif _own_charter_structurally_diverged(p, norm):
+                    # A real divergence (branch-only section, changed item
+                    # text) must not be laundered by the ledger-union fallback,
+                    # which only sees the markers git chose to emit and would
+                    # silently keep the divergent section.
+                    pass
+                elif _reconcile_history_only_conflict(p / f):
+                    marker = f + " (ledger union)"
+            elif (is_own_events and auto_resolve_own_paperwork
+                    and _reconcile_own_events_conflict(p, norm)):
+                marker = f + " (own events)"
+            elif is_own_ledger and _reconcile_history_only_conflict(p / f):
+                marker = f + " (ledger union)"
+            if marker:
                 add_res = _run(["git", "add", f], p)
                 if add_res.get("ok"):
-                    result["auto_resolved_files"].append(f + " (ledger union)")
+                    result["auto_resolved_files"].append(marker)
                     reconciled_any = True
                 else:
                     remaining_after_union.append(f)

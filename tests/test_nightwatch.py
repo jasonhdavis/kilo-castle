@@ -171,7 +171,7 @@ def test_a_reshipment_is_recollected_despite_the_old_gatekeeper_stamp(tmp_path):
         cogship_id="cogship-9",
         gatekeeper_session_id="ses_old_shipment",
         cogship_promoted_commit="abc1234",
-        git_status={"ahead": 45, "behind": 1},
+        git_status={"ahead": 45, "behind": 0},
     ))
     actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(max_workers=4), _workers())
     assert [a.kind for a in actions] == ["collect"]
@@ -1260,3 +1260,68 @@ def test_tick_dry_run_does_not_fold_the_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(nw, "snapshot", lambda repo, timeout=None: {"quests": []})
     nw.tick(tmp_path, _policy(), nw.load_state(tmp_path), dry_run=True, say=lambda *a, **k: None)
     assert folded == []
+
+
+# ---------------------------------------------------------------------------
+# Drift: a mechanical rebase precedes the spawn
+# ---------------------------------------------------------------------------
+
+def test_a_drifted_tribute_ready_quest_rebases_instead_of_coining(tmp_path):
+    """A Quest that is merely behind castle is not broken: rebase it this tick,
+    then coin it next tick once the branch is clean."""
+    wt = _free(tmp_path)
+    state = nw.load_state(tmp_path)
+    snap = _snap(_q("Q1", "TRIBUTE_READY", wt, git_status={"behind": 7}))
+    actions, _ = nw.plan(snap, state, _policy(max_workers=4), _workers())
+    (action,) = actions
+    assert (action.kind, action.quest_ids) == ("rebase", ["Q1"])
+    assert "7 commit(s)" in action.reason
+
+    nw._apply_bookkeeping(
+        state, action, {"ok": True, "stdout_tail": "🔄 Q1 merged: 7 -> 0 behind."}, 1000.0)
+    assert state["quests"]["Q1"]["last_rebase_ts"] == 1000.0
+    assert not state["quests"]["Q1"].get("coins")
+
+    clean = _snap(_q("Q1", "TRIBUTE_READY", wt, git_status={"behind": 0}))
+    actions, _ = nw.plan(clean, state, _policy(max_workers=4), _workers(), now=1301.0)
+    assert [a.kind for a in actions] == ["coin"]
+
+
+def test_a_conflicted_rebase_holds_the_quest_and_does_not_coin(tmp_path):
+    wt = _free(tmp_path)
+    state = nw.load_state(tmp_path)
+    action = nw.Action(kind="rebase", quest_ids=["Q1"], meta={"retry_backoff": 300})
+    nw._apply_bookkeeping(state, action, {
+        "ok": False,
+        "stdout_tail": ("🔴 Q1 CONFLICT in [.court/quests/Q1-X.md, apps/x.py] — "
+                        "aborted, needs manual resolution."),
+    }, 1000.0)
+    mc = state["quests"]["Q1"]["merge_conflict"]
+    assert mc["files"] == [".court/quests/Q1-X.md", "apps/x.py"]
+    assert not state["quests"]["Q1"].get("coins")
+
+    snap = _snap(_q("Q1", "TRIBUTE_READY", wt, git_status={"behind": 7}))
+    actions, notes = nw.plan(snap, state, _policy(max_workers=4), _workers(), now=1100.0)
+    assert actions == []
+    assert any(n.get("key") == "merge_conflict" for n in notes)
+
+
+def test_execute_treats_a_reported_rebase_conflict_as_a_failure(tmp_path, monkeypatch):
+    class R:
+        returncode = 0
+        stdout = "🔴 Q1 CONFLICT in [a.md] — aborted, needs manual resolution."
+        stderr = ""
+
+    monkeypatch.setattr(nw, "_court", lambda *a, **k: R())
+    res = nw.execute(tmp_path, nw.Action(kind="rebase", quest_ids=["Q1"]))
+    assert res["ok"] is False
+    assert res["argv"] == ["rebase", "Q1"]
+    assert nw._merge_conflict_files(res) == ["a.md"]
+
+
+def test_rebase_disabled_yields_no_rebase_action(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "TRIBUTE_READY", wt, git_status={"behind": 7}))
+    pol = _policy(enabled=("goad", "coin", "collect", "dispatch", "teardown"))
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path), pol, _workers())
+    assert [a.kind for a in actions] == ["coin"]

@@ -16,6 +16,8 @@ Scope of authority (deliberately narrow):
   * WORKING/QUESTING + dead worker      -> `goad` (bounded per serf; a spent serf
                                            falls over to a replacement `dispatch`)
   * TRIBUTE_READY + no live MoC         -> `coin`
+  * WORKING/TRIBUTE_READY/GATE behind   -> `rebase` (mechanical convergence onto
+    `castle`                               castle before a spawn; zero agent turns)
   * GATE + no live/recorded Gatekeeper  -> `collect --standup` (a PENDING UI
                                            review is escalated, never collected)
   * PLANNED/CHARTERED/DISPATCHED        -> report only (dispatching new work is a
@@ -106,6 +108,13 @@ DEFAULT_GATEHOUSE_GRACE = 10 * 60
 # failure: wait out the gate window instead of retrying on the short backoff.
 DEFAULT_LIVE_CONVOY_BACKOFF = 60 * 60
 DEFAULT_RETRY_BACKOFF = 300
+# A Quest that is merely BEHIND `castle` fails its coin/goad spawn once
+# (`_sync_base_before_spawn` aborts on a `git merge castle` conflict), gets a
+# merge_conflict marker, and burns a Steward muster. Drift is mechanical, so a
+# `rebase` action converges the worktree first and the coin lands on the next
+# tick. A short cooldown keeps a persistently conflicted worktree from being
+# retried every few seconds.
+DEFAULT_REBASE_COOLDOWN = 300
 # Steward muster: the last-resort action. The board must be unchanged for
 # `steward_stale_after`, with no live worker at all and a standing blocker,
 # before the watch brings up one single-turn Steward triage session. A muster
@@ -136,7 +145,7 @@ STALL_THRESHOLDS = {
     "master_of_coin": 30 * 60,
 }
 
-ENABLED_ACTIONS = ("goad", "coin", "collect", "dispatch", "steward", "raze", "teardown")
+ENABLED_ACTIONS = ("goad", "coin", "collect", "dispatch", "steward", "raze", "teardown", "rebase")
 
 # A board is only "live" while at least one Quest is in a pre-terminal stage.
 # Statuses the watch can move mechanically are excluded from the `steward`
@@ -175,6 +184,7 @@ class Policy:
     max_teardown_fails: int = DEFAULT_MAX_TEARDOWN_FAILS
     gatehouse_grace: int = DEFAULT_GATEHOUSE_GRACE
     retry_backoff: int = DEFAULT_RETRY_BACKOFF
+    rebase_cooldown: int = DEFAULT_REBASE_COOLDOWN
     # Steward muster (last resort). See DEFAULT_STEWARD_* above.
     steward_stale_after: int = DEFAULT_STEWARD_STALE_AFTER
     steward_cooldown: int = DEFAULT_STEWARD_COOLDOWN
@@ -195,11 +205,13 @@ class Policy:
     # never invents new work on its own.
     allow_dispatch: bool = True
     # Default to the safe mechanical set plus dead-gatehouse teardown (a common
-    # blocking failure the watch must be able to clear unattended). `steward`
-    # and `raze` remain deliberate opt-ins: steward spends a reasoning worker;
-    # raze deletes a branch ref. ENABLED_ACTIONS is the full `--enable`
-    # vocabulary.
-    enabled: tuple = ("goad", "coin", "collect", "dispatch", "teardown")
+    # blocking failure the watch must be able to clear unattended). `rebase` is
+    # also default-on: converging a drifted worktree onto castle is a local,
+    # zero-token git operation that prevents a deterministic coin/goad failure
+    # (and the wasted Steward muster that follows). `steward` and `raze` remain
+    # deliberate opt-ins: steward spends a reasoning worker; raze deletes a
+    # branch ref. ENABLED_ACTIONS is the full `--enable` vocabulary.
+    enabled: tuple = ("goad", "coin", "collect", "dispatch", "teardown", "rebase")
     allow_force_goad: bool = False
     status_timeout: int = DEFAULT_STATUS_TIMEOUT
     # Pleasance lane: each tick may fetch and apply remote paperwork (charters,
@@ -228,7 +240,7 @@ class Policy:
             f"enable={','.join(self.enabled)} · workers<={self.max_workers} · "
             f"spawns={self.max_spawns_per_tick}/tick,{self.max_spawns_per_hour}/h · "
             f"goad={self.goad_cooldown}s coin={self.coin_cooldown}s gate={self.gate_cooldown}s "
-            f"raze={self.raze_cooldown}s"
+            f"raze={self.raze_cooldown}s rebase={self.rebase_cooldown}s"
         )
 
     def goad_budget(self) -> int:
@@ -740,6 +752,55 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
             key = worktree
         return busy_dirs.get(key)
 
+    # --- Drift: converge a behind worktree before spawning a worker ---------
+    # A Quest that is merely behind `castle` is not broken, but its coin/goad
+    # spawn aborts deterministically on `git merge castle` and leaves a
+    # merge_conflict marker that escalates to a Steward. Drift is mechanical,
+    # so run the engine's own `court rebase` first (local git only, no model
+    # turn) and let the next tick coin the now-clean branch. The quest is
+    # skipped for coin/goad in THIS tick so a stale tree is never audited.
+    rebase_ids: set[str] = set()
+    if policy.allows("rebase"):
+        for q in quests.values():
+            if q.get("status") not in ("WORKING", "TRIBUTE_READY", "GATE"):
+                continue
+            if q.get("pending_audience"):
+                continue
+            if not q.get("worktree") or not Path(q["worktree"]).is_dir():
+                continue
+            st = qstate.get(q["id"]) or {}
+            if isinstance(st.get("merge_conflict"), dict):
+                continue
+            gs = q.get("git_status") or {}
+            try:
+                behind = int(gs.get("behind") or 0)
+            except (TypeError, ValueError):
+                behind = 0
+            if behind <= 0:
+                continue
+            if gs.get("dirty"):
+                note(q["id"], "wait",
+                     f"{behind} commit(s) behind castle but the worktree is DIRTY — "
+                     f"a rebase waits for a commit")
+                continue
+            if occupied(q.get("worktree")) or process_in(q.get("worktree")):
+                continue
+            if _within(st.get("last_rebase_ts"), policy.rebase_cooldown, now):
+                continue
+            if now < float(st.get("retry_at") or 0):
+                continue
+            if capacity <= 0:
+                note(q["id"], "skip",
+                     f"{behind} commit(s) behind castle but worker ceiling "
+                     f"reached ({busy_workers}/{policy.max_workers})")
+                continue
+            actions.append(Action(
+                kind="rebase", quest_ids=[q["id"]],
+                reason=f"{behind} commit(s) behind castle — mechanical rebase",
+                meta={"retry_backoff": policy.retry_backoff}))
+            rebase_ids.add(q["id"])
+            capacity -= 1
+
     # --- GATE: hand the convoy to a Gatekeeper -----------------------------
     by_cogship: dict[str, list[str]] = {}
     teardown_keys: set[str] = set()
@@ -907,6 +968,9 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
         if q.get("pending_audience"):
             note(q["id"], "skip", "TRIBUTE_READY but pending Audience — parked")
             continue
+        if q["id"] in rebase_ids:
+            note(q["id"], "wait", "rebasing onto castle this tick — coin follows next tick")
+            continue
         if not q.get("worktree") or not Path(q["worktree"]).is_dir():
             note(q["id"], "human", "TRIBUTE_READY with no usable worktree")
             continue
@@ -964,6 +1028,9 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
             continue
         if q.get("pending_audience"):
             note(q["id"], "skip", "WORKING but pending Audience — parked")
+            continue
+        if q["id"] in rebase_ids:
+            note(q["id"], "wait", "rebasing onto castle this tick — goad follows next tick")
             continue
         if not q.get("worktree") or not Path(q["worktree"]).is_dir():
             note(q["id"], "human", f"{q.get('status')} with no usable worktree")
@@ -1377,7 +1444,7 @@ def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -
                      env=court_env)
         out = (res.stdout or "").strip()
         err = (res.stderr or "").strip()
-        return {
+        result = {
             "ok": res.returncode == 0,
             "exit": res.returncode,
             "argv": argv,
@@ -1385,6 +1452,11 @@ def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -
             "stderr_tail": err[-1200:],
             "seconds": round(time.time() - started, 1),
         }
+        # `court rebase` exits 0 even when it reports a conflict, so the
+        # reported conflict — not the exit code — is the failure signal.
+        if action.kind == "rebase" and result["ok"] and _merge_conflict_files(result):
+            result["ok"] = False
+        return result
     except subprocess.TimeoutExpired:
         return {
             "ok": False, "exit": -1, "argv": argv,
@@ -1422,10 +1494,14 @@ _LIVE_CONVOY_RE = re.compile(r"convoy (\S+) is LIVE")
 # a Steward who picks the resolution course. The capture runs to the sentence
 # end so dotted paths (".court/quests/...md") survive.
 _MERGE_CONFLICT_RE = re.compile(r"cannot spawn — `git merge \S+` conflicts in: (.*?)\. The merge")
+# `court rebase <id>` reports conflicts as ``🔴 <id> CONFLICT in [a, b] — aborted``
+# and exits 0 (a conflicted rebase is a reported outcome, not a CLI error), so
+# execute() must both recognise the text and downgrade the result to a failure.
+_REBASE_CONFLICT_RE = re.compile(r"CONFLICT in \[(.*?)\]")
 
 
 def _merge_conflict_files(result: dict) -> list:
-    """Return the conflicting files a failed coin/goad spawn named, or [].
+    """Return the conflicting files a failed coin/goad/rebase named, or [].
 
     ``ERROR: coin: cannot spawn — `git merge castle` conflicts in:
     .court/quests/Q1046-....md, apps/foo/bar.py. The merge was aborted
@@ -1434,9 +1510,12 @@ def _merge_conflict_files(result: dict) -> list:
     transient failure to retry on the short backoff."""
     text = (result.get("stderr_tail") or "") + "\n" + (result.get("stdout_tail") or "")
     match = _MERGE_CONFLICT_RE.search(text)
-    if not match:
-        return []
-    return [f.strip() for f in match.group(1).split(",") if f.strip()]
+    if match:
+        return [f.strip() for f in match.group(1).split(",") if f.strip()]
+    match = _REBASE_CONFLICT_RE.search(text)
+    if match:
+        return [f.strip() for f in match.group(1).split(",") if f.strip()]
+    return []
 
 
 def _stale_convoy_worktree(result: dict) -> str:
@@ -1564,6 +1643,26 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
                 }
             else:
                 st["coins"] = int(st.get("coins") or 0) + 1
+    elif action.kind == "rebase":
+        # Drift is not a worker attempt: a successful rebase clears any hold,
+        # stamps the rebase cooldown, and the Quest coins on the NEXT tick. A
+        # conflict is recorded exactly like a blocked spawn so plan() holds the
+        # Quest for a Steward. Never touch coins/goads — this verb spends none.
+        for qid in action.quest_ids:
+            st = qstate.setdefault(qid, {})
+            mc = _merge_conflict_files(result)
+            if ok:
+                st["last_rebase_ts"] = now
+                st.pop("merge_conflict", None)
+                st["retry_at"] = 0
+            elif mc:
+                prev = st.get("merge_conflict") or {}
+                st["merge_conflict"] = {
+                    "files": mc, "ts": now,
+                    "escalated_ts": prev.get("escalated_ts"),
+                }
+            elif backoff:
+                st["retry_at"] = now + backoff
     elif action.kind == "raze":
         # Opt-in destructive help: a successful raze frees the worktree; the
         # Quest leaves READY_TO_RAZE so it simply stops being planned.

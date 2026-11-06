@@ -7312,6 +7312,7 @@ def cmd_nightwatch(args):
         collect_noop_backoff=getattr(args, "collect_noop_backoff", None) or nightwatch.DEFAULT_COLLECT_NOOP_BACKOFF,
         stale_convoy_backoff=getattr(args, "stale_convoy_backoff", None) or nightwatch.DEFAULT_STALE_CONVOY_BACKOFF,
         raze_cooldown=int(getattr(args, "raze_cooldown", 0) or 0) or 1800,
+        rebase_cooldown=int(getattr(args, "rebase_cooldown", 0) or 0) or nightwatch.DEFAULT_REBASE_COOLDOWN,
         retry_backoff=int(getattr(args, "retry_backoff", 0) or 0),
         steward_stale_after=int(getattr(args, "steward_stale_after", 0) or nightwatch.DEFAULT_STEWARD_STALE_AFTER),
         steward_cooldown=int(getattr(args, "steward_cooldown", 0) or nightwatch.DEFAULT_STEWARD_COOLDOWN),
@@ -9660,6 +9661,7 @@ def build_parser():
     p_nightwatch.add_argument("--collect-noop-backoff", dest="collect_noop_backoff", type=int, default=nightwatch.DEFAULT_COLLECT_NOOP_BACKOFF, help=f"Seconds to back a convoy off after a collect that packed nothing (default {nightwatch.DEFAULT_COLLECT_NOOP_BACKOFF})")
     p_nightwatch.add_argument("--stale-convoy-backoff", dest="stale_convoy_backoff", type=int, default=nightwatch.DEFAULT_STALE_CONVOY_BACKOFF, help=f"Seconds to hold a convoy whose gatehouse worktree already exists from a prior mid-integration death (default {nightwatch.DEFAULT_STALE_CONVOY_BACKOFF})")
     p_nightwatch.add_argument("--raze-cooldown", dest="raze_cooldown", type=int, default=1800, help="Seconds between opt-in `raze` attempts on a READY_TO_RAZE Quest (default 1800)")
+    p_nightwatch.add_argument("--rebase-cooldown", dest="rebase_cooldown", type=int, default=nightwatch.DEFAULT_REBASE_COOLDOWN, help=f"Seconds between mechanical `court rebase` attempts on a drifted Quest (default {nightwatch.DEFAULT_REBASE_COOLDOWN})")
     p_nightwatch.add_argument("--report", action="store_true", help="Roll up where the Night's Watch is stuck (livelocks, stale holds, goad/budget ceilings, failures) from the journal + state, then exit")
     p_nightwatch.add_argument("--context-soft", dest="context_soft", type=int, default=0, help="Cull line (tokens) at which a live watchdog re-prompting a session is flagged (0 = manifest context.cull_soft)")
     p_nightwatch.add_argument("--context-hard", dest="context_hard", type=int, default=0, help="Red zone (tokens) past which a live watchdog's same-session re-prompt is unacceptable (0 = manifest context.hard_red_zone)")
@@ -9670,7 +9672,7 @@ def build_parser():
     p_nightwatch.add_argument("--steward-stale-after", dest="steward_stale_after", type=int, default=nightwatch.DEFAULT_STEWARD_STALE_AFTER, help=f"Seconds an unchanged board with no live worker must sit before a Steward may be mustered (default {nightwatch.DEFAULT_STEWARD_STALE_AFTER})")
     p_nightwatch.add_argument("--steward-cooldown", dest="steward_cooldown", type=int, default=nightwatch.DEFAULT_STEWARD_COOLDOWN, help=f"Seconds between Steward musters (default {nightwatch.DEFAULT_STEWARD_COOLDOWN})")
     p_nightwatch.add_argument("--max-stewards-per-day", dest="max_stewards_per_day", type=int, default=nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY, help=f"Rolling 24-hour Steward muster cap (default {nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY})")
-    p_nightwatch.add_argument("--enable", default=",".join(nightwatch.Policy().enabled), help="Comma list of permitted actions (goad,coin,collect,dispatch,steward,raze,teardown). `teardown` (clearing a provably-dead gatehouse worktree so collect can re-run) is ON by default because it is a common blocking failure. `steward` and `raze` are OPT-IN: steward spends a reasoning worker; raze deletes a branch ref.")
+    p_nightwatch.add_argument("--enable", default=",".join(nightwatch.Policy().enabled), help="Comma list of permitted actions (goad,coin,collect,dispatch,steward,raze,teardown,rebase). `teardown` (clearing a provably-dead gatehouse worktree so collect can re-run) and `rebase` (converging a drifted worktree onto castle before a spawn, so drift cannot burn a Steward muster) are ON by default because they are local, mechanical operations. `steward` and `raze` are OPT-IN: steward spends a reasoning worker; raze deletes a branch ref.")
     p_nightwatch.add_argument("--allow-force-goad", dest="allow_force_goad", action="store_true", help="Permit --force goads (supersedes a live worker). Off by default.")
     p_nightwatch.add_argument("--no-pickup", dest="no_pickup", action="store_true", help="Do not fetch/apply Pleasance paperwork at the top of each tick (default: pickup ON when the checkout is on castle)")
     p_nightwatch.add_argument("--publish-pulse", dest="publish_pulse", action="store_true", help="Publish the per-tick steward pulse to the read-only status branch (ON by default)")

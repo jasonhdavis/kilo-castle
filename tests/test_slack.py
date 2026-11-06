@@ -222,6 +222,8 @@ def test_reply_becomes_one_validated_decree_and_is_consumed_once(tmp_path, monke
                         {"ts": "100.1", "channel": "C012345", "target": "C012345"})
 
     def handler(method, payload):
+        if method == "auth.test":
+            return {"ok": True, "user": "courtbridge", "user_id": "UBOT"}
         assert method == "conversations.replies"
         return {"ok": True, "messages": [
             {"ts": "100.1", "text": "[DECISION] Q123-Held-Thing"},
@@ -243,7 +245,129 @@ def test_reply_becomes_one_validated_decree_and_is_consumed_once(tmp_path, monke
     second = slack.sync(repo)
     assert second["replies"] == []
     assert len(sorted((repo / ".court" / "decrees").glob("*.json"))) == 1
-    assert len(calls) == 2
+    assert sum(1 for method, _ in calls if method == "auth.test") == 2
+
+
+def _reply_setup(tmp_path, monkeypatch, qid="Q123-Held-Thing"):
+    monkeypatch.setenv("COURT_SLACK_TOKEN", "xoxb-test-token")
+    monkeypatch.setenv("COURT_SLACK_CHANNEL", "C012345")
+    repo = _repo(tmp_path)
+    _add_quest(repo, qid=qid)
+    monkeypatch.setattr(slack.nightwatch, "snapshot", lambda repo, timeout=0: _snap(_quest(qid)))
+    monkeypatch.setattr(slack.nightwatch, "load_state", lambda repo: {"quests": {}, "last_pickup": {}})
+    monkeypatch.setattr(slack.decisions, "collect",
+                        lambda repo, snap=None, **kw: _frontier(qid))
+    monkeypatch.setattr(slack, "post_message",
+                        lambda cfg, text, state=None, target=None:
+                        {"ts": "200.1", "channel": "C012345", "target": "C012345"})
+    return repo
+
+
+def test_invalid_arguments_falls_back_to_history_and_authors_once(tmp_path, monkeypatch):
+    repo = _reply_setup(tmp_path, monkeypatch)
+
+    def handler(method, payload):
+        if method == "auth.test":
+            return {"ok": True, "user_id": "UBOT"}
+        if method == "conversations.replies":
+            raise slack.SlackError("conversations.replies failed: invalid_arguments")
+        assert method == "conversations.history"
+        assert payload == {"channel": "C012345", "limit": 200, "oldest": "200.1"}
+        return {"ok": True, "messages": [
+            {"ts": "200.1", "text": "[DECISION] Q123-Held-Thing"},
+            {"ts": "200.2", "user": "U02MA74K9DY", "text": "Use session cookies."},
+        ]}
+
+    _install_http(monkeypatch, handler)
+    first = slack.sync(repo)
+    assert len(first["replies"]) == 1
+    decrees = sorted((repo / ".court" / "decrees").glob("*.json"))
+    assert len(decrees) == 1
+    packet = json.loads(decrees[0].read_text(encoding="utf-8"))
+    assert packet["decisions"] == [{"quest": "Q123-Held-Thing",
+                                    "ruling": "Use session cookies."}]
+
+    second = slack.sync(repo)
+    assert second["replies"] == []
+    assert len(sorted((repo / ".court" / "decrees").glob("*.json"))) == 1
+
+
+def test_bot_authored_messages_are_ignored(tmp_path, monkeypatch):
+    repo = _reply_setup(tmp_path, monkeypatch)
+
+    def handler(method, payload):
+        if method == "auth.test":
+            return {"ok": True, "user_id": "UBOT"}
+        if method == "conversations.replies":
+            return {"ok": True, "messages": [
+                {"ts": "200.1", "text": "[DECISION] Q123-Held-Thing"},
+                {"ts": "200.2", "user": "UBOT", "text": "bot echo"},
+                {"ts": "200.3", "bot_id": "B99", "text": "bot webhook"},
+            ]}
+        raise AssertionError(method)
+
+    _install_http(monkeypatch, handler)
+    result = slack.sync(repo)
+    assert result["replies"] == []
+    assert sorted((repo / ".court" / "decrees").glob("*.json")) == []
+
+
+def test_ambiguous_top_level_reply_with_two_unanswered_posts_is_skipped(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("COURT_SLACK_TOKEN", "xoxb-test-token")
+    monkeypatch.setenv("COURT_SLACK_CHANNEL", "C012345")
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(slack.nightwatch, "snapshot", lambda repo, timeout=0: _snap())
+    monkeypatch.setattr(slack.nightwatch, "load_state", lambda repo: {"quests": {}, "last_pickup": {}})
+    monkeypatch.setattr(slack.decisions, "collect",
+                        lambda repo, snap=None, **kw: _frontier_many(2))
+    sent = []
+
+    def fake_post(cfg, text, state=None, target=None):
+        sent.append(text)
+        return {"ts": f"300.{len(sent)}", "channel": "C012345", "target": "C012345"}
+
+    monkeypatch.setattr(slack, "post_message", fake_post)
+
+    def handler(method, payload):
+        if method == "auth.test":
+            return {"ok": True, "user_id": "UBOT"}
+        assert method == "conversations.replies"
+        return {"ok": True, "messages": [
+            {"ts": payload["ts"], "text": "posted"},
+            {"ts": "300.9", "user": "U02MA74K9DY", "text": "Which one?"},
+        ]}
+
+    _install_http(monkeypatch, handler)
+    result = slack.sync(repo)
+    assert result["replies"] == []
+    assert sorted((repo / ".court" / "decrees").glob("*.json")) == []
+    assert "ambiguous top-level reply" in capsys.readouterr().out
+
+
+def test_threaded_reply_via_history_fallback_is_authored(tmp_path, monkeypatch):
+    repo = _reply_setup(tmp_path, monkeypatch)
+
+    def handler(method, payload):
+        if method == "auth.test":
+            return {"ok": True, "user_id": "UBOT"}
+        if method == "conversations.replies":
+            raise slack.SlackError("conversations.replies failed: invalid_arguments")
+        assert method == "conversations.history"
+        return {"ok": True, "messages": [
+            {"ts": "200.1", "text": "[DECISION] Q123-Held-Thing"},
+            {"ts": "200.2", "thread_ts": "200.1", "user": "U02MA74K9DY",
+             "text": "Threaded ruling."},
+        ]}
+
+    _install_http(monkeypatch, handler)
+    result = slack.sync(repo)
+    assert len(result["replies"]) == 1
+    decrees = sorted((repo / ".court" / "decrees").glob("*.json"))
+    assert len(decrees) == 1
+    packet = json.loads(decrees[0].read_text(encoding="utf-8"))
+    assert packet["decisions"] == [{"quest": "Q123-Held-Thing",
+                                    "ruling": "Threaded ruling."}]
 
 
 def _frontier_many(count):

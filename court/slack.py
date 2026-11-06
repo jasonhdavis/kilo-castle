@@ -283,8 +283,12 @@ def conversations_replies(cfg: SlackConfig, channel: str, ts: str) -> dict:
     return _api(cfg, "conversations.replies", {"channel": channel, "ts": ts})
 
 
-def conversations_history(cfg: SlackConfig, channel: str, limit: int = 20) -> dict:
-    return _api(cfg, "conversations.history", {"channel": channel, "limit": limit})
+def conversations_history(cfg: SlackConfig, channel: str, oldest: str = "",
+                          limit: int = 200) -> dict:
+    payload: dict = {"channel": channel, "limit": limit}
+    if oldest:
+        payload["oldest"] = oldest
+    return _api(cfg, "conversations.history", payload)
 
 
 # ---------------------------------------------------------------------------
@@ -317,13 +321,15 @@ def load_state(repo: Path) -> dict:
         if isinstance(payload, dict) and payload.get("version") == STATE_VERSION:
             payload.setdefault("posted", {})
             payload.setdefault("consumed_replies", [])
+            payload.setdefault("answered", {})
             payload.setdefault("dm_channels", {})
             payload.setdefault("last_sync", "")
             return payload
     except (OSError, ValueError):
         pass
     return {"version": STATE_VERSION, "repo": str(repo), "posted": {},
-            "consumed_replies": [], "dm_channels": {}, "last_sync": ""}
+            "consumed_replies": [], "answered": {}, "dm_channels": {},
+            "last_sync": ""}
 
 
 def save_state(repo: Path, state: dict) -> None:
@@ -554,37 +560,133 @@ def author_decree(repo: Path, quest_id: str, ruling: str, channel: str,
     return target
 
 
+def _bot_user_id(cfg: SlackConfig, state: dict, say=print) -> str:
+    """auth.test once per sync; the bot's own messages are never rulings."""
+    try:
+        user_id = str(auth_test(cfg).get("user_id") or "")
+    except SlackError as e:
+        cached = str(state.get("bot_user_id") or "")
+        say(f"  could not resolve the bot identity ({_redact(str(e), cfg.token)}); "
+            "filtering bot messages by bot_id only")
+        return cached
+    if user_id:
+        state["bot_user_id"] = user_id
+    return user_id
+
+
+def _is_bot_message(message: dict, bot_user_id: str) -> bool:
+    if message.get("bot_id") or message.get("subtype") == "bot_message":
+        return True
+    return bool(bot_user_id and str(message.get("user") or "") == bot_user_id)
+
+
+def _thread_messages(cfg: SlackConfig, channel: str, anchor: str, say=print) -> list[dict]:
+    """Thread replies, falling back to channel history when Slack refuses.
+
+    DM ``conversations.replies`` returns ``invalid_arguments`` for a top-level
+    DM message (no thread parent), so the history window from the same parent
+    timestamp is the reliable fallback.
+    """
+    try:
+        data = conversations_replies(cfg, channel, anchor)
+    except SlackError as e:
+        say(f"  conversations.replies failed ({_redact(str(e), cfg.token)}); "
+            f"falling back to conversations.history from {anchor}")
+        data = conversations_history(cfg, channel, oldest=anchor, limit=200)
+    return list(data.get("messages") or [])
+
+
+def _consume_reply(repo: Path, state: dict, rec: dict, message: dict,
+                   consumed: set, say=print) -> Optional[dict]:
+    """Author one decree for one reply; consumed by ts, never applied here."""
+    ts = str(message.get("ts") or "")
+    ruling = strip_mrkdwn(str(message.get("text") or ""))
+    if not ts or not ruling:
+        return None
+    path = author_decree(repo, str(rec.get("quest") or ""), ruling,
+                         str(rec.get("channel") or ""), ts, say=say)
+    if path is None:
+        return None
+    state.setdefault("consumed_replies", []).append(ts)
+    state.setdefault("answered", {})[str(rec.get("ts") or "")] = ts
+    consumed.add(ts)
+    return {"quest": str(rec.get("quest") or ""), "ts": ts,
+            "path": str(path), "ruling": ruling}
+
+
 def ingest_replies(cfg: SlackConfig, repo: Path, state: dict,
                    dry_run: bool = False, say=print) -> list[dict]:
-    """Turn unconsumed thread replies into decree packets (one per reply)."""
+    """Turn unconsumed replies into decree packets.
+
+    Threaded replies are matched by ``thread_ts`` to a message this bridge
+    posted in that channel. A plain top-level message (Slack DM clients often
+    send answers this way) is accepted only when exactly ONE posted message in
+    that channel is unanswered; with several unanswered posts the reply is
+    ambiguous and the bridge refuses to guess.
+    """
     authored: list[dict] = []
+    if dry_run:
+        return authored
     consumed = set(state.get("consumed_replies") or [])
-    for rec in list((state.get("posted") or {}).values()):
-        quest_id = str(rec.get("quest") or "")
-        channel = str(rec.get("channel") or "")
-        anchor = str(rec.get("ts") or "")
-        if not (quest_id and channel and anchor):
+    answered = state.setdefault("answered", {})
+    posted = [
+        rec for rec in (state.get("posted") or {}).values()
+        if isinstance(rec, dict)
+        and str(rec.get("quest") or "")
+        and str(rec.get("channel") or "")
+        and str(rec.get("ts") or "")
+    ]
+    by_channel: dict[str, list[dict]] = {}
+    for rec in posted:
+        by_channel.setdefault(str(rec["channel"]), []).append(rec)
+    if not by_channel:
+        return authored
+
+    bot_user_id = _bot_user_id(cfg, state, say=say)
+    for channel, recs in sorted(by_channel.items()):
+        anchors = {str(rec["ts"]): rec for rec in recs}
+        messages: dict[str, dict] = {}
+        for rec in recs:
+            for message in _thread_messages(cfg, channel, str(rec["ts"]), say=say):
+                ts = str(message.get("ts") or "")
+                if ts:
+                    messages[ts] = message
+
+        # 1. A real thread reply: thread_ts names one of our posted messages.
+        for ts, message in sorted(messages.items()):
+            if ts in anchors or ts in consumed:
+                continue
+            if _is_bot_message(message, bot_user_id):
+                continue
+            thread_ts = str(message.get("thread_ts") or "")
+            if thread_ts in anchors:
+                row = _consume_reply(repo, state, anchors[thread_ts], message,
+                                     consumed, say=say)
+                if row:
+                    authored.append(row)
+
+        # 2. A plain top-level message is an answer only when the channel has
+        #    exactly one unanswered posted message. Never guess between two.
+        unanswered = [rec for rec in recs
+                      if not answered.get(str(rec.get("ts") or ""))]
+        top_level = [
+            (ts, message) for ts, message in messages.items()
+            if ts not in anchors and ts not in consumed
+            and not message.get("thread_ts")
+            and not _is_bot_message(message, bot_user_id)
+        ]
+        if not top_level:
             continue
-        if dry_run:
+        if len(unanswered) > 1:
+            say(f"  ambiguous top-level reply in {channel}: {len(top_level)} message(s) "
+                f"but {len(unanswered)} posted messages are unanswered — not guessing")
             continue
-        data = conversations_replies(cfg, channel, anchor)
-        for message in (data.get("messages") or []):
-            ts = str(message.get("ts") or "")
-            if not ts or ts == anchor or ts in consumed:
-                continue
-            if message.get("bot_id") or message.get("subtype") == "bot_message":
-                continue
-            ruling = strip_mrkdwn(str(message.get("text") or ""))
-            if not ruling:
-                continue
-            path = author_decree(repo, quest_id, ruling, channel, ts,
-                                 dry_run=dry_run, say=say)
-            if path is None:
-                continue
-            state.setdefault("consumed_replies", []).append(ts)
-            consumed.add(ts)
-            authored.append({"quest": quest_id, "ts": ts, "path": str(path),
-                             "ruling": ruling})
+        if len(unanswered) == 1:
+            for ts, message in sorted(top_level):
+                row = _consume_reply(repo, state, unanswered[0], message,
+                                     consumed, say=say)
+                if row:
+                    authored.append(row)
     return authored
 
 

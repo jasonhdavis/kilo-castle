@@ -60,6 +60,7 @@ from . import punished_audit
 from . import pulse as court_pulse
 from . import decisions as court_decisions
 from . import blockers as court_blockers
+from . import slack as court_slack
 
 # The Ward's durable workspace: patrol ledger + Warden Report queue.
 WARD_DIR = Path(__file__).resolve().parent.parent / "ward"
@@ -9781,6 +9782,24 @@ def build_parser():
     p_decree.add_argument("--no-commit", action="store_true", help="Write the packet without committing")
     p_decree.set_defaults(func=court_decisions.cmd_decree)
 
+    p_slack = sub.add_parser(
+        "slack",
+        help="Slack bridge: surface blockers/decisions and turn thread replies into decree packets (status|post|sync)",
+    )
+    p_slack.add_argument("action", choices=["status", "post", "sync"],
+                         help="status | post (ad-hoc surface) | sync (cron entry point)")
+    p_slack.add_argument("--probe", action="store_true",
+                         help="status: run auth.test and print team/user (never the token)")
+    p_slack.add_argument("--quest", default="", help="post: Quest/Epic id the message concerns")
+    p_slack.add_argument("--kind", default="note", choices=["blocker", "decision", "note"],
+                         help="post: message kind (default note)")
+    p_slack.add_argument("--text", default="", help="post: what needs M'Lord")
+    p_slack.add_argument("--dry-run", action="store_true",
+                         help="sync: report what would be posted/consumed without sending or writing")
+    p_slack.add_argument("--json", action="store_true", help="sync: print the result as JSON")
+    p_slack.add_argument("--repo", default=None, help="Court repository (default: this repo)")
+    p_slack.set_defaults(func=court_slack.cmd_slack)
+
     p_pulse = sub.add_parser(
         "pulse",
         help="One short steward-readable status file: is the machine running, what landed, what is queued, what needs attention (optionally publish to the read-only status branch)",
@@ -9903,6 +9922,11 @@ _READ_ONLY_COMMANDS = {
     "status", "show", "list", "tally", "metrics", "ward", "ship", "diff", "timber",
     "model", "verify-merged", "verify-manifest", "verify-convoy", "runsuite", "browser",
     "awaiting", "pending", "decisions",
+    # `slack` is mostly network I/O; its one git write (a decree packet from a
+    # Slack reply) commits through git_commit_paths, which takes the court write
+    # lock itself. Holding the lock across a 10s Slack poll would stall the
+    # pipeline, so the outer lock is skipped here.
+    "slack",
     # `index`, `schedule` and `punished-audit` are pure read-only diagnostics:
     # they snapshot/plan against durable state and write reports to an out dir
     # (never the court tree), so they must not serialize behind the write lock.

@@ -48,6 +48,7 @@ htmlcov/
 # conflicts left on the Q707-era studio branches. Untracked now; per-quest
 # durable paperwork lives in .court/quests/.
 .kilo/TASK*.md
+.kilo/tasks/
 .court/archive/
 
 # Local runtime logs and config backups (machine-local, never publish)

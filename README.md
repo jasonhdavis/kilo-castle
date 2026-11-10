@@ -446,6 +446,7 @@ Agents are defined in `kilo.json` (`mode: primary`, pinned model, full prompt). 
 | `/artist <id>` | Court Artist UI studio with live runserver (after MoC, before collection) |
 | `/collect` | Pack approved Quests (TRIBUTE_READY → GATE) into a Cog Ship convoy |
 | `/reject_tribute` | Isolate a failing Quest from a convoy and dispatch Serf remediation |
+| `court peel <id> --reason "..."` | Withdraw a promoted Quest: revert its trunk commit, record the peel, supersede the suite proof, then re-pack |
 | `/ship [--confirm]` | Compile the deployment convoy summary + Commutation manifest; `--confirm` deploys |
 | `court commute <id> --note "..."` | Record a post-deploy commutation as done (Cogship Log entry) |
 | `court nightwatch --repo <path>` | Deterministic fleet supervisor: polls quest state, rolls `goad`/`coin`/`collect` under caps; `--once` for cron, `--report`/`--status`/`--dry-run` surfaces |
@@ -470,12 +471,12 @@ Agents are defined in `kilo.json` (`mode: primary`, pinned model, full prompt). 
 ```
 advance archive artist audit blockers charter collect commute diff dispatch
 dispatch-complete edict enqueue fix-branches fork-teardown-list init levy
-list log muster new nightwatch pillory punish raze realign-branches rebase
+list log muster new nightwatch peel pillory punish raze realign-branches rebase
 rollup set-field set-section ship show stamp status tally teardown-list
 timber tree update verify verify-merged vigil ward worktree-doc
 ```
 
-Highlights: `blockers` every non-terminal Quest with its blocker and the one verb that clears it (`--json` for tooling) · `verify` / `verify-merged` deterministic worktree checks · `rebase` zero-turn branch convergence · `diff` structured worktree diff · `rollup` extract any tribute pillar · `stamp` allocate a Cog Ship id · `timber` cross-reference worktrees ↔ sections ↔ Quests · `archive` shelve closed records · `update` vendor the latest engine.
+Highlights: `blockers` every non-terminal Quest with its blocker and the one verb that clears it (`--json` for tooling) · `verify` / `verify-merged` deterministic worktree checks · `rebase` zero-turn branch convergence · `peel` withdraw a promoted Quest and re-pack the survivors · `diff` structured worktree diff · `rollup` extract any tribute pillar · `stamp` allocate a Cog Ship id · `timber` cross-reference worktrees ↔ sections ↔ Quests · `archive` shelve closed records · `update` vendor the latest engine.
 
 ---
 

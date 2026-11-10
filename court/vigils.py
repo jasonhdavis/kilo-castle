@@ -47,10 +47,21 @@ VALID_STATUSES = (
 # Actions a vigil may take. Destructive or publication verbs (ship, raze,
 # pillory, patchwork) are deliberately absent: a timer must never be the thing
 # that publishes to production or freezes a quest.
-ALLOWED_ACTIONS = ("dispatch", "goad", "coin", "collect", "advance", "note")
+ALLOWED_ACTIONS = ("dispatch", "goad", "coin", "collect", "rebase", "advance",
+                  "note", "muster")
 # Actions that spawn a model worker (and therefore consume RAM + the watch's
-# spawn budgets). `note` and `advance` are bookkeeping only.
-SPAWNING_ACTIONS = ("dispatch", "goad", "coin", "collect")
+# spawn budgets). `note`, `advance` and `rebase` are bookkeeping/local-git only.
+# `muster` is the Steward's own bounded wake-up: a durable vigil that summons
+# ONE triage session later, instead of a session-scoped timer that dies with
+# its process.
+SPAWNING_ACTIONS = ("dispatch", "goad", "coin", "collect", "muster")
+# Actions whose worker reads a Steward-authored brief instead of the standard
+# charter/template prompt. A queued hand-off must be able to say WHICH merge
+# union, migration repair, or conflict resolution it is asking for; without
+# this a queue entry can only re-state the charter the worker already
+# satisfied, which is exactly the wasted-spawn loop `court enqueue` exists to
+# end.
+BRIEF_ACTIONS = ("dispatch", "goad")
 
 
 class VigilError(ValueError):
@@ -208,6 +219,13 @@ def validate(spec: dict) -> None:
         raise VigilError(f"action {verb!r} not allowed; choose from {', '.join(ALLOWED_ACTIONS)}")
     _parse_action(then)  # shape check
 
+    brief = (spec.get("brief") or "").strip()
+    if brief and verb not in BRIEF_ACTIONS:
+        raise VigilError(
+            f"--brief is only allowed on {'/'.join(BRIEF_ACTIONS)} (a worker reads it); "
+            f"{verb!r} has no prompt to override"
+        )
+
     mf = spec.get("max_fires")
     max_fires = DEFAULT_MAX_FIRES if mf is None else int(mf)
     if not 1 <= max_fires <= MAX_FIRES_CEILING:
@@ -260,7 +278,8 @@ def _resolve_when(when: list, now: Optional[datetime] = None) -> list:
 
 
 def build(id: str, when: list, then: str, reason: str, expires: str,
-          max_fires: int = DEFAULT_MAX_FIRES, created_by: str = "steward") -> dict:
+          max_fires: int = DEFAULT_MAX_FIRES, created_by: str = "steward",
+          brief: str = "") -> dict:
     spec = {
         "version": 1,
         "id": id.strip(),
@@ -274,6 +293,8 @@ def build(id: str, when: list, then: str, reason: str, expires: str,
         "fires": [],
         "status": "active",
     }
+    if (brief or "").strip():
+        spec["brief"] = str(brief).strip()
     validate(spec)
     return spec
 
@@ -367,6 +388,9 @@ def _parse_action(then: str) -> dict:
         return {"verb": "note", "target": "", "status": ""}
     if then == "collect":
         return {"verb": "collect", "target": "", "status": ""}
+    if then == "muster":
+        raise VigilError("muster: needs the reason to carry into the Steward prompt "
+                         "(use `muster:<why>`)")
     m = re.fullmatch(r"(\w+):([^=]+)=(\w+)", then)
     if m and m.group(1) == "advance":
         status = m.group(3).upper()
@@ -380,14 +404,24 @@ def _parse_action(then: str) -> dict:
             raise VigilError(f"action {verb!r} not allowed")
         if verb == "note":
             raise VigilError("use `note:<text>`")
+        if verb == "muster" and not target:
+            raise VigilError("muster: needs the reason to carry into the Steward prompt")
         return {"verb": verb, "target": target, "status": ""}
     raise VigilError(f"unreadable action {then!r} (try `dispatch:Q234`)")
 
 
-def action_argv(then: str) -> tuple[list, bool]:
-    """Map a vigil action to (court argv, spawns_a_worker)."""
+def action_argv(then: str, spec: Optional[dict] = None) -> tuple[list, bool]:
+    """Map a vigil action to (court argv, spawns_a_worker).
+
+    `spec` is optional so the pure grammar stays usable on its own, but any
+    call that actually runs the action must pass it: a `dispatch`/`goad` vigil
+    may carry a Steward-authored `brief`, and dropping it would silently queue
+    the standard charter prompt instead of the remediation the Steward wrote."""
     a = _parse_action(then)
     verb, target, status = a["verb"], a["target"], a["status"]
+    brief = str((spec or {}).get("brief") or "").strip()
+    if brief and verb not in BRIEF_ACTIONS:
+        raise VigilError(f"--brief is not allowed on {verb!r}")
     if verb == "note":
         return [], False
     if verb == "advance":
@@ -401,11 +435,25 @@ def action_argv(then: str) -> tuple[list, bool]:
     if verb == "dispatch":
         # `court dispatch` creates the worktree from the base trunk (castle)
         # by default — that is the "dispatch from castle tip" semantics.
-        return ["dispatch", target, "--standup"], True
+        argv = ["dispatch", target, "--standup"]
+        if brief:
+            argv += ["--brief", brief]
+        return argv, True
     if verb == "goad":
-        return ["goad", target], True
+        argv = ["goad", target]
+        if brief:
+            argv += ["--brief", brief]
+        return argv, True
     if verb == "coin":
         return ["coin", target], True
+    if verb == "rebase":
+        # Local `git merge castle` convergence: no model turn, no worker slot.
+        # Queued ahead of a coin/goad it guarantees the audit never starts on a
+        # stale tree, and a conflict is reported with no worker attached.
+        return ["rebase", target], False
+    if verb == "muster":
+        # One bounded Steward triage session on the trunk (`court muster`).
+        return ["muster", "--why", target], True
     raise VigilError(f"unhandled action {verb!r}")
 
 

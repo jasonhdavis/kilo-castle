@@ -211,6 +211,19 @@ def _journal_events(journal: list) -> list[dict]:
             elif picked:
                 out.append({"ts": ts, "kind": "pickup",
                             "text": f"pleasance pickup applied {', '.join(picked)}"})
+        elif event == "pickup_remedy":
+            action = record.get("action") or "none"
+            moved = len(record.get("moved") or [])
+            restored = len(record.get("restored") or [])
+            if record.get("ok"):
+                out.append({"ts": ts, "kind": "pickup",
+                            "text": f"pickup self-remediation ({action}): "
+                                    f"{moved} scratch file(s) quarantined, "
+                                    f"{restored} report(s) restored — retrying"})
+            else:
+                out.append({"ts": ts, "kind": "error",
+                            "text": f"pickup remediation declined: "
+                                    f"{str(record.get('error') or 'needs a human')[:160]}"})
     return out
 
 
@@ -396,6 +409,7 @@ def build(repo: Path, *, snap: Optional[dict] = None,
             # never pays a second git pass for the blocker board.
             "blockers": blockers.summary_from_snapshot(snap, state),
             "pleasance": state.get("last_pickup") or {},
+            "pleasance_remedy": state.get("pickup_remedy") or {},
             "trunk": trunk,
         },
         "events": events,
@@ -454,8 +468,23 @@ def render_markdown(pulse: dict) -> str:
             verdict = f"applied {picked} file(s)"
         else:
             verdict = "no-op (nothing new)"
+        skipped = pickup.get("skipped_files") or []
+        if skipped:
+            verdict += f" · {len(skipped)} file(s) skipped"
         lines.append(f"- **Pleasance pickup:** {verdict} "
                      f"({pickup.get('ts') or 'not seen yet'})")
+        for item in skipped[:3]:
+            lines.append(f"  - skipped `{item.get('path')}` — {item.get('reason')}")
+    remedy = run.get("pleasance_remedy") or {}
+    if remedy:
+        cls = remedy.get("class") or "unknown"
+        if remedy.get("ok"):
+            lines.append(f"- **Pickup self-remediation:** cleared `{cls}` "
+                         f"({remedy.get('action') or 'none'}) — quarantine at "
+                         f"`{remedy.get('quarantine_dir') or 'outside the tree'}`")
+        else:
+            lines.append(f"- **Pickup self-remediation:** could not clear `{cls}` — "
+                         f"{str(remedy.get('error') or 'needs a human')[:160]}")
     blockers_summary = run.get("blockers") or {}
     lines += [
         f"- **Board:** {board.get('total', 0)} active — "

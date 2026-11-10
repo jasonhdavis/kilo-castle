@@ -21,6 +21,14 @@ This module makes the promotion unit explicit and checkable:
 
 Nothing here mutates git. The command exits non-zero so the Gatekeeper (or a
 human) must back the offending branch out instead of promoting it.
+
+Reversibility (gatehouse peel): a Quest can be withdrawn from the trunk after
+promotion. ``court peel`` reverts the Quest's promotion commit, records the
+withdrawal in ``.court/peels/<QUEST>.json``, and supersedes the convoy's suite
+proof. This module reads those records so the trunk invariant treats a peeled
+Quest as withdrawn instead of "code in the trunk with no promotion decision".
+``court collect`` clears the record when the Quest is packed again — peeling off
+and re-packing.
 """
 from __future__ import annotations
 
@@ -173,6 +181,10 @@ def record_pack(
             return None
     path = pack_record_path(repo_root, cogship_id)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Re-packing reinstates a previously peeled Quest: its withdrawal record is
+    # cleared so the trunk invariant applies to it again.
+    for quest_id in ids:
+        clear_peel_record(repo_root, quest_id)
     payload = {
         "cogship_id": normalize_cogship_id(cogship_id),
         "quest_ids": [str(q) for q in quest_ids],
@@ -193,6 +205,67 @@ def load_pack(repo_root: Path, cogship_id: str) -> dict:
         return json.loads(pack_record_path(repo_root, cogship_id).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Peel records (gatehouse reversibility)
+# ---------------------------------------------------------------------------
+
+def peel_record_path(repo_root: Path, quest_id: str) -> Path:
+    """``.court/peels/<QID>.json`` — one file per withdrawn Quest."""
+    stem = (quest_id or "").split("-")[0].upper()
+    return Path(repo_root) / ".court" / "peels" / f"{stem}.json"
+
+
+def load_peel_record(repo_root: Path, quest_id: str) -> dict:
+    try:
+        payload = json.loads(peel_record_path(repo_root, quest_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def clear_peel_record(repo_root: Path, quest_id: str) -> bool:
+    """Drop the withdrawal record (the Quest is being packed again).
+
+    Re-packing is the reinstatement signal: a Quest that re-enters a convoy is
+    no longer withdrawn, so the trunk invariant applies to it again.
+    """
+    path = peel_record_path(repo_root, quest_id)
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def peeled_quest_ids(repo_root: Path, trunk: str = "castle") -> set[str]:
+    """Quest ids whose withdrawal is real: the peel's revert is in the trunk.
+
+    A record whose revert commit is not an ancestor of ``trunk`` is not evidence
+    the code is gone (it may have been undone by a later merge), so it does not
+    excuse the Quest from the trunk invariant.
+    """
+    directory = Path(repo_root) / ".court" / "peels"
+    if not directory.is_dir():
+        return set()
+    peeled: set[str] = set()
+    for path in sorted(directory.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        qid = str(payload.get("quest") or path.stem).split("-")[0].upper()
+        revert_sha = str(payload.get("revert_sha") or "").strip()
+        if not qid or not revert_sha:
+            continue
+        if _git(repo_root, "merge-base", "--is-ancestor", revert_sha, trunk).returncode == 0:
+            peeled.add(qid)
+    return peeled
 
 
 def _quest_file(repo_root: Path, quest_id: str) -> Optional[Path]:
@@ -257,6 +330,7 @@ def ui_review_pending(repo_root: Path, quest_id: str) -> bool:
 _UI_LINE_RE = re.compile(r"(?im)^\s*[-*]?\s*\*{0,2}UI Review\*{0,2}:?\*{0,2}\s*(.+)$")
 _SIGNOFF_LINE_RE = re.compile(r"(?im)^\s*[-*]?\s*\*{0,2}UI Sign-off\*{0,2}:?\*{0,2}\s*(.+)$")
 _PLACEHOLDER_RE = re.compile(r"(?i)^(pending|tbd|todo|n/a|none|unknown)?[\s.…-]*$")
+_STUDIO_BRANCH_RE = re.compile(r"^artist/.+-ui-studio$")
 
 
 def ui_assent_state(repo_root: Path, quest_id: str) -> tuple[str, str]:
@@ -312,6 +386,77 @@ def ui_assent_state(repo_root: Path, quest_id: str) -> tuple[str, str]:
     return "pending", review
 
 
+def studio_branches(repo_root: Path) -> list[str]:
+    """Combined artist studio branches currently defined in the repo.
+
+    Only ``artist/<cohort>-ui-studio`` refs count. Atelier convoys live on
+    ``the-gatehouse/*`` and are deliberately UI-review lanes, not studios.
+    """
+    res = _git(repo_root, "for-each-ref", "--format=%(refname:short)", "refs/heads/artist/")
+    if res.returncode != 0:
+        return []
+    return [
+        line.strip()
+        for line in res.stdout.splitlines()
+        if line.strip() and _STUDIO_BRANCH_RE.match(line.strip())
+    ]
+
+
+def studio_pending(repo_root: Path, quest_id: str) -> tuple[bool, str]:
+    """True when the Quest's branch is still inside an OPEN combined studio.
+
+    The failure this closes: a Quest routed to ``court studio`` keeps its base
+    code on its own branch while the reviewed artwork lives only on
+    ``artist/<cohort>-ui-studio``. Packing the Quest branch before sync-back (or
+    ``--close`` extraction) ships pre-review code and silently drops the
+    approved studio work — then the studio branch is torn down and that work is
+    unrecoverable.
+
+    A studio no longer holds the Quest once any of these is true:
+
+    * the studio tip is already an ancestor of the Quest branch (``--sync-back``
+      merged the reviewed state);
+    * a dated ``studio sign-off`` ledger stamp exists (``--close`` extraction);
+    * the charter carries written UI assent (signed / waived / deferred /
+      none-required), so there is no pending review left to lose.
+    """
+    try:
+        from . import store, studio_close
+    except Exception:  # pragma: no cover - import cycle safety
+        return False, ""
+    try:
+        quest = store.load(quest_id, court_root=Path(repo_root) / ".court")
+    except Exception:
+        return False, ""
+    branch = (getattr(quest, "branch", "") or "").strip()
+    if not branch:
+        return False, ""
+    quest_tip = convoy_tip(repo_root, branch)
+    if not quest_tip:
+        return False, ""
+
+    state, _detail = ui_assent_state(repo_root, quest_id)
+    if state in ("signed", "waived", "not_required", "deferred"):
+        return False, ""
+
+    for studio in studio_branches(repo_root):
+        studio_tip = convoy_tip(repo_root, studio)
+        if not studio_tip:
+            continue
+        if _git(repo_root, "merge-base", "--is-ancestor", quest_tip, studio_tip).returncode != 0:
+            continue
+        if _git(repo_root, "merge-base", "--is-ancestor", studio_tip, quest_tip).returncode == 0:
+            continue  # reviewed state already merged into the Quest branch
+        try:
+            if studio_close.signoff_line(quest):
+                continue  # closed via cherry-pick extraction
+        except Exception:
+            pass
+        return True, f"branch {branch} is still merged into open studio {studio}"
+
+    return False, ""
+
+
 def unpromoted_quests_in_trunk(
     repo_root: Path,
     trunk: str = "castle",
@@ -323,9 +468,12 @@ def unpromoted_quests_in_trunk(
     Message-independent (unlike merge-subject parsing), so it catches a rider
     even when the merge commit was written with a custom subject. Quests whose
     charter cannot be located (archived/razed) are skipped: an absent charter is
-    not evidence of an undecided promotion.
+    not evidence of an undecided promotion. Quests with a valid peel record are
+    skipped too: ``court peel`` reverted their code out of the trunk, so there is
+    no undecided code left to flag.
     """
     findings: list[Finding] = []
+    peeled = peeled_quest_ids(repo_root, trunk)
     res = _git(repo_root, "for-each-ref", "--format=%(refname:short)", "refs/heads/quest/")
     if res.returncode != 0:
         return findings
@@ -334,7 +482,7 @@ def unpromoted_quests_in_trunk(
         if not branch:
             continue
         qid = quest_id_from_branch(branch)
-        if not qid:
+        if not qid or qid in peeled:
             continue
         if _git(repo_root, "merge-base", "--is-ancestor", branch, trunk).returncode != 0:
             continue
@@ -377,12 +525,18 @@ def audit_promotion(
     allow_ui_pending: bool = False,
     allow_stale_suite: bool = False,
     require_suite: bool = False,
+    allow_pending_studio: bool = False,
 ) -> list[Finding]:
     """Pre-promotion audit of a convoy branch against ``base``.
 
     ``expected_quest_ids`` overrides the recorded pack; when neither is present
     the membership check degrades to a warning (legacy convoys predate the pack
     record) while the status and UI checks still run.
+
+    ``allow_ui_pending`` only silences the non-blocking UI-debt warning. A Quest
+    still inside an open combined artist studio is a hard block unless
+    ``allow_pending_studio`` is passed: its reviewed artwork lives only on the
+    studio branch, so promoting the Quest branch would ship pre-review code.
     """
     cid = normalize_cogship_id(cogship_id)
     branch = convoy_branch(cid)
@@ -457,6 +611,19 @@ def audit_promotion(
                 quest=qid,
                 branch=source,
             ))
+        if not allow_pending_studio:
+            pending, detail = studio_pending(repo_root, qid)
+            if pending:
+                findings.append(Finding(
+                    "error",
+                    f"{qid} is still in an open artist studio — {detail}. Sign it off and sync the "
+                    f"reviewed state back (`court studio <ids> --sync-back`, or `court studio <ids> "
+                    f"--close`), then re-pack; promoting now would ship pre-review code and lose the "
+                    f"studio work. (--allow-pending-studio overrides deliberately.)",
+                    quest=qid,
+                    branch=source,
+                    code="pending-studio",
+                ))
 
     if authorised and not merged:
         findings.append(Finding("warn", f"{cid} carries no candidate merges yet — nothing to promote"))
@@ -525,6 +692,7 @@ def riders_in_trunk(
     stamped_ids = _stamped_quest_ids(repo_root, cid)
     manifest = pack_ids or stamped_ids or {q.split("-")[0].upper() for q in (manifest_quest_ids or [])}
     findings: list[Finding] = []
+    peeled = peeled_quest_ids(repo_root, trunk)
     res = _git(repo_root, "log", trunk, "--merges", f"--max-count={scan}", "--format=%H%x09%s")
     if res.returncode != 0:
         return findings
@@ -540,7 +708,7 @@ def riders_in_trunk(
         if destination not in targets:
             continue
         qid = quest_id_from_branch(source)
-        if not qid or qid in seen:
+        if not qid or qid in seen or qid in peeled:
             continue
         seen.add(qid)
         if manifest and qid not in manifest:

@@ -185,6 +185,16 @@ DEFAULT_KILO_CONFIG = {
                 "independently cross-checked via the castle's read-only verification harness (harness.command in .court/config.json, e.g. the ROQ harness scripts/db/roq.py in pb-app). "
                 "A silent or near-zero match rate is a FAIL even with green tests — the selector is broken; fix the predicate before any write run. "
                 "Pasted real command output or it didn't happen; chartered UP FRONT, never retrofitted after a write run.\n\n"
+                "DISPATCH CONTRACT — new work is queued, never dispatched: `court enqueue <quest> --why \"...\"`; the Night's Watch drains it when worker capacity frees. "
+                "Direct `court dispatch` is break-glass only (watch down, or remediation into an existing worktree) and requires --break-glass, which records the bypass in the ledger.\n\n"
+                "QUEUED CLOG HAND-OFFS — converge first, then spend exactly one worker: most \"stuck\" Quests are stuck on drift, not on intent. "
+                "Never goad or hand-dispatch a drifted TRIBUTE_READY/GATE Quest to chase a merge. `court enqueue <quest> --why \"...\"` derives the single action that can advance the status "
+                "(PLANNED/CHARTERED -> dispatch, WORKING -> goad, TRIBUTE_READY -> coin, GATE -> collect) and the watch drains it under its worker ceiling; "
+                "`court vigil add ... --then rebase:<quest>` converges a tree with no model turn at all, so a drift wave costs one mechanical pass instead of a goad per tree. "
+                "When the job needs a real instruction — a union resolution, a migration renumber, an entangled file — attach it: "
+                "`court enqueue <quest> --action goad --brief .court/briefs/<quest>.md` (dispatch/goad only), and the worker reads YOUR text instead of re-reading a charter it already satisfied. "
+                "Chain follow-ons with status edges (`court vigil add ... --when quest-status:<quest>=TRIBUTE_READY --then coin:<quest>`), never with repeated manual goads. "
+                "A queued action that dies on `git merge castle` is recorded as a merge-conflict hold and escalates to you: resolve the conflict or write a remediation brief, do not re-goad.\n\n"
                 "Core Principle: Human attention is the scarcest resource. Resolve routine engineering decisions yourself. Only request an Audience when M'Lord's judgment or authority is genuinely required.\n\n"
                 "Zero Roleplay Leakage: Charters, acceptance criteria, and Serf prompts must be written 100% out of character in plain, domain-accurate engineering language with zero internal roleplay jargon.\n\n"
                 "Durable Memory: Always reconstruct state from disk: court status, court edict, kilo session list, .court/LEDGER.md, court rollup. NEVER use the agent_manager tool (retired for orchestration).\n\n"
@@ -468,6 +478,31 @@ def run_init(target_dir: Optional[Path] = None, force: bool = False) -> dict:
     kilo_json_path = target / "kilo.json"
     kilo_cfg = _kilo_config_with_manifest_models()
     if not kilo_json_path.exists() or force:
+        if force and kilo_json_path.exists():
+            # `court update --force` regenerates agent prompts/models from the
+            # skeleton, but a repo may carry governance the skeleton does not
+            # define (top-level `permission`, `snapshot`; per-agent
+            # `permission` such as agent_manager: deny or a gatekeeper's
+            # `bash: git push*: deny`). Dropping those silently would re-enable
+            # retired tools, so carry forward anything the skeleton omits.
+            # `model` is deliberately NOT carried: rebinding it from the role
+            # manifest is the reason force exists.
+            try:
+                existing = json.loads(kilo_json_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+            if isinstance(existing, dict):
+                for key, value in existing.items():
+                    kilo_cfg.setdefault(key, value)
+                existing_agents = existing.get("agent")
+                if isinstance(existing_agents, dict):
+                    for name, definition in existing_agents.items():
+                        skeleton_def = kilo_cfg["agent"].get(name)
+                        if not isinstance(definition, dict) or not isinstance(skeleton_def, dict):
+                            continue
+                        for key, value in definition.items():
+                            if key not in skeleton_def:
+                                skeleton_def[key] = value
         kilo_json_path.write_text(json.dumps(kilo_cfg, indent=2) + "\n", encoding="utf-8")
         print(f"  + Created {kilo_json_path.relative_to(target)}")
     else:

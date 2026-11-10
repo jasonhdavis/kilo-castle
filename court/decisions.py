@@ -144,6 +144,10 @@ def parse_decree_packet(text: str) -> dict:
             "question": question[:MAX_QUESTION_CHARS],
             "ruling": ruling,
             "status": status,
+            # An operational directive is written to the ledger, not to a
+            # charter: "muster a Steward for merge-blocker triage" is a work
+            # order about the pipeline, not a ruling on one Quest.
+            "directive": bool(item.get("directive")),
         })
 
     return {
@@ -166,8 +170,68 @@ def validate_decree(text: str, repo: Path) -> tuple[bool, str]:
     except DecreeError as e:
         return False, str(e)
     for item in packet["decisions"]:
-        if quest_path(repo, item["quest"]) is None:
+        if quest_path(repo, item["quest"]) is not None:
+            continue
+        if re.match(r"^Q\d+", item["quest"], re.IGNORECASE):
+            # A Quest-shaped id must resolve — "directive" is not a typo bypass.
             return False, f"decision names unknown quest {item['quest']!r} (no charter on castle)"
+        if item.get("directive"):
+            continue
+        return False, (f"decision target {item['quest']!r} is not a Quest; add "
+                       f"\"directive\": true to record it as an operational directive")
+    return True, ""
+
+
+_MULTI_QUEST_RE = re.compile(r"[,;]")
+
+
+def expand_decisions(packet: dict) -> dict:
+    """Split a decision that names several Quest ids into one decision per id.
+
+    A voice session often answers one question over a SET of ids
+    (``"Q408,Q508,..."``). The lane's contract is one decision per target, so
+    the expansion is mechanical and preserves question/ruling/status verbatim.
+    """
+    out = {**packet, "decisions": []}
+    for decision in packet.get("decisions") or []:
+        parts = [p.strip() for p in
+                 _MULTI_QUEST_RE.split(str(decision.get("quest") or "")) if p.strip()]
+        if len(parts) <= 1:
+            out["decisions"].append(decision)
+        else:
+            out["decisions"].extend({**decision, "quest": qid} for qid in parts)
+    return out
+
+
+def validate_decree_for_lane(text: str, repo: Path) -> tuple[bool, str]:
+    """Pickup-lane decree validation: structure + expanded targets.
+
+    Stricter than :func:`validate_decree` in exactly one way: a multi-id
+    ``quest`` field is expanded and EVERY id must resolve. The lane never
+    applies a ruling to a partial target set — a packet that names one dead id
+    is recorded as skipped so the rest of the batch still lands, and the
+    remote author can resend it corrected.
+    """
+    try:
+        packet = expand_decisions(parse_decree_packet(text))
+    except DecreeError as e:
+        return False, str(e)
+    unresolved: list[str] = []
+    for item in packet["decisions"]:
+        if quest_path(repo, item["quest"]) is not None:
+            continue
+        if re.match(r"^Q\d+", item["quest"], re.IGNORECASE):
+            unresolved.append(item["quest"])
+            continue
+        if item.get("directive"):
+            continue
+        return False, (f"decision target {item['quest']!r} is not a Quest; add "
+                       f"\"directive\": true to record it as an operational directive")
+    if unresolved:
+        return False, ("decision names unknown quest(s) "
+                       + ", ".join(repr(q) for q in unresolved)
+                       + " (no charter on castle); fix the id(s) and resend — a "
+                         "ruling is never applied to a partial target set")
     return True, ""
 
 
@@ -226,6 +290,29 @@ def apply_packets(repo: Path, packets: list[dict],
     decree_ids: list[str] = []
     for packet in packets:
         for decision in packet["decisions"]:
+            if (decision.get("directive")
+                    and quest_path(repo, decision["quest"]) is None):
+                # Operational directive: journal it, change no charter.
+                directives_dir = root / "directives"
+                directives_dir.mkdir(parents=True, exist_ok=True)
+                safe = re.sub(r"[^A-Za-z0-9._-]+", "-", decision["quest"]).strip("-")
+                path = directives_dir / f"{safe}.md"
+                block = [f"# Directive — {decision['quest']}", "",
+                         f"- **Decree:** `{packet['id']}` ({applied_at})",
+                         f"- **By:** {packet['by']}"
+                         + (f" ({packet['source']})" if packet.get("source") else "")]
+                if decision.get("question"):
+                    block.append(f"- **Question:** {decision['question']}")
+                block += ["", decision["ruling"], ""]
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write("\n".join(block))
+                changed.append(path)
+                applied.append({
+                    "decree": packet["id"], "quest": decision["quest"],
+                    "from": "DIRECTIVE", "to": "DIRECTIVE",
+                    "ruling": decision["ruling"][:200],
+                })
+                continue
             quest = store.load(decision["quest"], court_root=root)
             before = quest.status
             after = apply_to_quest(quest, packet, decision, applied_at=applied_at)

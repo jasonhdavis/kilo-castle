@@ -162,6 +162,22 @@ def test_rejects_an_invalid_prereq_predicate(tmp_path):
     assert pickup.load_state(repo)["applied_tip"] == ""
 
 
+def test_accepts_a_none_sentinel_in_prerequisites(tmp_path):
+    """A remote author writing "None." under `## Prerequisites` means "no
+    preconditions" — it must not reject the whole pickup batch as a bad
+    predicate."""
+    repo = _repo(tmp_path)
+    def builder(r):
+        (r / ".court" / "quests").mkdir(parents=True, exist_ok=True)
+        (r / ".court" / "quests" / "Q999-No-Prereqs.md").write_text(
+            _charter("Q999-No-Prereqs", "No prereqs", prereqs=["None."]),
+            encoding="utf-8")
+    _please(repo, builder)
+    res = pickup.run(repo, say=_silent())
+    assert not res["rejected"], res["rejected"]
+    assert (repo / ".court" / "quests" / "Q999-No-Prereqs.md").exists()
+
+
 def test_rejects_an_invalid_branch_frontmatter(tmp_path):
     repo = _repo(tmp_path)
     def builder(r):
@@ -536,24 +552,68 @@ def test_skips_a_decree_packet_that_was_already_applied(tmp_path):
     assert charter.count("Royal Decree `decree-1`") == 1
 
 
-def test_rejects_a_decree_for_an_unknown_quest(tmp_path):
+def test_skips_a_decree_for_an_unknown_quest_without_wedging_the_lane(tmp_path):
     repo = _repo(tmp_path)
     _held_quest(repo)
-    _please(repo, _decree_builder(_decree(quest="Q999-Ghost")))
+
+    def builder(r):
+        d = r / ".court" / "decrees"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "decree-1.json").write_text(_decree(quest="Q999-Ghost"), encoding="utf-8")
+        # a healthy charter rides the SAME batch: one unusable decree must not
+        # hold the paperwork lane hostage
+        q = r / ".court" / "quests" / "Q998-Also-Fine.md"
+        q.write_text(_charter("Q998-Also-Fine", "Fine thing"), encoding="utf-8")
+    _please(repo, builder)
+
     res = pickup.run(repo, say=_silent())
-    assert res["rejected"] and "unknown quest" in res["rejected"]
-    # the whole batch rejects: no decree file lands, the held quest stays held
+    assert res["rejected"] is None
+    assert res["decrees"] == []
+    assert res["picked"] == [".court/quests/Q998-Also-Fine.md"]
+    assert any("unknown quest" in i["reason"] for i in res["skipped_files"])
+    # nothing was applied to the wrong quest and no decree file landed
     assert not (repo / ".court" / "decrees" / "decree-1.json").exists()
     charter = (repo / ".court" / "quests" / "Q123-Held.md").read_text(encoding="utf-8")
     assert "status: HELD" in charter
 
 
-def test_rejects_a_decree_that_tries_to_raze(tmp_path):
+def test_skips_a_decree_that_tries_to_raze(tmp_path):
     repo = _repo(tmp_path)
     _held_quest(repo)
     _please(repo, _decree_builder(_decree(status="READY_TO_RAZE")))
     res = pickup.run(repo, say=_silent())
-    assert res["rejected"] and "human acts" in res["rejected"]
+    assert res["rejected"] is None
+    assert any("human acts" in i["reason"] for i in res["skipped_files"])
+    charter = (repo / ".court" / "quests" / "Q123-Held.md").read_text(encoding="utf-8")
+    assert "status: HELD" in charter
+
+
+def test_expands_a_multi_quest_decree_into_one_ruling_per_target(tmp_path):
+    repo = _repo(tmp_path)
+    _held_quest(repo, "Q123-Held")
+    _held_quest(repo, "Q124-Held")
+    quest = "Q123-Held,Q124-Held"
+    _please(repo, _decree_builder(_decree(quest=quest)))
+
+    res = pickup.run(repo, say=_silent())
+    assert res["rejected"] is None
+    assert len(res["decrees"]) == 2
+    assert {d["quest"] for d in res["decrees"]} == {"Q123-Held", "Q124-Held"}
+    for qid in ("Q123-Held", "Q124-Held"):
+        charter = (repo / ".court" / "quests" / f"{qid}.md").read_text(encoding="utf-8")
+        assert "status: WORKING" in charter
+        assert "Use session cookies." in charter
+
+
+def test_a_multi_quest_decree_with_one_dead_id_is_skipped_whole(tmp_path):
+    repo = _repo(tmp_path)
+    _held_quest(repo, "Q123-Held")
+    _please(repo, _decree_builder(_decree(quest="Q123-Held,Q999-Ghost")))
+    res = pickup.run(repo, say=_silent())
+    assert res["rejected"] is None
+    assert res["decrees"] == []
+    assert any("Q999-Ghost" in i["reason"] for i in res["skipped_files"])
+    # a ruling is never applied to a partial target set
     charter = (repo / ".court" / "quests" / "Q123-Held.md").read_text(encoding="utf-8")
     assert "status: HELD" in charter
 
@@ -651,7 +711,7 @@ def test_dirty_tracked_and_untracked_classes(tmp_path):
     assert res["rejection_paths"] == ["scripts/db/roq_prod.py"]
 
 
-def test_invalid_vigil_and_decree_classes(tmp_path):
+def test_invalid_vigil_classifies_as_a_batch_rejection(tmp_path):
     repo = _repo(tmp_path)
 
     def vigil_builder(r):
@@ -662,13 +722,18 @@ def test_invalid_vigil_and_decree_classes(tmp_path):
     assert res["rejection_class"] == "invalid-vigil"
     assert res["rejection_paths"] == [".court/vigils/broken.json"]
 
-    decree_repo = _repo(tmp_path / "decree")
-    _held_quest(decree_repo)
-    _please(decree_repo, _decree_builder(_decree(quest="Q999-Ghost")))
-    res = pickup.run(decree_repo, say=_silent())
-    assert res["rejection_class"] == "decree-invalid"
-    assert res["rejection_paths"] == [".court/decrees/decree-1.json"]
-    assert "unknown quest" in res["rejected"]
+
+def test_an_unusable_decree_is_skipped_but_never_classified_as_a_batch_failure(tmp_path):
+    """A malformed decree file is held back on its own (per-file supersession).
+    It carries no `rejection_class` because the lane as a whole is not blocked."""
+    repo = _repo(tmp_path)
+    _held_quest(repo)
+    _please(repo, _decree_builder(_decree(quest="Q999-Ghost")))
+    res = pickup.run(repo, say=_silent())
+    assert res["rejected"] is None
+    assert res["rejection_class"] is None
+    assert res["decrees"] == []
+    assert any("unknown quest" in i["reason"] for i in res["skipped_files"])
 
 
 def test_pickup_remedy_is_pure_and_non_destructive():
@@ -765,3 +830,172 @@ def test_pickup_streak_no_op_and_off_trunk_clear_it(tmp_path):
     result = nightwatch._run_pickup(repo, state, dry_run=False, say=_silent())
     assert result.get("rejected") is None
     assert "pickup_streak" not in state
+
+
+# ---------------------------------------------------------------------------
+# Mechanical remediation — the watch clears its own dirty-tree block
+# ---------------------------------------------------------------------------
+
+
+def _scratch_blocker(repo, rel="tasks/artifacts/q043/sql/01_counts.sql"):
+    p = repo / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("select 1;\n", encoding="utf-8")
+    return rel
+
+
+def test_remediation_plan_quarantines_scratch_and_refuses_real_edits(tmp_path):
+    repo = _repo(tmp_path)
+    scratch = _scratch_blocker(repo)
+    plan = pickup.remediation_plan(repo, "dirty-untracked", [scratch])
+    assert plan["ok"] and plan["action"] == "quarantine"
+    assert plan["untracked"] == [scratch]
+
+    real = repo / "scripts" / "db" / "roq_prod.py"
+    real.parent.mkdir(parents=True, exist_ok=True)
+    real.write_text("x = 1\n", encoding="utf-8")
+    plan = pickup.remediation_plan(repo, "dirty-untracked", ["scripts/db/roq_prod.py"])
+    assert not plan["ok"]
+    assert "not mechanically clearable" in plan["reason"]
+
+    # only the two dirty classes are mechanically addressable
+    assert not pickup.remediation_plan(repo, "invalid-charter", [scratch])["ok"]
+
+
+def test_remediate_moves_scratch_out_of_the_tree_and_unblocks_pickup(tmp_path):
+    repo = _repo(tmp_path)
+    _please(repo, _valid_builder)
+    scratch = _scratch_blocker(repo)
+    res = pickup.run(repo, say=_silent())
+    assert res["rejection_class"] == "dirty-untracked"
+
+    verdict = pickup.remediate(repo, res["rejection_class"], res["rejection_paths"],
+                               say=_silent())
+    assert verdict["ok"] and verdict["action"] == "quarantine"
+    assert verdict["moved"] == [scratch]
+    # the evidence is preserved OUTSIDE the tree (never deleted)
+    parked = Path(verdict["quarantine_dir"]) / scratch
+    assert parked.read_text(encoding="utf-8") == "select 1;\n"
+    assert not (repo / scratch).exists()
+
+    applied = pickup.run(repo, say=_silent())
+    assert applied["rejected"] is None
+    assert ".court/quests/Q999-Pickup-Lane.md" in applied["picked"]
+
+
+def test_remediate_restores_a_regenerable_tracked_report(tmp_path):
+    repo = _repo(tmp_path)
+    report = repo / "docs" / "PUNISHED_AUDIT.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("Generated: HEAD report\n", encoding="utf-8")
+    _git(repo, "add", "docs/PUNISHED_AUDIT.md")
+    _git(repo, "commit", "-m", "docs: audit report")
+    _please(repo, _valid_builder)
+    report.write_text("Generated: uncommitted regeneration\n", encoding="utf-8")
+
+    res = pickup.run(repo, say=_silent())
+    assert res["rejection_class"] == "dirty-tracked"
+    verdict = pickup.remediate(repo, res["rejection_class"], res["rejection_paths"],
+                               say=_silent())
+    assert verdict["ok"] and verdict["action"] == "restore"
+    assert verdict["restored"] == ["docs/PUNISHED_AUDIT.md"]
+    assert report.read_text(encoding="utf-8") == "Generated: HEAD report\n"
+    assert verdict["moved"] == []
+
+
+def test_maybe_remediate_pickup_retries_and_clears_the_streak(tmp_path):
+    repo = _repo(tmp_path)
+    _please(repo, _valid_builder)
+    _scratch_blocker(repo)
+    state = {}
+    for _ in range(2):
+        nightwatch._run_pickup(repo, state, dry_run=False, say=_silent())
+    assert state["pickup_streak"]["count"] == 2
+
+    record = nightwatch._maybe_remediate_pickup(
+        repo, state, nightwatch.Policy(), dry_run=False, say=_silent())
+    assert record and record["ok"] and record["action"] == "quarantine"
+    # the retry applied the batch, so the streak is gone
+    assert "pickup_streak" not in state
+    assert state["last_pickup"]["rejected"] is None
+    assert ".court/quests/Q999-Pickup-Lane.md" in state["last_pickup"]["picked"]
+    assert state["pickup_remedy"]["ok"] is True
+    # journaled once, with the moved path spelled out
+    events = [json.loads(l) for l in
+              nightwatch.journal_path(repo).read_text(encoding="utf-8").splitlines()]
+    remedy_events = [e for e in events if e.get("event") == "pickup_remedy"]
+    assert len(remedy_events) == 1
+    assert remedy_events[0]["moved"] == ["tasks/artifacts/q043/sql/01_counts.sql"]
+
+
+def test_maybe_remediate_pickup_respects_threshold_policy_and_cooldown(tmp_path):
+    repo = _repo(tmp_path)
+    _please(repo, _valid_builder)
+    _scratch_blocker(repo)
+    state = {}
+    nightwatch._run_pickup(repo, state, dry_run=False, say=_silent())
+
+    # below the threshold: one rejection is not yet treated as a wedge
+    assert nightwatch._maybe_remediate_pickup(
+        repo, state, nightwatch.Policy(pickup_remedy_after=2),
+        dry_run=False, say=_silent()) is None
+
+    # a disabled policy never touches the tree
+    blocked = nightwatch._maybe_remediate_pickup(
+        repo, state, nightwatch.Policy(pickup_remedy=False),
+        dry_run=False, say=_silent())
+    assert blocked is None
+    assert (repo / "tasks/artifacts/q043/sql/01_counts.sql").exists()
+
+    # after remediation succeeds the retry runs; a second call inside the
+    # cooldown is a no-op (the lane is already clear)
+    state["pickup_streak"] = {"count": 2, "since": "x", "class": "dirty-untracked",
+                              "paths": ["tasks/artifacts/q043/sql/01_counts.sql"]}
+    nightwatch._maybe_remediate_pickup(repo, state, nightwatch.Policy(),
+                                       dry_run=False, say=_silent())
+    assert nightwatch._maybe_remediate_pickup(
+        repo, state, nightwatch.Policy(), dry_run=False, say=_silent()) is None
+
+
+def _disable_lane_charters(repo):
+    cfg = repo / ".court" / "config.json"
+    data = {}
+    if cfg.exists():
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+    data.setdefault("pickup", {})["allow_lane_charters"] = False
+    cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    _git(repo, "add", ".court/config.json")
+    _git(repo, "commit", "-m", "court: requests-in, charters-out")
+
+
+def test_lane_charters_are_refused_when_the_repo_forbids_them(tmp_path):
+    repo = _repo(tmp_path)
+    _disable_lane_charters(repo)
+    _please(repo, _valid_builder)
+    res = pickup.run(repo, say=_silent())
+    assert res["picked"] == []
+    assert "may not author charters" in (res["rejected"] or "")
+    # The rejection names the replacement, so the remote author can self-correct.
+    assert ".court/requests/" in (res["rejected"] or "")
+
+
+def test_a_request_packet_lands_on_castle(tmp_path):
+    repo = _repo(tmp_path)
+    _disable_lane_charters(repo)
+
+    def builder(r):
+        (r / ".court" / "requests").mkdir(parents=True, exist_ok=True)
+        (r / ".court" / "requests" / "req-thing.json").write_text(json.dumps({
+            "id": "req-thing",
+            "title": "Ship the thing",
+            "ask": "Do the thing end to end, with tests.",
+            "requested_by": "voice-agent",
+        }), encoding="utf-8")
+
+    _please(repo, builder)
+    res = pickup.run(repo, say=_silent())
+    assert res["rejected"] is None, res["rejected"]
+    assert res["picked"] == [".court/requests/req-thing.json"]
+    landed = (repo / ".court" / "requests" / "req-thing.json")
+    assert landed.is_file()
+    assert "req-thing" in landed.read_text(encoding="utf-8")

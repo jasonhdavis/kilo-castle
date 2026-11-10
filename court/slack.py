@@ -38,7 +38,7 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -55,6 +55,13 @@ DEFAULT_TOKEN_ENV = "SLACK_BOT_TOKEN"
 DEFAULT_NOTIFY_USER = "U02MA74K9DY"
 MAX_RULING_CHARS = 2000
 MAX_INDIVIDUAL_MESSAGES = 5
+# Hard ceiling on how many NEW messages the bridge may push to a channel in any
+# rolling hour. Fingerprints stop repeats, but a lost state file or a genuinely
+# busy board must never turn into a message storm in M'Lord's DM.
+MAX_POSTS_PER_HOUR = 6
+# A channel that refuses us (app disabled, bot removed, token revoked) must not
+# be hammered every tick. After a hard failure, wait this long before retrying.
+POST_BACKOFF_SECONDS = 15 * 60
 DIGEST_MAX_LINES = 20
 
 SCOPE_HINT = (
@@ -357,13 +364,61 @@ def fingerprint(kind: str, quest_id: str, text: str) -> str:
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
-def _item(kind: str, quest_id: str, title: str, text: str) -> dict:
+def _in_post_backoff(state: dict) -> bool:
+    until = str((state.get("post_backoff") or {}).get("until") or "")
+    try:
+        when = datetime.fromisoformat(until.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) < when
+
+
+def _stamp_post_backoff(state: dict, error: str) -> None:
+    """Remember that the channel refused us, so the next ticks stay quiet."""
+    until = datetime.now(timezone.utc) + timedelta(seconds=POST_BACKOFF_SECONDS)
+    state["post_backoff"] = {
+        "until": until.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "error": str(error)[:300],
+        "at": _now_iso(),
+    }
+
+
+def _posts_in_last_hour(state: dict) -> int:
+    """How many messages this bridge sent in the last rolling hour."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+    count = 0
+    for meta in (state.get("posted") or {}).values():
+        if not isinstance(meta, dict):
+            continue
+        stamp = meta.get("posted_at") or ""
+        try:
+            when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        if when >= cutoff:
+            count += 1
+    return count
+
+
+def _item(kind: str, quest_id: str, title: str, text: str,
+          key: str | None = None) -> dict:
+    """One outbound item.
+
+    `key` is the stable identity of the *problem*, not of the sentence: the
+    message body carries volatile detail (drift counts, goad totals, streak
+    numbers) that changes every tick, so fingerprinting the rendered text made
+    the same standing blocker post again and again. Callers pass a coarser key
+    and the body can evolve underneath it without spamming the channel."""
     return {
         "kind": kind,
         "quest": quest_id,
         "title": title,
         "text": text,
-        "fingerprint": fingerprint(kind, quest_id, text),
+        "fingerprint": fingerprint(kind, quest_id, key if key is not None else text),
     }
 
 
@@ -436,7 +491,8 @@ def blocker_items(snap: dict, watch_state: dict) -> list[dict]:
                     + ("The worktree has drifted from the trunk. " if behind else "")
                     + "The rebase is held; a Steward decision is needed."
                 )
-                items.append(_item("blocker", qid, str(quest.get("title") or ""), text))
+                items.append(_item("blocker", qid, str(quest.get("title") or ""), text,
+                                   key=f"merge-conflict:{status}:{files}"))
                 continue
 
         worker = str((quest.get("worker") or {}).get("state") or "idle")
@@ -449,7 +505,8 @@ def blocker_items(snap: dict, watch_state: dict) -> list[dict]:
                 f"budget ({int(qstate.get('goads') or 0)}/{slots * per_serf}); "
                 "a Steward must step in."
             )
-            items.append(_item("blocker", qid, str(quest.get("title") or ""), text))
+            items.append(_item("blocker", qid, str(quest.get("title") or ""), text,
+                               key="worker-stalled"))
 
     last_pickup = watch_state.get("last_pickup") or {}
     rejected = str(last_pickup.get("rejected") or "").strip()
@@ -472,7 +529,10 @@ def blocker_items(snap: dict, watch_state: dict) -> list[dict]:
                 + (f"\nRemedy: {remedy}\n" if remedy else "")
                 + "\nPaperwork is not reaching castle; reply if this needs a ruling."
             )
-            items.append(_item("blocker", "", "Pleasance pickup", text))
+            # The streak is deliberately excluded: a standing rejection is ONE
+            # blocker that exists until it is fixed, not a new one per retry.
+            items.append(_item("blocker", "", "Pleasance pickup", text,
+                               key=f"pickup-rejected:{normalize_text(rejected)[:160]}"))
 
     return items
 
@@ -749,8 +809,26 @@ def sync(repo: Path, dry_run: bool = False, snap: Optional[dict] = None,
             "no message, reply, file, or state change was made.")
         return result
 
+    # Rolling-hour ceiling counted in MESSAGES (an overflow digest is one
+    # message too). Items with no message left in the budget are NOT recorded,
+    # so they stay new and post on a later tick rather than being dropped.
+    recent = _posts_in_last_hour(state)
+    budget = max(0, MAX_POSTS_PER_HOUR - recent)
+    if budget == 0:
+        if new_items:
+            say(f"Slack sync: {len(new_items)} item(s) held back by the "
+                f"{MAX_POSTS_PER_HOUR}/h post ceiling ({recent} sent in the last hour).")
+        new_items = []
+    if _in_post_backoff(state):
+        say("Slack sync: posting is in backoff after a delivery failure; "
+            "queued items will retry when it expires.")
+        new_items = []
+
     individual = new_items[:MAX_INDIVIDUAL_MESSAGES]
-    overflow = new_items[MAX_INDIVIDUAL_MESSAGES:]
+    if len(new_items) > len(individual) and len(individual) >= budget:
+        # Leave one message of headroom for the digest.
+        individual = individual[:max(0, budget - 1)]
+    overflow = new_items[len(individual):]
     try:
         for item in individual:
             sent = post_message(cfg, item["text"], state=state)
@@ -790,6 +868,8 @@ def sync(repo: Path, dry_run: bool = False, snap: Optional[dict] = None,
         result["replies"] = ingest_replies(cfg, repo, state, say=say)
     except SlackError as e:
         result["error"] = _redact(str(e), cfg.token)
+        _stamp_post_backoff(state, result["error"])
+        save_state(repo, state)
         say(f"ERROR: {result['error']}")
     except Exception as e:  # noqa: BLE001 — cron entry point stays alive
         result["error"] = _redact(str(e), cfg.token)

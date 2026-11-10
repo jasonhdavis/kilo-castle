@@ -51,3 +51,28 @@ def test_init_scaffolds_repository(tmp_path):
 
     # AGENTS.md
     assert (tmp_path / "AGENTS.md").is_file()
+
+
+def test_force_update_preserves_repo_local_governance_in_kilo_json(tmp_path):
+    """`court update --force` rebinds prompts/models from the skeleton; the
+    repo's own permission guards must survive it. Dropping
+    `permission.agent_manager: deny` would silently re-enable a retired tool."""
+    import json
+
+    run_init(target_dir=tmp_path)
+    cfg_path = tmp_path / "kilo.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["permission"] = {"agent_manager": "deny"}
+    cfg["snapshot"] = False
+    cfg["agent"]["steward"]["permission"] = {"agent_manager": "deny"}
+    cfg["agent"]["steward"]["model"] = "stale/model"
+    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+    run_init(target_dir=tmp_path, force=True)
+
+    after = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert after["permission"] == {"agent_manager": "deny"}
+    assert after["snapshot"] is False
+    assert after["agent"]["steward"]["permission"] == {"agent_manager": "deny"}
+    # model is rebound from the role manifest, never carried over stale
+    assert after["agent"]["steward"]["model"] != "stale/model"

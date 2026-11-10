@@ -93,6 +93,7 @@ An **atelier convoy** (`court atelier`) arrives at you already merged: the Court
 #### Case B: Test Failures / Regressions Occur in the Batch — `/reject_tribute`
 1. **Isolate & Re-test**: Pinpoint the exact commit / Quest that broke the build.
 2. **Reject the Offending Quest from the Cog Ship**: Back out the offending branch, re-run tests on the clean pack, promote passing Quests to `castle`, and advance them to `READY_TO_RAZE`.
+   - **Already promoted? Peel instead of backing out**: if the offending Quest's code already reached `castle` (promoted in an earlier convoy, or riding another Quest's promotion merge), back out is no longer possible from the convoy alone. Run `python3 -m court.cli peel <quest_id> --reason "<one line>"` to revert its promotion commit out of the trunk and supersede the convoy's stale suite proof, then re-pack the survivors with `court collect` and re-run the unified suite. `--dry-run` shows the plan; `--commit <sha>` names the Quest's own code commit when its convoy was entangled with a sibling's promotion. Never un-pillory or delete a branch to make the trunk invariant green.
 3. **Record the rejection** in the Quest's `## Cogship Log`:
    ```bash
    python3 -m court.cli set-section <id> "Cogship Log" --append \

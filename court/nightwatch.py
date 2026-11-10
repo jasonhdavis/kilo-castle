@@ -24,11 +24,20 @@ Scope of authority (deliberately narrow):
                                            Steward judgment call, not a timer —
                                            the one exception is a bounded
                                            replacement serf for a spent Quest)
-  * READY_TO_RAZE                       -> report only by default; opt-in `raze`
-                                           (`--enable ...,raze`) runs `court raze`
+  * READY_TO_RAZE                       -> `raze`: `court raze` verifies promotion,
+                                           then removes the worktree, the merged
+                                           branch, and its pytest databases
+                                           (default-on; `--keep-worktree` on the
+                                           verb leaves everything for a human)
+  * open charter request                -> `charter`: one bounded Steward turn
+                                           authors the charter and allocates the
+                                           Quest number (requests-in, charters-out)
+  * READY_TO_RAZE that raze refuses     -> `regate`: a squashed/diverged convoy is
+                                           handed back to a fresh convoy; after
+                                           `max_regates` failures the Quest is
+                                           escalated to a Steward
   * dead convoy (stale gatehouse)       -> `teardown` the provably-dead gatehouse
                                            worktree so `collect` can re-create it
-                                           (default-on; `raze` stays opt-in)
   * stale board, nobody running         -> `muster` ONE bounded Steward triage
                                            session (opt-in; see below)
 
@@ -108,6 +117,16 @@ DEFAULT_GATEHOUSE_GRACE = 10 * 60
 # failure: wait out the gate window instead of retrying on the short backoff.
 DEFAULT_LIVE_CONVOY_BACKOFF = 60 * 60
 DEFAULT_RETRY_BACKOFF = 300
+# A convoy that keeps failing the same collect does not heal on a fixed
+# 5-minute retry loop (the 2026-11-05 the-gatehouse-cogship-381/399 storm:
+# 23 identical failures at 300s apiece, ~2h of churn). Each consecutive
+# failure doubles the retry window up to `max_retry_backoff`, and at
+# `max_fails` the convoy is escalated as a dead letter so a Steward looks at
+# the actual blocker instead of the watch re-stamping it every tick. The
+# convoy keeps retrying at the capped window, so fixing the blocker (or a
+# restart) still resumes it without a manual state reset.
+DEFAULT_MAX_FAILS = 3
+DEFAULT_MAX_RETRY_BACKOFF = 60 * 60
 # A Quest that is merely BEHIND `castle` fails its coin/goad spawn once
 # (`_sync_base_before_spawn` aborts on a `git merge castle` conflict), gets a
 # merge_conflict marker, and burns a Steward muster. Drift is mechanical, so a
@@ -130,6 +149,31 @@ DEFAULT_MAX_STEWARDS_PER_DAY = 2
 # context.* by the CLI; these are the structural fallbacks.
 DEFAULT_CULL_SOFT = 350_000
 DEFAULT_HARD_RED_ZONE = 750_000
+# Session-store maintenance ("session razing"). The Kilo session/event store is
+# the perennial disk hog (it reached 15 GB on 2026-11-08 and hit 111 GB in the
+# 2026-09-28 incident). Razing ages sessions out in share-safe chunks and then
+# vacuums the file. It is housekeeping, not work: the watch only runs it when
+# the board is genuinely idle (no live worker, no worker-spawning action) because
+# VACUUM takes an exclusive lock that would fail a worker's write.
+DEFAULT_SESSION_RETENTION_DAYS = 14
+DEFAULT_SESSION_PRUNE_INTERVAL = 24 * 60 * 60
+DEFAULT_SESSION_KEEP_EVENTS = 1_200_000
+# A `raze` whose branch tip is not an ancestor of castle (squash/merge history)
+# cannot be razed until the Quest is re-gated. That is mechanical: `court collect
+# --regate` hands it back to a fresh convoy. Two consecutive failures means the
+# regate itself is broken, so the Quest bubbles up to a Steward instead of
+# looping. Test-database reaping is housekeeping like session pruning: interval
+# gated, idle-board only.
+DEFAULT_MAX_REGATES = 2
+DEFAULT_REGATE_COOLDOWN = 900
+DEFAULT_PG_PRUNE_INTERVAL = 6 * 60 * 60
+# A charter request is intent from the Pleasance lane; one bounded Steward turn
+# authors the charter (and allocates the Quest number, which the requester
+# cannot do without seeing the board).
+DEFAULT_MAX_CHARTER_FAILS = 2
+DEFAULT_CHARTER_COOLDOWN = 30 * 60
+PRUNE_TIMEOUT = 900
+SESSION_PRUNE_TIMEOUT = 2400
 DEFAULT_STATUS_TIMEOUT = 240
 DEFAULT_ACTION_TIMEOUT = 600
 COLLECT_TIMEOUT = 900
@@ -149,7 +193,8 @@ STALL_THRESHOLDS = {
     "master_of_coin": 30 * 60,
 }
 
-ENABLED_ACTIONS = ("goad", "coin", "collect", "dispatch", "steward", "raze", "teardown", "rebase")
+ENABLED_ACTIONS = ("goad", "coin", "collect", "dispatch", "steward", "charter",
+                   "raze", "regate", "teardown", "rebase", "prune", "pgprune")
 
 # A board is only "live" while at least one Quest is in a pre-terminal stage.
 # Statuses the watch can move mechanically are excluded from the `steward`
@@ -188,6 +233,10 @@ class Policy:
     max_teardown_fails: int = DEFAULT_MAX_TEARDOWN_FAILS
     gatehouse_grace: int = DEFAULT_GATEHOUSE_GRACE
     retry_backoff: int = DEFAULT_RETRY_BACKOFF
+    # Consecutive-failure handling for retried actions: exponential backoff
+    # capped at `max_retry_backoff`, escalated as a dead letter at `max_fails`.
+    max_fails: int = DEFAULT_MAX_FAILS
+    max_retry_backoff: int = DEFAULT_MAX_RETRY_BACKOFF
     rebase_cooldown: int = DEFAULT_REBASE_COOLDOWN
     # Steward muster (last resort). See DEFAULT_STEWARD_* above.
     steward_stale_after: int = DEFAULT_STEWARD_STALE_AFTER
@@ -201,8 +250,23 @@ class Policy:
     # process, no fresh session) and whose path matches `.kilo/worktrees/
     # the-gatehouse-*`.
     raze_cooldown: int = 1800
+    # Raze support: a raze that `court raze` refuses (branch tip not an ancestor
+    # of castle) is handed back to a fresh convoy automatically instead of
+    # waiting for a human; `max_regates` bounds the retries before a Steward is
+    # asked. Test-database reaping is interval + idle-board gated.
+    max_regates: int = DEFAULT_MAX_REGATES
+    regate_cooldown: int = DEFAULT_REGATE_COOLDOWN
+    pg_prune_interval: int = DEFAULT_PG_PRUNE_INTERVAL
+    max_charter_fails: int = DEFAULT_MAX_CHARTER_FAILS
+    charter_cooldown: int = DEFAULT_CHARTER_COOLDOWN
     cull_soft: int = DEFAULT_CULL_SOFT
     hard_red_zone: int = DEFAULT_HARD_RED_ZONE
+    # Session-store razing (opt in with `--enable ...,prune`). Runs at most once
+    # per interval, only on a fully idle board, and vacuums after pruning.
+    session_retention_days: int = DEFAULT_SESSION_RETENTION_DAYS
+    session_prune_interval: int = DEFAULT_SESSION_PRUNE_INTERVAL
+    session_keep_events: int = DEFAULT_SESSION_KEEP_EVENTS
+    session_prune_vacuum: bool = True
     bloat_cold_start: bool = False
     # A dispatch is only ever reachable through an explicitly registered
     # vigil (which carries its own reason, expiry, and fire cap) — the watch
@@ -215,7 +279,8 @@ class Policy:
     # (and the wasted Steward muster that follows). `steward` and `raze` remain
     # deliberate opt-ins: steward spends a reasoning worker; raze deletes a
     # branch ref. ENABLED_ACTIONS is the full `--enable` vocabulary.
-    enabled: tuple = ("goad", "coin", "collect", "dispatch", "teardown", "rebase")
+    enabled: tuple = ("goad", "coin", "collect", "dispatch", "teardown", "rebase",
+                      "raze", "regate", "charter", "pgprune")
     allow_force_goad: bool = False
     status_timeout: int = DEFAULT_STATUS_TIMEOUT
     # Pleasance lane: each tick may fetch and apply remote paperwork (charters,
@@ -226,6 +291,17 @@ class Policy:
     # steward can see liveness without extra flags; `--no-publish-pulse` keeps
     # it local-only.
     pickup: bool = True
+    # A paid lane that has been blocked for a while by the SAME local garbage
+    # (a Scout's untracked probe SQL, a regenerated audit report) does not need
+    # a Steward: it needs one mechanical move. After `pickup_remedy_after`
+    # identical rejections the watch clears a dirty-tree block itself — moving
+    # scratch into its quarantine dir (never deleting) and restoring
+    # regenerable reports — then retries the pickup once. Rejections whose
+    # paths are real local edits stay escalated. Rate-limited per repo so a
+    # fresh blocker is not remediated on every tick.
+    pickup_remedy: bool = True
+    pickup_remedy_after: int = 2
+    pickup_remedy_cooldown: int = 900
     publish_pulse: bool = True
     pulse_branch: str = "status/pleasance"
 
@@ -615,6 +691,27 @@ def _within(ts: Optional[float], window: int, now: float) -> bool:
     return bool(ts) and (now - float(ts)) < window
 
 
+def _failure_backoff(base: float, fails: int, cap: Optional[float] = None) -> float:
+    """Retry window for an action that has now failed `fails` times in a row.
+
+    First failure waits `base`, then doubles per consecutive failure (300s,
+    600s, 1200s ...), capped at `cap` when given. A single transient failure
+    keeps the short retry; a stuck blocker converges on the cap instead of
+    hammering the pipeline every 5 minutes forever."""
+    window = max(0.0, float(base)) * (2 ** max(0, int(fails) - 1))
+    return min(window, float(cap)) if cap else window
+
+
+def _fmt_window(seconds: float) -> str:
+    """Human-readable retry window for escalation text (e.g. `1h`, `20m`)."""
+    secs = max(0, int(seconds))
+    if secs >= 3600 and secs % 3600 == 0:
+        return f"{secs // 3600}h"
+    if secs >= 60 and secs % 60 == 0:
+        return f"{secs // 60}m"
+    return f"{secs}s"
+
+
 def _charter_ready(repo: Path, qmap: dict, now: Optional[datetime] = None) -> list:
     """Ids of CHARTERED quests (no worktree) whose castle charter's
     ``## Prerequisites`` predicates are ALL satisfied — the pleasance
@@ -650,7 +747,9 @@ def _charter_ready(repo: Path, qmap: dict, now: Optional[datetime] = None) -> li
 
 
 def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[float] = None,
-         ready_vigils: Optional[list] = None, charter_ready: Optional[list] = None) -> tuple[list, list]:
+         ready_vigils: Optional[list] = None, charter_ready: Optional[list] = None,
+         raze_regate: Optional[list] = None,
+         charter_requests: Optional[list] = None) -> tuple[list, list]:
     """Decide this tick's actions. Returns (actions, notes).
 
     Pure function: no I/O beyond the already-collected inputs, so the policy
@@ -677,6 +776,41 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
 
     busy_workers = workers.get("count", 0)
     capacity = max(0, policy.max_workers - busy_workers)
+
+    # --- charter requests (requests-in, charters-out) -----------------------
+    # Planned FIRST: a request is the pipeline's own input, so it must not
+    # queue behind cleanup (rebases, collects) and lose the per-tick budget.
+    # A request packet is intent, not a charter: the requester (usually the
+    # away-mode voice agent) cannot see the board, so it must not allocate a
+    # Quest number. One bounded Steward turn authors the charter.
+    req_state = state.get("requests") or {}
+    for packet in (charter_requests or []):
+        rid = packet.get("id") or ""
+        if not rid:
+            continue
+        if not policy.allows("charter"):
+            note(rid, "report",
+                 f"charter request {rid} — steward chartering disabled (`--enable ...,charter`)")
+            continue
+        st = req_state.get(rid) or {}
+        fails = int(st.get("fails") or 0)
+        if fails >= policy.max_charter_fails:
+            note(rid, "human",
+                 f"charter request {rid} ({packet.get('title') or ''}) failed {fails} time(s) — "
+                 f"it needs a human to clarify the ask or charter it directly",
+                 key="charter_exhausted")
+            continue
+        if _within(st.get("last_attempt_ts"), policy.charter_cooldown, now):
+            continue
+        if capacity <= 0:
+            note(rid, "skip", f"charter request {rid} ready but worker ceiling reached")
+            continue
+        actions.append(Action(
+            kind="charter", quest_ids=[rid],
+            reason=f"charter request {rid} — {packet.get('title') or 'remote request'}",
+            meta={"retry_backoff": policy.retry_backoff}))
+        capacity -= 1
+
     busy_dirs = workers.get("dirs") or {}
     ready_vigils = ready_vigils or []
 
@@ -713,7 +847,7 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
     # --- Vigils first: an explicit Steward hand-off beats the heuristics ---
     for spec, why in ready_vigils:
         try:
-            argv, spawns = vigils.action_argv(spec.get("then") or "")
+            argv, spawns = vigils.action_argv(spec.get("then") or "", spec)
         except vigils.VigilError as e:
             note(spec.get("id", "?"), "human", f"unreadable vigil action: {e}")
             continue
@@ -721,8 +855,20 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
         if spawns and verb in ("goad", "coin", "collect") and not policy.allows(verb):
             note(spec.get("id", "?"), "skip", f"vigil ready but {verb} is disabled")
             continue
+        if verb == "rebase" and not policy.allows("rebase"):
+            # Local git only, but it still converges a worktree a Steward may
+            # not want touched — same `--enable ...,rebase` lever as the
+            # watch's own drift pass.
+            note(spec.get("id", "?"), "skip", "vigil ready but rebase is disabled")
+            continue
         if spawns and verb == "dispatch" and not policy.allow_dispatch:
             note(spec.get("id", "?"), "skip", "vigil ready but dispatch is disabled")
+            continue
+        if spawns and verb == "muster" and not policy.allows("steward"):
+            # A muster spends a reasoning worker, so it stays behind the same
+            # opt-in (`--enable steward`) as the watch's own steward action.
+            note(spec.get("id", "?"), "skip",
+                 "vigil ready but steward (muster) is disabled")
             continue
         if spawns and capacity <= 0:
             note(spec.get("id", "?"), "skip",
@@ -737,7 +883,8 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
             kind="vigil",
             quest_ids=[target] if target else [],
             reason=f"vigil {spec['id']}: {why} → {spec.get('then')}",
-            meta={"vigil_id": spec["id"], "then": spec.get("then"), "spawns": spawns},
+            meta={"vigil_id": spec["id"], "then": spec.get("then"), "spawns": spawns,
+                  "brief": spec.get("brief") or ""},
         ))
         if spawns:
             capacity -= 1
@@ -782,7 +929,17 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                 behind = 0
             if behind <= 0:
                 continue
-            if gs.get("dirty"):
+            # Drift that carries only the Court's own bookkeeping (board
+            # snapshots, ledger syncs) is not real drift: the trunk gains one
+            # of those every tick, so rebasing on it re-merges the same branch
+            # forever and burns the spawn budget. The worker's own
+            # `git merge castle` picks bookkeeping up when it next runs.
+            if gs.get("behind_code") == 0:
+                note(q["id"], "skip",
+                     f"{behind} commit(s) behind castle but bookkeeping-only "
+                     f"(.court/) — no rebase needed")
+                continue
+            if gs.get("dirty") and not gs.get("dirty_disposable_only"):
                 note(q["id"], "wait",
                      f"{behind} commit(s) behind castle but the worktree is DIRTY — "
                      f"a rebase waits for a commit")
@@ -793,17 +950,16 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                 continue
             if now < float(st.get("retry_at") or 0):
                 continue
-            if capacity <= 0:
-                note(q["id"], "skip",
-                     f"{behind} commit(s) behind castle but worker ceiling "
-                     f"reached ({busy_workers}/{policy.max_workers})")
-                continue
+            # A rebase spawns no worker — it is a local `git merge castle`
+            # inside an already-idle worktree. Charging it against the worker
+            # ceiling let a drift wave (four drifted Quest branches) starve the
+            # spawn actions that tick, including a charter request that is the
+            # pipeline's own input. The per-tick action cap still bounds it.
             actions.append(Action(
                 kind="rebase", quest_ids=[q["id"]],
                 reason=f"{behind} commit(s) behind castle — mechanical rebase",
                 meta={"retry_backoff": policy.retry_backoff}))
             rebase_ids.add(q["id"])
-            capacity -= 1
 
     # --- GATE: hand the convoy to a Gatekeeper -----------------------------
     by_cogship: dict[str, list[str]] = {}
@@ -894,9 +1050,17 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                  f"(`court fork-teardown-list`; enable teardown with `--enable ...,teardown`)",
                  key="stale_convoy")
             continue
-        if int(convoy.get("fails") or 0) >= 3:
+        fails = int(convoy.get("fails") or 0)
+        if fails >= policy.max_fails:
             note(q["id"], "human",
-                 f"convoy {key} failed {convoy.get('fails')} collect attempt(s) — needs a Steward look "
+                 f"convoy {key} failed {fails} collect attempt(s) — DEAD LETTER at the "
+                 f"{policy.max_fails}-attempt ceiling, retrying only every "
+                 f"{_fmt_window(policy.max_retry_backoff)}; needs a Steward look "
+                 f"(last error: {str(convoy.get('last_error') or '')[:140]})",
+                 key="convoy_fails")
+        elif fails:
+            note(q["id"], "human",
+                 f"convoy {key} failed {fails} collect attempt(s) — needs a Steward look "
                  f"(last error: {str(convoy.get('last_error') or '')[:140]})",
                  key="convoy_fails")
         if now < float(convoy.get("retry_at") or 0):
@@ -920,7 +1084,8 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
             meta={"convoy": cog, "retry_backoff": policy.retry_backoff,
                   "noop_backoff": policy.collect_noop_backoff,
                   "stale_backoff": policy.stale_convoy_backoff,
-                  "live_backoff": policy.gate_cooldown},
+                  "live_backoff": policy.gate_cooldown,
+                  "max_retry_backoff": policy.max_retry_backoff},
         ))
         capacity -= 1
 
@@ -1254,23 +1419,19 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                           "retry_backoff": policy.retry_backoff}))
                 capacity -= 1
 
-    # --- report-only stages (raze is opt-in destructive help) ---------------
+    # --- raze / regate (automatic; razing is no longer human-gated) ---------
+    # A READY_TO_RAZE Quest has already had its promotion verified, so the
+    # remaining work is mechanical: tear the worktree down (raze), or — when
+    # `court raze`'s ancestor check fails because the convoy was squashed —
+    # hand the Quest back to a fresh convoy (regate) first. Neither needs a
+    # human decision; both are bounded (cooldown, regate attempts) and both
+    # escalate to a Steward only after the mechanical path is exhausted.
+    regate_ids = set(raze_regate or ())
     for q in quests.values():
         status = q.get("status")
         if status in ("PLANNED", "CHARTERED", "DISPATCHED"):
             note(q["id"], "report", f"{status} — waiting on a Steward dispatch decision")
         elif status == "READY_TO_RAZE":
-            if q.get("razed_at"):
-                note(q["id"], "report",
-                     f"READY_TO_RAZE but already razed at {q['razed_at']} — worktree "
-                     f"awaits manual prune (`court teardown-list`); not re-razing",
-                     key="razed_pruned")
-                continue
-            if not policy.allows("raze"):
-                note(q["id"], "report",
-                     "READY_TO_RAZE — promotion verified; `court raze` is a human/Steward call "
-                     "(opt in with `--enable ...,raze`)")
-                continue
             if q.get("kind") == "epic":
                 note(q["id"], "report", "READY_TO_RAZE epic — raze via the Steward")
                 continue
@@ -1281,16 +1442,104 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                 note(q["id"], "wait", "READY_TO_RAZE but a worker is still live in its worktree")
                 continue
             st = qstate.get(q["id"]) or {}
+            if q.get("razed_at"):
+                # Promotion was verified in an earlier pass; only the teardown
+                # is outstanding. `court raze` is idempotent for this state.
+                if not policy.allows("raze"):
+                    note(q["id"], "report",
+                         f"READY_TO_RAZE and already razed at {q['razed_at']} — worktree "
+                         f"awaits teardown (`--enable ...,raze`)", key="razed_pruned")
+                    continue
+                if _within(st.get("last_raze_ts"), policy.raze_cooldown, now):
+                    continue
+                actions.append(Action(
+                    kind="raze", quest_ids=[q["id"]],
+                    reason=f"already razed at {q['razed_at']} — running the outstanding teardown",
+                    meta={"retry_backoff": policy.retry_backoff}))
+                continue
+            if q["id"] in regate_ids:
+                if not policy.allows("regate"):
+                    note(q["id"], "report",
+                         "READY_TO_RAZE but the branch tip is not an ancestor of castle — "
+                         "regate needed (`--enable ...,regate`)")
+                    continue
+                fails = int(st.get("regate_fails") or 0)
+                if fails >= policy.max_regates:
+                    note(q["id"], "human",
+                         f"READY_TO_RAZE and raze refuses (branch tip not an ancestor of "
+                         f"castle); {fails} regate attempt(s) failed — the convoy needs a "
+                         f"Steward", key="regate_exhausted")
+                    continue
+                if _within(st.get("last_regate_ts"), policy.regate_cooldown, now):
+                    continue
+                actions.append(Action(
+                    kind="regate", quest_ids=[q["id"]],
+                    reason=("READY_TO_RAZE but raze refuses (branch tip not an ancestor of "
+                            "castle) — re-gating through a fresh convoy"),
+                    meta={"retry_backoff": policy.retry_backoff}))
+                continue
+            if not policy.allows("raze"):
+                note(q["id"], "report",
+                     "READY_TO_RAZE — promotion verified; teardown/raze is disabled "
+                     "(`--enable ...,raze`)")
+                continue
             if _within(st.get("last_raze_ts"), policy.raze_cooldown, now):
                 continue
             actions.append(Action(
                 kind="raze", quest_ids=[q["id"]],
-                reason="READY_TO_RAZE — promotion verified; razing (opt-in) to free the worktree",
+                reason="READY_TO_RAZE — promotion verified; razing and tearing down the worktree",
                 meta={"retry_backoff": policy.retry_backoff}))
         elif status == "HELD":
             note(q["id"], "report", "HELD — awaiting Audience")
 
     actions = actions[: policy.max_spawns_per_tick]
+
+    # --- Session-store razing (maintenance, never work) ---------------------
+    # The Kilo session/event store grows without bound (15 GB by 2026-11-08).
+    # Razing is deliberately appended AFTER the spawn budget: it is mechanical
+    # housekeeping, not a worker. It is only eligible on a genuinely idle board
+    # — no live worker anywhere and no worker-spawning action this tick — since
+    # its VACUUM takes an exclusive lock that would fail an in-flight write.
+    # At most once per `session_prune_interval`; retention and event-window are
+    # policy, so a quiet machine ages its own history without a human cron.
+    if policy.allows("prune"):
+        maint = state.get("maintenance") or {}
+        last = float(maint.get("session_prune_ts") or 0)
+        spawning = any(a.kind in ("goad", "coin", "collect", "dispatch", "steward", "prune")
+                       for a in actions)
+        if (busy_workers == 0 and not spawning
+                and (now - last) >= policy.session_prune_interval
+                and now >= float(maint.get("session_prune_retry_at") or 0)):
+            actions.append(Action(
+                kind="prune", quest_ids=[],
+                reason=(f"machine idle — razing sessions older than "
+                        f"{policy.session_retention_days}d and vacuuming the store"),
+                meta={"days": policy.session_retention_days,
+                      "keep_events": policy.session_keep_events,
+                      "vacuum": policy.session_prune_vacuum,
+                      "retry_backoff": policy.retry_backoff}))
+
+    # --- pytest-database reaping (maintenance, never work) ------------------
+    # Every ephemeral gatehouse worktree hashes a new BASE_DIR, so its pytest
+    # databases are new; `--reuse-db` never drops the previous set. 964 of them
+    # (~34 GB) had accumulated by 2026-11-09. Dropping a database is only safe
+    # while nothing is running, so this is idle-board gated like the session
+    # razing above, and interval-bounded so it is a background sweep rather
+    # than a per-tick query.
+    if policy.allows("pgprune"):
+        maint = state.get("maintenance") or {}
+        last = float(maint.get("pg_prune_ts") or 0)
+        spawning = any(a.kind in ("goad", "coin", "collect", "dispatch", "steward",
+                                  "regate", "prune", "pgprune")
+                       for a in actions)
+        if (state.get("supervisor_started") and busy_workers == 0 and not spawning
+                and (now - last) >= policy.pg_prune_interval
+                and now >= float(maint.get("pg_prune_retry_at") or 0)):
+            actions.append(Action(
+                kind="pgprune", quest_ids=[],
+                reason="machine idle — dropping pytest databases whose worktree no longer exists",
+                meta={"retry_backoff": policy.retry_backoff}))
+
     return actions, notes
 
 
@@ -1399,15 +1648,89 @@ def _execute_teardown(repo: Path, action: Action, timeout: int = 120) -> dict:
             "stderr_tail": "", "seconds": round(time.time() - started, 1)}
 
 
+def _execute_prune(repo: Path, action: Action, timeout: int = SESSION_PRUNE_TIMEOUT) -> dict:
+    """Raze old Kilo sessions, then reclaim the file.
+
+    Two idempotent steps through the verified ``court db-prune`` front door:
+    ``prune --apply`` (chunked, share-safe deletes) followed by
+    ``vacuum --apply`` (the only step that actually shrinks the file). A
+    partial success is a failure — the interval only advances when both land,
+    so a locked/refused vacuum is retried on the next idle window.
+    """
+    days = int(action.meta.get("days") or DEFAULT_SESSION_RETENTION_DAYS)
+    keep = int(action.meta.get("keep_events") or DEFAULT_SESSION_KEEP_EVENTS)
+    started = time.time()
+    outs: list[str] = []
+    errs: list[str] = []
+    steps = [["db-prune", "prune", "--days", str(days),
+              "--keep-events", str(keep), "--apply"]]
+    if action.meta.get("vacuum", True):
+        steps.append(["db-prune", "vacuum", "--apply"])
+    ok = True
+    for argv in steps:
+        try:
+            res = _court(repo, *argv, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            errs.append(f"{' '.join(argv)} timed out after {timeout}s")
+            ok = False
+            break
+        except Exception as e:  # noqa: BLE001 — a supervisor must never die on one action
+            errs.append(f"{' '.join(argv)} failed: {e}")
+            ok = False
+            break
+        outs.append((res.stdout or "").strip())
+        errs.append((res.stderr or "").strip())
+        if res.returncode != 0:
+            ok = False
+            break
+    return {"ok": ok, "exit": 0 if ok else 1, "argv": steps[-1],
+            "stdout_tail": "\n".join(o for o in outs if o)[-1200:],
+            "stderr_tail": "\n".join(e for e in errs if e)[-1200:],
+            "seconds": round(time.time() - started, 1)}
+
+
+def _execute_pgprune(repo: Path, action: Action, timeout: int = PRUNE_TIMEOUT) -> dict:
+    """Reap pytest databases whose worktree is gone (regenerable, ~6 s to rebuild)."""
+    started = time.time()
+    try:
+        res = _court(repo, "prune-test-dbs", "--apply", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "exit": -1, "argv": ["prune-test-dbs", "--apply"],
+                "stdout_tail": "", "stderr_tail": f"timed out after {timeout}s",
+                "seconds": round(time.time() - started, 1)}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "exit": -1, "argv": ["prune-test-dbs", "--apply"],
+                "stdout_tail": "", "stderr_tail": str(e)[:500],
+                "seconds": round(time.time() - started, 1)}
+    out = (res.stdout or "").strip()
+    err = (res.stderr or "").strip()
+    plan = action.meta or {}
+    return {"ok": res.returncode == 0, "exit": res.returncode,
+            "argv": ["prune-test-dbs", "--apply"],
+            "stdout_tail": out[-1200:], "stderr_tail": err[-1200:],
+            "seconds": round(time.time() - started, 1), "plan": plan}
+
+
 def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -> dict:
     if action.kind == "teardown":
         return _execute_teardown(repo, action)
+    if action.kind == "prune":
+        return _execute_prune(repo, action)
+    if action.kind == "pgprune":
+        return _execute_pgprune(repo, action)
     if action.kind == "vigil":
         then = action.meta.get("then") or ""
         if not action.meta.get("spawns", True):
             return {"ok": True, "exit": 0, "argv": [], "stdout_tail": f"note-only vigil: {then}",
                     "stderr_tail": "", "seconds": 0.0}
-        argv, _spawns = vigils.action_argv(then)
+        argv, _spawns = vigils.action_argv(
+            then, {"then": then, "brief": action.meta.get("brief") or ""})
+    elif action.kind == "charter":
+        argv = ["charter-request", *action.quest_ids]
+    elif action.kind == "regate":
+        # A raze the gate refused (branch tip not an ancestor of castle) goes
+        # back through a fresh convoy instead of waiting for a human.
+        argv = ["collect", *action.quest_ids, "--regate", "--standup"]
     elif action.kind == "collect":
         # `court collect` takes ONE positional that may be a comma-separated
         # list (quest_ids, batchable) — passing N positionals makes argparse
@@ -1457,8 +1780,10 @@ def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -
             "seconds": round(time.time() - started, 1),
         }
         # `court rebase` exits 0 even when it reports a conflict, so the
-        # reported conflict — not the exit code — is the failure signal.
-        if action.kind == "rebase" and result["ok"] and _merge_conflict_files(result):
+        # reported conflict — not the exit code — is the failure signal. This
+        # applies equally to the heuristic rebase action and a queued
+        # `rebase:<QID>` vigil, which share the same CLI verb.
+        if argv and argv[0] == "rebase" and result["ok"] and _merge_conflict_files(result):
             result["ok"] = False
         return result
     except subprocess.TimeoutExpired:
@@ -1592,6 +1917,21 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
                 if spec.get("id") == vid and spec.get("status") == "active":
                     vigils.mark_fired(repo, spec, result)
                     break
+        # A queued action that dies on `git merge castle` is the SAME
+        # deterministic blocker the heuristic paths already stamp: record it
+        # so a chained coin/goad holds for a Steward instead of firing next
+        # tick into the identical conflict and burning its own queue entry.
+        mc = _merge_conflict_files(result)
+        if not ok and mc:
+            verb = _vigil_verb({"then": action.meta.get("then") or ""})
+            if verb in ("rebase", "goad", "coin", "dispatch"):
+                for qid in action.quest_ids:
+                    st = qstate.setdefault(qid, {})
+                    prev = st.get("merge_conflict") or {}
+                    st["merge_conflict"] = {
+                        "files": mc, "ts": now,
+                        "escalated_ts": prev.get("escalated_ts"),
+                    }
         return
 
     if action.kind == "goad":
@@ -1667,13 +2007,76 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
                 }
             elif backoff:
                 st["retry_at"] = now + backoff
-    elif action.kind == "raze":
-        # Opt-in destructive help: a successful raze frees the worktree; the
-        # Quest leaves READY_TO_RAZE so it simply stops being planned.
+    elif action.kind == "prune":
+        # Session-store housekeeping on its own state key (board-level, not a
+        # Quest). The interval only advances on a full success so a refused or
+        # lock-contended vacuum is retried on the next idle window instead of
+        # being skipped for a whole day.
+        maint = state.setdefault("maintenance", {})
         if ok:
-            for qid in action.quest_ids:
-                st = qstate.setdefault(qid, {})
-                st["last_raze_ts"] = now
+            maint["session_prune_ts"] = now
+            maint["session_prune_fails"] = 0
+            maint["session_prune_error"] = ""
+            maint["session_prune_report"] = (result.get("stdout_tail") or "")[-600:]
+        else:
+            maint["session_prune_fails"] = int(maint.get("session_prune_fails") or 0) + 1
+            maint["session_prune_error"] = (result.get("stderr_tail") or "")[-400:]
+            if backoff:
+                maint["session_prune_retry_at"] = now + backoff
+    elif action.kind == "pgprune":
+        maint = state.setdefault("maintenance", {})
+        if ok:
+            maint["pg_prune_ts"] = now
+            maint["pg_prune_error"] = ""
+            maint["pg_prune_report"] = (result.get("stdout_tail") or "")[-600:]
+        else:
+            maint["pg_prune_fails"] = int(maint.get("pg_prune_fails") or 0) + 1
+            maint["pg_prune_error"] = (
+                result.get("stderr_tail") or result.get("stdout_tail") or ""
+            )[-400:]
+            if backoff:
+                maint["pg_prune_retry_at"] = now + backoff
+    elif action.kind == "raze":
+        # A successful raze tears the worktree down and archives the Quest, so
+        # it simply stops being planned. A refusal (dirty tree, a branch that
+        # turns out not to be an ancestor) is retried on the short backoff.
+        for qid in action.quest_ids:
+            st = qstate.setdefault(qid, {})
+            st["last_raze_ts"] = now
+            if not ok:
+                st["raze_fails"] = int(st.get("raze_fails") or 0) + 1
+                if backoff:
+                    st["raze_retry_at"] = now + backoff
+            else:
+                st.pop("raze_fails", None)
+                st.pop("raze_retry_at", None)
+    elif action.kind == "charter":
+        req_state = state.setdefault("requests", {})
+        for rid in action.quest_ids:
+            st = req_state.setdefault(rid, {})
+            st["last_attempt_ts"] = now
+            if ok:
+                st["fails"] = 0
+                st.pop("error", None)
+            else:
+                st["fails"] = int(st.get("fails") or 0) + 1
+                st["error"] = (result.get("stderr_tail") or result.get("stdout_tail") or "")[-400:]
+                if backoff:
+                    st["retry_at"] = now + backoff
+    elif action.kind == "regate":
+        # A regate hands a squashed/diverged Quest back to a fresh convoy. Its
+        # success is observable on the next tick (the Quest leaves
+        # READY_TO_RAZE); a repeatable failure counts toward `max_regates`,
+        # after which the Quest is escalated to a Steward instead of looping.
+        for qid in action.quest_ids:
+            st = qstate.setdefault(qid, {})
+            st["last_regate_ts"] = now
+            if ok:
+                st["regate_fails"] = 0
+            else:
+                st["regate_fails"] = int(st.get("regate_fails") or 0) + 1
+                if backoff:
+                    st["regate_retry_at"] = now + backoff
     elif action.kind == "teardown":
         # A successful teardown clears the stale-convoy hold so collect can
         # re-pack the convoy on the next tick. A failed one is remembered and
@@ -1764,11 +2167,13 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
             convoy["last_error"] = f"convoy {live_convoy} is LIVE"
             convoy["retry_at"] = now + live_backoff
         elif backoff:
-            # A hard failure (argparse slip, busy lock) retries quickly rather
-            # than burning the long noop backoff.
+            # A hard failure (argparse slip, busy lock) retries quickly at first,
+            # then backs off exponentially so a persistent blocker costs a
+            # window, not a 5-minute loop forever (cogship-381/399 storm).
             convoy["fails"] = int(convoy.get("fails") or 0) + 1
             convoy["last_error"] = (result.get("stderr_tail") or result.get("stdout_tail") or "")[-300:]
-            convoy["retry_at"] = now + backoff
+            convoy["retry_at"] = now + _failure_backoff(
+                backoff, convoy["fails"], action.meta.get("max_retry_backoff"))
 
     for qid in action.quest_ids:
         st = qstate.setdefault(qid, {})
@@ -1852,6 +2257,65 @@ def _current_branch(repo: Path) -> str:
         return ""
 
 
+def _maybe_remediate_pickup(repo: Path, state: dict, policy: "Policy",
+                            dry_run: bool, say=print) -> Optional[dict]:
+    """Clear a repeatable dirty-tree pickup block mechanically, then retry once.
+
+    The pickup gate exists so an atomic paperwork commit never mixes with a
+    human's uncommitted edit. It does not need a reasoning worker: when the
+    same rejection repeats and every blocking path is scratch under a known
+    root (or a regenerable report), the watch quarantines/restores it itself.
+    Anything else is left exactly where it is for a human.
+    """
+    if not policy.pickup_remedy:
+        return None
+    streak = state.get("pickup_streak") or {}
+    if int(streak.get("count") or 0) < policy.pickup_remedy_after:
+        return None
+    cls = streak.get("class")
+    paths = sorted({str(p) for p in (streak.get("paths") or []) if str(p)})
+    previous = state.get("pickup_remedy") or {}
+    same = (previous.get("class") == cls
+            and sorted(str(p) for p in (previous.get("paths") or [])) == paths)
+    if same and _within(previous.get("ts"), policy.pickup_remedy_cooldown, time.time()):
+        return None
+    try:
+        from . import pickup as pickup_lane
+        verdict = pickup_lane.remediate(repo, cls, paths, dry_run=dry_run, say=say)
+    except Exception as e:  # noqa: BLE001 — a remedy must never kill a tick
+        verdict = {"ok": False, "action": None, "error": str(e)[:300],
+                   "moved": [], "restored": []}
+    record = {
+        "ts": _now_iso(),
+        "event": "pickup_remedy",
+        "rejection_class": cls,
+        "rejection_paths": paths,
+        "action": verdict.get("action"),
+        "ok": bool(verdict.get("ok")),
+        "moved": list(verdict.get("moved") or []),
+        "restored": list(verdict.get("restored") or []),
+        "quarantine_dir": verdict.get("quarantine_dir") or "",
+        "error": verdict.get("error"),
+        "dry_run": dry_run,
+    }
+    _journal(repo, record)
+    state["pickup_remedy"] = {"ts": time.time(), "class": cls, "paths": paths,
+                              "ok": record["ok"], "action": record["action"],
+                              "error": record["error"]}
+    if not record["ok"]:
+        say(f"⚠️  pickup stays blocked — {record['error'] or 'no mechanical remedy'}")
+        return record
+    if dry_run:
+        say(f"[dry-run] would remediate {cls} on {len(paths)} path(s) "
+            f"({record['action']}) and retry the pickup")
+        return record
+    say(f"🧹 pickup remediation ({record['action']}): "
+        f"{len(record['moved'])} quarantined, {len(record['restored'])} restored — "
+        f"retrying the pickup")
+    _run_pickup(repo, state, dry_run=False, say=say)
+    return record
+
+
 def _run_pickup(repo: Path, state: dict, dry_run: bool, say=print) -> dict:
     """Apply remote Pleasance paperwork at the top of a tick.
 
@@ -1902,6 +2366,13 @@ def _run_pickup(repo: Path, state: dict, dry_run: bool, say=print) -> dict:
         "picked": list(result.get("picked") or []),
         "rejected": rejected,
         "skipped": result.get("skipped"),
+        # Per-file supersession (an unusable decree, a frozen charter) is
+        # journaled, not fatal; the pulse names it so an away steward sees
+        # exactly which paperwork was held back and why.
+        "skipped_files": [
+            {"path": str(i.get("path")), "reason": str(i.get("reason"))[:300]}
+            for i in (result.get("skipped_files") or [])
+        ],
         "rejection_class": (streak or {}).get("class"),
         "rejection_paths": list((streak or {}).get("paths") or []),
     }
@@ -1970,9 +2441,11 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
     # Fresh branch-side self-advances first: the snapshot below is the board
     # the planner reasons over, and it reads the trunk ledger.
     if not dry_run:
+        state.setdefault("supervisor_started", now)
         fold_ledger(repo, say=say)
         if policy.pickup:
             _run_pickup(repo, state, dry_run, say=say)
+            _maybe_remediate_pickup(repo, state, policy, dry_run, say=say)
     spawns = _prune_spawns(state, now)
     _heal_stale_convoys(state)
     workers = live_kilo_workers(repo)
@@ -2001,8 +2474,24 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
     vigil_notice: list[dict] = []
     for vn in vigil_notes:
         vigil_notice.append({"quest": vn["id"], "level": "vigil", "text": vn["text"]})
+    try:
+        raze_waiting = [q["id"] for q in snap.get("quests", [])
+                        if q.get("kind") != "epic"
+                        and (q.get("status") or "").upper() == "READY_TO_RAZE"
+                        and not q.get("razed_at")]
+        _raze_ready, raze_regate = _bucket_raze(repo, raze_waiting)
+    except Exception as e:  # noqa: BLE001 — bucketing must never kill a tick
+        raze_regate = []
+        say(f"⚠️  raze bucketing failed: {e}")
+    try:
+        from . import requests as requests_mod
+        open_requests = requests_mod.load_open(repo)
+    except Exception as e:  # noqa: BLE001 — a bad packet must not kill a tick
+        open_requests = []
+        say(f"⚠️  charter request scan failed: {e}")
     actions, notes = plan(snap, state, policy, workers, now=now, ready_vigils=ready,
-                          charter_ready=charter_ready)
+                          charter_ready=charter_ready, raze_regate=raze_regate,
+                          charter_requests=open_requests)
     notes = vigil_notice + notes
     _record_escalations(state, notes, now)
     # Board fingerprint: only re-stamp the "observed since" timestamp when the

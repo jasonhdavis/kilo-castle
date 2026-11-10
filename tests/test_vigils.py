@@ -77,6 +77,9 @@ def test_action_grammar_maps_to_court_argv():
     assert vigils.action_argv("collect") == (["collect", "--standup"], True)
     assert vigils.action_argv("advance:Q1=TRIBUTE_READY") == (["advance", "Q1", "TRIBUTE_READY"], False)
     assert vigils.action_argv("note:just tell me") == ([], False)
+    # a Steward's own bounded wake-up is a durable vigil, not a session timer
+    assert vigils.action_argv("muster:board stalled on merge blockers") == (
+        ["muster", "--why", "board stalled on merge blockers"], True)
 
 
 def test_advance_status_must_be_real():
@@ -236,3 +239,16 @@ def test_roundtrip_on_disk_is_json(tmp_path):
     data = json.loads(p.read_text(encoding="utf-8"))
     assert data["id"] == "q234-after-q123"
     assert data["then"] == "dispatch:Q234"
+
+
+def test_muster_vigil_requires_a_reason():
+    from court import vigils as v
+    import pytest
+    with pytest.raises(v.VigilError):
+        v.build(id="wake-me", when=["after:2h"], then="muster",
+                reason="Steward check-in in two hours", expires="6h")
+    spec = v.build(id="wake-me", when=["after:2h"],
+                   then="muster:clear Night's Watch blockers",
+                   reason="Steward check-in in two hours", expires="6h")
+    assert spec["then"].startswith("muster:")
+    assert v._parse_action(spec["then"])["verb"] == "muster"

@@ -132,6 +132,30 @@ def test_validate_requires_the_quest_to_exist_on_castle(tmp_path):
     assert not ok and "unknown quest" in why
 
 
+def test_a_declared_directive_needs_no_charter(tmp_path):
+    """A ruling about the pipeline ("muster a Steward for merge triage") names
+    no Quest. Declared as a directive it lands in `.court/directives/` instead
+    of being rejected on every pickup tick."""
+    repo = _repo(tmp_path)
+    text = _packet("merge-blocker-reconciliation", directive=True)
+    ok, why = decisions.validate_decree(text, repo)
+    assert ok, why
+
+    packet = decisions.parse_decree_packet(text)
+    result = decisions.apply_packets(repo, [packet])
+    written = repo / ".court" / "directives" / "merge-blocker-reconciliation.md"
+    assert written.exists()
+    assert "Use session cookies." in written.read_text(encoding="utf-8")
+    assert result["applied"][0]["to"] == "DIRECTIVE"
+
+
+def test_an_unknown_q_id_is_still_rejected_even_if_declared_a_directive(tmp_path):
+    """Directive is not a bypass for a typo'd Quest id."""
+    repo = _repo(tmp_path)
+    ok, why = decisions.validate_decree(_packet("Q999-Ghost", directive=True), repo)
+    assert not ok and "unknown quest" in why
+
+
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------

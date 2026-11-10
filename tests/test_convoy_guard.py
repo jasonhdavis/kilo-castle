@@ -28,8 +28,11 @@ def _repo(tmp_path):
     return repo
 
 
-def _charter(repo, qid, status, ui_review=""):
-    body = f"---\nid: {qid}\nstatus: {status}\n---\n\n# {qid}\n"
+def _charter(repo, qid, status, ui_review="", branch=""):
+    body = f"---\nid: {qid}\ntitle: {qid} Test\nstatus: {status}\n"
+    if branch:
+        body += f"branch: {branch}\n"
+    body += "---\n\n# {qid}\n"
     if ui_review:
         body += f"\n## Master of Coin's Audit\n\n- **UI Review:** {ui_review}\n"
     (repo / ".court" / "quests" / f"{qid}-Test.md").write_text(body)
@@ -284,3 +287,58 @@ def test_a_stamped_quest_excluded_from_a_filtered_ship_is_not_a_rider(tmp_path):
     # The ship selection filtered it out, but it is stamped on the convoy.
     findings = cg.riders_in_trunk(repo, "cogship-395", trunk="castle", manifest_quest_ids={"Q1009-Other"})
     assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# Open combined-studio guard
+# ---------------------------------------------------------------------------
+
+def _open_studio(repo, quest_branch, studio="artist/q1009-ui-studio"):
+    _git(repo, "checkout", "-b", studio, "castle")
+    _git(repo, "merge", "--no-ff", quest_branch, "-m", f"studio merge {quest_branch}")
+    _git(repo, "checkout", "castle")
+    return studio
+
+
+def test_a_quest_in_an_open_studio_blocks_promotion(tmp_path):
+    repo = _repo(tmp_path)
+    _charter(repo, "Q1009", "GATE", ui_review="PENDING", branch="quest/q1009-orders-fulfillment")
+    _quest_branch(repo, "quest/q1009-orders-fulfillment")
+    convoy = _convoy(repo)
+    _merge_into(repo, "quest/q1009-orders-fulfillment", convoy)
+    cg.record_pack(repo, "cogship-382", ["Q1009-Orders-Fulfillment"])
+    studio = _open_studio(repo, "quest/q1009-orders-fulfillment")
+
+    pending, detail = cg.studio_pending(repo, "Q1009")
+    assert pending is True
+    assert studio in detail
+
+    findings = cg.audit_promotion(repo, "cogship-382")
+    blocking = [f for f in findings if f.level == "error" and f.code == "pending-studio"]
+    assert blocking and "open artist studio" in blocking[0].message
+
+    allowed = cg.audit_promotion(repo, "cogship-382", allow_pending_studio=True)
+    assert not [f for f in allowed if f.code == "pending-studio"]
+
+
+def test_sync_back_clears_the_pending_studio(tmp_path):
+    repo = _repo(tmp_path)
+    _charter(repo, "Q1009", "GATE", ui_review="PENDING", branch="quest/q1009-orders-fulfillment")
+    _quest_branch(repo, "quest/q1009-orders-fulfillment")
+    studio = _open_studio(repo, "quest/q1009-orders-fulfillment")
+    assert cg.studio_pending(repo, "Q1009")[0] is True
+
+    _git(repo, "checkout", "quest/q1009-orders-fulfillment")
+    _git(repo, "merge", "--no-ff", studio, "-m", "sync back the reviewed studio")
+
+    assert cg.studio_pending(repo, "Q1009")[0] is False
+
+
+def test_a_studio_that_does_not_contain_the_quest_is_not_pending(tmp_path):
+    repo = _repo(tmp_path)
+    _charter(repo, "Q1009", "GATE", ui_review="PENDING", branch="quest/q1009-orders-fulfillment")
+    _quest_branch(repo, "quest/q1009-orders-fulfillment")
+    _git(repo, "checkout", "-b", "artist/other-ui-studio", "castle")
+    _git(repo, "checkout", "castle")
+
+    assert cg.studio_pending(repo, "Q1009")[0] is False

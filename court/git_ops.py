@@ -368,12 +368,14 @@ def get_worktree_git_status(
             "branch": "",
             "head_sha": "",
             "dirty": False,
+            "dirty_disposable_only": False,
             "untracked": [],
             "modified": [],
             "staged": [],
             "deleted": [],
             "ahead": None,
             "behind": None,
+            "behind_code": None,
             "diffstat": "",
             "error": f"path does not exist or is not a directory: {worktree_path}",
         }
@@ -410,6 +412,12 @@ def get_worktree_git_status(
                     deleted.append(file_path)
 
     dirty = bool(untracked or modified or staged or deleted)
+    # Generated prompt files (`.kilo/TASK*.md`) are rewritten on every spawn and
+    # are never deliverables. A worktree whose ONLY dirt is those files is not
+    # "dirty" for convergence purposes: the rebase restores them.
+    dirty_paths = set(untracked) | set(modified) | set(staged) | set(deleted)
+    disposable_only = bool(dirty_paths) and all(
+        _is_generated_scaffolding(path) for path in dirty_paths)
 
     ahead_behind_res = _run(["git", "rev-list", "--left-right", "--count", f"{base}...HEAD"], p)
     ahead = behind = None
@@ -420,6 +428,20 @@ def get_worktree_git_status(
                 behind, ahead = int(parts[0]), int(parts[1])
             except ValueError:
                 pass
+
+    # Drift that only carries the Court's own bookkeeping (`.court/**`: board
+    # snapshots, ledger syncs) never invalidates a Quest branch. The Night's
+    # Watch uses this to avoid rebasing the same branch on every tick, since
+    # the board snapshot commits a new `.court/board.json` each tick.
+    behind_code = None
+    if behind:
+        code_res = _run(
+            ["git", "rev-list", "--count", f"HEAD..{base}", "--", ".", ":(exclude).court"], p)
+        if code_res.get("ok") and (code_res.get("stdout") or "").strip():
+            try:
+                behind_code = int(code_res["stdout"].strip())
+            except ValueError:
+                behind_code = None
 
     diffstat_str = ""
     if include_diffstat:
@@ -433,12 +455,14 @@ def get_worktree_git_status(
         "branch": branch,
         "head_sha": head_sha,
         "dirty": dirty,
+        "dirty_disposable_only": disposable_only,
         "untracked": untracked,
         "modified": modified,
         "staged": staged,
         "deleted": deleted,
         "ahead": ahead,
         "behind": behind,
+        "behind_code": behind_code,
         "diffstat": diffstat_str,
         "error": None,
     }
@@ -1133,11 +1157,23 @@ def rebase_worktree_onto_base(
         return result
     dirty_lines = [l for l in status_res.get("stdout", "").splitlines() if l.strip()]
     if dirty_lines:
-        result["error"] = (
-            f"worktree is dirty ({len(dirty_lines)} uncommitted file(s)); "
-            "must be cleaned by Serf before rebase"
-        )
-        return result
+        # Generated `.kilo/TASK*.md` prompts are rewritten on every spawn and are
+        # never deliverables: restore them instead of refusing forever. Any real
+        # (non-scaffolding) dirt still blocks the rebase.
+        disposable = [l for l in dirty_lines
+                      if _is_generated_scaffolding(l[3:].strip())]
+        blocking = [l for l in dirty_lines if l not in disposable]
+        if blocking:
+            result["error"] = (
+                f"worktree is dirty ({len(blocking)} uncommitted file(s)); "
+                "must be cleaned by Serf before rebase"
+            )
+            return result
+        tracked = [l[3:].strip() for l in disposable
+                   if not l.strip().startswith("??")]
+        if tracked:
+            _run(["git", "checkout", "--", *tracked], p)
+            result["auto_resolved_files"] = list(tracked)
 
     behind_res = _run(["git", "rev-list", "--count", f"HEAD..{base_branch}"], p)
     before_behind = None

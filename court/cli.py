@@ -38,6 +38,7 @@ from typing import Any, Optional
 
 from . import store
 from . import convoy_guard
+from . import peel as gatehouse_peel
 from .models import Quest, STATUSES, SECTIONS, KINDS, now_iso, validate_branch_name, status_label, DEFAULT_BODY_SECTIONS, is_valid_section_name
 from . import git_ops
 from . import ward
@@ -3159,6 +3160,14 @@ def cmd_dispatch(args):
 
     worktree_path = Path(worktree).resolve()
 
+    # Base convergence for EVERY dispatch path (drift-at-dispatch class). A
+    # replacement/queued dispatch into an EXISTING worktree used to skip the
+    # sync that goad/coin always run, so the Serf started on a branch that
+    # could be hundreds of commits behind castle; its Gate-2 rebase then
+    # conflicted and the remediation cost a second spawn. A conflicted sync
+    # aborts here (nothing spawns) and names the files, exactly like `coin`.
+    _sync_base_before_spawn(worktree_path, quest, "dispatch")
+
     # Determine agent role (serf vs scout)
     is_scout = (getattr(quest, "kind", "") == "scout" or getattr(quest, "section", "") == "Investigation")
     agent_role = getattr(args, "agent", None) or ("scout" if is_scout else "serf")
@@ -3177,11 +3186,31 @@ def cmd_dispatch(args):
             capture_output=True,
         )
 
-    # Build pure task prompt (zero persona boilerplate)
-    if getattr(args, "replace", False):
-        task_prompt = getattr(args, "prompt", None) or build_serf_replacement_prompt(quest)
+    # Build pure task prompt (zero persona boilerplate). Precedence:
+    #   --prompt (inline break-glass text) > --brief (Steward-authored file
+    #   carried by a queued vigil) > the standard charter/replacement prompt.
+    brief_text = ""
+    brief_arg = (getattr(args, "brief", None) or "").strip()
+    if brief_arg:
+        brief_file = Path(brief_arg).expanduser()
+        if not brief_file.is_absolute():
+            brief_file = root / brief_file
+        if not brief_file.is_file():
+            print(f"ERROR: --brief file not found: {brief_arg}", file=sys.stderr)
+            sys.exit(1)
+        brief_text = brief_file.read_text(encoding="utf-8")
+        if not brief_text.strip():
+            print(f"ERROR: --brief is empty: {brief_file}", file=sys.stderr)
+            sys.exit(1)
+
+    if getattr(args, "prompt", None):
+        task_prompt = args.prompt
+    elif brief_text:
+        task_prompt = brief_text
+    elif getattr(args, "replace", False):
+        task_prompt = build_serf_replacement_prompt(quest)
     else:
-        task_prompt = getattr(args, "prompt", None) or build_serf_task_prompt(quest)
+        task_prompt = build_serf_task_prompt(quest)
 
     # Stand up session if requested or available
     session_id = getattr(args, "session_id", None)
@@ -3716,6 +3745,23 @@ def cmd_goad(args):
         .replace("{{ quest_id }}", quest.id)
         .replace("{{ branch }}", quest.branch or "-")
     )
+
+    # A Steward-authored brief replaces the generic goad template: this is how
+    # a queued remediation hand-off names the actual merge union or migration
+    # repair instead of asking the Serf to "resume work" on an already
+    # satisfied charter (the wasted-spawn loop).
+    brief_arg = (getattr(args, "brief", None) or "").strip()
+    if brief_arg:
+        brief_file = Path(brief_arg).expanduser()
+        if not brief_file.is_absolute():
+            brief_file = git_ops.get_repo_root() / brief_file
+        if not brief_file.is_file():
+            print(f"ERROR: --brief file not found: {brief_arg}", file=sys.stderr)
+            sys.exit(1)
+        rendered_prompt = brief_file.read_text(encoding="utf-8")
+        if not rendered_prompt.strip():
+            print(f"ERROR: --brief is empty: {brief_file}", file=sys.stderr)
+            sys.exit(1)
 
     setup_worktree_agent_config(wt, agent_role)
 
@@ -4884,6 +4930,71 @@ def _code_presence_check(quest: Quest, trunk: str = "castle") -> dict:
     return git_ops.verify_quest_promotion(quest_branch, trunk=trunk)
 
 
+def cmd_peel(args):
+    """Withdraw a promoted Quest from the trunk (gatehouse reversibility).
+
+    Reverts the Quest's promotion commit so the rejected code cannot ship,
+    records the withdrawal in ``.court/peels/`` (the trunk guard treats the
+    Quest as withdrawn), and supersedes the convoy's suite proof so the
+    remaining pack must be re-verified. ``court collect`` clears the record when
+    the Quest is packed again — peel off, then re-pack.
+    """
+    repo_root = git_ops.get_repo_root()
+    if getattr(args, "list", False):
+        rows = gatehouse_peel.list_peels(repo_root)
+        if getattr(args, "json", False):
+            print(json.dumps(rows, indent=2))
+            return
+        if not rows:
+            print("(no peeled Quests recorded)")
+            return
+        print(f"🧹 PEELED QUESTS ({len(rows)})")
+        for row in rows:
+            state = "ACTIVE" if row.get("active") else "stale (revert not in trunk)"
+            print(f"  * {row.get('quest')}: {state} — source {str(row.get('source_commit') or '')[:12]}, "
+                  f"revert {str(row.get('revert_sha') or '')[:12]}")
+            if row.get("reason"):
+                print(f"    reason: {row['reason']}")
+        return
+
+    try:
+        quest = store.load(args.quest_id, court_root=repo_root / ".court")
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        result = gatehouse_peel.peel_quest(
+            repo_root,
+            quest,
+            trunk=getattr(args, "base", "castle") or "castle",
+            commit=getattr(args, "commit", "") or "",
+            reason=(getattr(args, "reason", "") or "").strip(),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return
+    if result["dry_run"]:
+        print(f"🔎 WOULD PEEL {result['quest']} out of {result.get('trunk') or args.base}")
+        print(f"   source commit: {result['commit'][:12]} ({result['subject']})")
+        print(f"   method: {result['method']}; mainline: {result['mainline']}")
+        return
+    print(f"🧹 PEELED {result['quest']} out of {args.base}")
+    print(f"   reverted: {result['commit'][:12]} ({result['subject']})")
+    print(f"   peel commit: {result['revert_sha'][:12]}  ({result['method']})")
+    if result.get("superseded_suite_proof"):
+        print(f"   suite proof superseded: {result['superseded_suite_proof']} — re-run the convoy suite")
+    if result.get("bookkeeping_conflicts_kept"):
+        print(f"   bookkeeping conflicts kept (trunk content preserved): {', '.join(result['bookkeeping_conflicts_kept'])}")
+    print(f"   record: {result['peel_record']}")
+    print("   Next: re-pack the surviving Quests (`court collect`) and ship without this one.")
+    print("   NOTE: the peel commit is local to the trunk worktree; publish it with the normal castle push.")
+
+
 def cmd_verify_convoy(args):
     """Pre-promotion guard: refuse a convoy whose branch would carry Code into
     the trunk that this pack did not authorise.
@@ -4909,6 +5020,7 @@ def cmd_verify_convoy(args):
         allow_ui_pending=bool(getattr(args, "allow_ui_pending", False)),
         allow_stale_suite=bool(getattr(args, "allow_stale_suite", False)),
         require_suite=bool(getattr(args, "require_suite", False)),
+        allow_pending_studio=bool(getattr(args, "allow_pending_studio", False)),
     )
     errors = [f for f in findings if f.level == "error"]
     print(f"🛡️  CONVOY PROMOTION GUARD — {cogship} against '{base}'")
@@ -4996,6 +5108,44 @@ def _mark_quest_razed(quest: Quest, note: str = "") -> None:
     quest.razed_at = now_iso()
     quest.log_ledger(quest.status, quest.status, note or "Razed: durable razed_at marker written.")
     store.save(quest, commit_msg=f"court: mark {quest.id} razed")
+
+
+def _raze_teardown(args, quest: Quest, worktree: str, branch: str, is_scout: bool = False) -> bool:
+    """Remove a razed Quest's worktree, merged branch, and test databases.
+
+    `court raze` used to stop at the durable `razed_at` marker and leave the
+    directory for a manual `court fork-teardown-list` pass; 44 worktrees and 81
+    READY_TO_RAZE Quests accumulated that way. Teardown is now part of raze, and
+    every destructive step re-verifies its own precondition inside
+    `court.teardown` (clean tree, `.kilo/worktrees/` prefix, branch an ancestor
+    of castle). A refusal leaves everything on disk and returns False.
+    """
+    if getattr(args, "keep_worktree", False) or not worktree:
+        return False
+    try:
+        from . import teardown as teardown_mod
+        report = teardown_mod.teardown_worktree(
+            Path.cwd(),
+            worktree,
+            branch=branch,
+            is_scout=is_scout,
+            drop_dbs=not getattr(args, "no_drop_db", False),
+            apply=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — cleanup must never fail a raze
+        print(f"   ⚠️ {quest.id}: automatic teardown failed: {exc}")
+        return False
+    for step in report.get("steps") or []:
+        print(f"   🧹 {step}")
+    if not report.get("ok"):
+        return False
+    if getattr(args, "archive_pruned", True):
+        try:
+            dst = store.archive(quest.id)
+            print(f"   🪦 {quest.id}: archived to {dst}")
+        except FileNotFoundError:
+            pass
+    return True
 
 
 def cmd_raze(args):
@@ -5115,6 +5265,11 @@ def cmd_raze(args):
         if not wt_exists and not found_wt_id:
             if quest.status == "READY_TO_RAZE" and args.archive_pruned:
                 _mark_quest_razed(quest)
+                # The directory is gone; its pytest databases may not be.
+                _raze_teardown(
+                    args, quest, wt_path_str or "", quest.branch or "",
+                    is_scout=(quest.kind == "scout" or quest.section == "Investigation"),
+                )
                 try:
                     dst = store.archive(quest.id)
                     print(f"🪦 {quest.id}: Worktree already pruned from disk/AM -> Archived to {dst}")
@@ -5124,6 +5279,10 @@ def cmd_raze(args):
             elif quest.status == "READY_TO_RAZE":
                 if not quest.razed_at:
                     _mark_quest_razed(quest)
+                _raze_teardown(
+                    args, quest, wt_path_str or "", quest.branch or "",
+                    is_scout=(quest.kind == "scout" or quest.section == "Investigation"),
+                )
                 print(f"ℹ️ {quest.id}: Worktree already pruned from disk/AM (ready to archive: python3 -m court.cli archive {quest.id})")
                 return
 
@@ -5131,12 +5290,16 @@ def cmd_raze(args):
         # completed the raze verification. Re-running only repeats the same
         # destructive checks (and, before this marker existed, the Night's
         # Watch re-razed Q006/Q014/Q016/Q018 every cooldown indefinitely).
-        # Its worktree is still on disk and remains queued by teardown-list for
-        # M'Lord's manual prune.
+        # The marker means promotion is already verified, so this pass is the
+        # teardown that used to wait for a human (`court teardown-list`).
         if quest.razed_at:
             print(
-                f"⏭️  {quest.id}: already razed at {quest.razed_at} — skipping "
-                f"(worktree still queued in `court teardown-list` for manual prune)."
+                f"⏭️  {quest.id}: already razed at {quest.razed_at} — promotion verified; "
+                f"running teardown"
+            )
+            _raze_teardown(
+                args, quest, found_wt_path or wt_path_str or "", branch,
+                is_scout=(quest.kind == "scout" or quest.section == "Investigation"),
             )
             return
 
@@ -5213,12 +5376,14 @@ def cmd_raze(args):
         print(f"   - Session ID: {found_session_id or quest.serf_session_id or 'None'}")
         print(f"   - Ashes Section ID: {ashes_section_id}")
         if found_session_id and ashes_section_id:
-            print(f"   👉 Stop the idle session via Kilo CLI: kilo session delete {found_session_id} (Ashes section: {ashes_section_id}; M'Lord prunes the directory by hand)")
+            print(f"   👉 Stop the idle session via Kilo CLI: kilo session delete {found_session_id} (Ashes section: {ashes_section_id})")
 
-        # Durable marker: the worktree is still present, so the Quest stays at
-        # READY_TO_RAZE for teardown-list, but every later `court raze` and the
-        # Night's Watch planner now see that this raze already happened.
+        # Durable marker first, then the teardown it authorises. The marker is
+        # what makes this pass idempotent: a crash between the two leaves a
+        # Quest that the next `court raze` (or the Night's Watch) tears down
+        # without repeating the promotion checks.
         _mark_quest_razed(quest)
+        _raze_teardown(args, quest, found_wt_path or "", branch, is_scout=is_scout)
 
         # This Quest is a pillory successor: raze its frozen predecessor
         # together with it, in the same pass, per the Pillory protocol.
@@ -5373,6 +5538,20 @@ def cmd_collect(args):
             else:
                 skipped.append((quest.id, f"status is [{quest.status}], not TRIBUTE_READY or GATE"))
             continue
+        # Open-studio guard: a Quest routed to `court studio` keeps its base code
+        # on its own branch while the reviewed artwork lives only on the studio
+        # branch. Packing it now would promote pre-review code and lose the
+        # studio work when the studio branch is torn down.
+        if not bool(getattr(args, "allow_pending_studio", False)):
+            studio_open, studio_detail = convoy_guard.studio_pending(repo_root, quest.id)
+            if studio_open:
+                skipped.append((
+                    quest.id,
+                    f"open artist studio — {studio_detail}; sign it off and sync-back "
+                    "(`court studio <ids> --sync-back` / `--close`) before packing, or pass "
+                    "--allow-pending-studio",
+                ))
+                continue
         # Gates read the worktree charter first (freshest: coin verdicts and
         # UI-review approvals commit on the branch before any convoy promotes),
         # falling back to the castle copy when no worktree exists.
@@ -6194,6 +6373,14 @@ def cmd_atelier(args):
             continue
         if quest.status not in ("TRIBUTE_READY", "GATE"):
             skipped.append((quest.id, f"status is [{quest.status}], not TRIBUTE_READY or GATE"))
+            continue
+        studio_open, studio_detail = convoy_guard.studio_pending(repo_root, quest.id)
+        if studio_open:
+            skipped.append((
+                quest.id,
+                f"already in an open combined studio — {studio_detail}; sign it off and sync-back "
+                "before rolling it into an atelier convoy",
+            ))
             continue
         wt_quest = _quest_worktree_charter(quest)
         effective_quest = wt_quest if wt_quest is not None else quest
@@ -7230,6 +7417,196 @@ def cmd_muster(args):
     print(f"   why: {why}")
 
 
+def build_charter_request_prompt(repo: Path, packet: dict) -> str:
+    """Prompt for a bound Steward whose only job is to charter one request."""
+    from . import requests as requests_mod
+
+    tmpl = config.find_court_dir() / "templates" / "steward_charter_request.md"
+    if not tmpl.is_file():
+        tmpl = Path(__file__).resolve().parent / "templates" / "steward_charter_request.md"
+    try:
+        text = tmpl.read_text(encoding="utf-8")
+    except OSError:
+        text = ("# Steward — Charter Request\n\n<REQUEST>\n\n<DIGEST>\n\n"
+                "Charter the narrowest defensible Quest and close the request.")
+    try:
+        digest = nightwatch.render_digest(repo)
+    except Exception as e:  # noqa: BLE001 — the prompt must still render
+        digest = f"(digest unavailable: {e})"
+    return (text.replace("<REQUEST>", requests_mod.render_brief(packet))
+                .replace("<DIGEST>", digest[:4000]))
+
+
+def cmd_charter_request(args):
+    """Summon ONE bounded Steward to author a charter for a request packet.
+
+    Quest numbering deliberately lives here and not in the requester: the
+    Steward reads the board and allocates the next free id, which is what the
+    Pleasance lane kept getting wrong when the voice agent wrote charters.
+    """
+    from . import requests as requests_mod
+
+    repo = Path(getattr(args, "repo", None) or git_ops.get_repo_root()).resolve()
+    path = repo / requests_mod.REQUESTS_DIR / f"{args.request_id}.json"
+    try:
+        packet = requests_mod.parse_request(path.read_text(encoding="utf-8"))
+    except (OSError, requests_mod.RequestError) as e:
+        print(f"ERROR: cannot read request {args.request_id}: {e}", file=sys.stderr)
+        sys.exit(1)
+    if packet.get("chartered_quest"):
+        print(f"{packet['id']} is already chartered as {packet['chartered_quest']} — nothing to do")
+        return
+
+    prompt = build_charter_request_prompt(repo, packet)
+    if getattr(args, "print_prompt", False):
+        print(prompt)
+        return
+
+    kilo_bin = find_kilo_binary()
+    if not kilo_bin:
+        print("ERROR: Kilo binary not found. Cannot summon a Steward.", file=sys.stderr)
+        sys.exit(1)
+
+    model = getattr(args, "model", None) or config.get_model("steward")
+    title = f"Charter request — {packet['title'][:80]}"
+    spawn = standup_kilo_session(
+        repo,
+        agent="steward",
+        model=model,
+        prompt=prompt,
+        title=title,
+        kilo_bin=kilo_bin,
+        provider_hint="steward",
+        holder="nightwatch",
+        configure_agent=False,
+        task_file=None,
+    )
+    if spawn.get("mode") == "lease-held" or not spawn.get("ok") or spawn.get("mode") not in ("api", "cli"):
+        print(f"ERROR: {spawn.get('message')}", file=sys.stderr)
+        sys.exit(1)
+    print(f"📜 {spawn.get('message')}")
+    if spawn.get("log"):
+        print(f"   log: {spawn['log']}")
+    print(f"   request: {packet['id']} — {packet['title']}")
+
+
+def cmd_request(args):
+    """Author, list, or close a Pleasance charter request.
+
+    The lane is requests-in/charters-out: a requester (the voice agent, a remote
+    human) writes intent here; a Steward authors the Quest. Requests carry no
+    Quest id, so numbering cannot drift from the board.
+    """
+    from . import requests as requests_mod
+
+    repo = Path(getattr(args, "repo", None) or git_ops.get_repo_root()).resolve()
+
+    if getattr(args, "list", False):
+        open_requests = requests_mod.load_open(repo)
+        if not open_requests:
+            print("(no open charter requests)")
+            return
+        for packet in open_requests:
+            print(f"{packet['id']} · {packet['title']}")
+            if packet.get("requested_by"):
+                print(f"   by {packet['requested_by']}")
+        return
+
+    if getattr(args, "mark_chartered", None):
+        quest_id = (getattr(args, "quest", "") or "").strip()
+        if not quest_id:
+            print("ERROR: --mark-chartered needs --quest <Q-id>", file=sys.stderr)
+            sys.exit(1)
+        try:
+            path = requests_mod.mark_chartered(repo, args.mark_chartered, quest_id)
+        except (OSError, requests_mod.RequestError) as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"✅ {args.mark_chartered} closed against {quest_id} ({path})")
+        return
+
+    title = (getattr(args, "title", "") or "").strip()
+    ask = (getattr(args, "ask", "") or "").strip()
+    if not title or not ask:
+        print("ERROR: --title and --ask are required to author a request", file=sys.stderr)
+        sys.exit(1)
+    try:
+        path = requests_mod.write_request(
+            repo,
+            title=title,
+            ask=ask,
+            why=(getattr(args, "why", "") or ""),
+            constraints=list(getattr(args, "constraint", []) or []),
+            links=list(getattr(args, "link", []) or []),
+            requested_by=(getattr(args, "requested_by", "") or ""),
+            req_id=(getattr(args, "request_id", "") or ""),
+        )
+    except requests_mod.RequestError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"📝 wrote {path}")
+    print("   commit it to the pleasance lane; a Steward charters it after pickup")
+
+
+def cmd_db_prune(args):
+    """Session-store maintenance (the perennial kilo.db growth).
+
+    Thin Court-native front door over ``court.db_prune``: report what is old,
+    snapshot keepers, prune sessions older than the retention window in
+    share-safe chunks, and vacuum to actually reclaim the file. Prune/vacuum
+    are dry-run unless ``--apply`` is passed, matching the tool's doctrine.
+    """
+    from . import db_prune
+
+    argv = [args.db_cmd]
+    if args.db_cmd in ("prune", "keep-backup"):
+        argv += ["--days", str(args.days)]
+    if args.db_cmd == "prune":
+        argv += ["--keep-events", str(args.keep_events)]
+    if args.apply:
+        argv.append("--apply")
+
+    old_argv = sys.argv
+    sys.argv = ["court.db_prune", *argv]
+    try:
+        rc = db_prune.main()
+    finally:
+        sys.argv = old_argv
+    if rc:
+        sys.exit(rc)
+
+
+def cmd_prune_test_dbs(args):
+    """Reap pytest databases whose checkout is gone.
+
+    pytest-django names a worktree's databases from a hash of its absolute path
+    (`test_pb_app_local_<sha1(BASE_DIR)[:8]>[_gwN]`), and `--reuse-db` keeps
+    them across runs. An ephemeral gatehouse worktree therefore creates a new
+    set every convoy and leaves the previous one behind: 964 databases / ~34 GB
+    by 2026-11-09. A database is stale only when no worktree git knows about
+    (and no directory under `.kilo/worktrees/`) hashes to its suffix and no
+    backend is attached. Dry-run unless `--apply`.
+    """
+    from . import teardown as teardown_mod
+
+    plan = teardown_mod.drop_stale_test_dbs(
+        Path.cwd(),
+        apply=bool(getattr(args, "apply", False)),
+        min_age_seconds=int(getattr(args, "min_age_minutes", 0) or 0) * 60,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "stale": [{"name": d.name, "bytes": d.size_bytes} for d in plan.stale],
+            "dropped": plan.dropped,
+            "kept_live": len(plan.kept_live),
+            "kept_busy": len(plan.kept_busy),
+            "errors": plan.errors,
+        }, indent=2))
+        return
+    print("🧹 pytest database reaper — " + str(Path.cwd()))
+    print(teardown_mod.format_drop_plan(plan, apply=bool(getattr(args, "apply", False))))
+
+
 def cmd_nightwatch(args):
     """Deterministic overnight supervisor: reads durable quest state and issues
     `goad` / `coin` / `collect --standup` under hard RAM and cooldown caps.
@@ -7288,6 +7665,13 @@ def cmd_nightwatch(args):
                        else (f"picked {len(last_pickup.get('picked') or [])}"
                              if last_pickup.get("picked") else "no-op"))
             print(f"last pickup ({last_pickup.get('ts')}): {verdict}")
+        pickup_remedy = state.get("pickup_remedy") or {}
+        if pickup_remedy:
+            outcome = (f"cleared via {pickup_remedy.get('action')}"
+                       if pickup_remedy.get("ok")
+                       else f"declined — {pickup_remedy.get('error') or 'needs a human'}")
+            print(f"last pickup remedy: {outcome} "
+                  f"[{pickup_remedy.get('class') or 'unknown'}]")
         from . import pulse as _pulse
         md_path, _js = _pulse.local_paths(repo)
         print(f"pulse file: {md_path}")
@@ -7332,8 +7716,18 @@ def cmd_nightwatch(args):
         collect_noop_backoff=getattr(args, "collect_noop_backoff", None) or nightwatch.DEFAULT_COLLECT_NOOP_BACKOFF,
         stale_convoy_backoff=getattr(args, "stale_convoy_backoff", None) or nightwatch.DEFAULT_STALE_CONVOY_BACKOFF,
         raze_cooldown=int(getattr(args, "raze_cooldown", 0) or 0) or 1800,
+        max_regates=int(getattr(args, "max_regates", 0) or nightwatch.DEFAULT_MAX_REGATES),
+        max_charter_fails=int(getattr(args, "max_charter_fails", 0) or nightwatch.DEFAULT_MAX_CHARTER_FAILS),
+        charter_cooldown=int(getattr(args, "charter_cooldown", 0) or nightwatch.DEFAULT_CHARTER_COOLDOWN),
+        pg_prune_interval=int(getattr(args, "pg_prune_interval", 0) or nightwatch.DEFAULT_PG_PRUNE_INTERVAL),
         rebase_cooldown=int(getattr(args, "rebase_cooldown", 0) or 0) or nightwatch.DEFAULT_REBASE_COOLDOWN,
         retry_backoff=int(getattr(args, "retry_backoff", 0) or 0),
+        max_fails=int(getattr(args, "max_fails", 0) or nightwatch.DEFAULT_MAX_FAILS),
+        max_retry_backoff=int(getattr(args, "max_retry_backoff", 0) or nightwatch.DEFAULT_MAX_RETRY_BACKOFF),
+        session_retention_days=int(getattr(args, "session_retention_days", 0) or nightwatch.DEFAULT_SESSION_RETENTION_DAYS),
+        session_prune_interval=int(getattr(args, "session_prune_interval", 0) or nightwatch.DEFAULT_SESSION_PRUNE_INTERVAL),
+        session_keep_events=int(getattr(args, "session_keep_events", 0) or nightwatch.DEFAULT_SESSION_KEEP_EVENTS),
+        session_prune_vacuum=not bool(getattr(args, "no_session_vacuum", False)),
         steward_stale_after=int(getattr(args, "steward_stale_after", 0) or nightwatch.DEFAULT_STEWARD_STALE_AFTER),
         steward_cooldown=int(getattr(args, "steward_cooldown", 0) or nightwatch.DEFAULT_STEWARD_COOLDOWN),
         max_stewards_per_day=int(getattr(args, "max_stewards_per_day", 0) or nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY),
@@ -7344,6 +7738,11 @@ def cmd_nightwatch(args):
         enabled=enabled,
         allow_force_goad=bool(args.allow_force_goad),
         pickup=not bool(getattr(args, "no_pickup", False)),
+        pickup_remedy=not bool(getattr(args, "no_pickup_remedy", False)),
+        pickup_remedy_after=int(getattr(args, "pickup_remedy_after", 0)
+                                or nightwatch.Policy().pickup_remedy_after),
+        pickup_remedy_cooldown=int(getattr(args, "pickup_remedy_cooldown", 0)
+                                   or nightwatch.Policy().pickup_remedy_cooldown),
         publish_pulse=not bool(getattr(args, "no_publish_pulse", False)),
         pulse_branch=getattr(args, "pulse_branch", None) or "status/pleasance",
     )
@@ -7377,6 +7776,25 @@ def cmd_pickup(args):
         branch=getattr(args, "branch", pickup.PICKUP_BRANCH),
         dry_run=bool(getattr(args, "dry_run", False)),
     )
+    remediate = bool(getattr(args, "remediate", False))
+    if result.get("rejected") and remediate:
+        verdict = pickup.remediate(
+            repo,
+            result.get("rejection_class"),
+            result.get("rejection_paths"),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+        if not verdict.get("ok"):
+            print(f"REMEDY DECLINED: {verdict.get('reason') or verdict.get('error')}")
+            print(f"REJECTED: {result['rejected']}")
+            sys.exit(1)
+        result = pickup.run(
+            repo,
+            fetch=False,
+            base=getattr(args, "base", "castle"),
+            branch=getattr(args, "branch", pickup.PICKUP_BRANCH),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
     if result.get("rejected"):
         print(f"REJECTED: {result['rejected']}")
         sys.exit(1)
@@ -7468,6 +7886,44 @@ def cmd_awaiting(args):
             print(f"   … +{len(rows) - limit} more")
 
 
+BRIEF_MAX_BYTES = 64 * 1024
+
+
+def _resolve_vigil_brief(repo: Path, raw: str) -> str:
+    """Validate a Steward-authored brief for a queued worker; return an
+    absolute path ("" when none was given).
+
+    A brief is the remediation text a `dispatch:`/`goad:` vigil's worker reads
+    INSTEAD of the charter/template prompt. Resolving it at registration means
+    the watch never re-resolves a relative path from a different cwd, and the
+    repo-containment check stops a queue entry smuggling an arbitrary file path
+    into a spawned agent. Raises ValueError with a human-readable message."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = repo / candidate
+    try:
+        candidate = candidate.resolve(strict=True)
+    except OSError as e:
+        raise ValueError(f"--brief file not found: {raw} ({e})") from e
+    if not candidate.is_file():
+        raise ValueError(f"--brief is not a file: {candidate}")
+    try:
+        candidate.relative_to(repo.resolve())
+    except ValueError as e:
+        raise ValueError(
+            f"--brief must live inside the repository ({repo}); got {candidate}"
+        ) from e
+    if candidate.stat().st_size > BRIEF_MAX_BYTES:
+        raise ValueError(
+            f"--brief is larger than 64 KiB ({candidate}); a brief is a short "
+            f"remediation instruction, not a document dump"
+        )
+    return str(candidate)
+
+
 def cmd_vigil(args):
     """Register, list, remove, or dry-check a bounded watch hand-off.
 
@@ -7514,7 +7970,7 @@ def cmd_vigil(args):
             print(f"      then: {spec['then']}")
         if action == "run":
             for spec, _why in ready:
-                argv, _spawns = vigils.action_argv(spec["then"])
+                argv, _spawns = vigils.action_argv(spec["then"], spec)
                 if not argv:
                     print(f"  ℹ️  {spec['id']} is a note-only vigil: {spec['then']}")
                     vigils.mark_fired(repo, spec, {"ok": True, "exit": 0, "seconds": 0})
@@ -7534,6 +7990,11 @@ def cmd_vigil(args):
 
     if action == "add":
         try:
+            brief_path = _resolve_vigil_brief(repo, getattr(args, "brief", None) or "")
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        try:
             spec = vigils.build(
                 id=args.id,
                 when=args.when or [],
@@ -7542,6 +8003,7 @@ def cmd_vigil(args):
                 expires=args.expires,
                 max_fires=args.max_fires,
                 created_by="steward",
+                brief=brief_path,
             )
         except vigils.VigilError as e:
             print(f"ERROR: {e}", file=sys.stderr)
@@ -7550,6 +8012,8 @@ def cmd_vigil(args):
         print(f"🕯️  Vigil registered: {spec['id']}")
         print(f"   when: {' AND '.join(spec['when'])}")
         print(f"   then: {spec['then']}")
+        if brief_path:
+            print(f"   brief: {brief_path} (the worker reads this instead of its template)")
         print(f"   why:  {spec['reason']}")
         print(f"   expires: {spec['expires_at']} (max fires {spec['max_fires']})")
         print(f"   file: {p}")
@@ -7559,13 +8023,35 @@ def cmd_vigil(args):
     print(f"ERROR: unknown vigil action {action!r} (add|list|remove|check|run)", file=sys.stderr)
     sys.exit(1)
 
+# A Quest's status decides which queued action can actually advance it. This is
+# the whole point of `court enqueue` covering clogs: a Steward who has to
+# hand-dispatch every TRIBUTE_READY/GATE Quest cannot pace a drift wave, and the
+# same worktree gets rebased by repeated manual goads instead of one mechanical
+# convergence followed by one audit.
+ENQUEUE_STATUS_ACTIONS = {
+    "PLANNED": "dispatch",
+    "CHARTERED": "dispatch",
+    "DISPATCHED": "goad",
+    "QUESTING": "goad",
+    "WORKING": "goad",
+    "TRIBUTE_READY": "coin",
+    "GATE": "collect",
+}
+ENQUEUE_ACTIONS = ("dispatch", "goad", "coin", "collect")
+
+
 def cmd_enqueue(args):
-    """Queue a chartered Quest for dispatch by the Night's Watch.
+    """Queue a Quest for the Night's Watch, chosen by the status it is stuck in.
 
     This is sugar over the vigil contract: it registers a one-shot
-    `dispatch:<QID>` vigil with a reason and expiry. The watch drains it when
-    worker capacity is available, so the Steward plans and the fleet supervisor
-    spends the machine (Steward -> queue -> Nightwatch -> worker).
+    `<action>:<QID>` vigil with a reason and expiry, and the watch drains it
+    when worker capacity is available (Steward -> queue -> Nightwatch -> worker).
+    The action is the only one that can advance the Quest from its current
+    status: PLANNED/CHARTERED -> dispatch, WORKING -> goad (remediation),
+    TRIBUTE_READY -> coin, GATE -> collect. An optional `--brief` carries the
+    Steward's actual instruction into dispatch/goad, so a queued hand-off names
+    the merge union or migration repair instead of re-stating a satisfied
+    charter.
     """
     repo = Path(getattr(args, "repo", None) or git_ops.get_repo_root()).resolve()
     try:
@@ -7573,13 +8059,37 @@ def cmd_enqueue(args):
     except FileNotFoundError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
-    if quest.status not in ("PLANNED", "CHARTERED"):
-        print(f"ERROR: {quest.id} is {quest.status}; enqueue only PLANNED/CHARTERED "
-              f"work (charter it first)", file=sys.stderr)
+
+    status = (quest.status or "").upper()
+    implied = ENQUEUE_STATUS_ACTIONS.get(status)
+    requested = (getattr(args, "action", None) or "").strip().lower()
+    if requested and requested not in ENQUEUE_ACTIONS:
+        print(f"ERROR: --action must be one of {', '.join(ENQUEUE_ACTIONS)}", file=sys.stderr)
+        sys.exit(1)
+    if requested and implied and requested != implied:
+        print(f"ERROR: {quest.id} is {status}; the queued action that advances it is "
+              f"{implied!r}, not {requested!r}", file=sys.stderr)
+        sys.exit(1)
+    action = requested or implied
+    if not action:
+        print(f"ERROR: {quest.id} is {status}; enqueue covers "
+              f"{', '.join(f'{s}->{a}' for s, a in ENQUEUE_STATUS_ACTIONS.items())}. "
+              f"Charter it first, or use `court vigil add` for a free-form hand-off.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        brief_path = _resolve_vigil_brief(repo, getattr(args, "brief", None) or "")
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    if brief_path and action not in vigils.BRIEF_ACTIONS:
+        print(f"ERROR: --brief applies to {'/'.join(vigils.BRIEF_ACTIONS)} only; "
+              f"{action!r} has no prompt to override", file=sys.stderr)
         sys.exit(1)
 
     short = quest.id.split("-")[0].lower()
-    vid = f"dispatch-{short}"
+    vid = f"{action}-{short}"
     active = vigils.load_all(repo)
     if any(v.get("id") == vid for v in active):
         print(f"Already queued: {vid} (queued; the Night's Watch owns it)")
@@ -7595,24 +8105,28 @@ def cmd_enqueue(args):
         spec = vigils.build(
             id=vid,
             when=when,
-            then=f"dispatch:{quest.id}",
+            then=f"{action}:{quest.id}",
             reason=args.why,
             expires=args.expires,
             max_fires=1,
             created_by="steward",
+            brief=brief_path,
         )
     except vigils.VigilError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
     p = vigils.save(repo, spec)
-    depth = len([v for v in active if str(v.get("then") or "").startswith("dispatch:")])
-    print(f"🧵 Queued for the Night's Watch: {quest.id}")
+    depth = len([v for v in active if str(v.get("then") or "").startswith(f"{action}:")])
+    print(f"🧵 Queued for the Night's Watch: {quest.id} [{status}]")
     print(f"   id:      {vid}")
-    print(f"   then:    dispatch:{quest.id} (when capacity allows)")
+    print(f"   then:    {action}:{quest.id} (when capacity allows)")
+    if brief_path:
+        print(f"   brief:   {brief_path}")
     print(f"   expires: {spec['expires_at']}")
-    print(f"   queue:   {depth + 1} dispatch hand-off(s) active")
+    print(f"   queue:   {depth + 1} {action} hand-off(s) active")
     print(f"   file:    {p}")
-    quest.log_ledger(quest.status, quest.status, f"Queued for the Night's Watch ({vid})")
+    quest.log_ledger(quest.status, quest.status,
+                     f"Queued for the Night's Watch ({vid})")
     try:
         store.save(quest, court_root=repo / ".court", auto_commit=True)
     except Exception as e:  # never lose the queue entry over a ledger write
@@ -8200,6 +8714,42 @@ def _ship_interrogation(args, quests, trunk: str) -> tuple[list[str], list[str]]
     return integrity, ui
 
 
+SHIP_STAGES = ("interrogate", "merge", "push", "stamp")
+SHIP_DEFAULT_STAGES = ("merge", "push", "stamp")
+
+
+def _resolve_ship_stages(raw) -> list[str]:
+    """Canonical, de-duplicated stage order from repeatable/comma --stage values.
+
+    Staging exists for automated pipelines: ``--confirm --stage merge`` lands the
+    promotion locally and stops; ``--confirm --stage push`` triggers autodeploy
+    only once the merge is verified. Stages always execute in canonical order.
+    """
+    requested: list[str] = []
+    for item in raw or []:
+        for part in str(item).split(","):
+            part = part.strip().lower()
+            if part:
+                requested.append(part)
+    unknown = [stage for stage in requested if stage not in SHIP_STAGES]
+    if unknown:
+        raise ValueError(
+            f"unknown --stage {', '.join(sorted(set(unknown)))} "
+            f"(valid: {', '.join(SHIP_STAGES)})"
+        )
+    if not requested:
+        return list(SHIP_DEFAULT_STAGES)
+    return [stage for stage in SHIP_STAGES if stage in requested]
+
+
+def _ship_next_step_hint(stages: list[str]) -> str:
+    """The command that runs the next unperformed stage, or '' when done."""
+    remaining = [stage for stage in SHIP_DEFAULT_STAGES if stage not in stages]
+    if not remaining:
+        return ""
+    return f"court ship --confirm --stage {remaining[0]}"
+
+
 def cmd_ship(args):
     # v1332 double-ship guard: two operators (or two agents) packing the
     # manifest concurrently produce two Cog Ship manifests for one convoy.
@@ -8362,8 +8912,13 @@ def cmd_ship(args):
     print("=" * 76)
 
     # Q147: `--confirm` promotes the staged convoy into production. Everything
-    # above stays a read-only report; only this branch mutates git/remote/Fly.
+    # above stays a read-only report; only this branch mutates git/remote.
     if getattr(args, "confirm", False):
+        try:
+            stages = _resolve_ship_stages(getattr(args, "stage", None))
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(2)
         integrity, _ui = _ship_interrogation(args, quests or [], head_branch)
         if integrity:
             print(
@@ -8373,8 +8928,15 @@ def cmd_ship(args):
             for problem in integrity:
                 print(f"   - {problem}")
             sys.exit(1)
-        rc = _execute_ship_deployment(args, base_branch, head_branch, quests=quests)
+        rc = _execute_ship_deployment(args, base_branch, head_branch, quests=quests, stages=stages)
         sys.exit(rc)
+
+    if getattr(args, "stage", None):
+        print(
+            "ERROR: --stage only applies with --confirm (without it, `court ship` is a read-only report).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
 
 FLY_CONFIGS = {
@@ -8496,16 +9058,27 @@ def _ship_merge(main_wt: Path, base_branch: str, head_branch: str) -> dict:
     return {"ok": False, "already_up_to_date": False, "output": merge_res}
 
 
-def _execute_ship_deployment(args, base_branch: str, head_branch: str, quests=None) -> int:
-    """The mutating half of `court ship --confirm`: merge `head_branch` (castle)
-    into `base_branch` (main) and push `base_branch` to origin, kicking off the
-    remote autodeploy pipeline. Returns process exit code (0 = success, 1 = error)."""
+def _execute_ship_deployment(args, base_branch: str, head_branch: str, quests=None, stages=None) -> int:
+    """The mutating half of `court ship --confirm`, run as ordered stages.
+
+    Stages (canonical order): ``merge`` head_branch into base_branch, ``push``
+    base_branch to origin (triggering autodeploy), ``stamp`` the promoted commit
+    on every shipped Quest. The default runs all three, preserving the original
+    one-shot behaviour; ``--stage`` lets an automated pipeline land the merge and
+    verify it before a separate push. Returns process exit code."""
+    stage_list = [stage for stage in (stages or SHIP_DEFAULT_STAGES)]
+    mutation_stages = [stage for stage in stage_list if stage != "interrogate"]
     print("\n" + "=" * 76)
-    print(f"⚔️ DEPLOYMENT CONFIRMED — MERGING {head_branch} INTO {base_branch} & PUSHING TO ORIGIN")
+    print(f"⚔️ DEPLOYMENT CONFIRMED — {head_branch} -> {base_branch}")
+    print(f"   stages: {', '.join(stage_list)}")
     print("=" * 76)
+    if not mutation_stages:
+        print("ℹ️  Interrogation only — no mutating stage requested; nothing was merged or pushed.")
+        return 0
+
     dry_run = getattr(args, "dry_run", False)
     if dry_run:
-        print("🧪 DRY RUN: preflight checks will run; merge/push will NOT execute.\n")
+        print("🧪 DRY RUN: preflight checks will run; merge/push/stamp will NOT execute.\n")
 
     # Step 0 — locate the production checkout.
     main_wt = _ship_find_main_checkout(base_branch)
@@ -8522,52 +9095,78 @@ def _execute_ship_deployment(args, base_branch: str, head_branch: str, quests=No
             print(f"   - {p}")
         return 1
     print("✅ Preflight: clean tree, correct branch, push is fast-forward")
+    if "push" in mutation_stages and "merge" not in mutation_stages:
+        # A push-only run must never deploy a trunk that does not yet contain the
+        # promotion — that is exactly the half-finished state staging exists to
+        # make visible. Checked before --dry-run returns so the preview is honest.
+        contains = git_ops._run(
+            ["git", "merge-base", "--is-ancestor", head_branch, base_branch], main_wt
+        )
+        if not contains.get("ok"):
+            print(
+                f"❌ {base_branch} does not contain {head_branch} yet — run "
+                f"`court ship --confirm --stage merge` first; nothing was pushed."
+            )
+            return 1
     if dry_run:
         print("\n🧪 DRY RUN PASSED — all preflight checks green; no mutations performed.")
         return 0
 
+    performed: list[str] = []
+
     # Step 1 — merge head_branch into base_branch.
-    print(f"\n🔀 Merging {head_branch} into {base_branch} ...")
-    merge = _ship_merge(main_wt, base_branch, head_branch)
-    if not merge["ok"]:
-        out = merge["output"]
-        print(f"❌ Merge failed (aborted, {base_branch} untouched):")
-        print(f"   {out.get('stderr') or out.get('stdout')}")
-        return 1
-    if merge["already_up_to_date"]:
-        print(f"✅ {base_branch} already contains {head_branch} (no merge needed)")
-    else:
-        print(f"✅ Merged {head_branch} -> {base_branch}")
+    if "merge" in mutation_stages:
+        print(f"\n🔀 Merging {head_branch} into {base_branch} ...")
+        merge = _ship_merge(main_wt, base_branch, head_branch)
+        if not merge["ok"]:
+            out = merge["output"]
+            print(f"❌ Merge failed (aborted, {base_branch} untouched):")
+            print(f"   {out.get('stderr') or out.get('stdout')}")
+            return 1
+        if merge["already_up_to_date"]:
+            print(f"✅ {base_branch} already contains {head_branch} (no merge needed)")
+        else:
+            print(f"✅ Merged {head_branch} -> {base_branch}")
+        performed.append("merge")
 
     # Step 2 — push to origin.
-    print(f"\n📤 Pushing {base_branch} to origin ...")
-    push_res = git_ops._run(["git", "push", "origin", base_branch], main_wt, timeout=600)
-    if not push_res.get("ok"):
-        print(f"❌ Push failed: {push_res.get('stderr') or push_res.get('stdout')}")
-        print(f"   The merge to local {base_branch} succeeded; reconcile the remote and re-push manually.")
-        return 1
-    print(f"✅ Pushed {base_branch} -> origin/{base_branch}")
+    if "push" in mutation_stages:
+        print(f"\n📤 Pushing {base_branch} to origin ...")
+        push_res = git_ops._run(["git", "push", "origin", base_branch], main_wt, timeout=600)
+        if not push_res.get("ok"):
+            print(f"❌ Push failed: {push_res.get('stderr') or push_res.get('stdout')}")
+            print(f"   The merge to local {base_branch} succeeded; reconcile the remote and re-push manually.")
+            return 1
+        print(f"✅ Pushed {base_branch} -> origin/{base_branch}")
+        performed.append("push")
 
-    # Durable deploy stamps (cogship-257/261 staleness): record the
+    # Step 3 — durable deploy stamps (cogship-257/261 staleness): record the
     # post-promotion tip on every shipped quest so ship-readiness predicates
     # short-circuit on the stamp instead of fragile branch-tip ancestry —
     # quest branches keep receiving .court/ paperwork commits after deploy.
-    shipped = [q for q in (quests or []) if getattr(q, "kind", "") != "scout"]
-    if shipped:
-        tip_res = git_ops._run(["git", "rev-parse", base_branch], main_wt)
-        promoted_tip = (tip_res.get("stdout") or "").strip()
-        if promoted_tip:
-            stamped = 0
-            for q in shipped:
-                q.cogship_promoted_commit = promoted_tip
-                store.save(q, auto_commit=True, commit_msg=(
-                    f"court: stamp {q.id} promoted commit {promoted_tip[:12]}"
-                ))
-                stamped += 1
-            print(f"📌 Stamped promoted commit {promoted_tip[:12]} on {stamped} shipped quest(s)")
+    if "stamp" in mutation_stages:
+        shipped = [q for q in (quests or []) if getattr(q, "kind", "") != "scout"]
+        if shipped:
+            tip_res = git_ops._run(["git", "rev-parse", base_branch], main_wt)
+            promoted_tip = (tip_res.get("stdout") or "").strip()
+            if promoted_tip:
+                stamped = 0
+                for q in shipped:
+                    q.cogship_promoted_commit = promoted_tip
+                    store.save(q, auto_commit=True, commit_msg=(
+                        f"court: stamp {q.id} promoted commit {promoted_tip[:12]}"
+                    ))
+                    stamped += 1
+                print(f"📌 Stamped promoted commit {promoted_tip[:12]} on {stamped} shipped quest(s)")
+        performed.append("stamp")
 
     print("\n" + "=" * 76)
-    print(f"🏰 SHIP CONFIRMED — {head_branch} merged into {base_branch} and pushed to origin (autodeploy triggered)")
+    print(f"🏰 SHIP STAGE COMPLETE — {', '.join(performed)} on {base_branch}")
+    next_step = _ship_next_step_hint(mutation_stages)
+    if next_step:
+        print(f"   Next stage: {next_step}")
+    else:
+        print(f"✅ {head_branch} merged into {base_branch} and pushed to origin (autodeploy triggered)")
     print("=" * 76)
     return 0
 
@@ -9145,6 +9744,7 @@ def build_parser():
     p_dispatch.add_argument("--no-run", action="store_true", help="Configure worktree and write task without launching background Kilo session")
     p_dispatch.add_argument("--agent", default=None, help="Agent to use (default: serf, or scout for investigations)")
     p_dispatch.add_argument("--prompt", default=None, help="Custom prompt override (defaults to pure charter task instructions)")
+    p_dispatch.add_argument("--brief", default=None, help="Path to a prompt/remediation brief file (used unless --prompt is given); this is what a queued `dispatch:` vigil carries")
     p_dispatch.add_argument("--base", default="castle", help="Base branch for new worktrees (default: castle)")
     p_dispatch.add_argument(
         "--break-glass", dest="break_glass", action="store_true", default=False,
@@ -9182,6 +9782,7 @@ def build_parser():
     p_goad.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_goad.add_argument("--force", action="store_true", help="Supersede a live worker lease: kill the current worker's process group, then spawn the goad (default: refuse while a worker is live)")
     p_goad.add_argument("--mode", default="auto", choices=("auto", "cold", "resume"), help="Re-prompt mode: auto (continue the same session when healthy, cold-start when bloated/committed; default), cold (always a fresh session), resume (always continue the recorded serf session)")
+    p_goad.add_argument("--brief", default=None, help="Path to a Steward-authored remediation brief (replaces the generic goad template): the goaded Serf reads exactly this instruction")
     p_goad.set_defaults(func=cmd_goad)
 
     p_dispatch_complete = sub.add_parser(
@@ -9377,6 +9978,8 @@ def build_parser():
     add_quest_selector(p_raze, batchable=True, filters=("status",))
     p_raze.add_argument("--archive-pruned", dest="archive_pruned", action="store_true", default=True, help="Auto-archive already-pruned quests (default: on)")
     p_raze.add_argument("--no-archive-pruned", dest="archive_pruned", action="store_false", help="Do not auto-archive already-pruned quests")
+    p_raze.add_argument("--keep-worktree", dest="keep_worktree", action="store_true", help="Leave the razed Quest's worktree, branch, and test databases on disk (manual teardown via `court fork-teardown-list`)")
+    p_raze.add_argument("--no-drop-db", dest="no_drop_db", action="store_true", help="Tear down the worktree/branch but keep its pytest databases")
     p_raze.add_argument("--allow-forced", dest="allow_forced", action="store_true", help="Explicit override: raze a FORCED-promotion quest even if its code-presence audit fails")
     p_raze.set_defaults(func=cmd_raze)
 
@@ -9435,6 +10038,10 @@ def build_parser():
     p_collect.add_argument("--cogship", default=None, help="Existing Cog Ship ID to stamp (e.g. cogship-002); omit or pass 'new' to allocate the next id")
     p_collect.add_argument("--base", default="castle", help="Base branch for the compliance audit (default: castle)")
     p_collect.add_argument("--skip-ui-review", action="store_true", help="Bypass pending UI review check when packing into Cog Ship")
+    p_collect.add_argument(
+        "--allow-pending-studio", dest="allow_pending_studio", action="store_true", default=False,
+        help="Pack a Quest that is still inside an open combined artist studio (deliberate override only)",
+    )
     p_collect.add_argument("--hotfix", action="store_true", help="Allow hotfix fast-track inline audit and pack")
     p_collect.add_argument("--regate", action="store_true", help="Hand previously promoted Quests (READY_TO_RAZE) back to a Gatekeeper: mint a FRESH convoy, rewind them to GATE, clear stale promotion/session stamps, and stand up a new Gatekeeper")
     p_collect.add_argument("--standup", action="store_true", help="Automatically stand up the Gatekeeper worktree and session via Kilo CLI")
@@ -9566,6 +10173,18 @@ def build_parser():
         help="With --confirm: run preflight safety checks only; no merge/push/deploy is executed",
     )
     p_ship.add_argument(
+        "--stage",
+        action="append",
+        default=None,
+        metavar="{interrogate,merge,push,stamp}",
+        help=(
+            "With --confirm: run only the named stage(s). Repeatable or comma-separated, "
+            "always executed in canonical order (interrogate, merge, push, stamp). "
+            "Default: merge,push,stamp (one-shot ship). Use 'merge' then 'push' to sequence "
+            "a remote autodeploy pipeline."
+        ),
+    )
+    p_ship.add_argument(
         "--skip-ui-review", dest="skip_ui_review", action="store_true", default=False,
         help="Waive ONLY the UI-assent segment of the pre-ship interrogation (integrity findings still block)",
     )
@@ -9667,6 +10286,58 @@ def build_parser():
     p_muster.add_argument("--print-prompt", dest="print_prompt", action="store_true", help="Print the rendered triage prompt and exit (no session)")
     p_muster.set_defaults(func=cmd_muster)
 
+    p_db_prune = sub.add_parser(
+        "db-prune",
+        help="Maintain the Kilo session store (the perennial kilo.db growth): report / keep-backup / prune / vacuum / verify",
+    )
+    p_db_prune.add_argument("db_cmd", choices=("report", "keep-backup", "prune", "vacuum", "verify"),
+                            help="report=what is old · keep-backup=snapshot keepers · prune=delete old sessions · vacuum=reclaim the file · verify=integrity")
+    p_db_prune.add_argument("--days", type=int, default=14,
+                            help="Retention window for prune/keep-backup (default 14)")
+    p_db_prune.add_argument("--keep-events", dest="keep_events", type=int, default=1_200_000,
+                            help="Newest event rows to keep (default 1200000)")
+    p_db_prune.add_argument("--apply", action="store_true",
+                            help="Actually mutate (prune/vacuum are dry-run without it)")
+    p_db_prune.set_defaults(func=cmd_db_prune)
+
+    p_request = sub.add_parser(
+        "request",
+        help="Author/list/close a Pleasance charter request (the lane is requests-in, charters-out)",
+    )
+    p_request.add_argument("--title", default="", help="One-line intent")
+    p_request.add_argument("--ask", default="", help="What should be built, plain engineering language")
+    p_request.add_argument("--why", default="", help="Motivation / context (optional)")
+    p_request.add_argument("--constraint", action="append", default=[], help="Repeatable hard constraint")
+    p_request.add_argument("--link", action="append", default=[], help="Repeatable reference (URL, path, quest id)")
+    p_request.add_argument("--by", dest="requested_by", default="", help="Who is asking (e.g. voice-agent)")
+    p_request.add_argument("--id", dest="request_id", default="", help="Explicit request id (default: dated slug)")
+    p_request.add_argument("--list", action="store_true", help="List open requests on this checkout")
+    p_request.add_argument("--mark-chartered", dest="mark_chartered", default="", help="Close this request against --quest")
+    p_request.add_argument("--quest", default="", help="The Quest id that satisfies the request")
+    p_request.add_argument("--repo", default=None, help="Court repository (default: this repo)")
+    p_request.set_defaults(func=cmd_request)
+
+    p_charter_request = sub.add_parser(
+        "charter-request",
+        help="Summon ONE bounded Steward to author a charter for a request packet",
+    )
+    p_charter_request.add_argument("request_id", help="Request id under .court/requests/")
+    p_charter_request.add_argument("--repo", default=None, help="Court repository (default: this repo)")
+    p_charter_request.add_argument("--model", default=None, help="Override the Steward model")
+    p_charter_request.add_argument("--print-prompt", action="store_true", help="Render the prompt without spawning")
+    p_charter_request.set_defaults(func=cmd_charter_request)
+
+    p_prune_test_dbs = sub.add_parser(
+        "prune-test-dbs",
+        help="Drop pytest databases whose worktree no longer exists (dry-run unless --apply)",
+    )
+    p_prune_test_dbs.add_argument("--apply", action="store_true",
+                                  help="Actually drop the stale databases (default: report only)")
+    p_prune_test_dbs.add_argument("--min-age-minutes", dest="min_age_minutes", type=int, default=0,
+                                  help="Only consider databases older than this (default 0; live worktrees are always kept)")
+    p_prune_test_dbs.add_argument("--json", action="store_true", help="Emit the classification as JSON")
+    p_prune_test_dbs.set_defaults(func=cmd_prune_test_dbs)
+
     p_nightwatch = sub.add_parser(
         "nightwatch",
         help="Deterministic fleet supervisor (the Night's Watch): polls durable quest state and issues goad / coin / collect --standup under RAM, cooldown, and attempt caps — no LLM polling, no tokens",
@@ -9696,13 +10367,29 @@ def build_parser():
     p_nightwatch.add_argument("--no-dispatch", dest="no_dispatch", action="store_true", help="Forbid vigils from dispatching new quests (dispatching is otherwise allowed ONLY through an explicitly registered vigil)")
     p_nightwatch.add_argument("--bloat-cold-start", dest="bloat_cold_start", action="store_true", help="When a watchdog is about to re-prompt a session past the cull line, supersede it with a fresh cold-start goad (requires --allow-force-goad; off by default, so such sessions are flagged for a human instead)")
     p_nightwatch.add_argument("--retry-backoff", dest="retry_backoff", type=int, default=nightwatch.DEFAULT_RETRY_BACKOFF, help=f"Seconds to wait before retrying a FAILED action (a failed attempt must not burn the full cooldown; 0 disables; default {nightwatch.DEFAULT_RETRY_BACKOFF})")
+    p_nightwatch.add_argument("--max-fails", dest="max_fails", type=int, default=nightwatch.DEFAULT_MAX_FAILS, help=f"Consecutive failures before a convoy is escalated as a dead letter (default {nightwatch.DEFAULT_MAX_FAILS})")
+    p_nightwatch.add_argument("--max-retry-backoff", dest="max_retry_backoff", type=int, default=nightwatch.DEFAULT_MAX_RETRY_BACKOFF, help=f"Ceiling for the exponential retry window of a repeatedly failing action (default {nightwatch.DEFAULT_MAX_RETRY_BACKOFF})")
     p_nightwatch.add_argument("--max-coins", dest="max_coins", type=int, default=nightwatch.DEFAULT_MAX_COINS, help=f"Coin attempts before a Quest is flagged for a human (default {nightwatch.DEFAULT_MAX_COINS})")
+    p_nightwatch.add_argument("--session-retention-days", dest="session_retention_days", type=int, default=nightwatch.DEFAULT_SESSION_RETENTION_DAYS, help=f"Raze Kilo sessions older than this many days when the board is idle (opt in with `--enable ...,prune`; default {nightwatch.DEFAULT_SESSION_RETENTION_DAYS})")
+    p_nightwatch.add_argument("--session-prune-interval", dest="session_prune_interval", type=int, default=nightwatch.DEFAULT_SESSION_PRUNE_INTERVAL, help=f"Seconds between automatic session razes (default {nightwatch.DEFAULT_SESSION_PRUNE_INTERVAL})")
+    p_nightwatch.add_argument("--pg-prune-interval", dest="pg_prune_interval", type=int, default=nightwatch.DEFAULT_PG_PRUNE_INTERVAL, help=f"Seconds between pytest-database reap sweeps on an idle board (default {nightwatch.DEFAULT_PG_PRUNE_INTERVAL}); disable with `--enable` without pgprune")
+    p_nightwatch.add_argument("--max-regates", dest="max_regates", type=int, default=nightwatch.DEFAULT_MAX_REGATES, help=f"Regate attempts for a READY_TO_RAZE Quest raze refuses before escalating to a Steward (default {nightwatch.DEFAULT_MAX_REGATES})")
+    p_nightwatch.add_argument("--max-charter-fails", dest="max_charter_fails", type=int, default=nightwatch.DEFAULT_MAX_CHARTER_FAILS, help=f"Charter-request attempts before escalating to a human (default {nightwatch.DEFAULT_MAX_CHARTER_FAILS})")
+    p_nightwatch.add_argument("--charter-cooldown", dest="charter_cooldown", type=int, default=nightwatch.DEFAULT_CHARTER_COOLDOWN, help=f"Seconds between charter attempts for one request (default {nightwatch.DEFAULT_CHARTER_COOLDOWN})")
+    p_nightwatch.add_argument("--session-keep-events", dest="session_keep_events", type=int, default=nightwatch.DEFAULT_SESSION_KEEP_EVENTS, help=f"Newest event rows kept when razing sessions (default {nightwatch.DEFAULT_SESSION_KEEP_EVENTS})")
+    p_nightwatch.add_argument("--no-session-vacuum", dest="no_session_vacuum", action="store_true", help="Prune sessions but skip the VACUUM that actually reclaims the file (default: vacuum after prune)")
     p_nightwatch.add_argument("--steward-stale-after", dest="steward_stale_after", type=int, default=nightwatch.DEFAULT_STEWARD_STALE_AFTER, help=f"Seconds an unchanged board with no live worker must sit before a Steward may be mustered (default {nightwatch.DEFAULT_STEWARD_STALE_AFTER})")
     p_nightwatch.add_argument("--steward-cooldown", dest="steward_cooldown", type=int, default=nightwatch.DEFAULT_STEWARD_COOLDOWN, help=f"Seconds between Steward musters (default {nightwatch.DEFAULT_STEWARD_COOLDOWN})")
     p_nightwatch.add_argument("--max-stewards-per-day", dest="max_stewards_per_day", type=int, default=nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY, help=f"Rolling 24-hour Steward muster cap (default {nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY})")
-    p_nightwatch.add_argument("--enable", default=",".join(nightwatch.Policy().enabled), help="Comma list of permitted actions (goad,coin,collect,dispatch,steward,raze,teardown,rebase). `teardown` (clearing a provably-dead gatehouse worktree so collect can re-run) and `rebase` (converging a drifted worktree onto castle before a spawn, so drift cannot burn a Steward muster) are ON by default because they are local, mechanical operations. `steward` and `raze` are OPT-IN: steward spends a reasoning worker; raze deletes a branch ref.")
+    p_nightwatch.add_argument("--enable", default=",".join(nightwatch.Policy().enabled), help="Comma list of permitted actions (goad,coin,collect,dispatch,steward,charter,raze,regate,teardown,rebase,prune,pgprune). ON by default: goad,coin,collect,dispatch,teardown,rebase,raze,regate,charter,pgprune — local/mechanical, or one bounded Steward turn for a validated charter request (raze verifies promotion before deleting anything; teardown/DB reaping refuse anything a live worktree still owns). OPT-IN: steward (board-triage muster) and prune (Kilo session-store VACUUM).")
     p_nightwatch.add_argument("--allow-force-goad", dest="allow_force_goad", action="store_true", help="Permit --force goads (supersedes a live worker). Off by default.")
     p_nightwatch.add_argument("--no-pickup", dest="no_pickup", action="store_true", help="Do not fetch/apply Pleasance paperwork at the top of each tick (default: pickup ON when the checkout is on castle)")
+    p_nightwatch.add_argument("--no-pickup-remedy", dest="no_pickup_remedy", action="store_true",
+                              help="Do not mechanically clear a repeatable dirty-tree pickup block (default: the watch quarantines untracked scratch under tasks/artifacts/ and restores regenerable docs reports itself after the 2nd identical rejection, then retries once)")
+    p_nightwatch.add_argument("--pickup-remedy-after", dest="pickup_remedy_after", type=int, default=0,
+                              help=f"Identical pickup rejections before mechanical remediation (default {nightwatch.Policy().pickup_remedy_after})")
+    p_nightwatch.add_argument("--pickup-remedy-cooldown", dest="pickup_remedy_cooldown", type=int, default=0,
+                              help=f"Seconds before the same pickup block is remediated again (default {nightwatch.Policy().pickup_remedy_cooldown})")
     p_nightwatch.add_argument("--publish-pulse", dest="publish_pulse", action="store_true", help="Publish the per-tick steward pulse to the read-only status branch (ON by default)")
     p_nightwatch.add_argument("--no-publish-pulse", dest="no_publish_pulse", action="store_true", help="Keep the steward pulse local-only; do not push PULSE.md/PULSE.json")
     p_nightwatch.add_argument("--pulse-branch", dest="pulse_branch", default="status/pleasance", help="Branch that receives PULSE.md/PULSE.json (default: status/pleasance)")
@@ -9717,6 +10404,10 @@ def build_parser():
     p_pickup.add_argument("--no-fetch", dest="no_fetch", action="store_true",
                           help="Skip `git fetch origin pleasance` (use the existing local refs)")
     p_pickup.add_argument("--dry-run", action="store_true", help="Validate and print; change nothing")
+    p_pickup.add_argument("--remediate", action="store_true",
+                          help="When the batch is blocked only by untracked scratch under tasks/artifacts/ (etc.) "
+                               "or a regenerable docs report, quarantine/restore it mechanically and retry once "
+                               "(never deletes, never `git clean`)")
     p_pickup.add_argument("--base", default="castle", help="Trunk to apply onto and compare against (default: castle)")
     p_pickup.add_argument("--branch", default=pickup.PICKUP_BRANCH,
                           help=f"Pleasance branch name (default: {pickup.PICKUP_BRANCH})")
@@ -9819,7 +10510,8 @@ def build_parser():
     p_vigil.add_argument("id", nargs="?", default=None, help="Vigil id (add/remove)")
     p_vigil.add_argument("--repo", default=None, help="Court repository (default: this repo)")
     p_vigil.add_argument("--when", action="append", default=[], help="Condition, repeatable and ANDed: quest-status:Q123=READY_TO_RAZE, quest-merged:Q123, branch-merged:<branch>, file-exists:<path>, after:<iso>")
-    p_vigil.add_argument("--then", default=None, help="Action to take: dispatch:<QID>, goad:<QID>, coin:<QID>, collect[:<QID>], advance:<QID>=<STATUS>, note:<text>")
+    p_vigil.add_argument("--then", default=None, help="Action to take: dispatch:<QID>, goad:<QID>, coin:<QID>, collect[:<QID>], rebase:<QID>, advance:<QID>=<STATUS>, note:<text>")
+    p_vigil.add_argument("--brief", default=None, help="dispatch/goad only: path to a Steward-authored remediation brief the queued worker reads instead of its template prompt (must live inside the repo)")
     p_vigil.add_argument("--why", default=None, help="REQUIRED: why this watch exists")
     p_vigil.add_argument("--expires", default=None, help=f"REQUIRED: absolute ISO timestamp or a span like 6h/2d (ceiling {vigils.MAX_VIGIL_HOURS // 24} days)")
     p_vigil.add_argument("--max-fires", dest="max_fires", type=int, default=vigils.DEFAULT_MAX_FIRES, help=f"How many times it may fire before retiring (1..{vigils.MAX_FIRES_CEILING}, default {vigils.DEFAULT_MAX_FIRES})")
@@ -9827,10 +10519,13 @@ def build_parser():
     p_vigil.set_defaults(func=cmd_vigil)
     p_enqueue = sub.add_parser(
         "enqueue",
-        help="Queue a PLANNED/CHARTERED Quest for dispatch by the Night's Watch (a one-shot dispatch vigil) — the Steward plans, the watch spends the machine",
+        help="Queue a Quest for the Night's Watch, chosen by the status it is stuck in (dispatch/goad/coin/collect) — the Steward plans, the watch spends the machine",
     )
-    p_enqueue.add_argument("quest", help="Quest ID to queue (must be PLANNED or CHARTERED)")
-    p_enqueue.add_argument("--why", required=True, help="Why this dispatch is queued (min 12 chars)")
+    p_enqueue.add_argument("quest", help="Quest ID to queue (PLANNED/CHARTERED/DISPATCHED/QUESTING/WORKING/TRIBUTE_READY/GATE)")
+    p_enqueue.add_argument("--why", required=True, help="Why this hand-off is queued (min 12 chars)")
+    p_enqueue.add_argument("--action", default=None, choices=ENQUEUE_ACTIONS,
+                           help="Queued action (default: implied by status — PLANNED/CHARTERED->dispatch, WORKING->goad, TRIBUTE_READY->coin, GATE->collect)")
+    p_enqueue.add_argument("--brief", default=None, help="dispatch/goad only: path to a Steward-authored remediation brief the worker reads instead of its template (must live inside the repo)")
     p_enqueue.add_argument("--expires", default="24h", help="How long the queue entry stays live (span or ISO; default 24h)")
     p_enqueue.add_argument("--after", default="0s", help="Earliest dispatch delay, e.g. 30s/5m/2h (default 0s)")
     p_enqueue.add_argument("--repo", default=None, help="Court repository (default: this repo)")
@@ -9861,6 +10556,10 @@ def build_parser():
         help="Permit a merged Quest whose UI review is still pending (deliberate override only)",
     )
     p_verify_convoy.add_argument(
+        "--allow-pending-studio", dest="allow_pending_studio", action="store_true", default=False,
+        help="Permit a merged Quest still inside an open combined artist studio (deliberate override only)",
+    )
+    p_verify_convoy.add_argument(
         "--allow-stale-suite", dest="allow_stale_suite", action="store_true", default=False,
         help="Permit promotion when the green suite proof was stamped at a different convoy tip",
     )
@@ -9869,6 +10568,19 @@ def build_parser():
         help="Fail when no suite proof exists for this convoy at all",
     )
     p_verify_convoy.set_defaults(func=cmd_verify_convoy)
+
+    p_peel = sub.add_parser(
+        "peel",
+        help="Withdraw a promoted Quest from the trunk: revert its promotion commit, record the peel, supersede its suite proof (then re-pack with collect)",
+    )
+    p_peel.add_argument("quest_id", nargs="?", default=None, help="Quest to peel (with --list: omitted)")
+    p_peel.add_argument("--base", default="castle", help="Trunk the Quest was promoted into (default: castle)")
+    p_peel.add_argument("--commit", default="", help="Explicit promotion/code commit to revert (required for an entangled convoy)")
+    p_peel.add_argument("--reason", default="", help="Why the Quest is withdrawn (recorded in the peel record and commit message)")
+    p_peel.add_argument("--list", action="store_true", help="List recorded peels and whether each revert is still in the trunk")
+    p_peel.add_argument("--dry-run", dest="dry_run", action="store_true", help="Resolve and print the peel plan without touching git")
+    p_peel.add_argument("--json", action="store_true", help="Output JSON format")
+    p_peel.set_defaults(func=cmd_peel)
 
     p_diff = sub.add_parser("diff", help="Display structured worktree diff and file statistics vs base")
     p_diff.add_argument("quest_id", help="Quest ID to diff")

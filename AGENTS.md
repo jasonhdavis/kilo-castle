@@ -63,17 +63,32 @@ the pipeline runs to shipping with UI review treated as tracked debt rather
 than a gate.
 
 - **One root trunk, `pleasance`** (origin-based, like `castle`), carrying
-  **paperwork commits only**: `.court/quests/<Full-Id>.md` charters,
+  **paperwork commits only**: `.court/requests/<id>.json` charter requests,
   `.court/vigils/<id>.json` vigil specs, and `.court/decrees/<id>.json` royal
   decree packets (M'Lord's answers to pending Audiences). Anything else in a
   commit rejects the whole batch. Rebase on the current `origin/castle` tip
-  before pushing.
-- **Charter form**: frontmatter `id` == file stem, `kind: quest`,
-  `branch: quest/<id>-<slug>`, `status` in `OPEN`/`PLANNED`/`CHARTERED`.
-  `PLANNED` = held/report-only; `CHARTERED` = committed and dispatched the
-  moment its `## Prerequisites` predicates are satisfied (empty section =
-  immediate). Committed quests' charters are FROZEN — never amend beyond
-  `CHARTERED`.
+  before pushing; never merge `castle` into the lane.
+- **Requests in, charters out (2026-11-09)**: the lane must NOT author
+  `.court/quests/*.md`. A voice-transcribed LLM cannot see the board, so
+  charters written there arrived with invented Quest numbers and duplicates.
+  The requester lands a request packet instead —
+
+  ```json
+  {"id": "req-2026-11-09-thing", "title": "One line",
+   "ask": "What to build, plain language", "why": "optional",
+   "constraints": ["optional"], "links": ["optional"],
+   "requested_by": "voice-agent"}
+  ```
+
+  The Night's Watch plans a `charter` action FIRST on every tick: one bounded
+  Steward session reads the board, allocates the next free `Q<n>`, authors the
+  charter, and closes the request with `court request --mark-chartered <id>
+  --quest <Q-id>`. Requests carry no Quest id, so numbering cannot drift.
+  `court request --list` shows what is open; `court charter-request <id>
+  --print-prompt` renders the Steward brief. Enforcement is per repo:
+  `pickup.allow_lane_charters: false` in `.court/config.json` makes pickup
+  reject lane-authored charters with a message pointing at
+  `.court/requests/` (unset = the old behaviour).
 - **Prereq grammar** (one predicate per `## Prerequisites` line, vigils
   grammar verbatim): `quest-status:<id>=<STATUS>`, `quest-status:<id>!=<STATUS>`,
   `branch-merged:<branch>`, `quest-merged:<id>`, `file-exists:<path>`,
@@ -85,6 +100,21 @@ than a gate.
   Dispatch comes from the castle charter directly — **no synthesized vigil
   files** for this lane. A watch tick runs the pickup automatically (only on a
   `castle` checkout; `--no-pickup` disables it).
+- **Pickup self-remediation (mechanical, zero-token)**: a dirty-tree rejection
+  is not a Steward matter. After the second identical rejection the Night's
+  Watch clears its own block and retries the pickup in the same tick — untracked
+  scratch under `tasks/artifacts/` (or another known scratch root) is MOVED into
+  `.local/state/kilo-castle/nightwatch/pickup-quarantine/` (never deleted, never
+  `git clean`), and a regenerable report (`docs/PUNISHED_AUDIT.md`,
+  `docs/AI_INDEX.*`) is restored to HEAD. A real local edit is left exactly where
+  it is and stays a human decision. `court pickup --remediate` performs the same
+  clearance on demand; `--no-pickup-remedy` disables the automatic pass.
+- **A bad decree never wedges the lane**: a decree packet that is structurally
+  unusable or names a Quest id with no charter is skipped per file (journaled
+  and surfaced in the pulse), and a decision naming several Quest ids
+  (`"Q408,Q508,..."`) is expanded to one ruling per id. The ruling is never
+  applied to a partial target set; lane-integrity problems (out-of-lane paths,
+  deletions, dirty collisions) still reject the whole batch.
 - **Read area for the remote steward**: never `castle` (it is local). Read the
   read-only status mirror at `origin/status/pleasance`:
   - `PULSE.md` — one short file answering *is the machine running*, *what
@@ -99,11 +129,13 @@ than a gate.
   branch via git plumbing without touching the working tree. `--no-publish-pulse`
   keeps it local-only. The status branch is single-writer telemetry: it is never
   merged, picked up, or used to send work.
-- **Sending commands**: commit charters (`.court/quests/<id>.md`), vigil
-  specs (`.court/vigils/<id>.json`), or decree packets
+- **Sending commands**: commit request packets
+  (`.court/requests/<id>.json`), vigil specs
+  (`.court/vigils/<id>.json`), or decree packets
   (`.court/decrees/<id>.json`) to `pleasance`. Vigil actions are
   allow-listed: `dispatch:<quest>`, `goad:<quest>`, `coin:<quest>`,
-  `collect[:<cogship>]`, `advance:<quest>=<STATUS>`, `note:<text>`.
+  `collect[:<cogship>]`, `rebase:<quest>`, `advance:<quest>=<STATUS>`,
+  `note:<text>`, `muster:<why>`.
 - **Answering decisions from the Pleasance**: a decree packet batches the
   rulings from one voice session —
   `{"id": "...", "by": "M'Lord", "decisions": [{"quest": "Q123-Slug",
@@ -111,15 +143,36 @@ than a gate.
   packet, appends a dated `## Audience Log` entry to each named Quest, and
   applies the status (a `HELD` Quest with no explicit status resumes at
   `WORKING`). Safe targets only: `OPEN`, `PLANNED`, `CHARTERED`, `DISPATCHED`,
-  `QUESTING`, `WORKING`, `TRIBUTE_READY`, `GATE`, `HELD` — razing, shipping,
-  and the pillory remain human pipeline acts. Applied decree ids are recorded
+  `QUESTING`, `WORKING`, `TRIBUTE_READY`, `GATE`, `HELD` — shipping and the
+  pillory remain human pipeline acts; razing is mechanical (the Night's Watch
+  runs it, and `court raze` verifies promotion before tearing anything down). Applied decree ids are recorded
   outside the tree, so a re-delivered packet is skipped rather than duplicated.
   `court decree --quest <id> --ruling "..." [--status WORKING]` authors the
   same packet locally.
+Pytest-database reaping is part of teardown: a checkout's databases are named
+`test_<prefix>_<sha1(BASE_DIR)[:8]>[_gwN]`, so an ephemeral gatehouse worktree
+mints a fresh set per convoy. `court prune-test-dbs [--apply]` drops only
+databases whose hash matches no worktree git knows about and which hold no
+connection; the Night's Watch runs it on an idle board at most once per
+`--pg-prune-interval`.
+
 - **UI review is non-blocking debt**: pending/missing UI never withholds
   collect/promotion/ship; the collect report, pre-ship interrogation, and ship
   manifest list `ui_debt` / a UI Debt Roster for the Court Artist lane to close
   later via Royal Addendum. `court ui-signoff --defer` records a deferral.
+- **An OPEN combined studio does block packing/promotion**: a Quest routed to
+  `court studio` keeps its base code on its own branch while the reviewed
+  artwork lives only on `artist/<cohort>-ui-studio`. Until that state is merged
+  back (`court studio <ids> --sync-back`) or extracted (`--close`), `collect`
+  skips the Quest and `court verify-convoy` fails with a `pending-studio` error
+  — promoting now would ship pre-review code and lose the studio work when its
+  branch is torn down. `--allow-pending-studio` (collect / verify-convoy) is the
+  deliberate override.
+- **Ship confirmation can be sequenced**: `court ship --confirm --stage
+  merge|push|stamp` (repeatable/comma list, canonical order) lands the promotion
+  in separately verifiable steps; the default remains the one-shot
+  `merge,push,stamp`. A push-only run refuses unless `main` already contains
+  `castle`.
 - **Full contract for remote authors**: `PLEASANCE.md` in each app repo
   (pb-app etc.), which the pickup lane mirrors to origin.
 - Evidence/state (which pleasance tip is applied, last rejection) lives in the
@@ -159,10 +212,11 @@ than a gate.
    - Audit for Charter Anti-Tampering, Extra Tribute Not Requested, and Zero Roleplay Leakage.
 4. **Gate 4 — Gatekeeper Integration (`GATE`)**:
    - Run unified integration tests on convoy branch via `court collect --standup` or Kilo CLI Gatekeeper, verify zero roleplay leakage in production assets, promote to `castle`, advance Quests to `READY_TO_RAZE`, and pack deployment manifest (`court ship`).
-   - **Promotion guard (mandatory)**: before touching `castle`, run `court verify-convoy <cogship> --base castle --require-suite`. Eligibility is decided per Quest but promotion executes per branch, so a Quest merged onto `the-gatehouse/<cogship>` after collect (an artist UI preview, a conflict-resolution merge) rides the fast-forward into the trunk. The guard refuses when a merged Quest is not in the pack allow-list recorded by `collect` (`.court/convoys/<cogship>.json`), is not `GATE`/`READY_TO_RAZE`, still has a pending UI review, or when the green suite proof was stamped at a different tip. A non-zero exit means back the offending branch out and re-run the suite — never promote past it. `court verify-manifest` performs the matching post-promotion rider check.
+   - **Promotion guard (mandatory)**: before touching `castle`, run `court verify-convoy <cogship> --base castle --require-suite`. Eligibility is decided per Quest but promotion executes per branch, so a Quest merged onto `the-gatehouse/<cogship>` after collect (an artist UI preview, a conflict-resolution merge) rides the fast-forward into the trunk. The guard refuses when a merged Quest is not in the pack allow-list recorded by `collect` (`.court/convoys/<cogship>.json`), is not `GATE`/`READY_TO_RAZE`, is still inside an open `artist/*-ui-studio` branch (`pending-studio`), or when the green suite proof was stamped at a different tip. (Outstanding UI *review* alone stays a warning: it is tracked debt, not a block.) A non-zero exit means back the offending branch out and re-run the suite — never promote past it. `court verify-manifest` performs the matching post-promotion rider check.
+   - **Post-promotion withdrawal (peel and re-pack)**: when a Quest must be withdrawn *after* its code reached the trunk (a pillory after promotion, a royal ruling, a discovery that the merged code is wrong), run `court peel <quest> --reason "<why>"` from the trunk. It reverts the Quest's promotion commit out of `castle` (content-level, so the rejected code cannot ship), records the withdrawal in `.court/peels/<QUEST>.json`, and supersedes the convoy's green suite proof; the trunk invariant then treats the Quest as withdrawn. The survivors must be re-packed (`court collect` clears the peel record — the only reinstatement path) and re-verified (`court runsuite`, `court verify-convoy`) before shipping. `--dry-run` previews; `--commit <sha>` names the Quest's own code commit when its convoy was entangled with a sibling's promotion, and the command fails closed rather than reverting a sibling. Never un-pillory or delete a branch merely to make the trunk invariant green.
    - **Written UI assent (mandatory)**: UI approval is M'Lord's decision, given in chat (directly to the Court Artist in the worktree, or to the Steward) and recorded with `court ui-signoff <quest> --by "M'Lord" --note "<where it was said>"`. An `APPROVED …` sentence written by an agent is NOT approval; only a `**UI Sign-off:**` line (or an explicit `--waive` / `none-required` declaration) counts. `court ship --confirm` runs a pre-ship interrogation and refuses to merge `castle` into `main` when any Quest lacks written assent, when a Quest branch is in the trunk with no `READY_TO_RAZE`/`DONE` decision, or when a convoy carries a rider. Integrity findings never waive; `--skip-ui-review` waives ONLY the UI segment and names every waived Quest in the report.
 5. **Gate 5 — Raze & Teardown (`READY_TO_RAZE` -> `Ashes`)**:
-   - Run `court raze <id>` to verify merge ancestry, fast-forward branch, and move to Ashes. Run `court fork-teardown-list` to move and stop disposable Master of Coin and Gatekeeper scaffolding worktrees.
+   - Run `court raze <id>` to verify merge ancestry, fast-forward branch, and move to Ashes. Since 2026-11-09 **raze is mechanical, not human-gated**: after the durable `razed_at` marker it also tears down the worktree (`git worktree remove`), deletes the branch **only** when its tip is an ancestor of castle (a squash-promoted tip is kept as a ref, since deleting it is the one unrecoverable act), drops that checkout's pytest databases, and archives the Quest. `--keep-worktree` / `--no-drop-db` restore the old manual flow; every destructive step refuses a dirty tree or a path outside `.kilo/worktrees/`. `court fork-teardown-list` remains for disposable Master of Coin and Gatekeeper scaffolding worktrees.
 
 ---
 
@@ -273,7 +327,8 @@ session, no tokens) that reads `court status --json` on a timer and issues
 - single-instance lock per repo, and worktree occupancy checks that refuse to
   stack a worker beneath any live `kilo run` in the same worktree (lease or ps)
 - report-only for `PLANNED`/`CHARTERED`/`DISPATCHED` (dispatch is a Steward
-  judgment), `READY_TO_RAZE` (razing stays human), and pending-Audience quests
+  judgment) and pending-Audience quests; `READY_TO_RAZE` is acted on
+  (`raze` verifies promotion, then tears the worktree down and archives the Quest)
 
 Operate it with `--repo <path> --once` from cron or as a persistent loop;
 `--dry-run` prints decisions, `--status` reports daemon/state/counters. Journal
@@ -295,13 +350,58 @@ partners, and routine new work is queued rather than spawned:
   ledger. Queueing is the normal path because it is bounded, observable, and
   survives the Steward's session.
 
+### Clog triage: converge before spending a worker (2026-11-10)
+
+Merge drift, not missing intent, is what actually parks Quests. `castle` gains
+bookkeeping commits every tick, so a branch that was clean when its Tribute
+landed drifts again within minutes and every hand-goad re-walks the same
+conflict — the "multiple goads rebasing the same tree" waste.
+
+- **The watch already converges first.** `nightwatch.plan` plans a
+  zero-model `rebase` action for any WORKING/TRIBUTE_READY/GATE Quest with
+  `behind_code > 0`, and that Quest is skipped for coin/goad in the same tick
+  so a stale tree is never audited; the coin lands next tick. Bookkeeping-only
+  drift (`behind_code == 0`) is filtered, so the board's own `.court/`
+  snapshots never trigger a re-merge. `court goad` / `court coin` /
+  `court dispatch` additionally run `_sync_base_before_spawn` and abort the
+  spawn on a conflict rather than starting a worker on drifted code.
+- **Queue it, don't hand-dispatch it.** `court enqueue <quest> --why "..."`
+  derives the only action that can advance the Quest from its current status —
+  `PLANNED`/`CHARTERED` → `dispatch`, `WORKING`/`QUESTING`/`DISPATCHED` →
+  `goad` (remediation), `TRIBUTE_READY` → `coin`, `GATE` → `collect` — and
+  registers it as a one-shot vigil the watch drains under its worker ceiling.
+  An explicit `--action` that cannot advance that status is refused.
+- **`rebase:<quest>` is a vigil verb** (non-spawning: local `git merge castle`,
+  no model turn, no worker slot, no coin/goad attempt burned). A Steward chains
+  convergence ahead of a worker explicitly when a specific tree needs it rather
+  than waiting for the heuristic pass to notice.
+- **`--brief <repo-local file>` carries the instruction.** `dispatch:` and
+  `goad:` vigils, `court enqueue`, `court dispatch` and `court goad` accept a
+  brief that replaces the charter/goad template the worker would otherwise
+  read. A queued hand-off for a merge union, a migration renumber, or an
+  entangled file must name that work in the brief; re-stating a charter the
+  worker already satisfied is the no-op-or-churn failure mode.
+- **Chains are status edges, not repeated manual verbs**: a follow-on is
+  another vigil whose `--when` is the status this action produces
+  (`--when quest-status:<quest>=TRIBUTE_READY --then coin:<quest>`).
+- **Conflict outcomes escalate once.** A queued action that dies on
+  `git merge castle` is retired as `failed` and stamps the same
+  `merge_conflict` hold the heuristic paths use, so chained vigils hold instead
+  of re-firing into the same conflict. The Steward's move is to resolve the
+  conflict or write a remediation brief — never to goad again.
+
 ### Handing a watch off: vigils (narrowly gated, never indefinite)
 
 A Steward hands the watch a future intent only through `court vigil` — never a
 free-form "keep checking". Every vigil MUST carry a `--why` reason, a mandatory
 `--expires` (7-day ceiling), a bounded `--max-fires` (default 1), and an action
-from an allow-list (`dispatch`, `goad`, `coin`, `collect`, `advance`, `note`).
-`ship`/`raze`/`pillory` are not vigil-executable. Conditions are deterministic
+from an allow-list (`dispatch`, `goad`, `coin`, `collect`, `rebase`, `advance`,
+`note`, `muster`). `ship`/`raze`/`pillory` are not vigil-executable. A Steward's own
+check-in is a `muster:<why>` vigil: the watch summons ONE bounded triage session
+when the condition holds, so the wake-up survives its session (a
+`schedule_wakeup` timer dies with the session — the cogship-281 class — and is
+not a hand-off). `muster` stays behind `--enable steward` because it spends a
+reasoning worker. Conditions are deterministic
 predicates (`quest-status:Q123=READY_TO_RAZE`, `quest-merged:Q123`,
 `branch-merged:<branch>`, `file-exists:<path>`, `after:<iso>`), so the watch can
 evaluate them with no model call:

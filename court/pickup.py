@@ -32,7 +32,20 @@ The lane is deliberately surgical:
   * a charter for a quest that is ALREADY commissioned on `castle` (base status
     past ``CHARTERED``) is frozen — the base status is authoritative;
   * a vigil must validate under ``vigils.validate`` and must not collide with
-    an identically-id ``status: "active"`` vigil already on `castle`.
+    an identically-id ``status: "active"`` vigil already on `castle`;
+  * a decree packet whose structure or target set is unusable (an unparseable
+    id, no decisions, a status that is a human act, a Quest id with no charter)
+    is SKIPPED per file with a recorded reason — never applied to a partial
+    target set, and never allowed to wedge the rest of the batch. A decision
+    naming several Quest ids (``"Q408,Q508,..."``) is expanded mechanically to
+    one ruling per id. Lane-integrity problems (out-of-lane paths, an
+    unreadable/deleted file, a dirty collision) still reject the whole batch.
+
+A dirty-tree block is the one rejection the Night's Watch can clear without a
+Steward (see :func:`remediate`): untracked scratch under a known scratch root
+is MOVED into the watch's quarantine (never deleted, never ``git clean``) and a
+regenerable report is restored to HEAD, after which the pickup is retried. A
+real local edit is left untouched and stays a human decision.
 
 Applied-state (which pleasance tip is already merged, the last rejection)
 lives OUTSIDE the git tree, mirroring the Night's Watch's own state files —
@@ -47,6 +60,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,6 +88,7 @@ _QUEST_CHARTER_RE = re.compile(r"^\.court/quests/[^/]+\.(?:md|events\.jsonl)$")
 _VIGIL_FILE_RE = re.compile(r"^\.court/vigils/[^/]+\.json$")
 # A decree packet is M'Lord's answer to pending Audiences (see court.decisions).
 _DECREE_FILE_RE = re.compile(r"^\.court/decrees/[^/]+\.json$")
+_REQUEST_FILE_RE = re.compile(r"^\.court/requests/[^/]+\.json$")
 _SURFACE_DOC_RE = re.compile(r"^(?:AGENTS\.md|PLEASANCE\.md)$")
 # Statuses still open to Steward-driven dispatch. Anything past CHARTERED
 # (DISPATCHED/WORKING/GATE/...) means the quest is commissioned and its
@@ -81,6 +96,9 @@ _SURFACE_DOC_RE = re.compile(r"^(?:AGENTS\.md|PLEASANCE\.md)$")
 _OPEN_STATUSES = ("OPEN", "PLANNED", "CHARTERED")
 _PREREQ_HEADER_RE = re.compile(r"^#{2,3}\s+Prerequisites:?\s*$", re.MULTILINE)
 _PREREQ_LEAD_RE = re.compile(r"^-\s*(?:\[[ xX]\])?\s*")
+# A remote author stating "there are no prerequisites" is not a predicate.
+# Accept the usual sentinels instead of rejecting the whole batch for it.
+_PREREQ_NONE_RE = re.compile(r"^(?:none|nil|n/?a|no prerequisites)[.!:]?$", re.IGNORECASE)
 
 
 def _run(repo: Path, argv: list, timeout: int = 60) -> subprocess.CompletedProcess:
@@ -92,6 +110,24 @@ def _show(repo: Path, ref: str) -> str:
     """Resolve a ref to a commit sha, or '' when it does not exist."""
     res = _run(repo, ["rev-parse", "--verify", f"{ref}^{{commit}}"])
     return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def _lane_allows_charters(repo: Path) -> bool:
+    """Whether the lane may carry Quest charters itself.
+
+    Unset means yes (the historical away-mode contract). A repo that wants the
+    requests-in / charters-out discipline — because its remote author is an LLM
+    that cannot see the board and therefore cannot allocate Quest numbers — sets
+    ``pickup.allow_lane_charters: false`` in ``.court/config.json``.
+    """
+    try:
+        data = json.loads((Path(repo) / ".court" / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    pickup_cfg = data.get("pickup") if isinstance(data, dict) else None
+    if not isinstance(pickup_cfg, dict) or "allow_lane_charters" not in pickup_cfg:
+        return True
+    return bool(pickup_cfg.get("allow_lane_charters"))
 
 
 def _content(repo: Path, ref: str, path: str) -> str:
@@ -183,6 +219,8 @@ def parse_prerequisites(quest_text: str) -> list[str]:
             continue
         stripped = _PREREQ_LEAD_RE.sub("", stripped).strip()
         if not stripped:
+            continue
+        if _PREREQ_NONE_RE.match(stripped):
             continue
         out.append(stripped)
     return out
@@ -436,6 +474,172 @@ def pickup_remedy(rejection_class: str, paths=None) -> str:
     return template.format(path=first)
 
 
+# ---------------------------------------------------------------------------
+# Mechanical remediation (the Night's Watch clears its own dirty-tree block)
+# ---------------------------------------------------------------------------
+
+# Untracked roots that are never deliverables: per-Quest scratch, probe SQL,
+# caches and worker logs. A blocking file under one of these is MOVED into the
+# watch's quarantine (never deleted, never `git clean`) so the evidence survives
+# outside the tree while the lane unblocks.
+_QUARANTINE_ROOTS = ("tasks/artifacts/", ".pytest_cache/", ".ruff_cache/",
+                     "tmp/", "logs/", "__pycache__/")
+
+# Tracked reports the Court regenerates from tracked state (`court index`,
+# `court punished-audit`). A dirty copy on the trunk carries no unique work:
+# restoring it to HEAD is the mechanical clearance. Never `git stash`: that
+# leaves an entry nobody pops and re-dirties the next reader's expectations.
+_REGENERABLE_TRACKED = ("docs/PUNISHED_AUDIT.md", "docs/AI_INDEX.md",
+                        "docs/AI_INDEX.json")
+
+_IN_PROGRESS_GIT_MARKERS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
+                            "BISECT_LOG", "rebase-merge", "rebase-apply")
+
+_DIRTY_CLASSES = ("dirty-untracked", "dirty-tracked")
+
+
+def _git_dir(repo: Path) -> Optional[Path]:
+    res = _run(repo, ["rev-parse", "--absolute-git-dir"])
+    return Path(res.stdout.strip()) if res.returncode == 0 and res.stdout.strip() else None
+
+
+def _tracked_paths(repo: Path, paths) -> set:
+    if not paths:
+        return set()
+    res = _run(repo, ["ls-files", "--", *[str(p) for p in paths]])
+    return {line.strip() for line in (res.stdout or "").splitlines() if line.strip()}
+
+
+def _under_any(rel: str, roots) -> bool:
+    rel = str(rel).replace("\\", "/")
+    return any(rel == str(r).rstrip("/") or rel.startswith(str(r)) for r in roots)
+
+
+def remediation_plan(repo: Path, rejection_class: Optional[str], paths) -> dict:
+    """Decide — purely — whether a dirty-tree rejection is mechanically clearable.
+
+    Only the two dirty classes are candidates: every blocking path must be
+    either an untracked file under a known scratch root (quarantine) or a
+    tracked regenerable report (restore). Anything else is a real local edit
+    and stays a human decision, which the caller reports instead of touching.
+
+    Returns ``{"ok", "action", "untracked", "tracked", "reason"}`` where
+    ``action`` is ``quarantine``, ``restore``, ``mixed``, or ``None``.
+    """
+    named = sorted({str(p).strip() for p in (paths or ()) if str(p).strip()})
+    plan: dict = {"ok": False, "action": None, "untracked": [], "tracked": [],
+                  "reason": ""}
+    if rejection_class not in _DIRTY_CLASSES:
+        plan["reason"] = (f"rejection class {rejection_class or 'unknown'} is not a "
+                          f"dirty-tree block; no mechanical remedy")
+        return plan
+    if not named:
+        plan["reason"] = "the rejection named no blocking path; nothing to clear"
+        return plan
+    git_dir = _git_dir(repo)
+    if git_dir is not None:
+        for marker in _IN_PROGRESS_GIT_MARKERS:
+            if (git_dir / marker).exists():
+                plan["reason"] = (f"a git operation is in progress ({marker}); "
+                                  f"refusing to move or restore anything")
+                return plan
+    tracked = _tracked_paths(repo, named)
+    blocked: list[str] = []
+    for rel in named:
+        if rel in tracked:
+            if rel in _REGENERABLE_TRACKED:
+                plan["tracked"].append(rel)
+            else:
+                blocked.append(rel)
+        elif _under_any(rel, _QUARANTINE_ROOTS):
+            plan["untracked"].append(rel)
+        else:
+            blocked.append(rel)
+    if blocked:
+        plan["reason"] = ("not mechanically clearable: " + ", ".join(blocked[:3])
+                          + (f" (+{len(blocked) - 3} more)" if len(blocked) > 3 else "")
+                          + " — a real local edit needs its owner's consent")
+        return plan
+    plan["action"] = ("mixed" if plan["untracked"] and plan["tracked"]
+                      else ("quarantine" if plan["untracked"] else "restore"))
+    plan["ok"] = True
+    return plan
+
+
+def quarantine_root(repo: Path) -> Path:
+    """Where the watch parks scratch that blocked the lane (outside the tree)."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return nightwatch.state_dir(repo) / "pickup-quarantine" / stamp
+
+
+def remediate(repo: Path, rejection_class: Optional[str], paths, *,
+              dry_run: bool = False, say=print) -> dict:
+    """Clear a dirty-tree pickup block without destroying anything.
+
+    Untracked scratch is MOVED into ``quarantine_root(repo)`` preserving its
+    relative path; tracked regenerable reports are restored to HEAD. Nothing is
+    deleted, nothing is committed, and an unclassifiable edit is left untouched
+    so the caller still escalates it to a human.
+    """
+    repo = Path(repo)
+    plan = remediation_plan(repo, rejection_class, paths)
+    verdict: dict = {**plan, "dry_run": dry_run, "moved": [], "restored": [],
+                     "quarantine_dir": "", "error": None}
+    if not plan["ok"]:
+        say(f"pickup remediation declined: {plan['reason']}")
+        return verdict
+    if dry_run:
+        say(f"[dry-run] would restore {len(plan['tracked'])} tracked report(s) and "
+            f"quarantine {len(plan['untracked'])} scratch file(s)")
+        return verdict
+    if plan["tracked"]:
+        res = _run(repo, ["checkout", "--", *plan["tracked"]])
+        if res.returncode != 0:
+            verdict["ok"] = False
+            verdict["error"] = (res.stderr or res.stdout or "git checkout failed").strip()[:300]
+            say(f"pickup remediation failed restoring reports: {verdict['error']}")
+            return verdict
+        verdict["restored"] = list(plan["tracked"])
+    if plan["untracked"]:
+        root = quarantine_root(repo)
+        for rel in plan["untracked"]:
+            src = repo / rel
+            if not src.exists():
+                verdict["moved"].append(rel)
+                continue
+            dest = root / rel
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dest))
+                verdict["moved"].append(rel)
+            except OSError as e:
+                verdict["ok"] = False
+                verdict["error"] = f"could not move {rel}: {e}"[:300]
+                say(f"pickup remediation failed moving {rel}: {e}")
+                break
+        verdict["quarantine_dir"] = str(root)
+    # Re-verify: no named path may still block the lane. `-uall` avoids git's
+    # collapsed-directory form matching wrongly in either direction.
+    res = _run(repo, ["status", "--porcelain=v1", "-uall"])
+    still = {line.strip().split(None, 1)[-1] for line in (res.stdout or "").splitlines()
+             if line.strip()}
+    leftover = [p for p in plan["untracked"] + plan["tracked"]
+                if p in still or any(s.endswith("/") and p.startswith(s) for s in still)]
+    if leftover:
+        verdict["ok"] = False
+        verdict["error"] = (f"still dirty after remediation: {leftover[0]}"
+                            + (f" (+{len(leftover) - 1} more)" if len(leftover) > 1 else ""))
+        say(f"pickup remediation incomplete: {verdict['error']}")
+        return verdict
+    if verdict["moved"]:
+        say(f"🧹 quarantined {len(verdict['moved'])} scratch file(s) to "
+            f"{verdict['quarantine_dir']}")
+    if verdict["restored"]:
+        say(f"🧹 restored {len(verdict['restored'])} regenerable report(s) "
+            f"({', '.join(verdict['restored'])})")
+    return verdict
+
+
 def _append_ledger(repo: Path, line: str) -> None:
     p = Path(repo) / ".court" / "LEDGER.md"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -531,7 +735,7 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
         if text is None:
             continue
         try:
-            packet = decisions.parse_decree_packet(text)
+            packet = decisions.expand_decisions(decisions.parse_decree_packet(text))
         except decisions.DecreeError:
             continue  # the validation pass below reports it once, precisely
         for item in packet["decisions"]:
@@ -553,12 +757,24 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
         if _SURFACE_DOC_RE.match(path):
             surface_docs.append(path)
             continue
+        if _QUEST_CHARTER_RE.match(path) and not _lane_allows_charters(repo):
+            # Requests-in, charters-out (2026-11-09): the remote voice agent used
+            # to author charters, which arrived with invented numbers and no view
+            # of the board. A charter is now authored by a Steward from a
+            # request packet, so the lane's Quest paths are refused outright.
+            reason = (f"lane may not author charters ({path}) — land "
+                      f".court/requests/<id>.json instead; a Steward allocates the "
+                      f"Quest number and writes the charter (set "
+                      f"pickup.allow_lane_charters=true in .court/config.json to "
+                      f"restore the old behaviour)")
+            reject_paths = [path]
+            break
         if not (_QUEST_CHARTER_RE.match(path) or _VIGIL_FILE_RE.match(path)
-                or _DECREE_FILE_RE.match(path)):
+                or _DECREE_FILE_RE.match(path) or _REQUEST_FILE_RE.match(path)):
             reason = (f"out-of-lane path {path} in pleasance batch — only "
-                      f".court/quests/<id>.md, .court/quests/<id>.events.jsonl, "
-                      f".court/vigils/<id>.json, .court/decrees/<id>.json, AGENTS.md "
-                      f"and PLEASANCE.md may be picked up")
+                      f".court/requests/<id>.json, .court/vigils/<id>.json, "
+                      f".court/decrees/<id>.json, AGENTS.md and PLEASANCE.md may "
+                      f"be picked up")
             reject_paths = [path]
             break
     # Global gate 2: never mix the pickup commit with a dirty tree the
@@ -584,6 +800,7 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
 
     charters: list[str] = []
     vigils_to_apply: list[str] = []
+    requests_to_apply: list[str] = []
     decree_paths: list[str] = []
     decree_packets: dict[str, dict] = {}
     # Per-file supersession, NOT batch failure: a remote author may re-send a
@@ -591,7 +808,8 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
     # charter is frozen; a live vigil is already active). Those files are
     # skipped with a recorded reason so the rest of the batch still lands.
     # Only lane-integrity problems (out-of-lane paths, unreadable/deleted
-    # files, malformed paperwork, dirty collisions) reject the whole batch.
+    # files, dirty collisions) reject the whole batch; an unusable decree is a
+    # per-file skip like a superseded charter.
     skipped_files: list[dict] = []
     if reason is None:
         for path in changed:
@@ -657,18 +875,54 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
                         say(f"SKIP {path}: {skip_why} — castle copy kept")
                         continue
                 vigils_to_apply.append(path)
+            elif _REQUEST_FILE_RE.match(path):
+                text = _content(repo, tip, path)
+                if text is None:
+                    reason = f"cannot read {path} at pleasance tip (deletion is not a pickup)"
+                    reject_paths = [path]
+                    break
+                from . import requests as requests_mod
+                ok, why = requests_mod.validate_request(text)
+                if not ok:
+                    skip_why = f"request {Path(path).stem} not applied: {why}"
+                    skipped_files.append({"path": path, "reason": skip_why})
+                    say(f"SKIP {path}: {skip_why}")
+                    continue
+                req_path = Path(path).stem
+                base_text = _content(repo, base, path)
+                if base_text is not None:
+                    try:
+                        base_req = requests_mod.parse_request(base_text)
+                    except requests_mod.RequestError:
+                        base_req = None
+                    if base_req and base_req.get("chartered_quest"):
+                        skip_why = (f"request {req_path} was already chartered as "
+                                    f"{base_req['chartered_quest']}")
+                        skipped_files.append({"path": path, "reason": skip_why})
+                        say(f"SKIP {path}: {skip_why} — castle copy kept")
+                        continue
+                requests_to_apply.append(path)
             elif _DECREE_FILE_RE.match(path):
                 text = _content(repo, tip, path)
                 if text is None:
                     reason = f"cannot read {path} at pleasance tip (deletion is not a pickup)"
                     reject_paths = [path]
                     break
-                ok, why = decisions.validate_decree(text, repo)
+                # A malformed decree is a problem with ONE FILE, not with the
+                # lane. Rejecting the whole batch let a single multi-quest
+                # packet (2026-11-07) wedge four new charters and M'Lord's own
+                # pickup-remediation decree behind it for a full day, so an
+                # unusable decree is skipped and recorded, exactly like a
+                # superseded charter. It is never applied: a ruling is only
+                # written once every target it names resolves.
+                ok, why = decisions.validate_decree_for_lane(text, repo)
                 if not ok:
-                    reason = f"invalid decree {path}: {why}"
-                    reject_paths = [path]
-                    break
-                packet = decisions.parse_decree_packet(text)
+                    skip_why = f"decree {Path(path).stem} not applied: {why}"
+                    skipped_files.append({"path": path, "reason": skip_why})
+                    say(f"SKIP {path}: {skip_why}")
+                    continue
+                packet = decisions.expand_decisions(
+                    decisions.parse_decree_packet(text))
                 if packet["id"] in set(state.get("applied_decrees") or []):
                     skip_why = f"decree {packet['id']} was already applied"
                     skipped_files.append({"path": path, "reason": skip_why})
@@ -677,7 +931,7 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
                 decree_paths.append(path)
                 decree_packets[path] = packet
 
-    accepted = charters + vigils_to_apply + decree_paths
+    accepted = charters + vigils_to_apply + requests_to_apply + decree_paths
     if dry_run:
         for p in accepted:
             extra = (f" ({len(decree_packets[p]['decisions'])} royal decision(s))"
@@ -753,6 +1007,8 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
             decree_result = decisions.apply_packets(
                 repo, [decree_packets[p] for p in decree_paths])
         counts = [f"{len(charters)} charter(s)", f"{len(vigils_to_apply)} vigil(s)"]
+        if requests_to_apply:
+            counts.append(f"{len(requests_to_apply)} request(s)")
         if decree_result["applied"]:
             counts.append(f"{len(decree_result['applied'])} decree ruling(s)")
         _append_ledger(
@@ -795,6 +1051,8 @@ def run(repo: Path, *, fetch: bool = True, base: str = "castle",
         state["applied_decrees"] = applied_ids[-500:]
     save_state(repo, state)
     summary = (f"{len(charters)} charter(s), {len(vigils_to_apply)} vigil(s)")
+    if requests_to_apply:
+        summary += f", {len(requests_to_apply)} request(s)"
     if decree_result["applied"]:
         summary += f", {len(decree_result['applied'])} decree ruling(s)"
     say(f"✅ pleasance pickup applied {tip[:12]}: {summary}, {len(skipped_files)} skipped")

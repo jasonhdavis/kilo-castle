@@ -366,6 +366,30 @@ def test_a_vigil_for_a_disabled_action_is_skipped(tmp_path):
     assert any(n["level"] == "skip" for n in notes)
 
 
+def test_a_muster_vigil_wakes_one_steward_when_enabled(tmp_path):
+    """The Steward's own durable wake-up: a `muster:` vigil becomes a bounded
+    `court muster` action when the watch has the steward verb enabled."""
+    spec = _vigil(then="muster:clear the stalled Night's Watch board",
+                  when=["after:2026-01-01T00:00:00Z"])
+    actions, _ = nw.plan(_snap(), nw.load_state(tmp_path),
+                         _policy(enabled=("goad", "coin", "collect", "dispatch",
+                                          "steward")),
+                         _workers(), ready_vigils=[(spec, "ready")])
+    assert [a.kind for a in actions] == ["vigil"]
+    assert actions[0].meta["then"] == "muster:clear the stalled Night's Watch board"
+    assert actions[0].meta["spawns"] is True
+
+
+def test_a_muster_vigil_is_skipped_unless_the_watch_opted_into_steward(tmp_path):
+    spec = _vigil(then="muster:clear the stalled Night's Watch board",
+                  when=["after:2026-01-01T00:00:00Z"])
+    actions, notes = nw.plan(_snap(), nw.load_state(tmp_path),
+                             _policy(enabled=("goad", "coin", "collect", "dispatch")),
+                             _workers(), ready_vigils=[(spec, "ready")])
+    assert actions == []
+    assert any(n["level"] == "skip" and "steward" in n["text"] for n in notes)
+
+
 # ---------------------------------------------------------------------------
 # Context thresholds — cull line / red zone (soft / hard)
 # ---------------------------------------------------------------------------
@@ -480,6 +504,88 @@ def test_a_successful_action_clears_the_retry_window(tmp_path):
     assert state["quests"]["Q1"]["retry_at"] == 1300.0
     nw._apply_bookkeeping(state, action, {"ok": True, "stderr_tail": ""}, 1500.0)
     assert state["quests"]["Q1"]["retry_at"] == 0
+
+
+def test_session_prune_runs_only_on_an_idle_board_once_per_interval(tmp_path):
+    """The kilo.db perennial: razing is housekeeping, so it may only run when
+    nothing else is happening (VACUUM takes an exclusive lock) and at most once
+    per interval."""
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt, razed_at="2026-11-01T00:00:00Z"))
+    state = nw.load_state(tmp_path)
+    pol = _policy(max_workers=3, enabled=("prune",),
+                  session_prune_interval=86400, session_retention_days=14)
+
+    actions, _ = nw.plan(snap, state, pol, _workers(0), now=100_000.0)
+    (prune,) = [a for a in actions if a.kind == "prune"]
+    assert prune.meta["days"] == 14
+    assert prune.meta["vacuum"] is True
+
+    # A live worker anywhere makes the board non-idle.
+    actions, _ = nw.plan(snap, state, pol, _workers(1), now=200_000.0)
+    assert not [a for a in actions if a.kind == "prune"]
+
+    # Worker-spawning work this tick also defers it.
+    wt2 = _free(tmp_path, "wt2")
+    working = _snap(_q("Q1", "READY_TO_RAZE", wt, razed_at="2026-11-01T00:00:00Z"),
+                    _q("Q2", "WORKING", wt2, worker="exited"))
+    pol2 = _policy(max_workers=3, enabled=("prune", "goad"),
+                   session_prune_interval=86400)
+    actions, _ = nw.plan(working, state, pol2, _workers(0), now=300_000.0)
+    assert [a.kind for a in actions] == ["goad"]
+
+    # The interval is respected after a successful raze.
+    state["maintenance"] = {"session_prune_ts": 400_000.0}
+    plain = _snap(_q("Q1", "READY_TO_RAZE", wt, razed_at="2026-11-01T00:00:00Z"))
+    actions, _ = nw.plan(plain, state, pol, _workers(0), now=400_060.0)
+    assert not [a for a in actions if a.kind == "prune"]
+    actions, _ = nw.plan(plain, state, pol, _workers(0), now=400_000.0 + 86401)
+    assert [a.kind for a in actions if a.kind == "prune"]
+
+
+def test_a_failed_session_prune_backs_off_and_a_success_stamps_the_interval(tmp_path):
+    state = nw.load_state(tmp_path)
+    action = nw.Action(kind="prune", quest_ids=[],
+                       meta={"days": 14, "retry_backoff": 300})
+    nw._apply_bookkeeping(state, action, {"ok": False, "stderr_tail": "database is locked"}, 1000.0)
+    maint = state["maintenance"]
+    assert maint["session_prune_fails"] == 1
+    assert maint["session_prune_retry_at"] == 1300.0
+    assert "session_prune_ts" not in maint
+
+    nw._apply_bookkeeping(state, action, {"ok": True, "stdout_tail": "done"}, 2000.0)
+    maint = state["maintenance"]
+    assert maint["session_prune_ts"] == 2000.0
+    assert maint["session_prune_fails"] == 0
+
+
+def test_a_repeatedly_failing_convoy_backs_off_exponentially(tmp_path):
+    """cogship-381/399 storm: identical failures retried every 300s for hours.
+    Consecutive failures now double the window (capped) instead of looping."""
+    state = nw.load_state(tmp_path)
+    action = nw.Action(kind="collect", quest_ids=["Q1"],
+                       meta={"convoy": "cogship-381", "retry_backoff": 300,
+                             "max_retry_backoff": 3600})
+    for expected in (1300.0, 1600.0, 2200.0, 3400.0, 4600.0, 4600.0):
+        nw._apply_bookkeeping(state, action, {"ok": False, "stderr_tail": "boom"}, 1000.0)
+        assert state["convoys"]["cogship-381"]["retry_at"] == expected
+    assert state["convoys"]["cogship-381"]["fails"] == 6
+
+
+def test_a_convoy_at_the_fail_ceiling_is_escalated_as_a_dead_letter(tmp_path):
+    state = nw.load_state(tmp_path)
+    state["convoys"]["cogship-381"] = {
+        "fails": 3, "retry_at": 0, "last_error": "already exists (prior convoy died)",
+    }
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "GATE", wt, cogship_id="cogship-381"))
+    actions, notes = nw.plan(snap, state, _policy(max_workers=10), _workers(), now=5000.0)
+    (esc,) = [n for n in notes if n.get("key") == "convoy_fails"]
+    assert esc["level"] == "human"
+    assert "DEAD LETTER" in esc["text"]
+    # The convoy still retries at the capped window: fixing the blocker (or a
+    # restart) resumes it without a manual state reset.
+    assert [a.kind for a in actions] == ["collect"]
 
 
 def test_a_failed_convoy_pack_does_not_burn_the_gate_cooldown(tmp_path):
@@ -833,16 +939,19 @@ def test_digest_names_stuck_convoys_and_separates_noops(tmp_path, monkeypatch):
 # Opt-in raze / teardown help
 # ---------------------------------------------------------------------------
 
-def test_raze_is_off_by_default_and_planned_when_enabled(tmp_path):
+def test_raze_is_on_by_default_and_honours_an_explicit_disable(tmp_path):
+    """Razing stopped being a human gate on 2026-11-09: promotion is verified by
+    `court raze` itself, and the teardown that follows is mechanical. Disabling
+    it is still possible, and then the watch reports instead of acting."""
     wt = _free(tmp_path)
     snap = _snap(_q("Q1", "READY_TO_RAZE", wt, worker="idle"))
-    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers())
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers())
+    assert [(a.kind, a.quest_ids) for a in actions] == [("raze", ["Q1"])]
+
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path),
+                             _policy(enabled=("goad",)), _workers())
     assert actions == []
     assert any(n["level"] == "report" and "READY_TO_RAZE" in n["text"] for n in notes)
-
-    actions, _ = nw.plan(snap, nw.load_state(tmp_path),
-                         _policy(enabled=("raze",), max_workers=4), _workers())
-    assert [(a.kind, a.quest_ids) for a in actions] == [("raze", ["Q1"])]
 
 
 def test_raze_waits_for_a_live_worker(tmp_path):
@@ -867,18 +976,25 @@ def test_raze_action_runs_court_raze(tmp_path, monkeypatch):
     assert seen["argv"] == ["raze", "Q7"]
 
 
-def test_a_razed_quest_is_never_re_razed(tmp_path):
-    """The durable razed_at marker distinguishes 'awaiting raze' from
-    'already razed, awaiting manual prune' (the Q006/Q014 hourly no-op loop)."""
+def test_a_razed_quest_gets_one_teardown_and_no_re_verification(tmp_path):
+    """The durable razed_at marker distinguishes 'awaiting raze' from 'already
+    razed'. The latter only needs the outstanding teardown, so the watch emits
+    one idempotent `raze` (which tears down and archives) rather than repeating
+    the promotion checks — the Q006/Q014 hourly no-op loop."""
     wt = _free(tmp_path)
     snap = _snap(_q("Q1", "READY_TO_RAZE", wt, worker="idle",
                     razed_at="2026-11-02T16:00:00Z"))
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path),
+                         _policy(max_workers=4), _workers())
+    assert [(a.kind, a.quest_ids) for a in actions] == [("raze", ["Q1"])]
+    assert "teardown" in actions[0].reason
+
+    # Disabled: the old report-only behaviour, naming the outstanding teardown.
     actions, notes = nw.plan(snap, nw.load_state(tmp_path),
-                             _policy(enabled=("raze",), max_workers=4), _workers())
+                             _policy(enabled=("goad",)), _workers())
     assert actions == []
     (note,) = [n for n in notes if n.get("key") == "razed_pruned"]
     assert "already razed" in note["text"]
-    assert "teardown-list" in note["text"]
 
 
 def test_teardown_is_on_by_default_and_planned_when_the_convoy_is_dead(tmp_path):
@@ -1287,6 +1403,39 @@ def test_a_drifted_tribute_ready_quest_rebases_instead_of_coining(tmp_path):
     assert [a.kind for a in actions] == ["coin"]
 
 
+def test_bookkeeping_only_drift_does_not_rebase(tmp_path):
+    """The trunk gains a `.court/board.json` snapshot every tick, so a branch
+    is always "1 behind". Rebasing on that churn re-merges the same branch
+    every tick and burns the spawn budget, so bookkeeping-only drift is not
+    a rebase trigger."""
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "TRIBUTE_READY", wt,
+                    git_status={"behind": 1, "behind_code": 0}))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(max_workers=4), _workers())
+    assert [a.kind for a in actions] == ["coin"]
+    assert any("bookkeeping-only" in n["text"] for n in notes)
+
+
+def test_scaffolding_only_dirt_does_not_block_a_rebase(tmp_path):
+    """`.kilo/TASK*.md` prompts are regenerated on every spawn; they must not
+    freeze a drifted Quest out of convergence forever."""
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "TRIBUTE_READY", wt,
+                    git_status={"behind": 5, "behind_code": 5,
+                                "dirty": True, "dirty_disposable_only": True}))
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path), _policy(max_workers=4), _workers())
+    assert [(a.kind, a.quest_ids) for a in actions] == [("rebase", ["Q1"])]
+
+
+def test_real_dirt_still_blocks_a_rebase(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "TRIBUTE_READY", wt,
+                    git_status={"behind": 5, "behind_code": 5, "dirty": True}))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(max_workers=4), _workers())
+    assert "rebase" not in [a.kind for a in actions]
+    assert any("DIRTY" in n["text"] for n in notes)
+
+
 def test_a_conflicted_rebase_holds_the_quest_and_does_not_coin(tmp_path):
     wt = _free(tmp_path)
     state = nw.load_state(tmp_path)
@@ -1325,3 +1474,118 @@ def test_rebase_disabled_yields_no_rebase_action(tmp_path):
     pol = _policy(enabled=("goad", "coin", "collect", "dispatch", "teardown"))
     actions, _ = nw.plan(snap, nw.load_state(tmp_path), pol, _workers())
     assert [a.kind for a in actions] == ["coin"]
+
+
+def test_ready_to_raze_is_razed_by_default(tmp_path):
+    """Razing is mechanical now: a READY_TO_RAZE Quest with a free worktree is
+    planned for `court raze` (which verifies promotion, then tears down)."""
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers(),
+                             raze_regate=[])
+    assert [a.kind for a in actions] == ["raze"]
+    assert not [n for n in notes if n["level"] == "human"]
+
+
+def test_already_razed_quest_still_gets_its_teardown(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt, razed_at="2026-11-08T00:00:00Z"))
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers(),
+                         raze_regate=[])
+    assert [a.kind for a in actions] == ["raze"]
+    assert "teardown" in actions[0].reason
+
+
+def test_a_raze_the_gate_refuses_is_regated_mechanically(tmp_path):
+    """The branch tip not being an ancestor of castle is a mechanical problem,
+    not a human one: hand the Quest back to a fresh convoy."""
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt))
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers(),
+                         raze_regate=["Q1"])
+    assert [a.kind for a in actions] == ["regate"]
+
+
+def test_a_regate_that_keeps_failing_escalates_to_a_steward(tmp_path):
+    wt = _free(tmp_path)
+    state = nw.load_state(tmp_path)
+    state["quests"] = {"Q1": {"regate_fails": 2}}
+    snap = _snap(_q("Q1", "READY_TO_RAZE", wt))
+    actions, notes = nw.plan(snap, state, _policy(max_regates=2), _workers(),
+                             raze_regate=["Q1"])
+    assert actions == []
+    assert any(n["level"] == "human" and n.get("key") == "regate_exhausted" for n in notes)
+
+
+def test_a_failed_regate_counts_and_a_success_clears_it(tmp_path):
+    state = nw.load_state(tmp_path)
+    action = nw.Action(kind="regate", quest_ids=["Q1"], meta={"retry_backoff": 300})
+    nw._apply_bookkeeping(state, action, {"ok": False, "stderr_tail": "boom"}, 1000.0)
+    assert state["quests"]["Q1"]["regate_fails"] == 1
+    nw._apply_bookkeeping(state, action, {"ok": True, "stdout_tail": ""}, 2000.0)
+    assert state["quests"]["Q1"]["regate_fails"] == 0
+
+
+def test_pytest_db_reaping_runs_only_on_an_idle_board_once_per_interval(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "WORKING", wt, worker="live"))
+    state = nw.load_state(tmp_path)
+    state["supervisor_started"] = 1.0
+    pol = _policy(pg_prune_interval=3600)
+
+    actions, _ = nw.plan(snap, state, pol, _workers(0), now=100_000.0)
+    assert [a.kind for a in actions] == ["pgprune"]
+
+    # A live worker makes the board non-idle, and the interval is respected.
+    actions, _ = nw.plan(snap, state, pol, _workers(1), now=100_000.0)
+    assert not [a for a in actions if a.kind == "pgprune"]
+    state["maintenance"] = {"pg_prune_ts": 100_000.0}
+    actions, _ = nw.plan(snap, state, pol, _workers(0), now=100_060.0)
+    assert not [a for a in actions if a.kind == "pgprune"]
+    actions, _ = nw.plan(snap, state, pol, _workers(0), now=103_601.0)
+    assert [a.kind for a in actions if a.kind == "pgprune"]
+
+
+def test_an_open_charter_request_summons_one_steward_turn(tmp_path):
+    """Requests-in, charters-out: the watch charters a request instead of
+    letting the requester invent a Quest number."""
+    state = nw.load_state(tmp_path)
+    snap = _snap()
+    req = {"id": "req-2026-11-09-thing", "title": "Ship the thing"}
+    actions, _ = nw.plan(snap, state, _policy(), _workers(), now=1000.0,
+                         charter_requests=[req])
+    assert [(a.kind, a.quest_ids) for a in actions] == [("charter", ["req-2026-11-09-thing"])]
+
+
+def test_chartering_honours_capacity_and_the_cooldown(tmp_path):
+    state = nw.load_state(tmp_path)
+    snap = _snap()
+    req = {"id": "req-1", "title": "Ship it"}
+    actions, _ = nw.plan(snap, state, _policy(max_workers=1), _workers(count=1), now=1000.0,
+                         charter_requests=[req])
+    assert not [a for a in actions if a.kind == "charter"]
+
+    pol = _policy()
+    actions, _ = nw.plan(snap, state, pol, _workers(), now=1000.0, charter_requests=[req])
+    assert [a.kind for a in actions] == ["charter"]
+    nw._apply_bookkeeping(state, actions[0], {"ok": False, "stderr_tail": "boom"}, 1000.0)
+    actions, _ = nw.plan(snap, state, pol, _workers(), now=1000.0 + 60,
+                         charter_requests=[req])
+    assert not [a for a in actions if a.kind == "charter"]
+
+
+def test_a_charter_request_that_keeps_failing_escalates_to_a_human(tmp_path):
+    state = nw.load_state(tmp_path)
+    state["requests"] = {"req-1": {"fails": 2}}
+    snap = _snap()
+    actions, notes = nw.plan(snap, state, _policy(max_charter_fails=2), _workers(), now=1000.0,
+                             charter_requests=[{"id": "req-1", "title": "Ship it"}])
+    assert not [a for a in actions if a.kind == "charter"]
+    assert any(n["level"] == "human" and n.get("key") == "charter_exhausted" for n in notes)
+
+
+def test_chartering_is_disabled_without_the_verb(tmp_path):
+    actions, notes = nw.plan(_snap(), nw.load_state(tmp_path), _policy(enabled=("goad",)),
+                             _workers(), charter_requests=[{"id": "req-1", "title": "Ship it"}])
+    assert not [a for a in actions if a.kind == "charter"]
+    assert any("chartering disabled" in n["text"] for n in notes)

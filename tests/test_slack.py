@@ -427,6 +427,57 @@ def test_pickup_rejection_needs_streak_three_or_a_remedy(tmp_path, monkeypatch):
     assert "rebase the plea onto castle" in items[0]["text"]
 
 
+def test_a_standing_conflict_keeps_one_fingerprint_as_drift_grows(tmp_path, monkeypatch):
+    """Board-snapshot commits move `behind` every tick; the blocker identity must
+    not, or the same conflict is re-posted to Slack every few minutes."""
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(slack.decisions, "collect", lambda repo, snap=None, **kw: [])
+    watch = {"quests": {"Q123-Held-Thing": {"merge_conflict": {
+        "files": ["a.py"], "ts": 1, "escalated_ts": 2,
+    }}}, "last_pickup": {}}
+
+    first = slack.collect_items(
+        repo, _snap(_quest("Q123-Held-Thing", status="TRIBUTE_READY", behind=2)), watch)
+    later = slack.collect_items(
+        repo, _snap(_quest("Q123-Held-Thing", status="TRIBUTE_READY", behind=9)), watch)
+    assert first[0]["fingerprint"] == later[0]["fingerprint"]
+
+
+def test_a_standing_pickup_rejection_keeps_one_fingerprint_as_the_streak_grows():
+    quests = {"quests": {}, "last_pickup": {"rejected": "invalid prerequisite 'None.'"}}
+    three = slack.blocker_items(_snap(), dict(quests, pickup_streak=3))
+    nine = slack.blocker_items(_snap(), dict(quests, pickup_streak=9))
+    assert three[0]["fingerprint"] == nine[0]["fingerprint"]
+
+
+def test_a_refused_channel_backs_off_instead_of_retrying_every_tick(tmp_path, monkeypatch):
+    """If Slack stops accepting our posts (app messaging turned off, bot
+    removed), the bridge must go quiet for a while — not re-attempt every tick."""
+    monkeypatch.setenv("COURT_SLACK_TOKEN", "xoxb-test-token")
+    monkeypatch.setenv("COURT_SLACK_CHANNEL", "C012345")
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(slack.nightwatch, "snapshot", lambda repo, timeout=0: _snap())
+    monkeypatch.setattr(slack.nightwatch, "load_state", lambda repo: {"quests": {}, "last_pickup": {}})
+    monkeypatch.setattr(slack.decisions, "collect",
+                        lambda repo, snap=None, **kw: _frontier_many(2))
+    monkeypatch.setattr(slack, "ingest_replies", lambda *a, **k: [])
+
+    def _refuse(cfg, text, state=None):
+        raise slack.SlackError("Sending messages to this app has been turned off")
+
+    monkeypatch.setattr(slack, "post_message", _refuse)
+    out = []
+    slack.sync(repo, say=out.append)
+    assert any("ERROR" in line for line in out)
+    assert slack._in_post_backoff(slack.load_state(repo))
+
+    # Next tick: nothing is attempted, and nothing is recorded as sent.
+    monkeypatch.setattr(slack, "post_message",
+                        lambda *a, **k: pytest.fail("must not post during backoff"))
+    result = slack.sync(repo, say=out.append)
+    assert result["posted"] == []
+
+
 def test_eight_items_post_five_messages_plus_one_digest_then_nothing(tmp_path, monkeypatch):
     monkeypatch.setenv("COURT_SLACK_TOKEN", "xoxb-test-token")
     monkeypatch.setenv("COURT_SLACK_CHANNEL", "C012345")

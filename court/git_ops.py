@@ -69,6 +69,31 @@ def _is_generated_scaffolding(rel_path: str) -> bool:
     return bool(_SCAFFOLDING_TASK_RE.match(rel_path.replace("\\", "/")))
 
 
+def _merge_refused_on_local_changes(merge_res: dict) -> bool:
+    """True when git refused the merge because it would overwrite local edits.
+
+    A merge that is refused for this reason is safe to retry after restoring the
+    dirty scaffolding copies; any other failure (conflict, missing ref) is not.
+    """
+    text = f"{merge_res.get('stderr', '')}\n{merge_res.get('stdout', '')}".lower()
+    return (
+        "would be overwritten" in text
+        or "local changes" in text
+        or "untracked working tree files" in text
+    )
+
+
+# The Court's own trunk-side bookkeeping snapshots: regenerated on every tick
+# (`.court/board.json` is re-committed by the Night's Watch board snapshot), so
+# any stale branch conflicts on them as pure bookkeeping — never shipped code.
+# The base's canonical copy wins during convergence.
+_BOOKKEEPING_SNAPSHOT_FILES = frozenset({".court/board.json"})
+
+
+def _is_bookkeeping_snapshot(rel_path: str) -> bool:
+    return rel_path.replace("\\", "/") in _BOOKKEEPING_SNAPSHOT_FILES
+
+
 def _ledger_row_timestamp(line: str) -> Optional[str]:
     m = _HISTORY_ROW_RE.match(line)
     if m:
@@ -1156,10 +1181,16 @@ def rebase_worktree_onto_base(
         result["error"] = f"git status failed: {status_res.get('stderr')}"
         return result
     dirty_lines = [l for l in status_res.get("stdout", "").splitlines() if l.strip()]
+    scaffolding_to_revert: list[str] = []
     if dirty_lines:
         # Generated `.kilo/TASK*.md` prompts are rewritten on every spawn and are
-        # never deliverables: restore them instead of refusing forever. Any real
-        # (non-scaffolding) dirt still blocks the rebase.
+        # never deliverables, so they do not block the rebase. They are also the
+        # worktree's only live copy of the current brief (the atelier rewrites
+        # `.kilo/TASK_ARTIST.md` without committing it), so they must NOT be
+        # discarded up front: `git checkout --` restores whatever stale copy the
+        # branch has and silently replaces the live brief (the cogship-495
+        # class). Keep them, and fall back to the revert only when the merge
+        # itself refuses because it would overwrite the file.
         disposable = [l for l in dirty_lines
                       if _is_generated_scaffolding(l[3:].strip())]
         blocking = [l for l in dirty_lines if l not in disposable]
@@ -1169,11 +1200,8 @@ def rebase_worktree_onto_base(
                 "must be cleaned by Serf before rebase"
             )
             return result
-        tracked = [l[3:].strip() for l in disposable
-                   if not l.strip().startswith("??")]
-        if tracked:
-            _run(["git", "checkout", "--", *tracked], p)
-            result["auto_resolved_files"] = list(tracked)
+        scaffolding_to_revert = [l[3:].strip() for l in disposable
+                                 if not l.strip().startswith("??")]
 
     behind_res = _run(["git", "rev-list", "--count", f"HEAD..{base_branch}"], p)
     before_behind = None
@@ -1186,6 +1214,12 @@ def rebase_worktree_onto_base(
         return result
 
     merge_res = _run(["git", "merge", base_branch, "--no-edit"], p, timeout=120)
+    if (not merge_res.get("ok")
+            and scaffolding_to_revert
+            and _merge_refused_on_local_changes(merge_res)):
+        _run(["git", "checkout", "--", *scaffolding_to_revert], p)
+        result["auto_resolved_files"] = list(scaffolding_to_revert)
+        merge_res = _run(["git", "merge", base_branch, "--no-edit"], p, timeout=120)
     if merge_res.get("ok"):
         result["ok"] = True
         result["merged"] = True
@@ -1215,6 +1249,15 @@ def rebase_worktree_onto_base(
                 add_res = _run(["git", "add", f], p)
                 if chk_res.get("ok") and add_res.get("ok"):
                     auto_resolved.append(f)
+                else:
+                    remaining_conflicts.append(f)
+            elif _is_bookkeeping_snapshot(norm):
+                # Trunk-side bookkeeping snapshot (board.json): the base's
+                # canonical copy wins, unblocking the convergence.
+                chk_res = _run(["git", "checkout", f"--theirs", f], p)
+                add_res = _run(["git", "add", f], p)
+                if chk_res.get("ok") and add_res.get("ok"):
+                    auto_resolved.append(f + " (board snapshot)")
                 else:
                     remaining_conflicts.append(f)
             elif _is_generated_scaffolding(norm):

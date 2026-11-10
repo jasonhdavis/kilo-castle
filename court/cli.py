@@ -4575,6 +4575,13 @@ def cmd_artist(args):
 
     model = getattr(args, "model", None) or quest.artist_model or config.get_model("artist")
     provider = getattr(args, "provider", None) or config.get_provider("artist")
+    # .env plumbing — the gitignored per-checkout env file is absent in fresh
+    # worktrees, so the runserver dies on the missing QSTASH_URL before the
+    # review can open (same first-boot failure studio/atelier guard against).
+    root_env = REPO_ROOT / ".env"
+    if root_env.is_file() and not (wt / ".env").exists():
+        shutil.copy2(root_env, wt / ".env")
+
     port, runserver_url, server_status = _ensure_worktree_server(
         wt,
         port_override=getattr(args, "port", None),
@@ -5955,24 +5962,20 @@ def _quest_worktree_charter(quest: Quest) -> Optional[Quest]:
 def _pack_quest_branches(quests: list, wt_path: Path, cogship_id: str) -> tuple[list, list]:
     """Sequentially merge candidate Quest branches into the convoy worktree.
 
-    A branch that conflicts with earlier merges is isolated (merge aborted,
-    tree restored) and reported back — it stays stamped on the Cog Ship and
-    the Gatekeeper integrates it in the normal post-review pass.
+    Delegates to the studio conflict policy (`_merge_quest_branches_with_policy`):
+    charter paperwork — including the trunk's own `.court/board.json` snapshot —
+    resolves branch-wins, genuine code overlap resolves as a disclosed union, and
+    anything the policy cannot resolve isolates the branch (merge aborted, tree
+    restored) so it stays stamped on the Cog Ship for the Gatekeeper's normal
+    post-review pass. Without the bookkeeping branch-wins rule a convoy could not
+    pack any branch whose only divergence from the trunk is regenerated `.court/**`
+    state (board snapshots, ledger syncs), which the engine already treats as
+    non-invalidating drift.
     """
-    merged: list = []
-    isolated: list[tuple[str, str]] = []
-    for quest in quests:
-        res = git_ops._run(
-            ["git", "merge", quest.branch, "--no-edit", "-m", f"court: pack {quest.id} into {cogship_id} (atelier)"],
-            wt_path,
-        )
-        if res.get("ok"):
-            merged.append(quest)
-            continue
-        git_ops._run(["git", "merge", "--abort"], wt_path)
-        git_ops._run(["git", "reset", "--hard", "HEAD"], wt_path)
-        reason = ((res.get("stderr") or "") + (res.get("stdout") or "")).strip().splitlines()
-        isolated.append((quest.id, reason[-1][:200] if reason else "merge failed"))
+    merged, reports = _merge_quest_branches_with_policy(
+        quests, wt_path, cogship_id, merge_label="Cog Ship convoy",
+    )
+    isolated = [(r["id"], r["isolated"]) for r in reports if r.get("isolated")]
     return merged, isolated
 
 
@@ -5997,6 +6000,14 @@ STUDIO_PAPERWORK_PREFIXES = (
 STUDIO_PAPERWORK_FILES = (
     ".court/LEDGER.md",
     ".court/EDICTS.md",
+    # `.court/board.json` is the Night's Watch's own board snapshot, re-committed
+    # onto the trunk on every tick (`.court/**` drift never invalidates a Quest
+    # branch). It therefore conflicts on almost every stale branch purely as
+    # bookkeeping; taking either side is safe because the next `court` command
+    # regenerates it. Classifying it as paperwork — rather than letting it fall
+    # through to the JSON-breaking union resolver — is what lets a convoy pack a
+    # branch whose only divergence is bookkeeping.
+    ".court/board.json",
     ".kilo/TASK.md",
     ".kilo/TASK_ARTIST.md",
 )
@@ -6075,8 +6086,11 @@ def _union_merge_path(wt_path: Path, path: str) -> tuple[bool, str]:
     return True, "union of both sides' line-level changes"
 
 
-def _merge_quest_branches_with_policy(quests: list, wt_path: Path, studio_label: str) -> tuple[list, list[dict]]:
-    """Sequentially merge candidate Quest branches into the studio worktree
+def _merge_quest_branches_with_policy(
+    quests: list, wt_path: Path, studio_label: str,
+    merge_label: str = "combined artist studio",
+) -> tuple[list, list[dict]]:
+    """Sequentially merge candidate Quest branches into the studio/convoy worktree
     under the established conflict policy (Q-2; hand-run Q472/Q473/Q412, Q589,
     and Q617 cohorts):
 
@@ -6098,7 +6112,7 @@ def _merge_quest_branches_with_policy(quests: list, wt_path: Path, studio_label:
         res = git_ops._run(
             [
                 "git", "merge", quest.branch, "--no-edit", "-m",
-                f"court: merge {quest.id} into combined artist studio {studio_label}",
+                f"court: merge {quest.id} into {merge_label} {studio_label}",
             ],
             wt_path,
         )
@@ -6494,6 +6508,14 @@ def cmd_atelier(args):
         sys.exit(1)
 
     setup_worktree_agent_config(wt_path, "artist")
+
+    # .env plumbing — the gitignored per-checkout env file is absent in fresh
+    # worktrees (same Q617 first-boot failure studio guards against: the
+    # runserver dies on the missing QSTASH_URL before the review can open).
+    root_env = repo_root / ".env"
+    if root_env.is_file() and not (wt_path / ".env").exists():
+        shutil.copy2(root_env, wt_path / ".env")
+
     port, runserver_url, server_status = _ensure_worktree_server(
         wt_path,
         port_override=getattr(args, "port", None),

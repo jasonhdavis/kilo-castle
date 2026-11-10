@@ -5200,6 +5200,23 @@ def cmd_raze(args):
             print(f"Skipping {qid}: {e}")
             return
 
+        # UI-mandate guard: razing tears the worktree down, and that worktree is
+        # where the mandated artist session has to run (Q1135 shipped without
+        # one). The deliberate way past this is a sign-off or an explicit
+        # clearance (`court ui-mandate <quest> --clear --source "<why>"`).
+        try:
+            mandate_outstanding, mandate_detail = convoy_guard.ui_mandate_outstanding(
+                git_ops.get_repo_root(), quest.id)
+        except Exception:  # noqa: BLE001 — never block a raze on a charter parse
+            mandate_outstanding, mandate_detail = False, ""
+        if mandate_outstanding:
+            print(f"⏸️  {quest.id}: UI MANDATE unmet — {mandate_detail[:220]}")
+            print(f"    Razing would destroy the worktree the artist session needs. Run "
+                  f"`court artist {quest.id}` / `court studio <ids>`, record "
+                  f"`court ui-signoff {quest.id} --by M'Lord --note \"<where said>\"`, or clear "
+                  f"the mandate (`court ui-mandate {quest.id} --clear --source \"<why>\"`).")
+            return
+
         # Pillory linkage guard: a Punished Quest's frozen worktree is never
         # razed on its own — only once its successor has actually completed,
         # then both are razed together in the same pass.
@@ -5559,6 +5576,19 @@ def cmd_collect(args):
                     "--allow-pending-studio",
                 ))
                 continue
+        # A recorded UI MANDATE (royal decree or charter requirement) is not
+        # tracked debt: the Quest waits for its artist session instead of being
+        # packed with the review unperformed. `--allow-ui-pending` does not
+        # apply — a mandate is cleared by a sign-off, not by a warning flag.
+        mandate_outstanding, mandate_detail = convoy_guard.ui_mandate_outstanding(repo_root, quest.id)
+        if mandate_outstanding:
+            skipped.append((
+                quest.id,
+                f"UI mandate unmet — {mandate_detail}. Run the artist/studio session "
+                "(`court artist <quest>` / `court studio <ids>`) and record the sign-off "
+                "(`court ui-signoff <quest> --by \"M'Lord\" --note \"<where said>\"`) before packing",
+            ))
+            continue
         # Gates read the worktree charter first (freshest: coin verdicts and
         # UI-review approvals commit on the branch before any convoy promotes),
         # falling back to the castle copy when no worktree exists.
@@ -8641,6 +8671,17 @@ def cmd_ui_signoff(args):
     stamp = now_iso()
     suffix = f" — {note}" if note else ""
     if getattr(args, "defer", False):
+        mandated, mandate_source = convoy_guard.ui_mandate(
+            git_ops.get_repo_root(), quest.id)
+        if mandated:
+            print(
+                f"ERROR: {quest.id} carries a UI MANDATE ({mandate_source[:160]}). A deferral "
+                f"turns a required step into tracked debt — the Q1135 failure. Run the artist "
+                f"session and record the sign-off, or use --waive with the reason if the owner "
+                f"has released the requirement.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         review_line = f"- **UI Review:** DEFERRED — {by} — {stamp}{suffix}"
         kind = "deferral"
     elif args.waive:
@@ -8675,14 +8716,64 @@ def cmd_ui_signoff(args):
         print("   (no prior UI Review line existed — one was added to Master of Coin's Audit)")
 
 
+def cmd_ui_mandate(args):
+    """Record (or clear) a UI MANDATE on a Quest's charter.
+
+    Ordinary UI review is tracked debt. A mandate is different: the Quest's own
+    paperwork (a royal decree, an owner's charter note) names the Court Artist /
+    UI Studio session as a REQUIRED step before the UI may be called complete.
+    Recording it turns that step into a gate instead of a warning — `court
+    collect`, `court verify-convoy` and `court ship` all refuse until a written
+    sign-off exists, and `court ui-signoff --defer` refuses to launder it.
+
+    The marker lives next to the UI Review evidence in the Master of Coin's
+    Audit section, so the charter carries the requirement and its provenance.
+    """
+    quest = store.load(args.quest_id)
+    source = (args.source or "").strip()
+    stamp = now_iso()
+    section_name = "Master of Coin's Audit"
+    section = quest.body_sections.get(section_name) or quest.body_sections.get("Master of Coin Review", "")
+    lines = section.splitlines()
+
+    if args.clear:
+        line = f"- **UI Mandate:** none — cleared by {args.by or 'steward'} — {stamp}" + (
+            f" — {source}" if source else "")
+        kind = "cleared"
+    else:
+        if not source:
+            print("ERROR: --source is required (the decree id or charter note that requires "
+                  "the session)", file=sys.stderr)
+            sys.exit(1)
+        line = f"- **UI Mandate:** REQUIRED — {source} — recorded by {args.by or 'steward'} — {stamp}"
+        kind = "recorded"
+
+    replaced = False
+    for index, existing in enumerate(lines):
+        if re.match(r"(?i)^\s*[-*]?\s*\*{0,2}UI Mandate\*{0,2}:", existing):
+            lines[index] = line
+            replaced = True
+    if not replaced:
+        lines.append(line)
+    quest.body_sections[section_name] = "\n".join(lines).strip()
+    quest.log_ledger(quest.status, quest.status,
+                     f"UI mandate {kind}" + (f" — {source}" if source and not args.clear else ""))
+    store.save(quest, auto_commit=not getattr(args, "no_commit", False))
+    print(f"✅ {quest.id}: UI mandate {kind}")
+    if not args.clear:
+        print("   Packing is now blocked until a written sign-off exists "
+              "(`court ui-signoff <quest> --by M'Lord --note ...`).")
+
+
 def _ship_interrogation(args, quests, trunk: str) -> tuple[list[str], list[str]]:
     """Pre-confirm interrogation of what `ship --confirm` would carry.
 
     Returns ``(integrity, ui)``. Integrity findings always block: they mean
-    the trunk itself is wrong (code merged with no promotion decision, or a
-    convoy rider). UI review never blocks this ship — outstanding/deferred
-    review is reported as debt and closed later by a Court Artist pass, so
-    ``ui`` is always empty."""
+    the trunk itself is wrong (code merged with no promotion decision, a convoy
+    rider, or a recorded UI MANDATE with no evidenced review). Ordinary
+    outstanding/deferred review is debt, reported and closed later by a Court
+    Artist pass, so ``ui`` stays empty — a mandate is the one UI finding that
+    belongs in ``integrity``."""
     repo_root = git_ops.get_repo_root()
     integrity: list[str] = []
     ui: list[str] = []
@@ -8712,10 +8803,17 @@ def _ship_interrogation(args, quests, trunk: str) -> tuple[list[str], list[str]]
     if not rider_findings:
         print("   ✅ every convoy member is in the manifest")
 
-    print("\n3. UI review — outstanding/deferred (does NOT block this ship; Court Artist addendum closes it later)")
+    print("\n3. UI review — mandated review blocks; ordinary outstanding review is tracked debt")
     skip_ui = bool(getattr(args, "skip_ui_review", False))
     ui_debt: list[tuple[str, str]] = []
     for quest in quests:
+        mandated, mandate_detail = convoy_guard.ui_mandate_outstanding(repo_root, quest.id)
+        if mandated:
+            # A recorded UI mandate is an integrity finding: --skip-ui-review
+            # waives ordinary pending review, never the owner's required step.
+            integrity.append(f"{quest.id} UI mandate unmet — {mandate_detail}")
+            print(f"   ❌ {quest.id}: UI MANDATE unmet — {mandate_detail[:220]}")
+            continue
         state, detail = convoy_guard.ui_assent_state(repo_root, quest.id)
         if state in ("signed", "waived", "not_required", "deferred"):
             print(f"   ✅ {quest.id}: UI {state} — {detail[:90]}")
@@ -8723,7 +8821,7 @@ def _ship_interrogation(args, quests, trunk: str) -> tuple[list[str], list[str]]
         ui_debt.append((quest.id, state + (f" — {detail[:120]}" if detail else " (no UI record in the charter)")))
         print(f"   ⚠️ {quest.id}: UI {state}" + (f" — {detail[:110]}" if detail else " — no charter record"))
     if skip_ui:
-        print("   UI review is non-blocking this ship; --skip-ui-review is a noop")
+        print("   UI review is non-blocking this ship; --skip-ui-review is a noop for mandates")
 
     print("\n" + "-" * 76)
     if not integrity:
@@ -8794,8 +8892,11 @@ def cmd_ship(args):
     repo_root = git_ops.get_repo_root()
     ui_debt_roster = []
     for q in quests:
+        mandated, _mandate_detail = convoy_guard.ui_mandate_outstanding(repo_root, q.id)
         state, _detail = convoy_guard.ui_assent_state(repo_root, q.id)
-        if state not in ("signed", "waived", "not_required", "deferred"):
+        if mandated:
+            ui_debt_roster.append((q.id, f"MANDATE UNMET ({state}) — blocks the ship, not debt"))
+        elif state not in ("signed", "waived", "not_required", "deferred"):
             ui_debt_roster.append((q.id, state))
 
     ab = git_ops.get_ahead_behind(base_branch, head_branch)
@@ -10232,6 +10333,17 @@ def build_parser():
     p_ui_signoff.add_argument("--none-required", dest="none_required", action="store_true", help="Declare no UI surface was touched")
     p_ui_signoff.add_argument("--no-commit", dest="no_commit", action="store_true", help="Write the charter without committing")
     p_ui_signoff.set_defaults(func=cmd_ui_signoff)
+
+    p_ui_mandate = sub.add_parser(
+        "ui-mandate",
+        help="Record (or clear) a UI mandate: a decree/charter-required artist session that BLOCKS packing until signed off",
+    )
+    p_ui_mandate.add_argument("quest_id", help="Quest ID the mandate applies to")
+    p_ui_mandate.add_argument("--source", default="", help="Decree id or charter note that requires the session")
+    p_ui_mandate.add_argument("--by", default="steward", help="Who recorded it (default: steward)")
+    p_ui_mandate.add_argument("--clear", action="store_true", help="Clear a mandate (the owner released the requirement)")
+    p_ui_mandate.add_argument("--no-commit", dest="no_commit", action="store_true", help="Write the charter without committing")
+    p_ui_mandate.set_defaults(func=cmd_ui_mandate)
 
     p_audit = sub.add_parser("audit", help="Audit Quest tribute presence, gaps, and protocol compliance")
     add_quest_selector(p_audit, batchable=True, filters=("status", "app", "epic"))

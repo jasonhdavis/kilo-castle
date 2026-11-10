@@ -749,13 +749,15 @@ def _charter_ready(repo: Path, qmap: dict, now: Optional[datetime] = None) -> li
 def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[float] = None,
          ready_vigils: Optional[list] = None, charter_ready: Optional[list] = None,
          raze_regate: Optional[list] = None,
-         charter_requests: Optional[list] = None) -> tuple[list, list]:
+         charter_requests: Optional[list] = None,
+         ui_mandate_ids: Optional[list] = None) -> tuple[list, list]:
     """Decide this tick's actions. Returns (actions, notes).
 
     Pure function: no I/O beyond the already-collected inputs, so the policy
     can be unit-tested without touching a real repo."""
     now = time.time() if now is None else now
     quests = _quest_map(snap)
+    ui_mandate_ids = set(ui_mandate_ids or [])
     # Read-only views: plan is pure, so bookkeeping lands in tick().
     qstate = state.get("quests") or {}
     convoys = state.get("convoys") or {}
@@ -969,6 +971,17 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
             continue
         if q.get("pending_audience"):
             note(q["id"], "skip", "GATE but pending Audience — parked")
+            continue
+        if q["id"] in ui_mandate_ids:
+            # A mandate is the owner's required step, not tracked debt: packing
+            # it is how Q1135 shipped with no artist session. The Quest waits
+            # for a human-driven artist/studio review, then a sign-off.
+            note(q["id"], "human",
+                 "GATE but a UI MANDATE is unmet — packing is refused until the artist "
+                 "session is reviewed and signed off (`court artist <quest>` or "
+                 "`court studio <ids>`, then `court ui-signoff <quest> --by M'Lord "
+                 "--note \"<where said>\"`)",
+                 key="ui_mandate_gate")
             continue
         role = role_state(q.get("worktree"), "gatekeeper")
         if role["state"] in ("live", "stalled", "watching"):
@@ -1440,6 +1453,16 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                 continue
             if q.get("worktree") and (occupied(q.get("worktree")) or process_in(q.get("worktree"))):
                 note(q["id"], "wait", "READY_TO_RAZE but a worker is still live in its worktree")
+                continue
+            if q["id"] in ui_mandate_ids:
+                # Razing tears the worktree down; that is exactly where the
+                # mandated artist session has to run. Keep it and escalate.
+                note(q["id"], "human",
+                     "READY_TO_RAZE but a UI MANDATE is unmet — razing would destroy the "
+                     "worktree the artist session needs. Run `court artist <quest>` / "
+                     "`court studio <ids>`, record `court ui-signoff <quest> --by M'Lord "
+                     "--note \"<where said>\"`, then raze",
+                     key="ui_mandate_raze")
                 continue
             st = qstate.get(q["id"]) or {}
             if q.get("razed_at"):
@@ -2474,6 +2497,21 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
     vigil_notice: list[dict] = []
     for vn in vigil_notes:
         vigil_notice.append({"quest": vn["id"], "level": "vigil", "text": vn["text"]})
+    # A GATE Quest carrying an unmet UI mandate must not be packed: compute the
+    # set here (plan is pure) so the planner can hold it and escalate.
+    ui_mandate_ids: list[str] = []
+    try:
+        from . import convoy_guard
+        for q in snap.get("quests", []):
+            if q.get("kind") == "epic":
+                continue
+            if (q.get("status") or "").upper() not in ("GATE", "READY_TO_RAZE"):
+                continue
+            outstanding, _detail = convoy_guard.ui_mandate_outstanding(repo, q["id"])
+            if outstanding:
+                ui_mandate_ids.append(q["id"])
+    except Exception as e:  # noqa: BLE001 — a charter parse must not kill a tick
+        say(f"⚠️  UI mandate scan failed: {e}")
     try:
         raze_waiting = [q["id"] for q in snap.get("quests", [])
                         if q.get("kind") != "epic"
@@ -2491,7 +2529,7 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
         say(f"⚠️  charter request scan failed: {e}")
     actions, notes = plan(snap, state, policy, workers, now=now, ready_vigils=ready,
                           charter_ready=charter_ready, raze_regate=raze_regate,
-                          charter_requests=open_requests)
+                          charter_requests=open_requests, ui_mandate_ids=ui_mandate_ids)
     notes = vigil_notice + notes
     _record_escalations(state, notes, now)
     # Board fingerprint: only re-stamp the "observed since" timestamp when the

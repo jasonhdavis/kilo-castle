@@ -386,6 +386,77 @@ def ui_assent_state(repo_root: Path, quest_id: str) -> tuple[str, str]:
     return "pending", review
 
 
+_UI_MANDATE_LINE_RE = re.compile(
+    r"(?im)^\s*[-*]?\s*\*{0,2}UI Mandate\*{0,2}:?\*{0,2}\s*(.+)$"
+)
+_UI_MANDATE_OFF_RE = re.compile(r"(?i)^\s*(?:none|no|not required|false)\b")
+# A mandate as the paperwork actually states it: ONE sentence that names a UI
+# session AND demands it. Bounded to the Quest's own charter (Charter Notes,
+# Audience Log, decree rulings copied in by pickup) so a sentence about some
+# other Quest can never gate this one.
+_UI_MANDATE_SENTENCE_RE = re.compile(
+    r"(?i)(?:mandatory|explicitly requires|requires|required|required step)"
+    r"[^.\n]{0,180}(?:UI Studio|Court Artist)"
+    r"|(?:UI Studio|Court Artist)[^.\n]{0,180}(?:mandatory|explicitly requires|is required)"
+)
+
+
+def ui_mandate(repo_root: Path, quest_id: str) -> tuple[bool, str]:
+    """True when the Quest's own paperwork REQUIRES a UI review/artist session.
+
+    UI review is tracked debt by design: outstanding review never blocks a
+    promotion, and the Court Artist lane closes it later. A *mandate* is a
+    different animal — a royal decree or charter note that names the session as
+    a required step before the UI may be called complete. Downgrading that to
+    warning-only debt is how Q1135 shipped with no studio session at all.
+
+    Sources, in order:
+
+    * an explicit ``**UI Mandate:** REQUIRED — <source>`` line (``NONE`` clears);
+    * a mandate sentence in the Quest's own charter naming a UI Studio / Court
+      Artist session as mandatory or explicitly required.
+
+    Returns ``(mandated, source_text)``. Whether the mandate is SATISFIED is a
+    separate question — see ``ui_mandate_outstanding``.
+    """
+    path = _quest_file(repo_root, quest_id)
+    if path is None:
+        return False, ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False, ""
+
+    explicit = ""
+    for match in _UI_MANDATE_LINE_RE.finditer(text):
+        explicit = match.group(1).strip().strip("*").strip()
+    if explicit:
+        if _UI_MANDATE_OFF_RE.match(explicit):
+            return False, explicit
+        return True, explicit
+
+    for match in _UI_MANDATE_SENTENCE_RE.finditer(text):
+        sentence = match.group(0).strip()
+        return True, " ".join(sentence.split())[:240]
+    return False, ""
+
+
+def ui_mandate_outstanding(repo_root: Path, quest_id: str) -> tuple[bool, str]:
+    """True when a UI mandate is recorded and NOT satisfied by written assent.
+
+    ``deferred`` does NOT satisfy a mandate: a deferral is the tracked-debt
+    escape for ordinary review, not for a step the owner required before the UI
+    could be called complete (Q1135 was shipped exactly that way).
+    """
+    mandated, source = ui_mandate(repo_root, quest_id)
+    if not mandated:
+        return False, ""
+    state, detail = ui_assent_state(repo_root, quest_id)
+    if state in ("signed", "waived", "not_required"):
+        return False, ""
+    return True, f"{state}: {detail or 'no UI record in the charter'} — mandate: {source}"
+
+
 def studio_branches(repo_root: Path) -> list[str]:
     """Combined artist studio branches currently defined in the repo.
 
@@ -602,7 +673,25 @@ def audit_promotion(
                 quest=qid,
                 branch=source,
             ))
-        if not allow_ui_pending and ui_review_pending(repo_root, qid):
+        # A recorded UI MANDATE is an integrity finding, never debt, and
+        # --allow-ui-pending must not silence it: that flag means "ordinary
+        # outstanding review is tracked debt", not "the owner's required step is
+        # optional". Q1135 shipped on exactly that confusion.
+        mandate_outstanding, mandate_detail = ui_mandate_outstanding(repo_root, qid)
+        if mandate_outstanding:
+            findings.append(Finding(
+                "error",
+                f"{qid} carries a UI MANDATE that is not satisfied — {mandate_detail}. Run the "
+                f"Court Artist / UI Studio session on the rendered change and record it "
+                f"(`court artist <quest>` or `court studio <ids>`), then sign off with "
+                f"`court ui-signoff <quest> --by \"M'Lord\" --note \"<where said>\"`. A deferral "
+                f"does not satisfy a mandate: back {source} out of the pack until the review "
+                f"is evidenced, or record an explicit waiver sign-off.",
+                quest=qid,
+                branch=source,
+                code="ui-mandate",
+            ))
+        elif not allow_ui_pending and ui_review_pending(repo_root, qid):
             findings.append(Finding(
                 "warn",
                 f"{qid} carries a pending UI review — tracked debt, not a block: the Court "

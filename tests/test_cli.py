@@ -429,7 +429,7 @@ def test_ship_interrogation_missing_ui_review_returns_empty_ui(tmp_path, monkeyp
     assert integrity == []
     out = capsys.readouterr().out
     assert "UI missing" in out
-    assert "does NOT block this ship" in out
+    assert "ordinary outstanding review is tracked debt" in out
     assert "UI debt item(s)" in out
 
 

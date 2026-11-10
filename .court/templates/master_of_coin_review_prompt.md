@@ -18,7 +18,7 @@ Decrees, and the Steward charters a brand-new Quest+worktree from those Decrees.
 1. Read `branch`/`worktree` from the Quest's frontmatter (`court show {{ quest_id }}`).
 2. Dispatch via Court CLI:
    `python3 -m court.cli coin {{ quest_id }}`
-   (or via Kilo CLI: `kilo run --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir {{ worktree }} "<prompt>"`).
+   (or via Kilo CLI: `kilo run --auto --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir {{ worktree }} "<prompt>"`).
    This evaluates directly in the Quest's existing worktree under `agent: master_of_coin` with the configured `models.master_of_coin`, bypassing Agent Manager's agent-mode inheritance bug.
 3. The session assumes the Master of Coin persona inside the worktree, renders its one audit
    into `.court/quests/{{ quest_id }}.md` under `## Master of Coin's Audit`, and either
@@ -26,7 +26,7 @@ Decrees, and the Steward charters a brand-new Quest+worktree from those Decrees.
 5. **Mandatory sync-back**: because the advance/set-section commands in step 4 only ever commit onto the fork branch, the verdict is invisible to the real
    Serf branch until it is explicitly pushed back: `git push . HEAD:{{ branch }}` from inside the fork.
    If that push is rejected, `git merge {{ branch }}` into the fork first, re-verify anything that changed, then push.
-6. **Do not call `agent_manager stop` on your own session as your last action.** Teardown of this fork worktree (and its session)
+6. **Do not stop your own session as your last action.** Teardown of this fork worktree (and its session)
    is the Steward's job, done only after it confirms the sync-back in step 5 actually landed on the real branch.
 
 ---
@@ -71,6 +71,7 @@ Requires**, **Expected Tribute**, and the Serf's **Tribute Rendered**.
 3. **Expected vs. Delivered Line-by-Line**
    - Check the branch diff (`git diff castle...{{ branch }}` or equivalent) against every item on the **baseline Expected Tribute as committed on `castle`**.
    - Does the implementation satisfy EVERY item? Where a Tribute claim is checkable with a live command, **run it yourself** and confirm it matches.
+   - Stale kept test DB: when a scoped test run fails with "column already exists" / duplicate-table errors after a migration renumber (0038→0039 class), the `--keepdb`/`--reuse-db` database predates the new migrations. Recreate it for that run (drop `--keepdb`, or add `--create-db` for pytest-django; `court runsuite` does this automatically) — never hand-patch or delete migration files to appease a kept DB.
 
 4. **Duplication & Architecture Check**
    - Grep the codebase for the capability the Serf just built. Did the repository already possess an existing service or module that does the same thing?
@@ -109,17 +110,12 @@ Requires**, **Expected Tribute**, and the Serf's **Tribute Rendered**.
     - If UI changes exist:
       - Has M'Lord already reviewed and approved the UI via the **Court Artist** (`court artist {{ quest_id }}` / `/artist {{ quest_id }}`)?
       - If **UI Review is PENDING**: Note `- **UI Review:** PENDING (Recommend Court Artist session with worktree runserver via /artist {{ quest_id }})`. Present this to M'Lord during Audience so a Court Artist session can be spawned with a live runserver on localhost.
+      - **UI MANDATE (blocks the pipeline, not debt)**: if the charter carries `- **UI Mandate:** REQUIRED — <decree/charter source>` (or a decree sentence makes an artist session mandatory), the review is a required step. Note `- **UI Review:** PENDING (UI mandate — packing is refused until the artist session is signed off)` and escalate to the Steward for `court artist {{ quest_id }}` / `court studio <ids>`. Do NOT record a deferral: `court ui-signoff --defer` refused a mandated Quest, and `court collect` / `verify-convoy` / `ship --confirm` all refuse it until `court ui-signoff {{ quest_id }} --by M'Lord --note "<where said>"` exists.
       - If **UI Review was COMPLETED**: Note `- **UI Review:** APPROVED by M'Lord via Court Artist (Session: <id>, Model: <model>, Port: <port>)`.
       - If **No UI touched**: Note `- **UI Review:** None required (backend / headless logic only)`.
 
 12. **Commutation — What Does Production Still Need to Do?**
     - Concretely identify anything production still needs to activate this value (deploy commands, env var toggles, migrations, background schedules). State "none" if none.
-
-13. **Expected Tribute Proof Coverage (machine gate)**
-    - Run `python3 -m court.cli verify-tribute {{ quest_id }}` and read the report.
-    - A non-zero exit means at least one checked Expected Tribute item has no passing engine-observed proof recorded at the current HEAD (the item's checkbox is `[x]` but no command result backs it). Treat that as a Gate 3 finding.
-    - The only exception is an item explicitly marked cancelled as `[-]` in the charter with a stated justification; cancelled items are not required to carry proof.
-    - If a proof is stale (recorded at an older HEAD than the worktree now holds), re-run the recorded command in the worktree to refresh it, then re-run the gate.
 
 ## Outcomes — exactly two
 

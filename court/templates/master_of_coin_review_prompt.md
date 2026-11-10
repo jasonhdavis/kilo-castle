@@ -110,6 +110,7 @@ Requires**, **Expected Tribute**, and the Serf's **Tribute Rendered**.
     - If UI changes exist:
       - Has M'Lord already reviewed and approved the UI via the **Court Artist** (`court artist {{ quest_id }}` / `/artist {{ quest_id }}`)?
       - If **UI Review is PENDING**: Note `- **UI Review:** PENDING (Recommend Court Artist session with worktree runserver via /artist {{ quest_id }})`. Present this to M'Lord during Audience so a Court Artist session can be spawned with a live runserver on localhost.
+      - **UI MANDATE (blocks the pipeline, not debt)**: if the charter carries `- **UI Mandate:** REQUIRED — <decree/charter source>` (or a decree sentence makes an artist session mandatory), the review is a required step. Note `- **UI Review:** PENDING (UI mandate — packing is refused until the artist session is signed off)` and escalate to the Steward for `court artist {{ quest_id }}` / `court studio <ids>`. Do NOT record a deferral: `court ui-signoff --defer` refused a mandated Quest, and `court collect` / `verify-convoy` / `ship --confirm` all refuse it until `court ui-signoff {{ quest_id }} --by M'Lord --note "<where said>"` exists.
       - If **UI Review was COMPLETED**: Note `- **UI Review:** APPROVED by M'Lord via Court Artist (Session: <id>, Model: <model>, Port: <port>)`.
       - If **No UI touched**: Note `- **UI Review:** None required (backend / headless logic only)`.
 

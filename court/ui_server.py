@@ -125,7 +125,13 @@ header .spacer{flex:1}
 .vdiv{width:1px;height:22px;background:var(--edge)}
 
 main{display:grid;grid-template-columns:300px 1fr;overflow:hidden}
-nav{overflow-y:auto;background:var(--surface);border-right:1px solid var(--edge);padding:12px 12px 20px}
+ #navcol{display:flex;flex-direction:column;overflow:hidden;background:var(--surface);
+  border-right:1px solid var(--edge)}
+ #navsearch{padding:10px 12px;border-bottom:1px solid var(--edge);flex:none}
+ #navq{width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--edge);
+  color:var(--ink);border-radius:8px;padding:7px 9px;font:inherit;font-size:12px}
+ #navq::placeholder{color:var(--faint)}
+ nav{flex:1;overflow-y:auto;background:var(--surface);padding:12px 12px 20px}
 .appswitch{display:flex;gap:6px;margin-bottom:12px}
 .app{cursor:pointer;transition:all .12s ease}
 .appswitch .app,.vtabs .app{flex:1;text-align:center;padding:7px 4px;border-radius:var(--r-md);
@@ -438,6 +444,11 @@ code.ic{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var
 .srow{display:flex;gap:8px;align-items:baseline;padding:6px 4px;border-bottom:1px solid var(--edge-soft);
  font-size:11.5px;cursor:pointer}
 .srow:hover{background:var(--surface-2)}
+.qsrow{display:flex;flex-direction:column;gap:2px;padding:7px 4px;border-bottom:1px solid var(--edge-soft);
+ font-size:12px;cursor:pointer}
+.qsrow:hover{background:var(--surface-2)}
+.qsrowtop{display:flex;gap:8px;align-items:baseline;min-width:0}
+.qsrowsnip{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .annrow{border-bottom:1px solid var(--edge-soft);padding:9px 2px}
 .annrow:last-child{border-bottom:none}
 .annmeta{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;min-width:0}
@@ -574,7 +585,8 @@ html[data-theme="light"] .iconbtn .bcount{color:#fff}
 <div class="iconbtn" title="recent turns" onclick="openTurns()">≡</div>
 <div class="iconbtn" title="search sessions" onclick="openSearch()">⌕</div>
 <div class="iconbtn" id="gsync_btn" title="global sync — court sync --all (branch-tip quest paperwork onto the main checkout)" onclick="globalSync(this)">⇅</div></header>
-<main><nav id="nav"></nav>
+<main><div id="navcol"><div id="navsearch"><input id="navq" placeholder="find a quest charter…  (Enter = search all)"
+ autocomplete="off" spellcheck="false"></div><nav id="nav"></nav></div>
 <section id="chat">
   <div id="chatbar">
    <span class="wt" id="wt_label">select a worktree</span>
@@ -902,7 +914,26 @@ window.addEventListener('popstate',()=>{
   if(t==='stalled')return `<span class="sstat"><span class="stalledot static" title="interrupted — ${esc(why)}">!</span></span>`;
   if(t==='idle')return `<span class="sstat"><span class="idledot" title="${esc(why||'idle')}"></span></span>`;
   return '<span class="sstat"></span>';}
- function renderNav(){
+let NAVQ='';
+function wireNavSearch(){
+ const inp=$('navq');if(!inp)return;
+ inp.addEventListener('input',()=>{NAVQ=inp.value.trim().toLowerCase();renderNav();});
+ inp.addEventListener('keydown',e=>{
+  if(e.key==='Enter'){e.preventDefault();openQuestSearch(inp.value.trim());}
+  else if(e.key==='Escape'){inp.value='';NAVQ='';renderNav();}
+ });
+}
+wireNavSearch();
+// The nav IS the quest menu: the box above it filters the visible worktree/
+// quest rows live (id + title), and Enter escalates to a full charter search
+// (id, title, status, app, AND charter body text).
+function navMatches(b,w,r){
+ if(!NAVQ)return true;
+ const q=questFor(r.key,w.path,b);
+ const hay=((q?q.id+' '+(q.title||''):'')+' '+(b||'')).toLowerCase();
+ return hay.includes(NAVQ);
+}
+function renderNav(){
    const r=repo(); if(!r){$('nav').innerHTML='';return;}
    let h=`<div class="appswitch">`+S.repos.map(x=>
     `<div class="app ${x.key===selRepo?'on':''}" data-app="${esc(x.key)}">${x.key}</div>`).join('')+`</div>`;
@@ -930,9 +961,11 @@ window.addEventListener('popstate',()=>{
   }
   for(const sec of SECTION_ORDER){
    const s=secs[sec.id];
-   if(!s.units.length)continue;
-   h+=`<h2>${esc(sec.label)} · ${s.units.length}</h2>`;
-   const items=NAV_EXP[sec.id]?s.units:s.units.slice(0,30);
+   let units=s.units;
+   if(NAVQ)units=units.filter(u=>navMatches(u.b,u.w,r));
+   if(!units.length)continue;
+   h+=`<h2>${esc(sec.label)} · ${units.length}</h2>`;
+   const items=(NAVQ||NAV_EXP[sec.id])?units:units.slice(0,30);
     for(const u of items){
      const b=u.b,w=u.w;
      const nst=stateFor(w.path);
@@ -2109,8 +2142,10 @@ $('modal_bd').addEventListener('click',e=>{
   if(b){mcpToggle(b.dataset.file,b.dataset.name);return;}
  const p=e.target.closest('[data-pid]');
  if(p){reapProc(p.dataset.pid);return;}
- const t=e.target.closest('[data-sid2]');
- if(t){jumpToSession(t.dataset.sid2);return;}
+  const t=e.target.closest('[data-sid2]');
+  if(t){jumpToSession(t.dataset.sid2);return;}
+  const qr=e.target.closest('[data-qid2]');
+  if(qr){openQuestCharter(qr.dataset.qid2,qr.dataset.qrepo);return;}
 });
 $('modal').addEventListener('click',e=>{
  if(e.target.id==='modal')closeModal();});
@@ -2359,6 +2394,43 @@ function jumpToSession(sid){
  syncHash(true);
  poll();
 }
+// Quest-charter search: id / title / status / app / charter BODY text. The
+// result opens the charter drawer (same view as the ▤ button).
+function openQuestSearch(q0){
+ openModal('SEARCH QUEST CHARTERS',
+  '<input id="qs" placeholder="quest id, title, or charter text — Enter to search" '+
+  'style="width:100%;background:var(--bg);border:1px solid var(--edge);color:var(--ink);'+
+  'border-radius:8px;padding:8px 10px;font-size:12.5px">'+
+  '<div id="qsres" style="margin-top:8px;max-height:55vh;overflow-y:auto"></div>');
+ const inp=$('qs');if(!inp)return;
+ inp.focus();
+ inp.addEventListener('keydown',e=>{if(e.key==='Enter')doQuestSearch(inp.value.trim());});
+ if(q0){inp.value=q0;doQuestSearch(q0);}
+}
+async function doQuestSearch(q){
+ const el=$('qsres');if(!el)return;
+ if(!q){el.innerHTML='';return;}
+ el.innerHTML='<div class="dim">searching…</div>';
+ const r=repo();
+ let j={};
+ try{j=await (await fetch('/api/quests?app='+encodeURIComponent(r?r.key:'')+'&q='+encodeURIComponent(q))).json();}
+ catch(e){el.textContent='search failed';return;}
+ const rows=j.matches||[];
+ el.innerHTML=rows.length?rows.map(m=>
+  `<div class="qsrow" data-qid2="${esc(m.id)}" data-qrepo="${esc(m.repo||'')}">
+    <div class="qsrowtop"><span style="flex:none;font-weight:600">${esc(qnumOf(m.id)||m.id)}</span>`+
+    `<span class="dim" style="flex:none;font-size:10px">${esc(String(m.status||'').toLowerCase())}</span>`+
+    (m.app?`<span class="dim" style="flex:none;font-size:10px">${esc(m.app)}</span>`:'')+
+    `<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.title||'')}</span></div>`+
+    (m.snippet?`<div class="dim qsrowsnip">${esc(m.snippet)}</div>`:'')+
+   `</div>`).join('')
+  :'<div class="empty-note">no matches</div>';
+}
+function openQuestCharter(qid,repoKey){
+ closeModal();
+ if(repoKey&&repoKey!==selRepo)selRepo=repoKey;
+ openDocFor(qid);
+}
  async function mcpToggle(file,name){
   const m=(S.mcp||[]).find(x=>x.file===file&&x.name===name);
   if(!m){if(view==='settings')renderSettings();return;}
@@ -2465,6 +2537,7 @@ def _wt_dirty(path, ttl=30):
 
 
 _QUESTS_CACHE = {}
+_QUEST_BODY_CACHE = {}
 
 
 def _frontmatter_status(text):
@@ -2618,6 +2691,65 @@ def _all_quests():
             else:
                 out.append(dict(q, repo=r["key"]))
     return out
+
+
+def _quest_bodies(root, ttl=120):
+    """Lowercased charter bodies for one repo, cached alongside `_quests`.
+    Reading every charter is the cost of a content search, so it is memoized
+    on the same TTL as the quest cards."""
+    now = time.time()
+    hit = _QUEST_BODY_CACHE.get(root)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    bodies = {}
+    for card in _quests(root):
+        try:
+            with open(card["path"], encoding="utf-8", errors="ignore") as fh:
+                bodies[card["id"]] = fh.read().lower()
+        except OSError:
+            bodies[card["id"]] = ""
+    _QUEST_BODY_CACHE[root] = (now, bodies)
+    return bodies
+
+
+def _quest_search(root, query, limit=40):
+    """Ranked quest matches for one repo by id / title / status / app / charter
+    BODY text. All whitespace-separated terms must appear (AND). A hit that is
+    body-only carries a one-line snippet so the result explains itself."""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    terms = [t for t in re.split(r"\s+", q) if t]
+    bodies = _quest_bodies(root)
+    out = []
+    for card in _quests(root):
+        qid = card.get("id", "")
+        title = card.get("title", "")
+        hay = " ".join((qid, title, card.get("status", ""), card.get("app", ""))).lower()
+        body = bodies.get(qid, "")
+        if not all(t in hay or t in body for t in terms):
+            continue
+        score = 0
+        if qid.lower() == q:
+            score += 1000
+        elif qid.lower().startswith(q):
+            score += 600
+        elif q in qid.lower():
+            score += 300
+        if q in title.lower():
+            score += 200
+        if all(t in hay for t in terms):
+            score += 120
+        snippet = ""
+        if not all(t in hay for t in terms):
+            for line in body.splitlines():
+                if all(t in line for t in terms):
+                    snippet = line.strip()[:160]
+                    break
+        out.append((score, {"id": qid, "title": title, "status": card.get("status", ""),
+                            "app": card.get("app", ""), "snippet": snippet, "score": score}))
+    out.sort(key=lambda x: (-x[0], x[1]["id"]))
+    return [m for _, m in out[:limit]]
 
 
 def _quest_doc(root, wt, qid):
@@ -5651,6 +5783,21 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(urlparse(self.path).query)
             ids = [s for s in (qs.get("ids", [""])[0] or "").split(",") if s]
             self._json(_session_starts(ids))
+        elif self.path.startswith("/api/quests"):
+            # Quest-charter search (must precede /api/quest, which is a prefix
+            # of this path). Scoped to one app when given, else every repo.
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            key = qs.get("app", [""])[0].strip()
+            query = qs.get("q", [""])[0]
+            roots = [r for r in _repos() if not key or r["key"] == key]
+            matches = []
+            for r in roots:
+                for m in _quest_search(r["root"], query):
+                    m["repo"] = r["key"]
+                    matches.append(m)
+            matches.sort(key=lambda m: (-m.get("score", 0), m["id"]))
+            self._json({"ok": True, "matches": matches[:60]})
         elif self.path.startswith("/api/quest"):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)

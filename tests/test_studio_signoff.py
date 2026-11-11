@@ -5,6 +5,7 @@ Covers the pure helpers behind court/ui_server.py's /api/signoff endpoints and
 the browser-side substitution — the endpoint handlers themselves are exercised
 through these helpers (an HTTP server round-trip is out of scope here).
 """
+import json
 import subprocess
 import tempfile
 import unittest
@@ -50,6 +51,54 @@ class TestStudioQuestResolution(unittest.TestCase):
     def test_non_studio_branch_resolves_empty(self):
         _init_git_repo(self.wt, "castle")
         self.assertEqual(ui_server._studio_quest_ids(str(self.wt)), [])
+
+
+class TestAtelierQuestResolution(unittest.TestCase):
+    """The standing atelier's members come from the repo-level manifest, not
+    from the branch name (its branch is the stable `artist/atelier`)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "repo"
+        self.root.mkdir()
+        _init_git_repo(self.root, "castle")
+        self.atelier_wt = self.root / ".kilo" / "worktrees" / "artist-atelier"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _manifest(self, ids):
+        d = self.root / ".court" / "atelier"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "manifest.json").write_text(
+            json.dumps({"version": 1, "branch": "artist/atelier",
+                        "quests": {i: {"branch": f"quest/{i.lower()}"} for i in ids}}),
+            encoding="utf-8")
+
+    def _add_atelier_worktree(self):
+        subprocess.run(["git", "-C", str(self.root), "worktree", "add", "-q",
+                        str(self.atelier_wt), "-b", "artist/atelier"],
+                       check=True, capture_output=True)
+
+    def test_is_atelier_branch(self):
+        self.assertTrue(ui_server._is_atelier_branch("artist/atelier"))
+        self.assertFalse(ui_server._is_atelier_branch("artist/q617-q627-ui-studio"))
+        self.assertFalse(ui_server._is_atelier_branch(""))
+
+    def test_resolves_members_from_the_repo_manifest(self):
+        self._manifest(["Q1358-Common-WarehouseScannerUPCScanRate",
+                        "Q1403-Marketing-Trigger-Condition-Null-Operator-Inversion"])
+        self._add_atelier_worktree()
+        # Read from the MAIN checkout's manifest, though we query the worktree.
+        self.assertEqual(ui_server._studio_quest_ids(str(self.atelier_wt)),
+                         ["Q1358-Common-WarehouseScannerUPCScanRate",
+                          "Q1403-Marketing-Trigger-Condition-Null-Operator-Inversion"])
+        ok, err = ui_server._check_studio_signoff_ready(str(self.atelier_wt))
+        self.assertTrue(ok, err)
+
+    def test_atelier_without_a_manifest_resolves_empty(self):
+        self._add_atelier_worktree()
+        self.assertEqual(ui_server._studio_quest_ids(str(self.atelier_wt)), [])
 
 
 class TestSignoffToken(unittest.TestCase):

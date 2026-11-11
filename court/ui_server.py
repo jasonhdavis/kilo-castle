@@ -586,7 +586,7 @@ html[data-theme="light"] .iconbtn .bcount{color:#fff}
      <button class="bread lg" id="markread_btn" style="display:none" title="clear the turn marker" onclick="markReadCur()">mark read</button>
      <div class="iconbtn" title="open quest charter in drawer" onclick="toggleDoc(event)">▤</div>
     <div class="iconbtn" id="browser_btn" title="launch studio chromium" style="display:none" onclick="launchBrowser(event)">▶</div>
-    <div class="iconbtn" id="approve_btn" style="display:none;color:var(--green)" title="approve this studio — records a git-committed court ui-signoff for every merged quest" onclick="approveStudio(event)">✓</div>
+    <div class="iconbtn" id="approve_btn" style="display:none;color:var(--green)" title="approve this studio/atelier — records a git-committed UI sign-off (court ui-signoff / court patronize) for the merged quests" onclick="approveStudio(event)">✓</div>
     <div class="iconbtn" title="settings — models, presets, suite, MCP" onclick="setView('settings')">⚙</div>
     <div class="iconbtn" id="sess_del" title="delete this session" style="display:none" onclick="delSess(selSess)">✕</div>
     <div class="iconbtn" id="sess_burger" title="sessions in this worktree" onclick="toggleSessMenu(event)">☰</div>
@@ -2134,10 +2134,15 @@ function syncBrowserBtn(){
  syncApproveBtn();
 }
 
-// Combined-studio worktree on its deterministic integration branch.
+// Combined-studio worktree on its deterministic integration branch, or the
+// single standing atelier (stable branch artist/atelier).
+function isAtelierWt(){
+ const w=selWt&&S?(S.worktrees||[]).find(x=>x.path===selWt):null;
+ return !!(w&&w.branch==='artist/atelier');
+}
 function isStudioWt(){
  const w=selWt&&S?(S.worktrees||[]).find(x=>x.path===selWt):null;
- return !!(w&&w.branch&&/^artist\/[A-Za-z0-9_,-]+-ui-studio$/.test(w.branch));
+ return !!(w&&w.branch&&(/^artist\/[A-Za-z0-9_,-]+-ui-studio$/.test(w.branch)||w.branch==='artist/atelier'));
 }
 function syncApproveBtn(){
  const b=$('approve_btn');if(!b)return;
@@ -2154,12 +2159,15 @@ async function approveStudio(ev){
  }catch(e){}
  try{info=await (await fetch('/api/signoff?wt='+encodeURIComponent(wt))).json();}catch(e){}
  if(!tok||!info||!info.ok||!info.quests||!info.quests.length){
-  const el=$('arload');if(el)el.outerHTML='<div class="empty-note">no signoff-capable studio here — '+esc((info&&info.error)||'worktree is not on an artist/<ids>-ui-studio branch')+'</div>';
+  const el=$('arload');if(el)el.outerHTML='<div class="empty-note">no signoff-capable studio here — '+esc((info&&info.error)||'worktree is not on an artist/<ids>-ui-studio or artist/atelier branch')+'</div>';
   return;
  }
  window.__approveTok=tok;
  const by=info.by||"M'Lord";
- let h='<div class="dim" style="font-size:11.5px;margin-bottom:10px">records a git-committed <b>UI Review: APPROVED</b> + <b>UI Sign-off:</b> in each quest charter (same as <span class="mono">court ui-signoff</span>), on the studio branch — carried into each quest by <span class="mono">studio --sync-back</span>.</div>';
+ const atelier=isAtelierWt();
+ let h='<div class="dim" style="font-size:11.5px;margin-bottom:10px">'+(atelier
+  ?'records a git-committed <b>UI Review: APPROVED</b> + <b>UI Sign-off:</b> in each quest charter and pins its approved revision (its own artist commits) — same as <span class="mono">court patronize</span>. The Night\'s Watch then extracts each pinned revision onto its own branch and collects it.'
+  :'records a git-committed <b>UI Review: APPROVED</b> + <b>UI Sign-off:</b> in each quest charter (same as <span class="mono">court ui-signoff</span>), on the studio branch — carried into each quest by <span class="mono">studio --sync-back</span>.')+'</div>';
  h+='<div id="ar_qlist" style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px">'+
   info.quests.map(q=>`<label style="display:flex;gap:8px;align-items:center;font-size:13px"><input type="checkbox" value="${esc(q)}" checked> <b>${esc(q)}</b></label>`).join('')+'</div>';
  h+='<input id="ar_note" placeholder="optional note — which pages were reviewed…" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--edge);border-radius:6px;padding:7px 9px;color:var(--ink);font:inherit">';
@@ -5081,11 +5089,52 @@ def _studio_branch(wt):
     return res.stdout.strip() or ""
 
 
+def _main_repo_root(wt) -> str:
+    """The MAIN worktree root for a worktree path — where repo-level .court
+    bookkeeping (the atelier manifest) is written. A linked worktree's
+    ``--git-common-dir`` is the main checkout's ``.git``, so its parent is the
+    root."""
+    try:
+        res = subprocess.run(["git", "rev-parse", "--git-common-dir"],
+                             cwd=wt, capture_output=True, text=True, timeout=10)
+        if res.returncode == 0 and (res.stdout or "").strip():
+            common = res.stdout.strip()
+            if not os.path.isabs(common):
+                common = os.path.join(wt, common)
+            return os.path.dirname(os.path.normpath(common))
+    except Exception:
+        pass
+    return COURT_DIR
+
+
+def _is_atelier_branch(branch) -> bool:
+    """The standing atelier's stable branch (see court/atelier.py)."""
+    return (branch or "").strip() == "artist/atelier"
+
+
+def _atelier_member_ids(wt) -> list[str]:
+    """Quest ids merged into the standing atelier, from the repo-level
+    ``.court/atelier/manifest.json`` — written by ``court atelier --standing``
+    and ``court patronize`` in the MAIN checkout, never in the atelier worktree."""
+    mpath = os.path.join(_main_repo_root(wt), ".court", "atelier", "manifest.json")
+    try:
+        with open(mpath, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return []
+    quests = data.get("quests") if isinstance(data, dict) else None
+    if not isinstance(quests, dict):
+        return []
+    return sorted(k for k in quests if isinstance(k, str))
+
+
 def _studio_quest_ids(wt) -> list[str]:
-    """Resolve the Quests governed by a combined-studio worktree from its
-    integration branch name (artist/<ids>-ui-studio). Returns normalized ids
-    (e.g. Q617) that actually have a charter file in the worktree's .court."""
+    """Resolve the Quests governed by a studio/atelier worktree. A per-cohort
+    studio derives them from its integration branch name (artist/<ids>-ui-studio);
+    the standing atelier derives them from its membership manifest."""
     branch = _studio_branch(wt)
+    if _is_atelier_branch(branch):
+        return _atelier_member_ids(wt)
     m = _STUDIO_BRANCH_RE.match(branch) if branch else None
     if not m:
         return []
@@ -5137,7 +5186,8 @@ def _check_studio_signoff_ready(wt):
         return False, "worktree is not an existing git checkout"
     qids = _studio_quest_ids(wt)
     if not qids:
-        return False, "worktree is not a combined studio (no artist/<ids>-ui-studio branch)"
+        return False, ("worktree is not a studio/atelier "
+                       "(no artist/<ids>-ui-studio or artist/atelier branch)")
     return True, ""
 
 
@@ -5829,6 +5879,16 @@ class Handler(BaseHTTPRequestHandler):
         provenance = (f"via studio overlay approve — {wt}"
                       + (f" — {note}" if note else ""))
         qids = _studio_quest_ids(wt)
+        # In the STANDING ATELIER, approving a Quest is `court patronize`: it
+        # pins the Quest's own artist-commit SHAs, writes the UI sign-off the
+        # gates read, and queues the Night's Watch to collect it. It must run in
+        # the MAIN checkout — the atelier manifest and the collect both live
+        # there (never in the atelier worktree). A per-cohort studio still
+        # records a plain `court ui-signoff` on its own branch, carried to each
+        # Quest by `studio --sync-back`.
+        atelier = _is_atelier_branch(_studio_branch(wt))
+        verb = "patronize" if atelier else "ui-signoff"
+        run_cwd = _main_repo_root(wt) if atelier else wt
         results = []
         failed = []
         for qid in qids:
@@ -5841,9 +5901,9 @@ class Handler(BaseHTTPRequestHandler):
                 p for p in (COURT_DIR, env.get("PYTHONPATH", "")) if p)
             try:
                 res = subprocess.run(
-                    [sys.executable, "-m", "court.cli", "ui-signoff",
+                    [sys.executable, "-m", "court.cli", verb,
                      qid, "--by", by, "--note", note_arg],
-                    cwd=wt, env=env, capture_output=True, text=True, timeout=120)
+                    cwd=run_cwd, env=env, capture_output=True, text=True, timeout=120)
                 results.append({
                     "id": qid,
                     "ok": res.returncode == 0,

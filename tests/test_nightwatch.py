@@ -358,6 +358,93 @@ def test_vigil_dispatch_runs_with_the_watch_dispatch_marker(tmp_path, monkeypatc
     assert called["env"].get("COURT_WATCH_DISPATCH") == "1"
 
 
+def test_a_non_spawning_vigil_executes_its_command(tmp_path, monkeypatch):
+    """A `rebase:` vigil builds a real argv and must RUN it. The old
+    `spawns: false` short-circuit synthesised `ok/exit 0` while running nothing,
+    so a queued rebase burned its fires green and converged zero worktrees."""
+    called = {}
+
+    def fake_court(repo, *argv, timeout=None, env=None):
+        called["argv"] = argv
+        class R:
+            returncode = 0
+            stdout = "🔄 Q1 merged: 12 -> 0 behind."
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(nw, "_court", fake_court)
+    res = nw.execute(tmp_path, nw.Action("vigil", quest_ids=["Q1"],
+                                         meta={"then": "rebase:Q1", "spawns": False}))
+    assert list(called["argv"]) == ["rebase", "Q1"]
+    assert res["ok"] is True
+    assert res["argv"] == ["rebase", "Q1"]
+
+
+def test_an_advance_vigil_executes_its_command(tmp_path, monkeypatch):
+    called = {}
+
+    def fake_court(repo, *argv, timeout=None, env=None):
+        called["argv"] = argv
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(nw, "_court", fake_court)
+    res = nw.execute(tmp_path, nw.Action("vigil", quest_ids=["Q1"],
+                                         meta={"then": "advance:Q1=GATE", "spawns": False}))
+    assert list(called["argv"]) == ["advance", "Q1", "GATE"]
+    assert res["ok"] is True
+
+
+def test_a_note_vigil_runs_nothing(tmp_path, monkeypatch):
+    sentinel = {}
+
+    def fake_court(repo, *argv, timeout=None, env=None):
+        sentinel["argv"] = argv
+        raise AssertionError("a note vigil must not invoke court")
+
+    monkeypatch.setattr(nw, "_court", fake_court)
+    res = nw.execute(tmp_path, nw.Action("vigil", meta={"then": "note:hello there", "spawns": False}))
+    assert res["ok"] is True and res["argv"] == []
+    assert "argv" not in sentinel
+
+
+def test_non_spawning_vigils_are_not_capped_by_the_spawn_budget(tmp_path):
+    """Zero-cost local-git actions must not be truncated by the WORKER cap:
+    six rebase vigils all survive a max_spawns_per_tick=2 tick."""
+    specs = [(_vigil(id=f"r{q}", then=f"rebase:{q}", when=[f"quest-status:{q}=GATE"]), "ready")
+             for q in ("QA1", "QA2", "QA3", "QA4", "QA5", "QA6")]
+    actions, _ = nw.plan(_snap(), nw.load_state(tmp_path),
+                         _policy(max_workers=10, max_spawns_per_tick=2), _workers(),
+                         ready_vigils=specs)
+    assert len(actions) == 6
+    assert all(a.meta["spawns"] is False for a in actions)
+
+
+def test_non_spawning_vigils_do_not_starve_spawning_actions(tmp_path):
+    """The per-tick cap still bounds real spawns; the rebase queue rides free."""
+    rebases = [(_vigil(id=f"rb{i}", then=f"rebase:QR{i}", when=[f"quest-status:QR{i}=GATE"]), "ready")
+               for i in range(6)]
+    quests = [_q(f"QS{i}", "TRIBUTE_READY", _free(tmp_path, f"ws{i}")) for i in range(3)]
+    actions, _ = nw.plan(_snap(*quests), nw.load_state(tmp_path),
+                         _policy(max_workers=10, max_spawns_per_tick=2), _workers(),
+                         ready_vigils=rebases)
+    assert sum(1 for a in actions if a.kind == "vigil") == 6   # none dropped
+    assert sum(1 for a in actions if a.kind == "coin") == 2    # worker cap intact
+
+
+def test_action_spawns_classification():
+    assert nw._action_spawns(nw.Action("vigil", meta={"then": "rebase:Q1", "spawns": False})) is False
+    assert nw._action_spawns(nw.Action("vigil", meta={"then": "coin:Q1", "spawns": True})) is True
+    assert nw._action_spawns(nw.Action("rebase", quest_ids=["Q1"])) is False
+    assert nw._action_spawns(nw.Action("raze", quest_ids=["Q1"])) is False
+    assert nw._action_spawns(nw.Action("coin", quest_ids=["Q1"])) is True
+    assert nw._action_spawns(nw.Action("collect", quest_ids=["Q1"])) is True
+    assert nw._action_spawns(nw.Action("steward")) is True
+
+
 def test_a_vigil_for_a_disabled_action_is_skipped(tmp_path):
     spec = _vigil(then="coin:Q1", when=["quest-status:Q1=TRIBUTE_READY"])
     actions, notes = nw.plan(_snap(), nw.load_state(tmp_path), _policy(enabled=("goad",)),

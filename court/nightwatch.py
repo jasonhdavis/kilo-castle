@@ -662,6 +662,24 @@ def _vigil_verb(spec: dict) -> str:
         return ""
 
 
+# Action kinds that run LOCAL git / bookkeeping only — they start no worker, so
+# they must not be bounded by the per-tick WORKER cap nor charged against the
+# hourly SPAWN budget. `rebase` and `advance` arrive as non-spawning vigils;
+# `raze`, `teardown`, `prune` and `pgprune` are mechanical housekeeping.
+LOCAL_ACTION_KINDS = frozenset({"rebase", "advance", "note", "raze", "teardown", "prune", "pgprune"})
+
+
+def _action_spawns(action: "Action") -> bool:
+    """Whether an action starts a worker (and so consumes capacity and the
+    hourly spawn budget).
+
+    A vigil's own `spawns` flag is authoritative: `dispatch`/`goad`/`coin`/
+    `collect`/`muster` spawn; `rebase`/`advance`/`note` do not."""
+    if action.kind == "vigil":
+        return bool(action.meta.get("spawns", True))
+    return action.kind not in LOCAL_ACTION_KINDS
+
+
 def _quest_map(snap: dict) -> dict:
     return {q["id"]: q for q in snap.get("quests", []) if q.get("kind") != "epic"}
 
@@ -1515,7 +1533,21 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
         elif status == "HELD":
             note(q["id"], "report", "HELD — awaiting Audience")
 
-    actions = actions[: policy.max_spawns_per_tick]
+    # The per-tick cap bounds WORKER spawns, not local-git/bookkeeping actions.
+    # Capping the flat list let a queue of zero-cost `rebase`/`advance`/`note`
+    # vigils (appended ahead of the heuristics) consume every slot and starve
+    # the dispatch/coin/collect actions that actually move the pipeline — and
+    # the watch's own drift-rebase lane with them. Non-spawning actions pass
+    # through; only spawning ones are capped at `max_spawns_per_tick`.
+    _capped: list = []
+    _spawn_budget = policy.max_spawns_per_tick
+    for _a in actions:
+        if _action_spawns(_a):
+            if _spawn_budget <= 0:
+                continue
+            _spawn_budget -= 1
+        _capped.append(_a)
+    actions = _capped
 
     # --- Session-store razing (maintenance, never work) ---------------------
     # The Kilo session/event store grows without bound (15 GB by 2026-11-08).
@@ -1743,11 +1775,18 @@ def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -
         return _execute_pgprune(repo, action)
     if action.kind == "vigil":
         then = action.meta.get("then") or ""
-        if not action.meta.get("spawns", True):
-            return {"ok": True, "exit": 0, "argv": [], "stdout_tail": f"note-only vigil: {then}",
-                    "stderr_tail": "", "seconds": 0.0}
         argv, _spawns = vigils.action_argv(
             then, {"then": then, "brief": action.meta.get("brief") or ""})
+        if not argv:
+            # `note:<text>` is bookkeeping only — there is no command to run.
+            # Every OTHER non-spawning vigil (`rebase`, `advance`) builds a real
+            # argv and MUST execute. The old early-return for `spawns: false`
+            # synthesised `ok/exit 0` without running anything, so a queued
+            # `rebase:<QID>` vigil burned its fires green and converged nothing
+            # (and, being appended ahead of the heuristics, starved the watch's
+            # own rebase lane at the per-tick cap).
+            return {"ok": True, "exit": 0, "argv": [], "stdout_tail": f"note-only vigil: {then}",
+                    "stderr_tail": "", "seconds": 0.0}
     elif action.kind == "charter":
         argv = ["charter-request", *action.quest_ids]
     elif action.kind == "regate":
@@ -2544,7 +2583,8 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
         state["board_sig_since"] = now
     executed = []
     for action in actions:
-        if len(spawns) >= policy.max_spawns_per_hour:
+        _spends = _action_spawns(action)
+        if _spends and len(spawns) >= policy.max_spawns_per_hour:
             say(f"\u23f8\ufe0f  hourly spawn budget reached ({policy.max_spawns_per_hour}/h) \u2014 skipping {action.kind} {','.join(action.quest_ids)}")
             notes.append({"quest": ",".join(action.quest_ids), "level": "skip",
                           "text": f"hourly spawn budget reached ({policy.max_spawns_per_hour}/h)"})
@@ -2556,8 +2596,12 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
             continue
         say(f"\u25b6 {label} \u2014 {action.reason}")
         result = execute(repo, action)
-        spawns.append(now)
-        state["spawns"] = spawns
+        # Only a worker-spawning action spends the hourly budget: a local-git
+        # `rebase`/`advance` vigil is zero-cost and must not exhaust the budget
+        # that gates real dispatches and coins.
+        if _spends:
+            spawns.append(now)
+            state["spawns"] = spawns
         _apply_bookkeeping(state, action, result, now, repo)
         record = {"ts": _now_iso(), "event": "action", "action": action.__dict__, "result": result,
                   "workers_before": workers}

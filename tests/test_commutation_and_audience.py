@@ -67,6 +67,30 @@ class TestCommutationAndAudience(unittest.TestCase):
         )
         self.assertFalse(q3.has_pending_audience())
 
+    def test_audience_verdict_prefix_with_a_trailing_rationale(self):
+        """A leading 'None required'/'None outstanding' verdict followed by a
+        dash/colon/comma rationale is normal style, not a hedge. Matching the
+        WHOLE leading clause flagged every such well-formed Audience as Pending
+        and re-parked ripe Quests."""
+        for body in (
+            "None required — no UI surface changed.",
+            "None outstanding: handled upstream in Q1400.",
+            "None otherwise, nothing needed from M'Lord",
+            "No audience required (pure refactor).",
+        ):
+            q = Quest(id="Q960", title="t", app="crm", concern="test",
+                      body_sections={"Tribute Rendered": f"## Audience\n{body}\n\n## Ballad\nDone."})
+            self.assertFalse(q.has_pending_audience(), body)
+
+    def test_a_real_audience_beginning_with_none_is_still_pending(self):
+        """The bare 'none' stays an EXACT verdict — a genuine decision request
+        that merely starts with 'none' must not be swallowed."""
+        q = Quest(id="Q961", title="t", app="crm", concern="test",
+                  body_sections={"Tribute Rendered":
+                                 "## Audience\nNone of the proposed options are acceptable; "
+                                 "M'Lord must decide between A and B.\n\n## Ballad\nDone."})
+        self.assertTrue(q.has_pending_audience())
+
     def test_rollup_ship_manifest_commutations(self):
         q1 = Quest(
             id="Q955",

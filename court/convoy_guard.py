@@ -386,7 +386,8 @@ def ui_assent_state(repo_root: Path, quest_id: str) -> tuple[str, str]:
         return "deferred", review
     if "waived" in lowered:
         return "waived", review
-    if "not required" in lowered or "none required" in lowered or "no ui" in lowered:
+    if ("not required" in lowered or "none required" in lowered or "no ui" in lowered
+            or "none outstanding" in lowered or "none otherwise" in lowered):
         return "not_required", review
     if any(word in lowered for word in ("approved", "verified", "passed")):
         # An APPROVED assertion with no UI Sign-off line: treated as outstanding.

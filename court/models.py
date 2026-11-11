@@ -772,6 +772,15 @@ class Quest:
         )
         if cleaned in none_phrases:
             return False
+        # The verdict is only the LEADING clause; a trailing rationale after a
+        # dash, colon or comma ("None required — no UI surface changed",
+        # "None outstanding: handled upstream") is normal style, not a hedge,
+        # and must still read as no decision. Prefix-match the MULTI-WORD
+        # verdicts; the bare "none"/"n/a" stay exact so a genuine "none of the
+        # above, we need a decision" is not swallowed.
+        if any(cleaned.startswith(p) and not cleaned[len(p)].isalnum()
+               for p in none_phrases if " " in p):
+            return False
         aud_log = self.body_sections.get("Audience Log", "").strip()
         if aud_log and not _is_placeholder(aud_log):
             return False

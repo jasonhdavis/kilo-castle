@@ -268,10 +268,18 @@ def peeled_quest_ids(repo_root: Path, trunk: str = "castle") -> set[str]:
     return peeled
 
 
-def _quest_file(repo_root: Path, quest_id: str) -> Optional[Path]:
+def _quest_file(repo_root: Path, quest_id: str, branch: str = "") -> Optional[Path]:
     directory = Path(repo_root) / ".court" / "quests"
     if not directory.is_dir():
         return None
+    # A short Quest id (Q1307) can collide across apps (Marketplace vs Common).
+    # When the branch slug is supplied, prefer the file whose stem matches it so
+    # the invariant audits the Quest the branch actually belongs to.
+    if branch:
+        slug = branch.rstrip("/").rsplit("/", 1)[-1]
+        for candidate in sorted(directory.glob(f"{quest_id}-*.md")):
+            if candidate.is_file() and candidate.stem.lower() == slug.lower():
+                return candidate
     for pattern in (f"{quest_id}-*.md", f"{quest_id}*.md"):
         for candidate in sorted(directory.glob(pattern)):
             if candidate.is_file():
@@ -279,8 +287,8 @@ def _quest_file(repo_root: Path, quest_id: str) -> Optional[Path]:
     return None
 
 
-def quest_status(repo_root: Path, quest_id: str) -> str:
-    path = _quest_file(repo_root, quest_id)
+def quest_status(repo_root: Path, quest_id: str, branch: str = "") -> str:
+    path = _quest_file(repo_root, quest_id, branch=branch)
     if path is None:
         return ""
     try:
@@ -557,7 +565,31 @@ def unpromoted_quests_in_trunk(
             continue
         if _git(repo_root, "merge-base", "--is-ancestor", branch, trunk).returncode != 0:
             continue
-        status = quest_status(repo_root, qid)
+        # A branch whose tip is itself a trunk commit is a pointer that was cut
+        # from the trunk and never advanced — it carries no Quest code of its
+        # own (a freshly dispatched Quest before its first commit, or an OPEN
+        # Quest never worked). Only a real branch tip (a commit NOT on the
+        # trunk's first-parent line) is genuinely merged material needing a
+        # promotion decision.
+        tip = (_git(repo_root, "rev-parse", branch).stdout or "").strip()
+        trunk_line = (_git(repo_root, "rev-list", "--first-parent", trunk).stdout or "").splitlines()
+        if tip and tip in trunk_line:
+            continue
+        # A tip that is a Court bookkeeping commit naming a DIFFERENT Quest is a
+        # shared ledger-sync pointer: the branch was cut from / synced onto a
+        # commit belonging to another Quest's lineage. `castle` is occasionally
+        # rewritten (reset, not revert), so such a pointer can sit OFF the
+        # first-parent line and masquerade as merged material. It carries no
+        # code of this Quest's own, so it is not a rider. A real rider's tip is
+        # its own last commit (a code commit or its own `court:` advance), so it
+        # still flags. (Q1420, 2026-11-11.)
+        if tip:
+            subject = (_git(repo_root, "log", "-1", "--format=%s", tip).stdout or "").strip()
+            named = re.search(r"\bQ(\d+)\b", subject)
+            own = re.search(r"(\d+)", qid or "")
+            if subject.lower().startswith("court: ") and named and own and named.group(1) != own.group(1):
+                continue
+        status = quest_status(repo_root, qid, branch=branch)
         if status and status not in allowed_statuses:
             findings.append(Finding(
                 "error",
@@ -664,7 +696,7 @@ def audit_promotion(
                 branch=source,
             ))
             continue
-        status = quest_status(repo_root, qid)
+        status = quest_status(repo_root, qid, branch=source)
         if status and status not in PROMOTABLE_STATUSES:
             findings.append(Finding(
                 "error",

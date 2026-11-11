@@ -52,7 +52,7 @@ symlink to `.court/engine`). If an import fails, retry `court nightwatch --repo 
 | Dam | Board state | What clears it |
 |---|---|---|
 | **Idea creation** | `OPEN` (no charter), `PLANNED` (chartered, undispatched) | write the charter, then `court enqueue <quest> --why "..."` |
-| **Design approval** | pending Audience, `ui_pending` (Court Artist summoned) | `/artist` or `/atelier`, then **record** the sign-off: `court ui-signoff <quest> --by "M'Lord" --note "..."` |
+| **Design approval** | pending Audience, `ui_pending` (Court Artist summoned) | merge into the standing atelier (`court atelier --standing <ids> --standup`), then **patronize** per Quest: `court patronize <quest> --by "M'Lord" --note "..."` |
 | **Implementation approval** | `GATE` (awaiting collect), `TRIBUTE_READY` (awaiting Master of Coin), `READY_TO_RAZE` (awaiting raze) | `court collect`, `court coin`, `court raze` |
 
 Report by dam, newest evidence first, then propose one action per dam. Entries
@@ -123,7 +123,8 @@ never invents work; between jobs it just ticks.
   goad/coin budget usage, and Quests ready to raze — plus
   `python3 -m court.cli nightwatch --status` for the daemon and counters.
 - **Do only what the watch cannot.** Summon a Court Artist for a PENDING UI
-  review (`/artist`/`/atelier`), regate or clear a stale gatekeeper stamp,
+  review (the standing atelier: `court atelier --standing <ids> --standup`,
+  then `court patronize`), regate or clear a stale gatekeeper stamp,
   triage a Quest that reached its worker-recovery budget, and clear a dead
   convoy's gatehouse worktree. The watch surfaces these as attention items; it
   will not spin on a corpse.
@@ -263,11 +264,13 @@ python3 -m court.cli dispatch-complete <id> --session-id <ses_id> --branch <bran
 - Dispatch **Master of Coin** (`master_of_coin_review_prompt.md`) via Kilo CLI directly in the Quest's worktree (`python3 -m court.cli coin <id>`, or `kilo run --auto --agent master_of_coin --model "$(python3 -m court.cli model master_of_coin)" --dir <wt>`; `model` resolved from `.court/config.json`).
 - Master of Coin verifies the claims live, fixes paperwork, identifies commutation steps, and advances to `GATE`.
 
-### 6b. Court Artist & UI Review (`/artist`)
-- If a Quest modified templates, styles, or user-facing views, summon the **Court Artist** (`/artist <id>`) before Gatehouse collection (`model: "GLM-5.3"` / `openrouter`).
-- Launches an interactive design review session with an active worktree runserver directly with M'Lord.
-- Court Artist edits templates live, updates the Tally, commits changes, and passes to `/collect`.
-- **Batched UI convoys (`/atelier`)**: when several small UI quests are pending review at once, roll them up into one Cog Ship with `court atelier <ids>` instead of running per-quest `/artist` sessions. It merges their branches onto the convoy branch PRE-integration-test, stands up one Court Artist with a runserver on the merged (untested) branch, and lets M'Lord review everything — plus direct extra UI changes ("Royal Addendum", attributed per-commit) — in a single session. Single-writer: the Gatekeeper enters the convoy worktree only after the artist signs off; if it later rejects a quest, addendum polish entangled with that quest's files is reverted with it.
+### 6b. Court Artist & UI Review (Standing Atelier — the single path)
+- If a Quest modified templates, styles, or user-facing views, route it to the **Standing Atelier** before Gatehouse collection. There is ONE atelier: a single long-lived worktree (`.kilo/worktrees/artist-atelier`) on the stable branch `artist/atelier`, with one merged dev server.
+- **Merge Quests in as their tribute lands**: `court atelier --standing <ids>` merges their branches into the merged view (single-writer: a live artist turn refuses a merge-in). `court atelier --list` shows membership; `court atelier --reap` tears the worktree down (branch ref kept).
+- **Summon the Court Artist inside the merged view**: `court atelier --standing <ids> --standup` (or the printed `kilo run --auto --agent artist ... "$(cat .kilo/TASK_ARTIST.md)"` line). The artist confirms each Quest's code is merged and its view renders, inspects the tribute for compliance, and summarizes the pages to review. It has authority to write view code AND the service functions behind it; extra un-chartered changes M'Lord directs are legitimate **Royal Addenda** when attributed (`Addendum-Quests:` trailer + `## Royal Addendum` entry).
+- **M'Lord patronizes each Quest independently**: `court patronize <quest> --by "M'Lord" --note "<where said>"`. This pins the Quest's approved revision as the ordered set of its OWN artist-review commit SHAs, writes the written UI sign-off the gates read, and queues the Night's Watch to collect it. The pin is a SHA set, never the atelier tip — so one Quest's promotion can never drag in another's in-progress work.
+- **Extraction is deferred and mechanical**: `court collect` replays each patronized Quest's pinned commits onto its own branch (patch-id-verified no-op when already applied) before packing, then the Gatekeeper integrates that Quest through its own branch. `court collect` refuses an atelier member that is not yet patronized.
+- `court studio` (per-cohort) and the convoy `court atelier` remain for compatibility, but the standing atelier supersedes them for UI review — prefer it. `court artist <id>` still summons a single-Quest review in the Quest's own worktree for a one-off.
 
 ### 7. Collect & Gate (`/collect`)
 - Run `python3 -m court.cli collect` to audit Quests waiting at `GATE`, stamp a Cog Ship convoy (`cogship-NNN`), and prepare the Gatekeeper dispatch payload.

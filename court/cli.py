@@ -48,6 +48,7 @@ from . import migration_guard
 from . import migration_graph
 from . import browser as studio_browser
 from . import studio_close
+from . import atelier
 from . import lease as worker_lease
 from . import handoff
 from . import vigils
@@ -75,6 +76,7 @@ SERF_DISPATCH_TEMPLATE = ".court/templates/serf_dispatch_prompt.md"
 ARTIST_DISPATCH_TEMPLATE = ".court/templates/court_artist_prompt.md"
 ATELIER_DISPATCH_TEMPLATE = ".court/templates/court_artist_convoy_prompt.md"
 STUDIO_DISPATCH_TEMPLATE = ".court/templates/court_artist_studio_prompt.md"
+ATELIER_STANDING_DISPATCH_TEMPLATE = ".court/templates/court_artist_atelier_prompt.md"
 REPO_ROOT = git_ops.get_repo_root()
 MANAGE_SERVERS_PATH = REPO_ROOT / ".kilo" / "manage_servers.sh"
 
@@ -5576,6 +5578,43 @@ def cmd_collect(args):
                     "--allow-pending-studio",
                 ))
                 continue
+        # Standing-atelier handling (the single UI-review path). A Quest merged
+        # into the atelier must be PATRONIZED before it can pack, and its pinned
+        # approved revision must be extracted onto its own branch first.
+        # Extraction is mechanical and per-Quest — the pin is a set of the
+        # Quest's OWN commit SHAs, so no other Quest's in-progress work rides in.
+        atelier_member = atelier.member(repo_root, quest.id)
+        if atelier_member is not None:
+            pin = atelier_member.get("patronage") if isinstance(atelier_member.get("patronage"), dict) else None
+            if not pin:
+                skipped.append((
+                    quest.id,
+                    "merged into the standing atelier and not yet patronized — review it in the merged "
+                    "view and run `court patronize <quest> --by \"M'Lord\"` before packing",
+                ))
+                continue
+            atelier_branch = pin.get("atelier_branch") or atelier.ATELIER_BRANCH
+            if not atelier.extraction_status(repo_root, quest).get("applied"):
+                report = atelier.extract_quest(
+                    repo_root, quest, pin, atelier_branch=atelier_branch,
+                    base=base_branch, auto_commit=auto_commit,
+                )
+                if report["status"] in ("conflict", "no-worktree", "dirty", "missing-commit"):
+                    detail = (report.get("detail") or report.get("reason")
+                              or ", ".join(report.get("conflicts") or []) or report["status"])
+                    skipped.append((
+                        quest.id,
+                        f"atelier extraction failed ({report['status']}): {detail} — resolve and re-run "
+                        "`court collect`, or re-patronize after the artist reconciles",
+                    ))
+                    continue
+                print(f"🎨 {quest.id}: extracted {len(report.get('picked') or [])} pinned atelier "
+                      f"commit(s) onto {quest.branch} ({report['status']})")
+            else:
+                atelier.mark_extracted(
+                    repo_root, quest.id,
+                    [c["hash"] for c in (pin.get("commits") or [])], auto_commit=auto_commit,
+                )
         # A recorded UI MANDATE (royal decree or charter requirement) is not
         # tracked debt: the Quest waits for its artist session instead of being
         # packed with the review unperformed. `--allow-ui-pending` does not
@@ -6378,6 +6417,268 @@ def _studio_sync_back(args, auto_commit: bool, repo_root: Path) -> None:
     print("=" * 76)
 
 
+# ---------------------------------------------------------------------------
+# Standing Artist Atelier (single merged view + one dev server).
+#
+# The single UI-review path: ONE long-lived worktree (`.kilo/worktrees/
+# artist-atelier`) on a stable branch (`artist/atelier`), one merged dev
+# server. Quests merge in as their tribute lands; M'Lord reviews them in that
+# one merged view and patronizes each independently (`court patronize`), which
+# pins that Quest's approved revision as a set of its own commit SHAs. The
+# pinned commits are extracted onto each Quest's own branch mechanically at
+# collect time — never by an interactive peel against the moving atelier tip.
+# ---------------------------------------------------------------------------
+
+def _atelier_ensure_worktree(repo_root: Path, branch: str, base: str) -> tuple[Path, bool]:
+    """Ensure the standing atelier worktree + branch exist; create from `base`
+    when absent. Returns (worktree_path, created)."""
+    wt_path = atelier.worktree_path(repo_root)
+    if wt_path.is_dir() and _verify_branch_exists(branch, repo_root):
+        return wt_path, False
+    wt_name = atelier.ATELIER_WORKTREE_NAME
+    created = False
+    kilo_bin = find_kilo_binary()
+    if kilo_bin and not wt_path.exists():
+        try:
+            subprocess.run([str(kilo_bin), "worktree", "create", wt_name], cwd=str(repo_root),
+                           capture_output=True, check=True, timeout=300)
+            git_ops.clear_git_cache()
+            subprocess.run(["git", "-C", str(wt_path), "branch", "-m", branch],
+                           capture_output=True, timeout=60)
+            created = True
+        except Exception as e:
+            print(f"⚠️ kilo worktree create failed ({e}); falling back to git worktree add")
+    if not created and not wt_path.exists():
+        cmd = (["git", "worktree", "add", str(wt_path), branch]
+               if _verify_branch_exists(branch, repo_root)
+               else ["git", "worktree", "add", str(wt_path), "-b", branch, base])
+        res = git_ops._run(cmd, repo_root)
+        if not res.get("ok"):
+            print(f"ERROR: could not create atelier worktree at {wt_path}: {res.get('stderr')}",
+                  file=sys.stderr)
+            sys.exit(1)
+        created = True
+    return wt_path, created
+
+
+def cmd_atelier_status(args) -> None:
+    repo_root = git_ops.get_repo_root()
+    m = atelier.load_manifest(repo_root)
+    wt_path = atelier.worktree_path(repo_root)
+    rows = []
+    for qid, rec in sorted(m.get("quests", {}).items()):
+        pin = rec.get("patronage") if isinstance(rec.get("patronage"), dict) else None
+        rows.append({
+            "quest": qid,
+            "title": rec.get("title", ""),
+            "branch": rec.get("branch", ""),
+            "merged_at": rec.get("merged_at", ""),
+            "patronized": bool(pin),
+            "by": (pin or {}).get("by", ""),
+            "approved_at": (pin or {}).get("approved_at", ""),
+            "shas": (pin or {}).get("shas", []),
+            "extracted": (pin or {}).get("extracted", False),
+        })
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "branch": m.get("branch"),
+            "worktree": str(wt_path),
+            "exists": wt_path.is_dir(),
+            "members": rows,
+            "pending_extraction": atelier.pending_extraction(repo_root),
+        }, indent=2))
+        return
+    print("=" * 76)
+    print(f"🎨 STANDING ATELIER — {m.get('branch')}")
+    print("=" * 76)
+    print(f"Worktree:   {wt_path}  [{'present' if wt_path.is_dir() else 'absent'}]")
+    if not rows:
+        print("(no Quests merged in yet)")
+    for r in rows:
+        state = "patronized" if r["patronized"] else "under review"
+        if r["patronized"]:
+            state += " / extracted" if r["extracted"] else " / pending extraction"
+        print(f"  • {r['quest']}: {state}  ({len(r['shas'])} pinned commit(s))")
+    pend = atelier.pending_extraction(repo_root)
+    if pend:
+        print(f"Pending extraction: {', '.join(pend)} (collect extracts them mechanically)")
+    print("=" * 76)
+
+
+def cmd_atelier_reap(args) -> None:
+    repo_root = git_ops.get_repo_root()
+    wt_path = atelier.worktree_path(repo_root)
+    branch = getattr(args, "branch", None) or atelier.ATELIER_BRANCH
+    pend = atelier.pending_extraction(repo_root)
+    if pend and not getattr(args, "force", False):
+        print(f"ERROR: {len(pend)} patronized Quest(s) still pending extraction "
+              f"({', '.join(pend)}). Collect them first, or pass --force.", file=sys.stderr)
+        sys.exit(1)
+    if not wt_path.is_dir():
+        print(f"(no atelier worktree at {wt_path} — nothing to reap)")
+        return
+    res = git_ops._run(["git", "worktree", "remove", "--force", str(wt_path)], repo_root)
+    if not res.get("ok"):
+        print(f"ERROR: could not remove atelier worktree: {res.get('stderr')}", file=sys.stderr)
+        sys.exit(1)
+    print(f"🧹 Atelier worktree removed: {wt_path} (branch {branch} ref kept)")
+
+
+def cmd_atelier_standing(args) -> None:
+    repo_root = git_ops.get_repo_root()
+    auto_commit = not getattr(args, "no_commit", False)
+    branch = getattr(args, "branch", None) or atelier.ATELIER_BRANCH
+    base = getattr(args, "base", "castle") or "castle"
+    wt_path, created = _atelier_ensure_worktree(repo_root, branch, base)
+
+    explicit = getattr(args, "quest_ids", None)
+    has_filter = any(getattr(args, k, None) for k in ("status_filter", "app", "epic", "cogship"))
+    quests = resolve_quest_selection(args, batchable=True, required=False) if (explicit or has_filter) else []
+
+    # Serialize merge-in against a live artist turn (single-writer): merging new
+    # Quest branches under the artist's feet would move the tree mid-review. The
+    # deferred hand-off is a vigil — queue it and the watch merges when the
+    # artist is idle, rather than racing the merged view.
+    if quests and not getattr(args, "force", False):
+        try:
+            artist_live = session_is_fresh(wt_path)
+        except Exception:
+            artist_live = False
+        if artist_live:
+            print(
+                "⏸️  An artist session is live in the atelier worktree — not merging new Quests into the "
+                "merged view now. Queue the merge for when the artist is idle "
+                f"(`court atelier --standing {','.join(q.id for q in quests)}` again, or a vigil), "
+                "or pass --force to merge anyway.",
+                file=sys.stderr,
+            )
+            quests = []
+
+    merged, reports = [], []
+    if quests:
+        merged, reports = _merge_quest_branches_with_policy(quests, wt_path, "atelier")
+        for r in reports:
+            if r.get("paperwork"):
+                print(f"📄 {r['id']}: charter paperwork branch-wins: {', '.join(r['paperwork'])}")
+            for u in r.get("union") or []:
+                print(f"🔀 {r['id']}: code overlap union-resolved: {u}")
+            if r.get("isolated"):
+                print(f"⚠️  Isolated {r['id']}: {r['isolated']} — review it per-Quest")
+        for q in merged:
+            atelier.record_member(repo_root, q, auto_commit=auto_commit)
+            q.log_ledger(q.status, q.status,
+                         f"Merged into the standing atelier {branch} (worktree {wt_path.name})")
+        if merged:
+            store.save_many(merged, f"court: merge {len(merged)} quest(s) into atelier {branch}",
+                            auto_commit=auto_commit)
+
+    root_env = repo_root / ".env"
+    if root_env.is_file() and not (wt_path / ".env").exists():
+        shutil.copy2(root_env, wt_path / ".env")
+
+    setup_worktree_agent_config(wt_path, "artist")
+
+    port, runserver_url, server_status = _ensure_worktree_server(
+        wt_path, port_override=getattr(args, "port", None),
+        no_server=getattr(args, "no_server", False),
+    )
+
+    model = getattr(args, "model", None) or config.get_model("artist")
+    provider = getattr(args, "provider", None) or config.get_provider("artist")
+
+    member_ids = [q.id for q in merged] or list(atelier.members(repo_root))
+    quest_blocks = []
+    for qid in member_ids:
+        rec = atelier.member(repo_root, qid) or {}
+        pin = rec.get("patronage") if isinstance(rec.get("patronage"), dict) else None
+        quest_blocks.append(
+            f"### {qid} — {rec.get('title', '')}\n- Branch: `{rec.get('branch', '')}`\n"
+            f"- Status: {'patronized' if pin else 'under review'}"
+        )
+
+    tmpl_path = REPO_ROOT / ATELIER_STANDING_DISPATCH_TEMPLATE
+    if not tmpl_path.exists():
+        tmpl_path = Path(__file__).resolve().parent / "templates" / "court_artist_atelier_prompt.md"
+    if tmpl_path.exists():
+        tmpl_text = tmpl_path.read_text(encoding="utf-8")
+    else:
+        tmpl_text = (
+            "You are the Court Artist in the standing atelier {{ atelier_branch }}. "
+            "Worktree: {{ worktree }}. Runserver: {{ runserver_url }}. Quests: {{ quest_ids }}"
+        )
+
+    fresh_verdict = _freshness_verdict(_run_freshness_gate(repo_root))
+    routes: list[str] = []
+    for qid in member_ids:
+        try:
+            routes.extend(_extract_target_routes(store.load(qid), worktree=wt_path))
+        except Exception:
+            pass
+    routes_str = "\n".join(
+        f"- {runserver_url}{r}" if not r.startswith("http") else f"- {r}" for r in routes
+    ) or "- (no routes detected yet — navigate from the app home)"
+
+    prompt = (
+        tmpl_text
+        .replace("{{ atelier_branch }}", branch)
+        .replace("{{ worktree }}", str(wt_path))
+        .replace("{{ base_branch }}", base)
+        .replace("{{ runserver_url }}", runserver_url)
+        .replace("{{ port }}", str(port))
+        .replace("{{ model }}", model)
+        .replace("{{ quest_ids }}", ", ".join(member_ids))
+        .replace("{{ quest_blocks }}", "\n\n".join(quest_blocks))
+        .replace("{{ target_routes }}", routes_str)
+        .replace("{{ freshness_note }}", fresh_verdict)
+    )
+
+    brief_path = wt_path / ".kilo" / "TASK_ARTIST.md"
+    try:
+        brief_path.parent.mkdir(parents=True, exist_ok=True)
+        brief_path.write_text(prompt, encoding="utf-8")
+    except Exception as e:
+        print(f"⚠️  could not write {brief_path} ({e})")
+
+    spawn = None
+    if getattr(args, "standup", False):
+        spawn = standup_kilo_session(wt_path, agent="artist", model=model, prompt=prompt,
+                                     title="Standing Atelier", kilo_bin=find_kilo_binary(),
+                                     provider_hint="artist", holder="studio")
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "branch": branch,
+            "worktree": str(wt_path),
+            "created": created,
+            "merged": [q.id for q in merged],
+            "members": member_ids,
+            "port": port,
+            "runserver_url": runserver_url,
+            "model": model,
+            "provider": provider,
+            "brief": str(brief_path),
+            "spawn": spawn or {},
+        }, indent=2))
+        return
+
+    print("=" * 76)
+    print("🎨 STANDING ATELIER — SINGLE MERGED VIEW, ONE DEV SERVER")
+    print("=" * 76)
+    print(f"Branch:     {branch} (cut from {base})")
+    print(f"Worktree:   {wt_path}" + ("  [newly created]" if created else "  [existing]"))
+    print(f"Runserver:  {runserver_url} (Port {port}) [{server_status}]")
+    print(f"Members:    {', '.join(member_ids) if member_ids else '(none yet)'}")
+    print(f"Model:      {model} ({provider})")
+    print()
+    print("Next steps:")
+    print(f"  1. Summon the artist in the merged view: kilo run --auto --agent artist --model \"{model}\" "
+          f"--dir {wt_path} \"$(cat {brief_path})\"")
+    print("  2. Merge more Quests in as their tribute lands: court atelier --standing <ids>")
+    print("  3. M'Lord patronizes each Quest independently: court patronize <quest> --by \"M'Lord\"")
+    print("  4. Collect extracts each patronized Quest's pinned revision mechanically, then packs it.")
+    print("=" * 76)
+
+
 def cmd_atelier(args):
     """Royal UI Convoy Atelier: roll up multiple UI-review-pending Quests into one
     Cog Ship convoy PRE-integration-test, merge their branches together into the
@@ -6403,6 +6704,12 @@ def cmd_atelier(args):
     Quests whose UI Review is PENDING are accepted — already-approved or
     headless Quests have nothing for the artist and route through /collect.
     """
+    if getattr(args, "list", False):
+        return cmd_atelier_status(args)
+    if getattr(args, "reap", False):
+        return cmd_atelier_reap(args)
+    if getattr(args, "standing", False):
+        return cmd_atelier_standing(args)
     base_branch = getattr(args, "base", "castle") or "castle"
     auto_commit = not getattr(args, "no_commit", False)
     candidates = resolve_quest_selection(args, batchable=True, required=True, default_status="TRIBUTE_READY,GATE")
@@ -8652,6 +8959,27 @@ def cmd_edict(args):
             print("(no royal edicts recorded; add with: python3 -m court.cli edict 'Your priority')")
 
 
+def _write_ui_review(quest, review_line: str, signoff_line: str) -> bool:
+    """Write (or replace) the `UI Review` line and append the `UI Sign-off`
+    line in the Master of Coin's Audit section. Shared by `court ui-signoff`
+    and `court patronize` so both record assent in the one place the gates
+    read. Returns True when an existing UI Review line was replaced (False
+    when one was added fresh)."""
+    section_name = "Master of Coin's Audit"
+    section = quest.body_sections.get(section_name) or quest.body_sections.get("Master of Coin Review", "")
+    lines = section.splitlines()
+    replaced = False
+    for index, line in enumerate(lines):
+        if re.match(r"(?i)^\s*[-*]?\s*\*{0,2}UI Review\*{0,2}:", line):
+            lines[index] = review_line
+            replaced = True
+    if not replaced:
+        lines.append(review_line)
+    lines.append(signoff_line)
+    quest.body_sections[section_name] = "\n".join(line for line in lines if line is not None).strip()
+    return replaced
+
+
 def cmd_ui_signoff(args):
     """Record M'Lord's written UI assent (or an explicit waiver / none-required).
 
@@ -8694,21 +9022,11 @@ def cmd_ui_signoff(args):
         review_line = f"- **UI Review:** APPROVED — signed off by {by} on {stamp}{suffix}"
         kind = "approval"
 
-    section_name = "Master of Coin's Audit"
-    section = quest.body_sections.get(section_name) or quest.body_sections.get("Master of Coin Review", "")
-    lines = section.splitlines()
-    replaced = False
-    for index, line in enumerate(lines):
-        if re.match(r"(?i)^\s*[-*]?\s*\*{0,2}UI Review\*{0,2}:", line):
-            lines[index] = review_line
-            replaced = True
-    if not replaced:
-        lines.append(review_line)
     if getattr(args, "defer", False):
-        lines.append(f"- **UI Sign-off:** {by} — deferred ({stamp} UTC){suffix}")
+        signoff_line = f"- **UI Sign-off:** {by} — deferred ({stamp} UTC){suffix}"
     else:
-        lines.append(f"- **UI Sign-off:** {by} — {stamp}{suffix}")
-    quest.body_sections[section_name] = "\n".join(line for line in lines if line is not None).strip()
+        signoff_line = f"- **UI Sign-off:** {by} — {stamp}{suffix}"
+    replaced = _write_ui_review(quest, review_line, signoff_line)
     quest.log_ledger(quest.status, quest.status, f"UI {kind} recorded by {by}{suffix}")
     store.save(quest, auto_commit=not getattr(args, "no_commit", False))
     print(f"✅ {quest.id}: UI {kind} recorded by {by} at {stamp}")
@@ -8763,6 +9081,136 @@ def cmd_ui_mandate(args):
     if not args.clear:
         print("   Packing is now blocked until a written sign-off exists "
               "(`court ui-signoff <quest> --by M'Lord --note ...`).")
+
+
+def _enqueue_collect_vigil(repo: Path, quest, *, why: str, expires: str = "24h") -> dict:
+    """Queue a one-shot `collect:<quest>` hand-off for the Night's Watch.
+
+    The promotion sequence that follows a patronage: the watch, when capacity
+    allows, runs `court collect <quest> --standup`, which mechanically extracts
+    the pinned approved revision onto the Quest's branch and packs it."""
+    short = quest.id.split("-")[0].lower()
+    vid = f"collect-{short}"
+    if any(v.get("id") == vid for v in vigils.load_all(repo)):
+        return {"id": vid, "queued": False, "note": "already queued"}
+    try:
+        spec = vigils.build(
+            id=vid, when=["after:0s"], then=f"collect:{quest.id}",
+            reason=why, expires=expires, max_fires=1, created_by="patronize",
+        )
+    except vigils.VigilError as e:
+        return {"id": vid, "queued": False, "error": str(e)}
+    vigils.save(repo, spec)
+    return {"id": vid, "queued": True, "expires": spec["expires_at"]}
+
+
+def cmd_patronize(args):
+    """M'Lord patronizes one Quest's UI inside the standing atelier.
+
+    The approval→pin step, and the whole per-Quest lifecycle in one mechanical
+    command. It records the Quest's approved revision as the ordered set of its
+    OWN artist-review commit SHAs — never the atelier tip, so no other Quest's
+    in-progress work can ride along — writes the written UI sign-off the gates
+    read, and (by default) queues the Night's Watch to collect it.
+
+    The reviewed commits are extracted onto the Quest's own branch LATER, at
+    collect time (`court collect`), mechanically and per-Quest. Patronage never
+    performs an interactive peel, and the atelier tip may keep moving under
+    M'Lord's feet without affecting any pin already taken.
+    """
+    repo_root = git_ops.get_repo_root()
+    auto_commit = not getattr(args, "no_commit", False)
+    quest = store.load(args.quest_id)
+    by = (args.by or "").strip()
+    if not by:
+        print("ERROR: --by is required (who patronized, for example \"M'Lord\")", file=sys.stderr)
+        sys.exit(1)
+    note = (args.note or "").strip()
+    atelier_branch = getattr(args, "atelier", None) or atelier.ATELIER_BRANCH
+    base = getattr(args, "base", "castle") or "castle"
+
+    explicit = [s.strip() for s in (getattr(args, "revision", "") or "").split(",") if s.strip()]
+    if explicit:
+        commits = atelier._commits_for_shas(repo_root, explicit)
+        resolved = {c["hash"] for c in commits}
+        bad = [s for s in explicit if s not in resolved]
+        if bad:
+            print(f"ERROR: --revision SHA(s) do not resolve to commits here: {', '.join(bad)}",
+                  file=sys.stderr)
+            sys.exit(1)
+    else:
+        if not _verify_branch_exists(atelier_branch, repo_root):
+            print(f"ERROR: atelier branch '{atelier_branch}' not found — stand it up and merge {quest.id} "
+                  f"in (`court atelier --standing {quest.id}`) before patronizing.", file=sys.stderr)
+            sys.exit(1)
+        commits = atelier.labeled_shas(repo_root, atelier_branch, quest.id, base)
+        if not commits and not getattr(args, "allow_empty", False):
+            print(f"ERROR: no artist-review commits for {quest.id} on {atelier_branch}. Merge it in and run "
+                  f"the artist session first, or pass explicit --revision <sha,...> (or --allow-empty for an "
+                  f"approval with no artist changes).", file=sys.stderr)
+            sys.exit(1)
+
+    pin = atelier.pin_quest(repo_root, quest, commits, by=by, note=note, base=base,
+                            atelier_branch=atelier_branch, auto_commit=auto_commit)
+
+    stamp = now_iso()
+    suffix = f" — {note}" if note else ""
+    review_line = f"- **UI Review:** APPROVED — signed off by {by} on {stamp}{suffix}"
+    signoff_line = f"- **UI Sign-off:** {by} — {stamp}{suffix}"
+    _write_ui_review(quest, review_line, signoff_line)
+    shas_short = ", ".join(c["hash"][:12] for c in commits) or "(no artist commits — approval only)"
+    quest.log_ledger(quest.status, quest.status,
+                     f"Patronized in {atelier_branch}: approved revision {shas_short} (by {by}){suffix}")
+    store.save(quest, auto_commit=auto_commit, commit_msg=f"court: patronize {quest.id}")
+
+    extract_report = None
+    if getattr(args, "extract", False):
+        extract_report = atelier.extract_quest(
+            repo_root, quest, atelier.pin_for(repo_root, quest.id),
+            atelier_branch=atelier_branch, base=base, auto_commit=auto_commit,
+        )
+
+    queued = None
+    if not getattr(args, "no_enqueue", False):
+        queued = _enqueue_collect_vigil(
+            repo_root, quest,
+            why=f"{quest.id} patronized in {atelier_branch} — extract the pinned revision and collect",
+        )
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "quest": quest.id,
+            "atelier_branch": atelier_branch,
+            "by": by,
+            "note": note,
+            "shas": pin["shas"],
+            "empty": pin["empty"],
+            "manifest": str(atelier.manifest_path(repo_root)),
+            "queued": queued,
+            "extract": extract_report,
+        }, indent=2))
+        return
+
+    print("=" * 76)
+    print(f"👑 PATRONIZED {quest.id} IN {atelier_branch}")
+    print("=" * 76)
+    print(f"Approved revision: {shas_short}")
+    print(f"Patron:            {by}{suffix}")
+    print(f"Manifest:          {atelier.manifest_path(repo_root)}")
+    if extract_report:
+        print(f"Extraction:        {extract_report['status']}"
+              + (f" — {extract_report.get('detail') or extract_report.get('reason') or ''}"
+                 if extract_report.get('detail') or extract_report.get('reason') else ""))
+    else:
+        print("Extraction:        deferred to collect (mechanical, per-Quest)")
+    if queued:
+        if queued.get("queued"):
+            print(f"Night's Watch:     queued collect:{quest.id} (vigil {queued['id']}, expires {queued.get('expires')})")
+        else:
+            print(f"Night's Watch:     not queued ({queued.get('note') or queued.get('error')})")
+    else:
+        print("Night's Watch:     not queued (--no-enqueue)")
+    print("=" * 76)
 
 
 def _ship_interrogation(args, quests, trunk: str) -> tuple[list[str], list[str]]:
@@ -10186,6 +10634,16 @@ def build_parser():
     p_atelier.add_argument("--prompt-only", action="store_true", help="Print only the rendered convoy Court Artist prompt")
     p_atelier.add_argument("--json", action="store_true", help="Output JSON format for scripts (spawn payload uses the unified Kilo CLI path)")
     p_atelier.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
+    p_atelier.add_argument(
+        "--standing", action="store_true",
+        help="Stand up/attach the SINGLE standing atelier (one merged worktree + dev server) and merge "
+             "the selected Quests in — the single UI-review path",
+    )
+    p_atelier.add_argument("--branch", default=None, help="--standing: atelier branch override (default: artist/atelier)")
+    p_atelier.add_argument("--list", action="store_true", help="--standing: list atelier membership and per-Quest patronage state")
+    p_atelier.add_argument("--reap", action="store_true", help="--standing: tear down the standing atelier worktree (branch ref kept)")
+    p_atelier.add_argument("--standup", action="store_true", help="--standing: spawn the Court Artist session via Kilo CLI and record it")
+    p_atelier.add_argument("--force", action="store_true", help="--reap: remove the worktree even with Quests pending extraction")
     p_atelier.set_defaults(func=cmd_atelier)
 
     p_studio = sub.add_parser(
@@ -10344,6 +10802,30 @@ def build_parser():
     p_ui_mandate.add_argument("--clear", action="store_true", help="Clear a mandate (the owner released the requirement)")
     p_ui_mandate.add_argument("--no-commit", dest="no_commit", action="store_true", help="Write the charter without committing")
     p_ui_mandate.set_defaults(func=cmd_ui_mandate)
+
+    p_patronize = sub.add_parser(
+        "patronize",
+        help="M'Lord patronizes one Quest's UI in the standing atelier: pin its approved revision (its own "
+             "artist-commit SHAs), write the UI sign-off, and queue the Night's Watch to extract + collect",
+    )
+    p_patronize.add_argument("quest_id", help="Quest ID being patronized (e.g. Q123)")
+    p_patronize.add_argument("--by", required=True, help="Who patronized (for example M'Lord)")
+    p_patronize.add_argument("--note", default="", help="Provenance: which session/chat the approval came from")
+    p_patronize.add_argument("--atelier", default=None, help="Atelier branch (default: artist/atelier)")
+    p_patronize.add_argument("--base", default="castle", help="Base branch the atelier was cut from (default: castle)")
+    p_patronize.add_argument(
+        "--revision", default="",
+        help="Explicit comma-separated approved commit SHAs (default: the Quest's labeled artist commits on the atelier branch)",
+    )
+    p_patronize.add_argument("--allow-empty", dest="allow_empty", action="store_true",
+                             help="Allow an approval with no artist commits (reviewed, no changes)")
+    p_patronize.add_argument("--extract", action="store_true",
+                             help="Extract the pinned revision onto the Quest's branch now (default: deferred to collect)")
+    p_patronize.add_argument("--no-enqueue", dest="no_enqueue", action="store_true",
+                             help="Do not queue the Night's Watch collect hand-off")
+    p_patronize.add_argument("--json", action="store_true", help="Output JSON format")
+    p_patronize.add_argument("--no-commit", dest="no_commit", action="store_true", help="Write without committing")
+    p_patronize.set_defaults(func=cmd_patronize)
 
     p_audit = sub.add_parser("audit", help="Audit Quest tribute presence, gaps, and protocol compliance")
     add_quest_selector(p_audit, batchable=True, filters=("status", "app", "epic"))

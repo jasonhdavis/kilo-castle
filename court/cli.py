@@ -5705,6 +5705,18 @@ def cmd_collect(args):
 
     if not accepted:
         print("(no Master-of-Coin-approved Quests ready to pack into a Cog Ship)")
+        if regate:
+            # A regate exists to hand a promoted convoy back to a Gatekeeper;
+            # packing nothing means the Quest cannot be re-gated (no MoC audit,
+            # no usable worktree, or a compliance block). Exit non-zero so the
+            # caller counts a failed attempt and escalates instead of treating
+            # the no-op as success forever (the Q137 regate loop).
+            print(
+                "ERROR: --regate packed nothing — the Quest needs a Master of Coin audit "
+                "or a usable worktree before it can be handed to a Gatekeeper.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         return
 
     # Single-writer serialization for the convoy-minting tail: stamp + standup
@@ -5938,6 +5950,27 @@ def cmd_collect(args):
                             f"- Worker log: tail -f {log_path}",
                             f"- Once promoted to castle and advanced to READY_TO_RAZE, raze the worktree: `court raze {solo.id}`",
                         ]
+                else:
+                    # A size-1 convoy runs its Gatekeeper in the Quest's own
+                    # worktree, so there is nowhere to start one if that
+                    # worktree is gone. The old path printed instructions and
+                    # exited 0, which left regated Quests stranded in GATE with
+                    # no Gatekeeper and no way to integrate (Q123/Q233/Q333/
+                    # Q587/Q719/Q815 on 2026-11-12). Fail loudly instead.
+                    print(
+                        f"ERROR: {solo.id} cannot stand up a Gatekeeper: "
+                        f"{'no worktree is recorded' if not solo.worktree else str(solo.worktree) + ' does not exist'}. "
+                        "Recreate the Quest worktree (or dispatch a fresh serf) before re-gating.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                if not stood_up and not solo.gatekeeper_session_id:
+                    print(
+                        f"ERROR: could not stand up a Gatekeeper for {solo.id}; "
+                        "the Quest is packed but has no integrator.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
             else:
                 root = git_ops.get_repo_root()
                 wt_name = f"the-gatehouse-{cogship_id}"
@@ -8076,6 +8109,10 @@ def cmd_nightwatch(args):
         stale_convoy_backoff=getattr(args, "stale_convoy_backoff", None) or nightwatch.DEFAULT_STALE_CONVOY_BACKOFF,
         raze_cooldown=int(getattr(args, "raze_cooldown", 0) or 0) or 1800,
         max_regates=int(getattr(args, "max_regates", 0) or nightwatch.DEFAULT_MAX_REGATES),
+        collect_min_batch=max(1, int(getattr(args, "collect_min_batch", 0) or nightwatch.DEFAULT_COLLECT_MIN_BATCH)),
+        collect_batch_window=max(0, int(getattr(args, "collect_batch_window", nightwatch.DEFAULT_COLLECT_BATCH_WINDOW))),
+        collect_batch_max=max(0, int(getattr(args, "collect_batch_max", nightwatch.DEFAULT_COLLECT_BATCH_MAX))),
+        regate_batch_max=max(1, int(getattr(args, "regate_batch_max", 0) or nightwatch.DEFAULT_REGATE_BATCH_MAX)),
         max_charter_fails=int(getattr(args, "max_charter_fails", 0) or nightwatch.DEFAULT_MAX_CHARTER_FAILS),
         charter_cooldown=int(getattr(args, "charter_cooldown", 0) or nightwatch.DEFAULT_CHARTER_COOLDOWN),
         pg_prune_interval=int(getattr(args, "pg_prune_interval", 0) or nightwatch.DEFAULT_PG_PRUNE_INTERVAL),
@@ -10990,6 +11027,10 @@ def build_parser():
     p_nightwatch.add_argument("--session-prune-interval", dest="session_prune_interval", type=int, default=nightwatch.DEFAULT_SESSION_PRUNE_INTERVAL, help=f"Seconds between automatic session razes (default {nightwatch.DEFAULT_SESSION_PRUNE_INTERVAL})")
     p_nightwatch.add_argument("--pg-prune-interval", dest="pg_prune_interval", type=int, default=nightwatch.DEFAULT_PG_PRUNE_INTERVAL, help=f"Seconds between pytest-database reap sweeps on an idle board (default {nightwatch.DEFAULT_PG_PRUNE_INTERVAL}); disable with `--enable` without pgprune")
     p_nightwatch.add_argument("--max-regates", dest="max_regates", type=int, default=nightwatch.DEFAULT_MAX_REGATES, help=f"Regate attempts for a READY_TO_RAZE Quest raze refuses before escalating to a Steward (default {nightwatch.DEFAULT_MAX_REGATES})")
+    p_nightwatch.add_argument("--collect-min-batch", dest="collect_min_batch", type=int, default=nightwatch.DEFAULT_COLLECT_MIN_BATCH, help=f"Unstamped GATE Quests that must accumulate before packing a convoy (1 = collect immediately; default {nightwatch.DEFAULT_COLLECT_MIN_BATCH})")
+    p_nightwatch.add_argument("--collect-batch-window", dest="collect_batch_window", type=int, default=nightwatch.DEFAULT_COLLECT_BATCH_WINDOW, help=f"Seconds a lone GATE Quest may wait for peers before packing alone (default {nightwatch.DEFAULT_COLLECT_BATCH_WINDOW})")
+    p_nightwatch.add_argument("--collect-batch-max", dest="collect_batch_max", type=int, default=nightwatch.DEFAULT_COLLECT_BATCH_MAX, help=f"Maximum Quests packed into one collect convoy (0 = unbounded; default {nightwatch.DEFAULT_COLLECT_BATCH_MAX})")
+    p_nightwatch.add_argument("--regate-batch-max", dest="regate_batch_max", type=int, default=nightwatch.DEFAULT_REGATE_BATCH_MAX, help=f"Maximum Quests packed into one regate convoy (default {nightwatch.DEFAULT_REGATE_BATCH_MAX})")
     p_nightwatch.add_argument("--max-charter-fails", dest="max_charter_fails", type=int, default=nightwatch.DEFAULT_MAX_CHARTER_FAILS, help=f"Charter-request attempts before escalating to a human (default {nightwatch.DEFAULT_MAX_CHARTER_FAILS})")
     p_nightwatch.add_argument("--charter-cooldown", dest="charter_cooldown", type=int, default=nightwatch.DEFAULT_CHARTER_COOLDOWN, help=f"Seconds between charter attempts for one request (default {nightwatch.DEFAULT_CHARTER_COOLDOWN})")
     p_nightwatch.add_argument("--session-keep-events", dest="session_keep_events", type=int, default=nightwatch.DEFAULT_SESSION_KEEP_EVENTS, help=f"Newest event rows kept when razing sessions (default {nightwatch.DEFAULT_SESSION_KEEP_EVENTS})")

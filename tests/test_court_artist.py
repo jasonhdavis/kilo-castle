@@ -305,6 +305,8 @@ class TestCourtArtist(unittest.TestCase):
         args.force = False
         args.skip_ui_review = False
         args.cogship = None
+        args.regate = False
+        args.standup = False
 
         import io
         from contextlib import redirect_stdout
@@ -362,6 +364,8 @@ class TestCourtArtist(unittest.TestCase):
         args.force = False
         args.skip_ui_review = True
         args.cogship = "cogship-999"
+        args.regate = False
+        args.standup = False
 
         import io
         from contextlib import redirect_stdout

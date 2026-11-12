@@ -14,6 +14,8 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from court import cli, store
 from court.models import Quest
 
@@ -208,3 +210,32 @@ def test_collect_packs_a_pending_ui_quest_and_records_ui_debt(tmp_path, monkeypa
     assert pack_path.is_file()
     pack = json.loads(pack_path.read_text(encoding="utf-8"))
     assert pack.get("ui_debt") == ["Q902-Pending-UI: deferred"]
+
+
+def test_collect_regate_that_packs_nothing_exits_nonzero(tmp_path, monkeypatch):
+    """A regate with no Master-of-Coin audit packs nothing. Exit 0 made the
+    watch treat the no-op as success and retry forever (the Q137 loop)."""
+    quest = _regate_quest()
+    quest.body_sections["Master of Coin's Audit"] = ""
+    with pytest.raises(SystemExit) as exc:
+        _run_collect(quest, _collect_args(regate=True), tmp_path, monkeypatch)
+    assert exc.value.code == 1
+
+
+def test_collect_standup_without_a_worktree_exits_nonzero(tmp_path, monkeypatch):
+    """A size-1 convoy runs its Gatekeeper in the Quest worktree. If that
+    worktree is gone, the old path printed instructions and exited 0, leaving
+    the Quest GATE-packed with no integrator."""
+    quest = _regate_quest()
+    quest.status = "TRIBUTE_READY"
+    quest.cogship_id = ""
+    quest.cogship_promoted_commit = ""
+    quest.gatekeeper_session_id = ""
+    quest.gatekeeper_model = ""
+    quest.worktree = ""
+    monkeypatch.setattr(store, "stamp_cogship", lambda *a, **k: "cogship-014")
+    monkeypatch.setattr(cli, "find_kilo_binary", lambda: "/usr/bin/kilo")
+
+    with pytest.raises(SystemExit) as exc:
+        _run_collect(quest, _collect_args(standup=True), tmp_path, monkeypatch)
+    assert exc.value.code == 1

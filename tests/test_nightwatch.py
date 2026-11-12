@@ -153,6 +153,59 @@ def test_groups_unstamped_gate_quests_into_one_convoy(tmp_path):
     assert actions[0].cogship == ""
 
 
+def test_unstamped_gate_quests_share_one_convoy_regardless_of_app(tmp_path):
+    wts = [_free(tmp_path, n) for n in ("a", "b", "c", "d")]
+    snap = _snap(
+        _q("Q1", "GATE", wts[0], app="marketing"),
+        _q("Q2", "GATE", wts[1], app="marketing"),
+        _q("Q3", "GATE", wts[2], app="crm"),
+        _q("Q4", "GATE", wts[3], app="crm"),
+    )
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers())
+    collect = [a for a in actions if a.kind == "collect"]
+    assert len(collect) == 1
+    assert sorted(collect[0].quest_ids) == ["Q1", "Q2", "Q3", "Q4"]
+    assert collect[0].cogship == ""
+
+
+def test_a_lone_gate_quest_waits_for_a_cohort_then_packs_alone(tmp_path):
+    wt = _free(tmp_path)
+    state = nw.load_state(tmp_path)
+    snap = _snap(_q("Q1", "GATE", wt, app="marketing"))
+
+    actions, notes = nw.plan(snap, state, _policy(), _workers(), now=1000.0)
+    assert actions == []
+    assert any(n.get("key") == "collect_cohort:new" for n in notes)
+
+    # The batching window is a ceiling, not an indefinite hold.
+    state["quests"]["Q1"] = {"gate_since_ts": 1000.0}
+    actions, _ = nw.plan(snap, state, _policy(), _workers(), now=1000.0 + 1801)
+    assert [(a.kind, a.quest_ids, a.cogship) for a in actions] == [("collect", ["Q1"], "")]
+
+
+def test_collect_min_batch_one_restores_immediate_packing(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "GATE", wt, app="marketing"))
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path),
+                         _policy(collect_min_batch=1), _workers(), now=1000.0)
+    assert [a.kind for a in actions] == ["collect"]
+
+
+def test_a_cohort_larger_than_the_cap_defers_the_remainder(tmp_path):
+    wts = [_free(tmp_path, str(i)) for i in range(7)]
+    snap = _snap(*[_q(f"Q{i}", "GATE", wts[i], app="crm") for i in range(7)])
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path),
+                             _policy(collect_batch_max=3, max_workers=4, max_spawns_per_tick=10),
+                             _workers())
+    collect = [a for a in actions if a.kind == "collect"]
+    assert len(collect) == 1
+    assert len(collect[0].quest_ids) == 3
+    assert any(n.get("key") == "collect_remainder:new" for n in notes)
+
+
+
+
+
 def test_gate_with_a_dead_recorded_gatekeeper_is_flagged_not_respawned(tmp_path):
     wt = _free(tmp_path)
     snap = _snap(_q("Q1", "GATE", wt, gatekeeper_session_id="ses_dead", cogship_id="cogship-9"))
@@ -1063,6 +1116,29 @@ def test_raze_action_runs_court_raze(tmp_path, monkeypatch):
     assert seen["argv"] == ["raze", "Q7"]
 
 
+def test_execute_records_pack_success_before_truncating_stdout(tmp_path, monkeypatch):
+    """The `Stamped` line precedes a long next-steps block, so the truncated
+    tail loses it; a multi-quest pack must still count as progress."""
+    class R:
+        returncode = 0
+        stderr = ""
+        stdout = "🚢 Stamped 2 Quest(s) onto cogship-9.\n" + ("next-steps line\n" * 300)
+
+    monkeypatch.setattr(nw, "_court", lambda *a, **k: R())
+    res = nw.execute(tmp_path, nw.Action(kind="collect", quest_ids=["Q1", "Q2"]))
+    assert "Stamped" not in res["stdout_tail"]
+    assert res["packed"] is True
+    assert nw._collect_packed(res) is True
+
+
+def test_collect_packed_honours_the_explicit_flag():
+    assert nw._collect_packed({"ok": True, "packed": True,
+                               "stdout_tail": "no marker here"}) is True
+    assert nw._collect_packed({"ok": True, "packed": False,
+                               "stdout_tail": "🚢 Stamped 2 Quest(s) onto cogship-9."}) is False
+
+
+
 def test_a_razed_quest_gets_one_teardown_and_no_re_verification(tmp_path):
     """The durable razed_at marker distinguishes 'awaiting raze' from 'already
     razed'. The latter only needs the outstanding teardown, so the watch emits
@@ -1591,6 +1667,60 @@ def test_a_raze_the_gate_refuses_is_regated_mechanically(tmp_path):
     actions, _ = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers(),
                          raze_regate=["Q1"])
     assert [a.kind for a in actions] == ["regate"]
+
+
+def test_regates_are_batched_by_app(tmp_path):
+    """Same-app raze refusals share one fresh convoy (and one unified suite)
+    instead of minting a singleton convoy per Quest."""
+    wts = [_free(tmp_path, n) for n in ("a", "b", "c")]
+    snap = _snap(
+        _q("Q1", "READY_TO_RAZE", wts[0], app="inventory"),
+        _q("Q2", "READY_TO_RAZE", wts[1], app="inventory"),
+        _q("Q3", "READY_TO_RAZE", wts[2], app="marketing"),
+    )
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers(),
+                         raze_regate=["Q1", "Q2", "Q3"])
+    regates = [a for a in actions if a.kind == "regate"]
+    assert sorted(tuple(a.quest_ids) for a in regates) == [("Q1", "Q2"), ("Q3",)]
+
+
+def test_regate_batches_respect_the_size_cap(tmp_path):
+    wts = [_free(tmp_path, n) for n in ("a", "b", "c")]
+    snap = _snap(*[_q(qid, "READY_TO_RAZE", wts[i], app="crm")
+                   for i, qid in enumerate(("Q1", "Q2", "Q3"))])
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path),
+                             _policy(regate_batch_max=2), _workers(),
+                             raze_regate=["Q1", "Q2", "Q3"])
+    regates = [tuple(a.quest_ids) for a in actions if a.kind == "regate"]
+    assert regates == [("Q1", "Q2")]
+    assert any(n.get("key") == "regate_remainder:crm" for n in notes)
+
+
+def test_only_one_multi_quest_gatehouse_convoy_is_planned_per_tick(tmp_path):
+    wts = [_free(tmp_path, str(i)) for i in range(4)]
+    snap = _snap(
+        _q("Q1", "READY_TO_RAZE", wts[0], app="inventory"),
+        _q("Q2", "READY_TO_RAZE", wts[1], app="inventory"),
+        _q("Q3", "READY_TO_RAZE", wts[2], app="marketing"),
+        _q("Q4", "READY_TO_RAZE", wts[3], app="marketing"),
+    )
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers(),
+                             raze_regate=["Q1", "Q2", "Q3", "Q4"])
+    regates = [tuple(a.quest_ids) for a in actions if a.kind == "regate"]
+    assert regates == [("Q1", "Q2")]
+    assert any(n.get("key") == "regate_gatehouse_busy:marketing" for n in notes)
+
+
+def test_a_batched_regate_passes_one_comma_separated_positional(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        nw, "_court",
+        lambda repo, *argv, **kw: seen.setdefault("argv", list(argv))
+        or __import__("subprocess").CompletedProcess(argv, 1, "", ""))
+    nw.execute(tmp_path, nw.Action(kind="regate", quest_ids=["Q1", "Q2"]))
+    assert seen["argv"] == ["collect", "Q1,Q2", "--regate", "--standup"]
+
+
 
 
 def test_a_regate_that_keeps_failing_escalates_to_a_steward(tmp_path):

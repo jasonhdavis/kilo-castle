@@ -41,6 +41,14 @@ Scope of authority (deliberately narrow):
   * stale board, nobody running         -> `muster` ONE bounded Steward triage
                                            session (opt-in; see below)
 
+Convoy sizing is policy, not an accident: unstamped GATE Quests share one
+cohort and wait for `--collect-min-batch` peers (bounded by
+`--collect-batch-window`) so one gatehouse worktree and one unified suite cover
+several Quests; `--collect-batch-max` caps a cohort. Raze-refused
+READY_TO_RAZE Quests are re-gated as one convoy per app cohort
+(`--regate-batch-max`) for the same reason, and only one multi-Quest gatehouse
+convoy is planned per tick (the collect guard serialises gatehouses anyway).
+
 Hard caps exist because this runs unattended on a laptop with limited RAM:
 a live-worker ceiling (`--max-workers`), per-tick spawn limit, hourly spawn
 budget, per-quest cooldowns, and a worker-recovery budget (`serf_slots` serfs x
@@ -166,6 +174,17 @@ DEFAULT_SESSION_KEEP_EVENTS = 1_200_000
 # gated, idle-board only.
 DEFAULT_MAX_REGATES = 2
 DEFAULT_REGATE_COOLDOWN = 900
+# Convoy sizing. A GATE Quest with no convoy yet waits for a cohort of
+# `collect_min_batch` peers (or `collect_batch_window` seconds, whichever comes
+# first) so N Quests share one gatehouse worktree and one unified suite run
+# instead of N singleton convoys; `collect_batch_max` caps a cohort.
+# `collect_min_batch=1` restores the old collect-on-first-sighting behaviour.
+# Regates are batched by app and capped at `regate_batch_max` Quests per fresh
+# convoy so conflict resolution stays tractable.
+DEFAULT_COLLECT_MIN_BATCH = 2
+DEFAULT_COLLECT_BATCH_WINDOW = 30 * 60
+DEFAULT_COLLECT_BATCH_MAX = 6
+DEFAULT_REGATE_BATCH_MAX = 4
 DEFAULT_PG_PRUNE_INTERVAL = 6 * 60 * 60
 # A charter request is intent from the Pleasance lane; one bounded Steward turn
 # authors the charter (and allocates the Quest number, which the requester
@@ -256,6 +275,10 @@ class Policy:
     # asked. Test-database reaping is interval + idle-board gated.
     max_regates: int = DEFAULT_MAX_REGATES
     regate_cooldown: int = DEFAULT_REGATE_COOLDOWN
+    collect_min_batch: int = DEFAULT_COLLECT_MIN_BATCH
+    collect_batch_window: int = DEFAULT_COLLECT_BATCH_WINDOW
+    collect_batch_max: int = DEFAULT_COLLECT_BATCH_MAX
+    regate_batch_max: int = DEFAULT_REGATE_BATCH_MAX
     pg_prune_interval: int = DEFAULT_PG_PRUNE_INTERVAL
     max_charter_fails: int = DEFAULT_MAX_CHARTER_FAILS
     charter_cooldown: int = DEFAULT_CHARTER_COOLDOWN
@@ -709,6 +732,27 @@ def _within(ts: Optional[float], window: int, now: float) -> bool:
     return bool(ts) and (now - float(ts)) < window
 
 
+def _collect_cohort_ready(ids: list, qstate: dict, policy: "Policy", now: float) -> bool:
+    """Whether an unstamped GATE cohort should pack now.
+
+    The dominant cost of a convoy is the unified suite, so a singleton waits
+    for peers: ready once the cohort reaches `collect_min_batch`, or once its
+    oldest Quest has been in GATE for `collect_batch_window`.
+    `collect_min_batch <= 1` (or a zero window) restores immediate collection.
+    """
+    min_batch = max(1, int(policy.collect_min_batch or 1))
+    if len(ids) >= min_batch:
+        return True
+    window = max(0, int(policy.collect_batch_window or 0))
+    if window <= 0:
+        return True
+    for qid in ids:
+        since = (qstate.get(qid) or {}).get("gate_since_ts")
+        if since and (now - float(since)) >= window:
+            return True
+    return False
+
+
 def _failure_backoff(base: float, fails: int, cap: Optional[float] = None) -> float:
     """Retry window for an action that has now failed `fails` times in a row.
 
@@ -983,6 +1027,11 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
 
     # --- GATE: hand the convoy to a Gatekeeper -----------------------------
     by_cogship: dict[str, list[str]] = {}
+    # Only one multi-Quest convoy may be minted per tick: a pack > 1 creates a
+    # gatehouse worktree, and `court collect` refuses a second collect while the
+    # first gatehouse is live. Size-1 convoys run in the Quest worktree and are
+    # exempt (they do not consume this slot).
+    gatehouse_slot = 1
     teardown_keys: set[str] = set()
     for q in quests.values():
         if q.get("status") != "GATE":
@@ -1100,18 +1149,43 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
             continue
         by_cogship.setdefault(key, []).append(q["id"])
 
-    for cog, ids in by_cogship.items():
+    for cog, ids in sorted(by_cogship.items(), key=lambda kv: (-len(kv[1]), kv[0])):
         if not policy.allows("collect"):
             note(",".join(ids), "skip", "GATE convoy ready but collect is disabled")
             continue
+        if cog == "new" and not _collect_cohort_ready(ids, qstate, policy, now):
+            note(",".join(ids), "wait",
+                 f"{len(ids)} GATE Quest(s) — waiting for a coherent cohort "
+                 f"(min {max(1, policy.collect_min_batch)}) or "
+                 f"{_fmt_window(policy.collect_batch_window)} before packing",
+                 key="collect_cohort:new")
+            continue
+        # One convoy per tick is enough: a multi-Quest convoy creates a
+        # gatehouse, and `court collect` refuses a second one while the first is
+        # live. Cap the cohort and leave the remainder for the next tick rather
+        # than minting a colliding convoy.
+        batch = ids
+        if policy.collect_batch_max:
+            size = max(1, int(policy.collect_batch_max))
+            batch = ids[:size]
+            if len(ids) > size:
+                note(",".join(ids[size:]), "wait",
+                     f"{len(ids) - size} GATE Quest(s) held for the next collect tick "
+                     f"(convoy cap {size})", key=f"collect_remainder:{cog}")
+        if len(batch) > 1 and gatehouse_slot <= 0:
+            note(",".join(batch), "wait",
+                 "GATE convoy ready but a gatehouse convoy is already integrating — "
+                 "waiting for the next tick", key=f"gatehouse_busy:{cog}")
+            continue
         if capacity <= 0:
-            note(",".join(ids), "skip", f"GATE convoy ready but worker ceiling reached ({busy_workers}/{policy.max_workers})")
+            note(",".join(batch), "skip",
+                 f"GATE convoy ready but worker ceiling reached ({busy_workers}/{policy.max_workers})")
             continue
         actions.append(Action(
             kind="collect",
-            quest_ids=ids,
+            quest_ids=batch,
             cogship="" if cog == "new" else cog,
-            reason=f"{len(ids)} Quest(s) in GATE awaiting a Gatekeeper",
+            reason=f"{len(batch)} Quest(s) in GATE awaiting a Gatekeeper",
             meta={"convoy": cog, "retry_backoff": policy.retry_backoff,
                   "noop_backoff": policy.collect_noop_backoff,
                   "stale_backoff": policy.stale_convoy_backoff,
@@ -1119,6 +1193,8 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                   "max_retry_backoff": policy.max_retry_backoff},
         ))
         capacity -= 1
+        if len(batch) > 1:
+            gatehouse_slot -= 1
 
     # --- Dead gatehouse sweep (independent of any GATE Quest) ---------------
     # A dead `the-gatehouse/*` worktree blocks future collects whose allocated
@@ -1458,6 +1534,11 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
     # human decision; both are bounded (cooldown, regate attempts) and both
     # escalate to a Steward only after the mechanical path is exhausted.
     regate_ids = set(raze_regate or ())
+    # Regates are batched by app: handing two same-app Quests back in one fresh
+    # convoy re-runs the unified suite once instead of once per Quest. The
+    # per-Quest cooldown/attempt gates are still evaluated below, so a Quest
+    # already in backoff is simply left out of its cohort.
+    regate_batches: dict[str, list[str]] = {}
     for q in quests.values():
         status = q.get("status")
         if status in ("PLANNED", "CHARTERED", "DISPATCHED"):
@@ -1513,11 +1594,7 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                     continue
                 if _within(st.get("last_regate_ts"), policy.regate_cooldown, now):
                     continue
-                actions.append(Action(
-                    kind="regate", quest_ids=[q["id"]],
-                    reason=("READY_TO_RAZE but raze refuses (branch tip not an ancestor of "
-                            "castle) — re-gating through a fresh convoy"),
-                    meta={"retry_backoff": policy.retry_backoff}))
+                regate_batches.setdefault(q.get("app") or "unknown", []).append(q["id"])
                 continue
             if not policy.allows("raze"):
                 note(q["id"], "report",
@@ -1532,6 +1609,31 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                 meta={"retry_backoff": policy.retry_backoff}))
         elif status == "HELD":
             note(q["id"], "report", "HELD — awaiting Audience")
+
+    # One fresh convoy per app cohort, largest first. A multi-Quest regate
+    # creates a gatehouse, so at most one such cohort (across collect + regate)
+    # is planned per tick; size-1 regates run in the Quest worktree and are
+    # exempt. The remainder of a capped cohort waits for the next tick.
+    max_batch = max(1, int(policy.regate_batch_max or 1))
+    for app, ids in sorted(regate_batches.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        chunk = ids[:max_batch]
+        if len(ids) > len(chunk):
+            note(",".join(ids[len(chunk):]), "wait",
+                 f"{len(ids) - len(chunk)} READY_TO_RAZE Quest(s) for {app} held for the "
+                 f"next regate tick (cohort cap {max_batch})",
+                 key=f"regate_remainder:{app}")
+        if len(chunk) > 1 and gatehouse_slot <= 0:
+            note(",".join(chunk), "wait",
+                 "regate cohort ready but a gatehouse convoy is already integrating — "
+                 "waiting for the next tick", key=f"regate_gatehouse_busy:{app}")
+            continue
+        actions.append(Action(
+            kind="regate", quest_ids=chunk,
+            reason=(f"{len(chunk)} READY_TO_RAZE Quest(s) for {app} refused by raze "
+                    f"(branch tip not an ancestor of castle) — re-gating one fresh convoy"),
+            meta={"retry_backoff": policy.retry_backoff, "cohort": app}))
+        if len(chunk) > 1:
+            gatehouse_slot -= 1
 
     # The per-tick cap bounds WORKER spawns, not local-git/bookkeeping actions.
     # Capping the flat list let a queue of zero-cost `rebase`/`advance`/`note`
@@ -1791,8 +1893,10 @@ def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -
         argv = ["charter-request", *action.quest_ids]
     elif action.kind == "regate":
         # A raze the gate refused (branch tip not an ancestor of castle) goes
-        # back through a fresh convoy instead of waiting for a human.
-        argv = ["collect", *action.quest_ids, "--regate", "--standup"]
+        # back through a fresh convoy instead of waiting for a human. `collect`
+        # takes ONE positional that may be a comma-separated cohort, so the
+        # batch rides in one argv entry (N positionals are rejected).
+        argv = ["collect", ",".join(action.quest_ids), "--regate", "--standup"]
     elif action.kind == "collect":
         # `court collect` takes ONE positional that may be a comma-separated
         # list (quest_ids, batchable) — passing N positionals makes argparse
@@ -1840,6 +1944,9 @@ def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -
             "stdout_tail": out[-1200:],
             "stderr_tail": err[-1200:],
             "seconds": round(time.time() - started, 1),
+            # Decided on the FULL stdout: the pack line is printed before the
+            # (long) next-steps block, so a truncated tail can lose it.
+            "packed": "Stamped" in out,
         }
         # `court rebase` exits 0 even when it reports a conflict, so the
         # reported conflict — not the exit code — is the failure signal. This
@@ -1868,6 +1975,8 @@ def _collect_packed(result: dict) -> bool:
     progress."""
     if not result.get("ok"):
         return False
+    if "packed" in result:
+        return bool(result.get("packed"))
     return "Stamped" in (result.get("stdout_tail") or "")
 
 
@@ -2533,6 +2642,18 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
     except Exception as e:  # noqa: BLE001
         ready, vigil_notes, charter_ready = [], [], []
         say(f"⚠️  vigil evaluation failed: {e}")
+    # GATE age, for convoy coalescing. `plan` is pure, so the watch records when
+    # it first saw each Quest in GATE: a cohort waits for same-app teammates but
+    # never longer than `collect_batch_window`.
+    qbook = state.setdefault("quests", {})
+    for q in snap.get("quests", []):
+        if q.get("kind") == "epic":
+            continue
+        st = qbook.setdefault(q["id"], {})
+        if (q.get("status") or "").upper() == "GATE":
+            st.setdefault("gate_since_ts", now)
+        else:
+            st.pop("gate_since_ts", None)
     vigil_notice: list[dict] = []
     for vn in vigil_notes:
         vigil_notice.append({"quest": vn["id"], "level": "vigil", "text": vn["text"]})

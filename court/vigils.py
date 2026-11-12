@@ -61,7 +61,7 @@ SPAWNING_ACTIONS = ("dispatch", "goad", "coin", "collect", "muster")
 # this a queue entry can only re-state the charter the worker already
 # satisfied, which is exactly the wasted-spawn loop `court enqueue` exists to
 # end.
-BRIEF_ACTIONS = ("dispatch", "goad")
+BRIEF_ACTIONS = ("dispatch", "goad", "coin")
 
 
 class VigilError(ValueError):
@@ -445,7 +445,10 @@ def action_argv(then: str, spec: Optional[dict] = None) -> tuple[list, bool]:
             argv += ["--brief", brief]
         return argv, True
     if verb == "coin":
-        return ["coin", target], True
+        argv = ["coin", target]
+        if brief:
+            argv += ["--brief", brief]
+        return argv, True
     if verb == "rebase":
         # Local `git merge castle` convergence: no model turn, no worker slot.
         # Queued ahead of a coin/goad it guarantees the audit never starts on a

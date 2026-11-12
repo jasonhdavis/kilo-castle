@@ -82,6 +82,21 @@ def test_action_grammar_maps_to_court_argv():
         ["muster", "--why", "board stalled on merge blockers"], True)
 
 
+def test_a_brief_is_carried_on_dispatch_goad_and_coin():
+    for then in ("dispatch:Q1", "goad:Q1", "coin:Q1"):
+        argv, spawns = vigils.action_argv(then, {"brief": ".court/briefs/q1.md"})
+        assert spawns is True
+        assert argv[-2:] == ["--brief", ".court/briefs/q1.md"], then
+    # A non-worker verb still has no prompt to override.
+    with pytest.raises(vigils.VigilError):
+        vigils.action_argv("collect:Q1", {"brief": ".court/briefs/q1.md"})
+
+
+def test_coin_brief_is_accepted_by_the_vigil_builder():
+    spec = _spec(then="coin:Q1", brief=".court/briefs/q1.md")
+    assert spec["brief"] == ".court/briefs/q1.md"
+
+
 def test_advance_status_must_be_real():
     with pytest.raises(vigils.VigilError):
         _spec(then="advance:Q1=SOMEWHERE")

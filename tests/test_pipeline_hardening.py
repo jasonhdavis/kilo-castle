@@ -373,7 +373,81 @@ class TestBaseSyncBeforeSpawn:
         with pytest.raises(SystemExit) as ei:
             cli._sync_base_before_spawn(tmp_path, self._quest(), "coin")
         assert ei.value.code == 1
-        assert "conflicts in: court/cli.py" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "conflicts in: court/cli.py" in err
+        assert "--brief" in err and "--no-sync" in err
+
+    def test_conflict_with_a_brief_spawns_anyway(self, tmp_path, monkeypatch, capsys):
+        """The guard's own remedy was unreachable: a conflicted tree refused
+        every spawning verb. A Steward brief is the remediation instruction, so
+        the aborted merge must not abort the spawn."""
+        monkeypatch.setattr(cli.git_ops, "_run", lambda *a, **k: {"ok": True})
+        monkeypatch.setattr(
+            cli.git_ops, "rebase_worktree_onto_base",
+            lambda *a, **k: {"ok": False, "conflict": True, "conflicting_files": ["models.py"]},
+        )
+        cli._sync_base_before_spawn(
+            tmp_path, self._quest(), "goad", brief_path=".court/briefs/q1379.md")
+        err = capsys.readouterr().err
+        assert "spawning anyway because --brief" in err
+        assert "models.py" in err
+
+    def test_no_sync_skips_the_merge_entirely(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(cli.git_ops, "_run", lambda *a, **k: {"ok": True})
+        merged = []
+        monkeypatch.setattr(
+            cli.git_ops, "rebase_worktree_onto_base",
+            lambda *a, **k: merged.append(1) or {"ok": False, "conflict": True},
+        )
+        cli._sync_base_before_spawn(tmp_path, self._quest(), "coin", no_sync=True)
+        assert merged == []
+        assert "--no-sync" in capsys.readouterr().err
+
+    def test_spawn_verbs_parse_no_sync_and_coin_brief(self):
+        parser = cli.build_parser()
+        for verb in ("dispatch", "coin", "goad"):
+            assert parser.parse_args([verb, QUEST, "--no-sync"]).no_sync is True
+        assert parser.parse_args(["coin", QUEST, "--brief", "b.md"]).brief == "b.md"
+
+    def test_cmd_goad_passes_the_brief_and_no_sync_to_the_guard(self, court_repo, monkeypatch):
+        import argparse
+        seen = {}
+
+        def fake_sync(wt, quest, label, brief_path=None, no_sync=False):
+            seen.update(label=label, brief=brief_path, no_sync=no_sync)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(cli, "_sync_base_before_spawn", fake_sync)
+        monkeypatch.setattr(cli, "find_kilo_binary", lambda: Path("/fake/kilo"))
+        q = _quest()
+        q.worktree = str(court_repo)
+        store.save(q)
+        with pytest.raises(SystemExit):
+            cli.cmd_goad(argparse.Namespace(
+                quest_id=QUEST, model=None, mode="auto", force=False, no_commit=True,
+                brief=".court/briefs/q1.md", no_sync=True,
+            ))
+        assert seen == {"label": "goad", "brief": ".court/briefs/q1.md", "no_sync": True}
+
+    def test_cmd_coin_passes_the_brief_and_no_sync_to_the_guard(self, court_repo, monkeypatch):
+        import argparse
+        seen = {}
+
+        def fake_sync(wt, quest, label, brief_path=None, no_sync=False):
+            seen.update(label=label, brief=brief_path, no_sync=no_sync)
+
+        monkeypatch.setattr(cli, "_sync_base_before_spawn", fake_sync)
+        monkeypatch.setattr(cli, "find_kilo_binary", lambda: None)
+        q = _quest()
+        q.set_status("TRIBUTE_READY", "ready")
+        q.worktree = str(court_repo)
+        store.save(q)
+        with pytest.raises(SystemExit):
+            cli.cmd_coin(argparse.Namespace(
+                quest_id=QUEST, model=None, force=False, wait=False, no_commit=True,
+                brief=".court/briefs/q1.md", no_sync=True,
+            ))
+        assert seen == {"label": "coin", "brief": ".court/briefs/q1.md", "no_sync": True}
 
     def test_merged_reports_drift(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(cli.git_ops, "_run", lambda *a, **k: {"ok": True})

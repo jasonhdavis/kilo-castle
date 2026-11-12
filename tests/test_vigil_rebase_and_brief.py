@@ -75,10 +75,10 @@ def test_brief_rides_a_dispatch_vigil_into_the_argv():
 def test_brief_is_rejected_on_actions_with_no_prompt_to_override():
     with pytest.raises(vigils.VigilError):
         vigils.build(
-            id="coin-q234",
+            id="collect-q234",
             when=["quest-status:Q234=TRIBUTE_READY"],
-            then="coin:Q234",
-            reason="audit the tribute once it is rendered and rebased",
+            then="collect:Q234",
+            reason="pack the tribute once it is rendered and rebased",
             expires="6h",
             brief="/repo/.court/briefs/Q234.md",
         )

@@ -3167,8 +3167,14 @@ def cmd_dispatch(args):
     # sync that goad/coin always run, so the Serf started on a branch that
     # could be hundreds of commits behind castle; its Gate-2 rebase then
     # conflicted and the remediation cost a second spawn. A conflicted sync
-    # aborts here (nothing spawns) and names the files, exactly like `coin`.
-    _sync_base_before_spawn(worktree_path, quest, "dispatch")
+    # aborts here (nothing spawns) and names the files, exactly like `coin` —
+    # unless a Steward brief is carried, in which case the brief IS the
+    # remediation instruction for the conflicted tree.
+    _sync_base_before_spawn(
+        worktree_path, quest, "dispatch",
+        brief_path=getattr(args, "brief", None),
+        no_sync=getattr(args, "no_sync", False),
+    )
 
     # Determine agent role (serf vs scout)
     is_scout = (getattr(quest, "kind", "") == "scout" or getattr(quest, "section", "") == "Investigation")
@@ -3473,7 +3479,13 @@ def cmd_patchwork(args):
     print(f"   Promote to trunk: python3 -m court.cli patchwork {quest.id} --promote")
 
 
-def _sync_base_before_spawn(wt: Path, quest, label: str) -> None:
+def _sync_base_before_spawn(
+    wt: Path,
+    quest,
+    label: str,
+    brief_path: Optional[str] = None,
+    no_sync: bool = False,
+) -> None:
     """Merge the base trunk into a Quest worktree before spawning a worker there.
 
     Closes the gap where `court goad` / `court coin` spawned with NO base sync —
@@ -3485,12 +3497,28 @@ def _sync_base_before_spawn(wt: Path, quest, label: str) -> None:
     (git_ops.rebase_worktree_onto_base → a real `git merge <base> --no-edit`).
 
     Behaviour:
+      * `--no-sync` → skip entirely and say so (break-glass for a known
+        conflicted tree);
       * base ref absent (repos whose trunk is not `castle`) → warn, skip;
       * worktree dirty → warn, skip (a resumed Serf may hold uncommitted work;
         the merge would refuse anyway and stranding the worker is worse);
-      * merge conflict → the primitive aborts the merge cleanly; abort the spawn
-        (non-zero exit) and report the conflicting files.
+      * merge conflict WITHOUT a brief → the primitive aborts the merge
+        cleanly; abort the spawn (non-zero exit) and report the conflicting
+        files;
+      * merge conflict WITH `--brief` → the merge was aborted cleanly, but the
+        Steward's brief is the remediation instruction for exactly this tree,
+        so warn and continue. Otherwise the guard made its own prescribed
+        remedy ("dispatch a remediation Serf") unreachable: every spawning
+        verb refused to start on the conflicted branch (the Q1376/Q1379/Q1388
+        deadlock, 2026-11-12).
     """
+    if no_sync:
+        print(
+            f"⏭️  {label}: --no-sync — skipping base sync; the worker inherits the "
+            f"tree as-is.",
+            file=sys.stderr,
+        )
+        return
     base_branch = "castle"
     probe = git_ops._run(["git", "rev-parse", "--verify", "--quiet", base_branch], wt)
     if not probe.get("ok"):
@@ -3516,10 +3544,19 @@ def _sync_base_before_spawn(wt: Path, quest, label: str) -> None:
         return
     if res.get("conflict"):
         files = ", ".join(res.get("conflicting_files", [])[:8]) or "unknown files"
+        if brief_path:
+            print(
+                f"⚠️  {label}: `git merge {base_branch}` conflicts in: {files}. "
+                f"The merge was aborted cleanly; spawning anyway because --brief supplies "
+                f"the remediation instruction. The worker must resolve these files first.",
+                file=sys.stderr,
+            )
+            return
         print(
             f"ERROR: {label}: cannot spawn — `git merge {base_branch}` conflicts in: {files}. "
-            f"The merge was aborted cleanly; resolve on the branch (or dispatch a remediation "
-            f"Serf) before re-running `court {label}`.",
+            f"The merge was aborted cleanly; resolve on the branch, or re-run with "
+            f"`--brief <file>` / `--no-sync` to spawn a remediation worker into the "
+            f"conflicted tree.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -3545,7 +3582,11 @@ def cmd_coin(args):
         print(f"⚠️  {quest.id} is [{quest.status}], not [TRIBUTE_READY]. Pass --force to audit anyway.", file=sys.stderr)
         sys.exit(1)
 
-    _sync_base_before_spawn(wt, quest, "coin")
+    _sync_base_before_spawn(
+        wt, quest, "coin",
+        brief_path=getattr(args, "brief", None),
+        no_sync=getattr(args, "no_sync", False),
+    )
 
     kilo_bin = find_kilo_binary()
     if not kilo_bin:
@@ -3573,6 +3614,24 @@ def cmd_coin(args):
         .replace("{{ epic_id }}", quest.parent_epic or "-")
         .replace("{{ epic_title }}", quest.parent_epic or "-")
     )
+
+    # A Steward-authored brief replaces the standard audit prompt. This is how
+    # a conflicted tree can still be audited: the pre-spawn merge is allowed to
+    # continue on a conflict when a brief is carried, and the brief tells the
+    # Master of Coin exactly which conflict to assess or which evidence to
+    # verify instead of re-deriving the generic checklist.
+    brief_arg = (getattr(args, "brief", None) or "").strip()
+    if brief_arg:
+        brief_file = Path(brief_arg).expanduser()
+        if not brief_file.is_absolute():
+            brief_file = git_ops.get_repo_root() / brief_file
+        if not brief_file.is_file():
+            print(f"ERROR: --brief file not found: {brief_arg}", file=sys.stderr)
+            sys.exit(1)
+        rendered_prompt = brief_file.read_text(encoding="utf-8")
+        if not rendered_prompt.strip():
+            print(f"ERROR: --brief is empty: {brief_file}", file=sys.stderr)
+            sys.exit(1)
 
     setup_worktree_agent_config(wt, "master_of_coin")
 
@@ -3723,7 +3782,11 @@ def cmd_goad(args):
         print("ERROR: Kilo binary not found. Cannot goad session via CLI.", file=sys.stderr)
         sys.exit(1)
 
-    _sync_base_before_spawn(wt, quest, "goad")
+    _sync_base_before_spawn(
+        wt, quest, "goad",
+        brief_path=getattr(args, "brief", None),
+        no_sync=getattr(args, "no_sync", False),
+    )
 
     is_scout = getattr(quest, "kind", "") == "scout" or getattr(quest, "section", "") == "Investigation"
     agent_role = "scout" if is_scout else "serf"
@@ -10352,7 +10415,8 @@ def build_parser():
     p_dispatch.add_argument("--no-run", action="store_true", help="Configure worktree and write task without launching background Kilo session")
     p_dispatch.add_argument("--agent", default=None, help="Agent to use (default: serf, or scout for investigations)")
     p_dispatch.add_argument("--prompt", default=None, help="Custom prompt override (defaults to pure charter task instructions)")
-    p_dispatch.add_argument("--brief", default=None, help="Path to a prompt/remediation brief file (used unless --prompt is given); this is what a queued `dispatch:` vigil carries")
+    p_dispatch.add_argument("--brief", default=None, help="Path to a prompt/remediation brief file (used unless --prompt is given); this is what a queued `dispatch:` vigil carries. A brief also lets the spawn proceed when the pre-spawn base merge conflicts — the brief must resolve those files")
+    p_dispatch.add_argument("--no-sync", dest="no_sync", action="store_true", help="Skip the pre-spawn `git merge castle` (break-glass for a known-conflicted tree a brief will repair)")
     p_dispatch.add_argument("--base", default="castle", help="Base branch for new worktrees (default: castle)")
     p_dispatch.add_argument(
         "--break-glass", dest="break_glass", action="store_true", default=False,
@@ -10379,6 +10443,8 @@ def build_parser():
     p_coin.add_argument("--force", action="store_true", help="Audit even if not currently in TRIBUTE_READY; also supersedes a live worker lease (kills the wedged holder)")
     p_coin.add_argument("--wait", action="store_true", help="Run synchronously and wait for completion instead of background")
     p_coin.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
+    p_coin.add_argument("--brief", default=None, help="Path to a Steward-authored brief that replaces the standard Master of Coin prompt. A brief also lets the audit proceed when the pre-spawn base merge conflicts")
+    p_coin.add_argument("--no-sync", dest="no_sync", action="store_true", help="Skip the pre-spawn `git merge castle` (break-glass for a known-conflicted tree)")
     p_coin.set_defaults(func=cmd_coin)
 
     p_goad = sub.add_parser(
@@ -10390,7 +10456,8 @@ def build_parser():
     p_goad.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_goad.add_argument("--force", action="store_true", help="Supersede a live worker lease: kill the current worker's process group, then spawn the goad (default: refuse while a worker is live)")
     p_goad.add_argument("--mode", default="auto", choices=("auto", "cold", "resume"), help="Re-prompt mode: auto (continue the same session when healthy, cold-start when bloated/committed; default), cold (always a fresh session), resume (always continue the recorded serf session)")
-    p_goad.add_argument("--brief", default=None, help="Path to a Steward-authored remediation brief (replaces the generic goad template): the goaded Serf reads exactly this instruction")
+    p_goad.add_argument("--brief", default=None, help="Path to a Steward-authored remediation brief (replaces the generic goad template): the goaded Serf reads exactly this instruction. A brief also lets the spawn proceed when the pre-spawn base merge conflicts — the brief must resolve those files")
+    p_goad.add_argument("--no-sync", dest="no_sync", action="store_true", help="Skip the pre-spawn `git merge castle` (break-glass for a known-conflicted tree a brief will repair)")
     p_goad.set_defaults(func=cmd_goad)
 
     p_dispatch_complete = sub.add_parser(

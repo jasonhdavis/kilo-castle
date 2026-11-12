@@ -8508,8 +8508,8 @@ def cmd_enqueue(args):
     The action is the only one that can advance the Quest from its current
     status: PLANNED/CHARTERED -> dispatch, WORKING -> goad (remediation),
     TRIBUTE_READY -> coin, GATE -> collect. An optional `--brief` carries the
-    Steward's actual instruction into dispatch/goad, so a queued hand-off names
-    the merge union or migration repair instead of re-stating a satisfied
+    Steward's actual instruction into dispatch/goad/coin, so a queued hand-off
+    names the merge union or migration repair instead of re-stating a satisfied
     charter.
     """
     repo = Path(getattr(args, "repo", None) or git_ops.get_repo_root()).resolve()
@@ -11235,7 +11235,7 @@ def build_parser():
     p_vigil.add_argument("--repo", default=None, help="Court repository (default: this repo)")
     p_vigil.add_argument("--when", action="append", default=[], help="Condition, repeatable and ANDed: quest-status:Q123=READY_TO_RAZE, quest-merged:Q123, branch-merged:<branch>, file-exists:<path>, after:<iso>")
     p_vigil.add_argument("--then", default=None, help="Action to take: dispatch:<QID>, goad:<QID>, coin:<QID>, collect[:<QID>], rebase:<QID>, advance:<QID>=<STATUS>, note:<text>")
-    p_vigil.add_argument("--brief", default=None, help="dispatch/goad only: path to a Steward-authored remediation brief the queued worker reads instead of its template prompt (must live inside the repo)")
+    p_vigil.add_argument("--brief", default=None, help="dispatch/goad/coin only: path to a Steward-authored remediation brief the queued worker reads instead of its template prompt (must live inside the repo)")
     p_vigil.add_argument("--why", default=None, help="REQUIRED: why this watch exists")
     p_vigil.add_argument("--expires", default=None, help=f"REQUIRED: absolute ISO timestamp or a span like 6h/2d (ceiling {vigils.MAX_VIGIL_HOURS // 24} days)")
     p_vigil.add_argument("--max-fires", dest="max_fires", type=int, default=vigils.DEFAULT_MAX_FIRES, help=f"How many times it may fire before retiring (1..{vigils.MAX_FIRES_CEILING}, default {vigils.DEFAULT_MAX_FIRES})")
@@ -11249,7 +11249,7 @@ def build_parser():
     p_enqueue.add_argument("--why", required=True, help="Why this hand-off is queued (min 12 chars)")
     p_enqueue.add_argument("--action", default=None, choices=ENQUEUE_ACTIONS,
                            help="Queued action (default: implied by status — PLANNED/CHARTERED->dispatch, WORKING->goad, TRIBUTE_READY->coin, GATE->collect)")
-    p_enqueue.add_argument("--brief", default=None, help="dispatch/goad only: path to a Steward-authored remediation brief the worker reads instead of its template (must live inside the repo)")
+    p_enqueue.add_argument("--brief", default=None, help="dispatch/goad/coin only: path to a Steward-authored remediation brief the worker reads instead of its template (must live inside the repo)")
     p_enqueue.add_argument("--expires", default="24h", help="How long the queue entry stays live (span or ISO; default 24h)")
     p_enqueue.add_argument("--after", default="0s", help="Earliest dispatch delay, e.g. 30s/5m/2h (default 0s)")
     p_enqueue.add_argument("--repo", default=None, help="Court repository (default: this repo)")

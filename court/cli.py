@@ -9858,8 +9858,11 @@ def _ship_build_images(main_wt: Path, promoted_sha: str, records: list, dry_run:
         print(_tail(output, 4))
 
         # A member in a different registry namespace gets its own copy. The
-        # driver must not assume an app may pull another app's namespace.
-        for member in ship_deploy.namespace_members(image_id, main_wt):
+        # driver must not assume an app may pull another app's namespace, and the
+        # fan-out is scoped to the apps actually being deployed -- tagging an app
+        # that is not part of this release would fail on an app that is not there.
+        deployed_apps = [rec["app"] for rec in records]
+        for member in ship_deploy.namespace_members(image_id, main_wt, apps=deployed_apps):
             member_ref = ship_deploy.image_ref(image_id, main_wt, label, app_name=member)
             if not _ship_replicate_image(main_wt, ref, member_ref, member):
                 failed = True
@@ -9869,6 +9872,23 @@ def _ship_build_images(main_wt: Path, promoted_sha: str, records: list, dry_run:
     return refs, failed
 
 
+def _ship_registry_auth(main_wt: Path, member_app: str) -> bool:
+    """Authenticate Docker against registry.fly.io.
+
+    ``flyctl auth docker`` is org-wide (no ``-a``) and its credential expires in
+    ~9 minutes, so this is called immediately before each push -- never once at
+    the start of the build stage, whose build can take 10-20 minutes."""
+    argv = ship_deploy.docker_login_argv()
+    res = _flyctl(argv, main_wt, 300)
+    out = ((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")).strip()
+    if not res.get("ok"):
+        print(f"❌ registry auth FAILED before pushing to '{member_app}' (exit {res.get('exit_code')})")
+        print(_tail(out))
+        return False
+    print(f"   $ {' '.join(argv)}  ✅")
+    return True
+
+
 def _ship_replicate_image(main_wt: Path, source_ref: str, target_ref: str, member_app: str) -> bool:
     """Copy an already-built image into a member app's registry namespace.
 
@@ -9876,7 +9896,9 @@ def _ship_replicate_image(main_wt: Path, source_ref: str, target_ref: str, membe
     namespace per app and the driver will not assume cross-app pulls are allowed.
     ``flyctl auth docker`` logs the local Docker daemon into registry.fly.io, then
     ``docker tag``/``docker push`` replays the built image into the member's
-    namespace -- no rebuild.
+    namespace -- no rebuild. The auth is re-run immediately before the push (its
+    credential expires in ~9 minutes) and re-run once more if the push itself is
+    rejected as unauthorized.
 
     When Docker is unavailable the copy is skipped with a loud warning and the
     shared reference is used instead, so an unverified cross-namespace pull can
@@ -9890,17 +9912,34 @@ def _ship_replicate_image(main_wt: Path, source_ref: str, target_ref: str, membe
             f"docker and re-run `court ship --confirm --stage build`."
         )
         return True
-    for argv in (
-        ship_deploy.docker_login_argv(member_app),
-        ship_deploy.docker_tag_argv(source_ref, target_ref),
-        ship_deploy.docker_push_argv(target_ref),
-    ):
-        res = _flyctl(argv, main_wt, 900)
-        out = ((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")).strip()
-        if not res.get("ok"):
-            print(f"❌ image copy into '{member_app}' namespace FAILED (exit {res.get('exit_code')})")
-            print(_tail(out))
+
+    if not _ship_registry_auth(main_wt, member_app):
+        return False
+
+    tag_argv = ship_deploy.docker_tag_argv(source_ref, target_ref)
+    res = _flyctl(tag_argv, main_wt, 300)
+    if not res.get("ok"):
+        print(f"❌ docker tag into '{member_app}' namespace FAILED (exit {res.get('exit_code')})")
+        print(_tail(((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")).strip()))
+        return False
+    print(f"   $ {' '.join(tag_argv)}")
+
+    push_argv = ship_deploy.docker_push_argv(target_ref)
+    res = _flyctl(push_argv, main_wt, 900)
+    out = ((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")).strip()
+    if not res.get("ok") and ship_deploy.looks_like_registry_auth_error(out):
+        # The ~9-minute credential can expire mid-fan-out: authenticate again and
+        # retry the push once before failing the deploy.
+        print(f"   ↩️  push to '{member_app}' was rejected as unauthorized — re-authenticating and retrying.")
+        if not _ship_registry_auth(main_wt, member_app):
             return False
+        res = _flyctl(push_argv, main_wt, 900)
+        out = ((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")).strip()
+    if not res.get("ok"):
+        print(f"❌ image copy into '{member_app}' namespace FAILED (exit {res.get('exit_code')})")
+        print(_tail(out))
+        return False
+    print(f"   $ {' '.join(push_argv)}")
     print(f"   ✅ replicated into {member_app}'s namespace -> {target_ref}")
     return True
 
@@ -10101,15 +10140,18 @@ def _ship_rehearse_deploy(args, main_wt: Path, base_branch: str, mutation_stages
             argv = ship_deploy.build_argv(image_id, ship_deploy.build_config_for_image(image_id), label)
             print(f"   $ {' '.join(argv)}")
             # A member in a different registry namespace gets its own copy of the
-            # image (built once, pushed per namespace).
-            for member in ship_deploy.namespace_members(image_id, main_wt):
+            # image (built once, pushed per namespace), scoped to the apps in this
+            # release. The auth is re-run immediately before the push: the
+            # credential `fly auth docker` writes expires in ~9 minutes.
+            deployed_apps = [rec["app"] for rec in records]
+            for member in ship_deploy.namespace_members(image_id, main_wt, apps=deployed_apps):
                 if shutil.which("docker") is None:
                     print(f"   # (docker unavailable — {member} would be released from the shared ref)")
                     continue
                 src = ship_deploy.image_ref(image_id, main_wt, label)
                 dst = ship_deploy.image_ref(image_id, main_wt, label, app_name=member)
                 for sub in (
-                    ship_deploy.docker_login_argv(member),
+                    ship_deploy.docker_login_argv(),
                     ship_deploy.docker_tag_argv(src, dst),
                     ship_deploy.docker_push_argv(dst),
                 ):

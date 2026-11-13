@@ -238,14 +238,107 @@ def test_image_ref_can_select_a_member_namespace(tmp_path):
     )
 
 
-def test_docker_replication_argv():
-    assert sd.docker_login_argv("pb-app-worker-light") == ["flyctl", "auth", "docker", "-a", "pb-app-worker-light"]
+def test_docker_login_argv_is_org_wide_and_takes_no_app():
+    """`fly auth docker` takes no app: `-a` is not a flag it accepts on flyctl
+    v0.5.3 ("unknown shorthand flag: 'a' in -a")."""
+    assert sd.docker_login_argv() == ["flyctl", "auth", "docker"]
+    assert "-a" not in sd.docker_login_argv()
+    assert "--app" not in sd.docker_login_argv()
+
+
+def test_docker_tag_and_push_argv():
     assert sd.docker_tag_argv("registry.fly.io/pb-app-web:T", "registry.fly.io/pb-app-worker-light:T") == [
         "docker", "tag", "registry.fly.io/pb-app-web:T", "registry.fly.io/pb-app-worker-light:T",
     ]
     assert sd.docker_push_argv("registry.fly.io/pb-app-worker-light:T") == [
         "docker", "push", "registry.fly.io/pb-app-worker-light:T",
     ]
+
+
+def test_looks_like_registry_auth_error():
+    assert sd.looks_like_registry_auth_error("unauthorized: authentication required")
+    assert sd.looks_like_registry_auth_error("no basic auth credentials")
+    assert sd.looks_like_registry_auth_error("Error response from daemon: 401 Unauthorized")
+    assert not sd.looks_like_registry_auth_error("manifest unknown")
+    assert not sd.looks_like_registry_auth_error("")
+
+
+def test_namespace_members_can_be_scoped_to_the_deployed_apps(tmp_path):
+    _write_all(tmp_path)
+    # unscoped: every member of the image except the build app
+    assert sd.namespace_members("app", tmp_path) == ("pb-app-worker-light",)
+    # scoped to a release that does not include worker-light -> nothing to fan out
+    assert sd.namespace_members("app", tmp_path, apps=["pb-app-web", "pb-app-worker"]) == ()
+    # scoped to a release that does include it -> exactly that member
+    assert sd.namespace_members(
+        "app", tmp_path, apps=["pb-app-web", "pb-app-worker-light"]) == ("pb-app-worker-light",)
+    # the science image, scoped to a release without worker-heavy
+    assert sd.namespace_members("science", tmp_path, apps=["pb-app-web", "pb-app-worker"]) == ()
+
+
+def test_auth_runs_immediately_before_each_push_and_has_no_app_flag(tmp_path, monkeypatch):
+    calls = []
+
+    def fake(argv, cwd, timeout):
+        calls.append(list(argv))
+        return {"ok": True, "exit_code": 0, "stdout": "Authentication successful.", "stderr": ""}
+
+    monkeypatch.setattr(cli, "_flyctl", fake)
+    ok = cli._ship_replicate_image(
+        tmp_path, "registry.fly.io/pb-app-web:app-x",
+        "registry.fly.io/pb-app-worker-light:app-x", "pb-app-worker-light",
+    )
+    assert ok is True
+    assert calls == [
+        ["flyctl", "auth", "docker"],
+        ["docker", "tag", "registry.fly.io/pb-app-web:app-x", "registry.fly.io/pb-app-worker-light:app-x"],
+        ["docker", "push", "registry.fly.io/pb-app-worker-light:app-x"],
+    ]
+
+
+def test_an_expired_credential_is_re_authed_and_the_push_retried(tmp_path, monkeypatch, capsys):
+    """The credential expires in ~9 minutes; a push rejected as unauthorized is
+    re-authenticated and retried once rather than failing the deploy."""
+    calls = []
+    pushes = {"n": 0}
+
+    def fake(argv, cwd, timeout):
+        calls.append(list(argv))
+        if argv[:3] == ["flyctl", "auth", "docker"]:
+            return {"ok": True, "exit_code": 0, "stdout": "Authentication successful.", "stderr": ""}
+        if argv[:2] == ["docker", "push"]:
+            pushes["n"] += 1
+            if pushes["n"] == 1:
+                return {"ok": False, "exit_code": 1, "stdout": "",
+                        "stderr": "unauthorized: authentication required"}
+            return {"ok": True, "exit_code": 0, "stdout": "pushed", "stderr": ""}
+        return {"ok": True, "exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(cli, "_flyctl", fake)
+    ok = cli._ship_replicate_image(tmp_path, "src", "dst", "pb-app-worker-light")
+    assert ok is True
+    assert sum(1 for a in calls if a[:3] == ["flyctl", "auth", "docker"]) == 2
+    assert sum(1 for a in calls if a[:2] == ["docker", "push"]) == 2
+
+
+def test_the_fan_out_is_scoped_to_the_deployed_apps(tmp_path, monkeypatch):
+    """`--fly-app web,worker,worker-heavy` must not tag or push into
+    pb-app-worker-light's namespace: that app is not part of this release."""
+    _write_all(tmp_path)
+    records, errors = sd.resolve_apps(tmp_path, ["web", "worker", "worker-heavy"])
+    assert errors == []
+    calls = []
+
+    def fake(argv, cwd, timeout):
+        calls.append(" ".join(argv))
+        return {"ok": True, "exit_code": 0,
+                "stdout": "registry.fly.io/pb-app-worker-heavy:science-c2356b213f00 pushed", "stderr": ""}
+
+    monkeypatch.setattr(cli, "_flyctl", fake)
+    _refs, failed = cli._ship_build_images(tmp_path, "c2356b213f00", records, False)
+    assert failed is False
+    assert not any("pb-app-worker-light" in c for c in calls), "an out-of-release app must not be fanned out"
+    assert any("pb-app-worker-heavy" in c for c in calls)
 
 
 def test_per_app_ref_prefers_its_own_namespace_then_falls_back_to_shared(tmp_path, monkeypatch):

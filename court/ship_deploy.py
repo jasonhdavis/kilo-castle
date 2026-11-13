@@ -265,7 +265,7 @@ def image_ref(image_id: str, repo_root: Path, label: str, app_name: Optional[str
     return f"{FLY_REGISTRY}/{namespace}:{label}"
 
 
-def namespace_members(image_id: str, repo_root: Path) -> tuple:
+def namespace_members(image_id: str, repo_root: Path, apps=None) -> tuple:
     """Member apps whose registry namespace differs from the image's build
     namespace — each needs its own copy of the image before it can be released.
 
@@ -273,14 +273,29 @@ def namespace_members(image_id: str, repo_root: Path) -> tuple:
     ``--image registry.fly.io/<other-app>:<tag>`` depends on the pulling app
     being allowed to read another app's namespace. That is not something this
     driver can assume, so a member in a different namespace gets the image
-    replicated into its own (built once, pushed per namespace)."""
+    replicated into its own (built once, pushed per namespace).
+
+    ``apps`` scopes the fan-out to the apps actually being deployed: a
+    ``--fly-app web --fly-app worker`` run must not tag or push into
+    ``pb-app-worker-light``'s namespace, which would fail on an app that is not
+    being released at all. ``None`` means "every member of the image"."""
     build_app = registry_app_for_image(image_id, repo_root)
-    return tuple(app for app in apps_for_image(image_id) if app != build_app)
+    members = apps_for_image(image_id)
+    if apps is not None:
+        wanted = set(apps)
+        members = tuple(app for app in members if app in wanted)
+    return tuple(app for app in members if app != build_app)
 
 
-def docker_login_argv(app_name: str) -> list:
-    """Authenticate the local Docker daemon against registry.fly.io for pushes."""
-    return ["flyctl", "auth", "docker", "-a", app_name]
+def docker_login_argv() -> list:
+    """Authenticate the local Docker daemon against registry.fly.io for pushes.
+
+    ``flyctl auth docker`` is ORG-WIDE and takes NO app argument: ``-a/--app`` is
+    not a flag ``auth docker`` accepts (on flyctl v0.5.3 it fails with "unknown
+    shorthand flag: 'a' in -a"). The credential it writes expires in ~9 minutes,
+    so the driver re-runs it immediately before every push rather than once at the
+    start of the build stage."""
+    return ["flyctl", "auth", "docker"]
 
 
 def docker_tag_argv(source_ref: str, target_ref: str) -> list:
@@ -289,6 +304,18 @@ def docker_tag_argv(source_ref: str, target_ref: str) -> list:
 
 def docker_push_argv(target_ref: str) -> list:
     return ["docker", "push", target_ref]
+
+
+_AUTH_ERROR_RE = re.compile(
+    r"unauthorized|authentication required|no basic auth credentials|401|denied",
+    re.IGNORECASE,
+)
+
+
+def looks_like_registry_auth_error(output: Optional[str]) -> bool:
+    """Whether a push failure reads as an expired/missing registry credential,
+    so the driver re-authenticates and retries instead of failing the deploy."""
+    return bool(_AUTH_ERROR_RE.search(output or ""))
 
 
 _IMAGE_REF_RE = re.compile(r"registry\.fly\.io/[^\s'\"]+:[^\s'\"]+")

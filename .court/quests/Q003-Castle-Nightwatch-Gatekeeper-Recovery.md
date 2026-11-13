@@ -7,7 +7,7 @@ concern: nightwatch-gatekeeper-recovery
 parent_epic: 
 section: Bug fix
 tags: Bug fix
-status: OPEN
+status: PLANNED
 cogship_id: 
 cogship_station: 
 cogship_promoted_commit: 
@@ -27,7 +27,7 @@ artist_session_id:
 artist_model: 
 vassal_session_id: 
 created_at: 2026-11-13T13:26:43Z
-updated_at: 2026-11-13T13:26:43Z
+updated_at: 2026-11-13T13:26:46Z
 razed_at: 
 ---
 
@@ -36,6 +36,7 @@ razed_at:
 ## Castle Ledger
 
 - **2026-11-13T13:26:43Z** — - → OPEN: Quest created
+- **2026-11-13T13:26:46Z** — OPEN → PLANNED: Chartered via composite `court charter`
 
 ## The Kingdom Requires
 
@@ -74,6 +75,8 @@ Give the Gatekeeper a first-class, durable restart/goad path at the fleet level,
 - Do not regress: the stall-referee thresholds, the lease/`occupied()` single-writer guards, the dead-gatehouse teardown, the `stale_gatekeeper` human escalation, and the per-convoy watchdog already spawned by `court collect --standup`.
 - This Quest shares `court/nightwatch.py` with `Q002-Castle-Nightwatch-Convoy-Backpressure` (convoy admission + raze/regate livelock). Dispatch the two sequentially so their branches do not collide at the convoy merge.
 - Suite must pass: `python3 -m pytest tests -q`.
+
+M'Lord's Charter Notes: Chartered 2026-11-13T13:2xZ on M'Lord's directive. Answer to 'does a gatekeeper restart exist?': a per-convoy continuation watchdog does (court watch --agent gatekeeper, spawned beside the standup with a 45-min stall referee), but it dies with the tick/session, and the fleet watch has no in-place resume - only human escalation or teardown+re-collect (full ~18k suite re-run). court goad itself is serf/scout-only. This Quest adds the missing durable, bounded, fleet-level half. Dispatch AFTER Q002 (shared court/nightwatch.py).
 
 ## Expected Tribute
 

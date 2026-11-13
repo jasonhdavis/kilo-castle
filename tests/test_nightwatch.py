@@ -3,6 +3,7 @@
 The planner is pure: snapshot + state + policy + worker census in, actions out.
 No repo, no subprocess, no clock.
 """
+import collections
 import json
 import time
 from pathlib import Path
@@ -474,6 +475,85 @@ def test_non_spawning_vigils_are_not_capped_by_the_spawn_budget(tmp_path):
                          ready_vigils=specs)
     assert len(actions) == 6
     assert all(a.meta["spawns"] is False for a in actions)
+
+
+def _dispatch_vigils(n):
+    return [
+        (_vigil(id=f"dispatch-q{i}", then=f"dispatch:QD{i}", when=["after:2000-01-01T00:00:00Z"]), "ready")
+        for i in range(n)
+    ]
+
+
+def test_a_dispatch_vigil_backlog_does_not_starve_the_drain_lane(tmp_path):
+    """In-flight work (coin/collect) must not be starved by Steward-enqueued
+    `dispatch` hand-offs.
+
+    2026-11-13: two armed dispatch vigils took both free worker slots, 9 of 16
+    TRIBUTE_READY Quests were skipped "worker ceiling reached (1/3)", and — at
+    `--max-spawns-per-tick 1` — the single action slot also went to a vigil, so no
+    coin or collect action ran for hours while the pipeline backed up."""
+    quests = [_q("Q1", "TRIBUTE_READY", _free(tmp_path, "w1")),
+              _q("Q2", "TRIBUTE_READY", _free(tmp_path, "w2"))]
+    actions, notes = nw.plan(
+        _snap(*quests), nw.load_state(tmp_path),
+        _policy(max_workers=3, max_spawns_per_tick=1), _workers(count=1),
+        ready_vigils=_dispatch_vigils(2))
+    # the one slot goes to the drain path, not to a vigil
+    assert [a.kind for a in actions if nw._action_spawns(a)] == ["coin"]
+    assert not any(n["quest"] == "Q1" and "worker ceiling" in n["text"] for n in notes)
+
+
+def test_the_drain_lane_keeps_a_slot_from_a_large_hand_off_backlog(tmp_path):
+    """Even six armed dispatch vigils (capacity is 2 with one live worker) leave a
+    slot for a Master of Coin — the pool spawns hand-offs only with what is left."""
+    quests = [_q("Q1", "TRIBUTE_READY", _free(tmp_path, "w1"))]
+    actions, _ = nw.plan(
+        _snap(*quests), nw.load_state(tmp_path),
+        _policy(max_workers=3, max_spawns_per_tick=1), _workers(count=1),
+        ready_vigils=_dispatch_vigils(6))
+    assert [a.kind for a in actions if nw._action_spawns(a)] == ["coin"]
+
+
+def test_both_drain_and_new_work_progress_on_a_raised_budget(tmp_path):
+    """With room for more than one spawn, the budget is shared: in-flight work and
+    new work both advance, so neither lane is shut out by the other's backlog."""
+    quests = [_q("Q1", "TRIBUTE_READY", _free(tmp_path, "w1")),
+              _q("Q2", "TRIBUTE_READY", _free(tmp_path, "w2"))]
+    actions, _ = nw.plan(
+        _snap(*quests), nw.load_state(tmp_path),
+        _policy(max_workers=3, max_spawns_per_tick=3), _workers(count=1),
+        ready_vigils=_dispatch_vigils(1))
+    kinds = collections.Counter(a.kind for a in actions if nw._action_spawns(a))
+    assert kinds["coin"] >= 1 and kinds["vigil"] == 1
+
+
+def test_one_class_may_still_use_the_whole_budget(tmp_path):
+    """The per-class reservation must not bind when only one class is waiting."""
+    quests = [_q(f"Q{i}", "TRIBUTE_READY", _free(tmp_path, f"w{i}")) for i in range(5)]
+    actions, _ = nw.plan(_snap(*quests), nw.load_state(tmp_path),
+                         _policy(max_workers=10, max_spawns_per_tick=2), _workers())
+    assert sum(1 for a in actions if a.kind == "coin") == 2
+
+
+def test_spawn_class_and_rank_helpers():
+    assert nw._spawn_class(nw.Action("coin", quest_ids=["Q1"])) == "coin"
+    assert nw._spawn_class(nw.Action("vigil", meta={"then": "dispatch:Q1"})) == "dispatch"
+    # the in-flight exit path outranks everything else
+    assert nw._spawn_rank(nw.Action("coin", quest_ids=["Q1"])) == 0
+    assert nw._spawn_rank(nw.Action("collect", quest_ids=["Q1"])) == 0
+    assert nw._spawn_rank(nw.Action("dispatch", quest_ids=["Q1"])) == 1
+    assert nw._spawn_rank(nw.Action("vigil", meta={"then": "dispatch:Q1"})) == 1
+    assert nw._spawn_rank(nw.Action("goad", quest_ids=["Q1"])) == 1
+    assert nw._spawn_rank(nw.Action("vigil", meta={"then": "coin:Q1"})) == 0
+
+
+def test_drain_pending_detects_in_flight_work(tmp_path):
+    assert nw._drain_pending({}) is False
+    assert nw._drain_pending(nw._quest_map(_snap(_q("Q1", "WORKING")))) is False
+    assert nw._drain_pending(nw._quest_map(_snap(_q("Q1", "TRIBUTE_READY")))) is True
+    assert nw._drain_pending(nw._quest_map(_snap(_q("Q1", "GATE")))) is True
+    # a parked Quest is M'Lord's, not drain work
+    assert nw._drain_pending(nw._quest_map(_snap(_q("Q1", "TRIBUTE_READY", pending_audience=True)))) is False
 
 
 def test_non_spawning_vigils_do_not_starve_spawning_actions(tmp_path):

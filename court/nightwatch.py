@@ -703,6 +703,38 @@ def _action_spawns(action: "Action") -> bool:
     return action.kind not in LOCAL_ACTION_KINDS
 
 
+# The pipeline's in-flight exit path. A Gatekeeper convoy (collect) and a Master
+# of Coin (coin) drain work that is already at the gate; everything else starts
+# new work or repairs a lane.
+DRAIN_KINDS = frozenset({"collect", "coin"})
+
+
+def _spawn_class(action: "Action") -> str:
+    """The class a spawning action belongs to, for the per-class budget cap: a
+    vigil is classified by its verb (dispatch/coin/collect/...)."""
+    if action.kind == "vigil":
+        return _vigil_verb({"then": action.meta.get("then") or ""}) or "vigil"
+    return action.kind
+
+
+def _spawn_rank(action: "Action") -> int:
+    """Slot-allocation rank for a spawning action: 0 for the in-flight drain path
+    (collect/coin), 1 for everything else. Only this pair is re-ranked; every
+    other action keeps its existing plan order, which is stable within a tier."""
+    return 0 if _spawn_class(action) in DRAIN_KINDS else 1
+
+
+def _drain_pending(quests: dict) -> bool:
+    """Whether in-flight work wants a worker slot this tick: a GATE Quest waiting
+    for a Gatekeeper, or an unparked TRIBUTE_READY Quest waiting for a Master of
+    Coin. Deliberately a cheap over-approximation — the reservation it drives is
+    a single slot, and each drain heuristic re-checks its own guards."""
+    for q in quests.values():
+        if (q.get("status") or "").upper() in ("GATE", "TRIBUTE_READY") and not q.get("pending_audience"):
+            return True
+    return False
+
+
 def _quest_map(snap: dict) -> dict:
     return {q["id"]: q for q in snap.get("quests", []) if q.get("kind") != "epic"}
 
@@ -840,6 +872,19 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
 
     busy_workers = workers.get("count", 0)
     capacity = max(0, policy.max_workers - busy_workers)
+
+    # The worker-slot pool is spent in plan order, and Steward-enqueued `dispatch`
+    # hand-offs are planned ahead of the heuristics, so a small vigil backlog can
+    # consume every free slot and starve the pipeline's in-flight exit path: on
+    # 2026-11-13 two armed dispatch vigils took both free slots, 9 of 16
+    # TRIBUTE_READY Quests were skipped "worker ceiling reached (1/3)", and no
+    # coin or collect action ran at all while the pipeline backed up. Hold the
+    # drain share back from the pre-drain blocks so collect/coin always have a
+    # slot to spend; it is restored before the GATE/drain heuristics below.
+    drain_hold = 0
+    if capacity > 0 and _drain_pending(quests):
+        drain_hold = capacity if capacity <= 1 else 1
+    capacity -= drain_hold
 
     # --- charter requests (requests-in, charters-out) -----------------------
     # Planned FIRST: a request is the pipeline's own input, so it must not
@@ -1024,6 +1069,11 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                 reason=f"{behind} commit(s) behind castle — mechanical rebase",
                 meta={"retry_backoff": policy.retry_backoff}))
             rebase_ids.add(q["id"])
+
+    # Restore the drain share held back above: the queue-driven blocks (charters,
+    # dispatch vigils) have taken their slots, so collect/coin now compete only
+    # with each other for the reserved capacity.
+    capacity += drain_hold
 
     # --- GATE: hand the convoy to a Gatekeeper -----------------------------
     by_cogship: dict[str, list[str]] = {}
@@ -1641,15 +1691,31 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
     # the dispatch/coin/collect actions that actually move the pipeline — and
     # the watch's own drift-rebase lane with them. Non-spawning actions pass
     # through; only spawning ones are capped at `max_spawns_per_tick`.
-    _capped: list = []
-    _spawn_budget = policy.max_spawns_per_tick
-    for _a in actions:
-        if _action_spawns(_a):
-            if _spawn_budget <= 0:
-                continue
-            _spawn_budget -= 1
-        _capped.append(_a)
-    actions = _capped
+    #
+    # The budget is spent by CLASS, not by append order. With a small budget the
+    # one or two slots go to whichever action happens to be first, and Steward-
+    # enqueued `dispatch` hand-offs are planned ahead of the drain heuristics, so
+    # a vigil backlog starves collect/coin exactly as it starves the worker-slot
+    # pool above. Spend the budget drain-first (the pipeline's in-flight exit
+    # path) and reserve one slot for every other class that has work waiting, so
+    # neither in-flight work nor new work is shut out while the other has a
+    # backlog. The surviving spawning actions keep their original plan order.
+    _budget = max(0, policy.max_spawns_per_tick)
+    _spawn_slots = [_i for _i, _a in enumerate(actions) if _action_spawns(_a)]
+    _classes = {_spawn_class(actions[_i]) for _i in _spawn_slots}
+    _per_class_cap = max(1, _budget - (len(_classes) - 1))
+    _ranked = sorted(_spawn_slots, key=lambda _i: (_spawn_rank(actions[_i]), _i))
+    _kept: set = set()
+    _spent: dict = {}
+    for _i in _ranked:
+        if len(_kept) >= _budget:
+            break
+        _cls = _spawn_class(actions[_i])
+        if _spent.get(_cls, 0) >= _per_class_cap:
+            continue
+        _spent[_cls] = _spent.get(_cls, 0) + 1
+        _kept.add(_i)
+    actions = [_a for _i, _a in enumerate(actions) if _i in _kept or not _action_spawns(_a)]
 
     # --- Session-store razing (maintenance, never work) ---------------------
     # The Kilo session/event store grows without bound (15 GB by 2026-11-08).

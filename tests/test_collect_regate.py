@@ -92,6 +92,7 @@ def _collect_args(**overrides) -> MagicMock:
     args.skip_ui_review = False
     args.hotfix = False
     args.regate = False
+    args.no_premerge = False
     args.cogship = None
     args.standup = False
     for k, v in overrides.items():
@@ -239,3 +240,64 @@ def test_collect_standup_without_a_worktree_exits_nonzero(tmp_path, monkeypatch)
     with pytest.raises(SystemExit) as exc:
         _run_collect(quest, _collect_args(standup=True), tmp_path, monkeypatch)
     assert exc.value.code == 1
+
+
+def _packable_quest(tmp_path) -> Quest:
+    quest = _regate_quest()
+    quest.status = "TRIBUTE_READY"
+    quest.cogship_id = ""
+    quest.cogship_promoted_commit = ""
+    quest.gatekeeper_session_id = ""
+    quest.gatekeeper_model = ""
+    wt = tmp_path / "wt"
+    wt.mkdir(exist_ok=True)
+    quest.worktree = str(wt)
+    return quest
+
+
+def test_collect_converges_each_quest_before_packing(tmp_path, monkeypatch):
+    """cogship-574 spent 68 minutes merging 554- and 291-commit-behind branches
+    inside the gatehouse before its suite started. The same merge costs seconds
+    in the Quest worktree, so collect must do it before stamping."""
+    quest = _packable_quest(tmp_path)
+    seen = {}
+
+    def fake_rebase(wt, base_branch="castle", own_quest_id=None):
+        seen.update(wt=str(wt), base=base_branch, quest=own_quest_id)
+        return {"ok": True, "merged": True, "before_behind": 554, "after_behind": 0}
+
+    monkeypatch.setattr(cli.git_ops, "rebase_worktree_onto_base", fake_rebase)
+    monkeypatch.setattr(store, "stamp_cogship", lambda *a, **k: "cogship-014")
+    out = _run_collect(quest, _collect_args(), tmp_path, monkeypatch)
+    assert seen == {"wt": str(tmp_path / "wt"), "base": "castle", "quest": quest.id}
+    assert "pre-pack converged onto castle" in out
+    assert "554 → 0" in out
+    assert "Stamped 1 Quest(s) onto cogship-014" in out
+
+
+def test_collect_does_not_pack_a_quest_that_conflicts_with_base(tmp_path, monkeypatch):
+    quest = _packable_quest(tmp_path)
+    monkeypatch.setattr(
+        cli.git_ops, "rebase_worktree_onto_base",
+        lambda *a, **k: {"ok": False, "conflict": True,
+                         "conflicting_files": ["apps/shops/models.py"]},
+    )
+    stamp = MagicMock()
+    monkeypatch.setattr(store, "stamp_cogship", stamp)
+    out = _run_collect(quest, _collect_args(), tmp_path, monkeypatch)
+    assert "pre-pack merge onto castle conflicts in: apps/shops/models.py" in out
+    assert "Stamped" not in out
+    stamp.assert_not_called()
+
+
+def test_collect_reports_quarantined_suite_proofs(tmp_path, monkeypatch):
+    quest = _packable_quest(tmp_path)
+    monkeypatch.setattr(
+        cli.git_ops, "rebase_worktree_onto_base",
+        lambda *a, **k: {"ok": True, "merged": True, "before_behind": 2, "after_behind": 0,
+                         "quarantined_files": [".court/suites/cogship-565.json"],
+                         "quarantine_dir": "/tmp/suite-quarantine"},
+    )
+    monkeypatch.setattr(store, "stamp_cogship", lambda *a, **k: "cogship-014")
+    out = _run_collect(quest, _collect_args(), tmp_path, monkeypatch)
+    assert "quarantined 1 orphaned suite proof(s) to /tmp/suite-quarantine" in out

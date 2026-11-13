@@ -306,6 +306,7 @@ class TestCourtArtist(unittest.TestCase):
         args.skip_ui_review = False
         args.cogship = None
         args.regate = False
+        args.no_premerge = False
         args.standup = False
 
         import io
@@ -365,6 +366,7 @@ class TestCourtArtist(unittest.TestCase):
         args.skip_ui_review = True
         args.cogship = "cogship-999"
         args.regate = False
+        args.no_premerge = False
         args.standup = False
 
         import io

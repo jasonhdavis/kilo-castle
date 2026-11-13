@@ -3537,6 +3537,10 @@ def _sync_base_before_spawn(
                 f" (auto-resolved {len(auto)} foreign ledger conflict(s) to {base_branch})"
                 if auto else ""
             )
+            if res.get("quarantined_files"):
+                note += (
+                    f" (quarantined {len(res['quarantined_files'])} orphaned suite proof(s))"
+                )
             print(
                 f"🔄 {label}: base-synced {getattr(quest, 'id', '?')} onto {base_branch} "
                 f"(behind {res.get('before_behind')} → 0){note}"
@@ -5597,6 +5601,15 @@ def cmd_collect(args):
     worktree (nothing to batch, no reason for a separate integration point);
     a size>1 convoy gets a brand-new ephemeral worktree scoped to that one
     convoy only (`the-gatehouse/<cogship_id>`), torn down after promotion.
+
+    Pre-pack convergence (2026-11-12, cogship-574 post-mortem): each accepted
+    Quest is merged onto `--base` in its own worktree BEFORE stamping. A branch
+    hundreds of commits behind otherwise turns the Gatekeeper's convoy merge
+    into a long manual-resolution session (cogship-574 spent 68 minutes merging
+    before its suite launched); the same merge costs seconds here. A genuine
+    conflict refuses the Quest at pack time, and orphaned untracked
+    `.court/suites/*.json` proofs are quarantined so they do not block it.
+    `--no-premerge` restores pack-as-is.
     """
     regate = bool(getattr(args, "regate", False))
     candidates = resolve_quest_selection(
@@ -5691,6 +5704,60 @@ def cmd_collect(args):
                 "(`court ui-signoff <quest> --by \"M'Lord\" --note \"<where said>\"`) before packing",
             ))
             continue
+        # Pre-pack convergence (2026-11-12, cogship-574 post-mortem): a branch
+        # hundreds of commits behind castle turns the Gatekeeper's convoy merge
+        # into a long manual-resolution session (cogship-574 spent 68 minutes
+        # merging before its suite started). The same merge in the Quest's own
+        # worktree costs seconds, so converge here, before stamping: the convoy
+        # is packed from branches already at castle, and a genuine conflict is
+        # refused now for `court rebase`/a brief instead of surfacing inside the
+        # gatehouse. `--no-premerge` restores the old pack-as-is behaviour.
+        if not bool(getattr(args, "no_premerge", False)):
+            conv_wt = None
+            if quest.worktree and Path(quest.worktree).is_dir():
+                conv_wt = Path(quest.worktree)
+            else:
+                try:
+                    found = git_ops.find_worktree_for_quest(quest)
+                except Exception:
+                    found = None
+                if found and Path(found).is_dir():
+                    conv_wt = Path(found)
+            if conv_wt is None:
+                scan_warnings.append(
+                    f"{quest.id}: no resolvable worktree — pre-pack convergence skipped; "
+                    f"the Gatekeeper will merge its branch")
+            else:
+                conv = git_ops.rebase_worktree_onto_base(
+                    str(conv_wt), base_branch=base_branch, own_quest_id=quest.id)
+                if conv.get("merged"):
+                    qnote = ""
+                    if conv.get("quarantined_files"):
+                        qnote = (
+                            f"; quarantined {len(conv['quarantined_files'])} orphaned "
+                            f"suite proof(s) to {conv.get('quarantine_dir')}")
+                    print(
+                        f"🔄 {quest.id}: pre-pack converged onto {base_branch} "
+                        f"(behind {conv.get('before_behind')} → 0){qnote}")
+                elif conv.get("conflict"):
+                    files = ", ".join(conv.get("conflicting_files", [])[:5]) or "unknown files"
+                    skipped.append((
+                        quest.id,
+                        f"pre-pack merge onto {base_branch} conflicts in: {files} — resolve "
+                        f"with `court rebase {quest.id}` or a `--brief` remediation before packing",
+                    ))
+                    continue
+                elif not conv.get("ok"):
+                    err = conv.get("error") or "merge could not run"
+                    if "dirty" in err:
+                        skipped.append((quest.id, f"pre-pack convergence failed: {err}"))
+                        continue
+                    # A broken/unreadable worktree is not a packing blocker (the
+                    # pre-pack merge is an optimisation, not an audit gate): warn
+                    # and let the Gatekeeper merge the branch, as before.
+                    scan_warnings.append(
+                        f"{quest.id}: pre-pack convergence skipped — {err}; "
+                        f"the Gatekeeper will merge its branch")
         # Gates read the worktree charter first (freshest: coin verdicts and
         # UI-review approvals commit on the branch before any convoy promotes),
         # falling back to the castle copy when no worktree exists.
@@ -10134,7 +10201,13 @@ def cmd_rebase(args):
         elif r.get("merged"):
             auto_resolved = r.get("auto_resolved_files") or []
             foreign_note = f"  [auto-resolved {len(auto_resolved)} foreign ledger conflict(s) -> {base_branch}]" if auto_resolved else ""
-            print(f"  🔄 {qid:36} merged: {r.get('before_behind')} -> {r.get('after_behind')} behind.{foreign_note}  {title}")
+            q_note = ""
+            if r.get("quarantined_files"):
+                q_note = (
+                    f"  [quarantined {len(r['quarantined_files'])} orphaned suite proof(s) -> "
+                    f"{r.get('quarantine_dir')}]"
+                )
+            print(f"  🔄 {qid:36} merged: {r.get('before_behind')} -> {r.get('after_behind')} behind.{foreign_note}{q_note}  {title}")
         elif r.get("conflict"):
             sample = ", ".join(r.get("conflicting_files", [])[:5]) or "unknown files"
             print(f"  🔴 {qid:36} CONFLICT in [{sample}] — aborted, needs manual resolution.  {title}")
@@ -10711,7 +10784,7 @@ def build_parser():
     p_collect = sub.add_parser("collect", help="Pack Master-of-Coin-approved Quests into a Cog Ship convoy: audit, stamp, batch-advance to GATE, print the Gatekeeper NEXT STEPS")
     add_quest_selector(p_collect, batchable=True, filters=("status", "app", "epic"))
     p_collect.add_argument("--cogship", default=None, help="Existing Cog Ship ID to stamp (e.g. cogship-002); omit or pass 'new' to allocate the next id")
-    p_collect.add_argument("--base", default="castle", help="Base branch for the compliance audit (default: castle)")
+    p_collect.add_argument("--base", default="castle", help="Base branch for pre-pack convergence and the compliance audit (default: castle)")
     p_collect.add_argument("--skip-ui-review", action="store_true", help="Bypass pending UI review check when packing into Cog Ship")
     p_collect.add_argument(
         "--allow-pending-studio", dest="allow_pending_studio", action="store_true", default=False,
@@ -10719,6 +10792,7 @@ def build_parser():
     )
     p_collect.add_argument("--hotfix", action="store_true", help="Allow hotfix fast-track inline audit and pack")
     p_collect.add_argument("--regate", action="store_true", help="Hand previously promoted Quests (READY_TO_RAZE) back to a Gatekeeper: mint a FRESH convoy, rewind them to GATE, clear stale promotion/session stamps, and stand up a new Gatekeeper")
+    p_collect.add_argument("--no-premerge", dest="no_premerge", action="store_true", help="Skip the pre-pack `git merge <base>` convergence in each Quest worktree (default: converge so the Gatekeeper starts from branches already at the base tip)")
     p_collect.add_argument("--standup", action="store_true", help="Automatically stand up the Gatekeeper worktree and session via Kilo CLI")
     p_collect.add_argument("--force", action="store_true", help="Force packing even if checks warn/fail")
     p_collect.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")

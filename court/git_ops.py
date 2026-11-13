@@ -69,6 +69,44 @@ def _is_generated_scaffolding(rel_path: str) -> bool:
     return bool(_SCAFFOLDING_TASK_RE.match(rel_path.replace("\\", "/")))
 
 
+# Durable unified-suite proofs (`court runsuite` writes `.court/suites/*.json`).
+# A proof left UNTRACKED in a Quest worktree is an orphan from a convoy run in
+# that checkout, not a deliverable: it makes the worktree "dirty" and blocks the
+# pre-spawn/pre-pack merge. It is regenerable evidence, so it is moved to the
+# watch's quarantine (never deleted) and the convergence proceeds (cogship-565/
+# 566, 2026-11-12: two Quests could not be packed until the records were
+# committed by hand).
+_SUITE_PROOF_RE = re.compile(r"^\.court/suites/[^/]+\.json$")
+
+
+def _is_untracked_suite_proof(line: str) -> bool:
+    return line.startswith("?? ") and bool(_SUITE_PROOF_RE.match(line[3:].strip()))
+
+
+def _quarantine_untracked_suite_proofs(p: Path, rel_paths: list[str]) -> tuple[str, list[str]]:
+    """Move untracked `.court/suites/*.json` proofs out of the worktree.
+
+    Returns (quarantine_dir, moved_paths). Never deletes: the evidence lands
+    under `~/.local/state/kilo-castle/suite-quarantine/`. A move failure leaves
+    the file where it is and reports no directory, so the caller can fail closed.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    root = Path.home() / ".local" / "state" / "kilo-castle" / "suite-quarantine" / f"{p.name}-{stamp}"
+    moved: list[str] = []
+    for rel in rel_paths:
+        src = p / rel
+        if not src.is_file():
+            continue
+        dest = root / rel
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+        except OSError:
+            return "", []
+        moved.append(rel)
+    return (str(root) if moved else ""), moved
+
+
 def _merge_refused_on_local_changes(merge_res: dict) -> bool:
     """True when git refused the merge because it would overwrite local edits.
 
@@ -1192,7 +1230,8 @@ def rebase_worktree_onto_base(
         # class). Keep them, and fall back to the revert only when the merge
         # itself refuses because it would overwrite the file.
         disposable = [l for l in dirty_lines
-                      if _is_generated_scaffolding(l[3:].strip())]
+                      if _is_generated_scaffolding(l[3:].strip())
+                      or _is_untracked_suite_proof(l)]
         blocking = [l for l in dirty_lines if l not in disposable]
         if blocking:
             result["error"] = (
@@ -1212,6 +1251,21 @@ def rebase_worktree_onto_base(
         result["ok"] = True
         result["already_current"] = True
         return result
+
+    # Orphaned untracked suite proofs make the tree dirty but are not evidence
+    # of user edits; move them to quarantine so the merge can run. A genuine
+    # untracked file was already rejected as blocking above.
+    suite_proofs = [l[3:].strip() for l in dirty_lines if _is_untracked_suite_proof(l)]
+    if suite_proofs:
+        qdir, moved = _quarantine_untracked_suite_proofs(p, suite_proofs)
+        if not moved:
+            result["error"] = (
+                "untracked suite proof(s) could not be quarantined: "
+                + ", ".join(suite_proofs)
+            )
+            return result
+        result["quarantined_files"] = moved
+        result["quarantine_dir"] = qdir
 
     merge_res = _run(["git", "merge", base_branch, "--no-edit"], p, timeout=120)
     if (not merge_res.get("ok")

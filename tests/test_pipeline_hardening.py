@@ -470,6 +470,43 @@ class TestBaseSyncBeforeSpawn:
         assert "base sync skipped" in capsys.readouterr().err
 
 
+class TestRebaseSuiteProofQuarantine:
+    """Orphaned untracked `.court/suites/*.json` proofs blocked pre-pack/
+    pre-spawn convergence until a human committed them (cogship-565/566)."""
+
+    def _diverge(self, repo):
+        subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "quest/q1"], check=True)
+        (repo / "q1.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "quest"], check=True)
+        subprocess.run(["git", "-C", str(repo), "checkout", "-q", "castle"], check=True)
+        (repo / "castle.py").write_text("y = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "castle"], check=True)
+        subprocess.run(["git", "-C", str(repo), "checkout", "-q", "quest/q1"], check=True)
+
+    def test_untracked_suite_proof_is_quarantined_and_merge_proceeds(self, tmp_path, monkeypatch):
+        _init_git_repo(tmp_path, branch="castle")
+        self._diverge(tmp_path)
+        proofs = tmp_path / ".court" / "suites"
+        proofs.mkdir(parents=True)
+        (proofs / "cogship-999.json").write_text("{}\n", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        res = cli.git_ops.rebase_worktree_onto_base(str(tmp_path), "castle", own_quest_id="Q1")
+        assert res["ok"] and res["merged"]
+        assert res["quarantined_files"] == [".court/suites/cogship-999.json"]
+        assert not (proofs / "cogship-999.json").exists()
+        assert (Path(res["quarantine_dir"]) / ".court" / "suites" / "cogship-999.json").is_file()
+
+    def test_plain_untracked_file_still_blocks(self, tmp_path):
+        _init_git_repo(tmp_path, branch="castle")
+        self._diverge(tmp_path)
+        (tmp_path / "notes.txt").write_text("keep me\n", encoding="utf-8")
+        res = cli.git_ops.rebase_worktree_onto_base(str(tmp_path), "castle", own_quest_id="Q1")
+        assert res["ok"] is False and res["conflict"] is False
+        assert "worktree is dirty" in res["error"]
+
+
 class TestSpawnLiveness:
     def test_standup_reports_dead_spawn(self, tmp_path, monkeypatch):
         class DeadProc:

@@ -54,8 +54,9 @@ class TestStudioQuestResolution(unittest.TestCase):
 
 
 class TestAtelierQuestResolution(unittest.TestCase):
-    """The standing atelier's members come from the repo-level manifest, not
-    from the branch name (its branch is the stable `artist/atelier`)."""
+    """The standing atelier's members come from the repo-level manifest, but a
+    manifest entry outlives an atelier rebuild; membership is verified against
+    the live branch and the main checkout's charters."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -67,18 +68,43 @@ class TestAtelierQuestResolution(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _manifest(self, ids):
+    def _git(self, *args, cwd=None):
+        subprocess.run(["git", "-C", str(cwd or self.root), *args],
+                       check=True, capture_output=True)
+
+    def _manifest(self, ids, stale=()):
         d = self.root / ".court" / "atelier"
         d.mkdir(parents=True, exist_ok=True)
+        quests = {i: {"branch": f"quest/{i.lower()}"} for i in ids}
+        for i in stale:
+            quests[i] = {"branch": f"quest/{i.lower()}"}
         (d / "manifest.json").write_text(
             json.dumps({"version": 1, "branch": "artist/atelier",
-                        "quests": {i: {"branch": f"quest/{i.lower()}"} for i in ids}}),
+                        "quests": quests}),
             encoding="utf-8")
+
+    def _seed_member(self, qid):
+        qdir = self.root / ".court" / "quests"
+        qdir.mkdir(parents=True, exist_ok=True)
+        (qdir / f"{qid}.md").write_text(f"id: {qid}\n", encoding="utf-8")
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", f"charter {qid}")
+        branch = f"quest/{qid.lower()}"
+        self._git("checkout", "-q", "-b", branch)
+        (self.root / f"{qid}.txt").write_text("work\n", encoding="utf-8")
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", f"work {qid}")
+        self._git("checkout", "-q", "castle")
 
     def _add_atelier_worktree(self):
         subprocess.run(["git", "-C", str(self.root), "worktree", "add", "-q",
                         str(self.atelier_wt), "-b", "artist/atelier"],
                        check=True, capture_output=True)
+
+    def _merge_into_atelier(self, qid):
+        self._git("merge", "--no-edit", "-m",
+                  f"court: merge {qid} into combined artist studio atelier",
+                  f"quest/{qid.lower()}", cwd=self.atelier_wt)
 
     def test_is_atelier_branch(self):
         self.assertTrue(ui_server._is_atelier_branch("artist/atelier"))
@@ -86,19 +112,44 @@ class TestAtelierQuestResolution(unittest.TestCase):
         self.assertFalse(ui_server._is_atelier_branch(""))
 
     def test_resolves_members_from_the_repo_manifest(self):
-        self._manifest(["Q1358-Common-WarehouseScannerUPCScanRate",
-                        "Q1403-Marketing-Trigger-Condition-Null-Operator-Inversion"])
+        ids = ["Q1358-Common-WarehouseScannerUPCScanRate",
+               "Q1403-Marketing-Trigger-Condition-Null-Operator-Inversion"]
+        for qid in ids:
+            self._seed_member(qid)
         self._add_atelier_worktree()
+        for qid in ids:
+            self._merge_into_atelier(qid)
+        # Q1350 is a stale manifest entry (the rebuilt atelier lost its merge).
+        self._manifest(ids, stale=["Q1350-Core-Web-Request-Ceiling-Successor"])
         # Read from the MAIN checkout's manifest, though we query the worktree.
-        self.assertEqual(ui_server._studio_quest_ids(str(self.atelier_wt)),
-                         ["Q1358-Common-WarehouseScannerUPCScanRate",
-                          "Q1403-Marketing-Trigger-Condition-Null-Operator-Inversion"])
+        self.assertEqual(ui_server._studio_quest_ids(str(self.atelier_wt)), ids)
         ok, err = ui_server._check_studio_signoff_ready(str(self.atelier_wt))
         self.assertTrue(ok, err)
+
+    def test_member_without_a_live_merge_is_not_offered(self):
+        ids = ["Q1358-Common-WarehouseScannerUPCScanRate",
+               "Q1362-Tasks-WorkerLightTier"]
+        for qid in ids:
+            self._seed_member(qid)
+        self._add_atelier_worktree()
+        self._merge_into_atelier(ids[0])
+        self._manifest(ids)
+        self.assertEqual(ui_server._studio_quest_ids(str(self.atelier_wt)), [ids[0]])
 
     def test_atelier_without_a_manifest_resolves_empty(self):
         self._add_atelier_worktree()
         self.assertEqual(ui_server._studio_quest_ids(str(self.atelier_wt)), [])
+
+
+class TestSignoffCommand(unittest.TestCase):
+    def test_patronize_allows_an_empty_revision(self):
+        argv = ui_server._signoff_command(
+            "patronize", "Q1358-Common-WarehouseScannerUPCScanRate", "M'Lord", "note")
+        self.assertEqual(argv[-1], "--allow-empty")
+
+    def test_plain_ui_signoff_does_not(self):
+        argv = ui_server._signoff_command("ui-signoff", "Q1", "M'Lord", "note")
+        self.assertNotIn("--allow-empty", argv)
 
 
 class TestSignoffToken(unittest.TestCase):

@@ -5245,10 +5245,17 @@ def _is_atelier_branch(branch) -> bool:
 
 
 def _atelier_member_ids(wt) -> list[str]:
-    """Quest ids merged into the standing atelier, from the repo-level
-    ``.court/atelier/manifest.json`` — written by ``court atelier --standing``
-    and ``court patronize`` in the MAIN checkout, never in the atelier worktree."""
-    mpath = os.path.join(_main_repo_root(wt), ".court", "atelier", "manifest.json")
+    """Quest ids actually merged into the standing atelier.
+
+    The manifest is the membership record, but it is append-only across atelier
+    rebuilds/reaps: a stale entry can outlive its merge (Q1350, 2026-11-12: the
+    atelier was rebuilt, its merge did not survive, and the UI still offered it
+    for approval from a dead record). Membership is therefore verified against
+    the live atelier branch and the main checkout's charter directory before a
+    Quest is offered.
+    """
+    root = _main_repo_root(wt)
+    mpath = os.path.join(root, ".court", "atelier", "manifest.json")
     try:
         with open(mpath, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -5257,7 +5264,55 @@ def _atelier_member_ids(wt) -> list[str]:
     quests = data.get("quests") if isinstance(data, dict) else None
     if not isinstance(quests, dict):
         return []
-    return sorted(k for k in quests if isinstance(k, str))
+    branch = str((data or {}).get("branch") or "artist/atelier")
+    out: list[str] = []
+    for qid, rec in quests.items():
+        if not isinstance(qid, str):
+            continue
+        if not _quest_charter_in_main(root, qid):
+            continue
+        qbranch = (rec or {}).get("branch") if isinstance(rec, dict) else ""
+        if not _atelier_merge_present(root, branch, qid, qbranch or ""):
+            continue
+        out.append(qid)
+    return sorted(out)
+
+
+def _quest_charter_in_main(repo_root, quest_id: str) -> bool:
+    """A Quest offered for atelier approval must still have a live charter in
+    the MAIN checkout. Archived Quests live under `.court/archive/` and are not
+    review candidates."""
+    qdir = Path(repo_root) / ".court" / "quests"
+    try:
+        return any(p.name.startswith(quest_id) and p.name.endswith(".md")
+                   for p in qdir.iterdir())
+    except OSError:
+        return False
+
+
+def _atelier_merge_present(repo_root, atelier_branch: str, quest_id: str,
+                           quest_branch: str) -> bool:
+    """Whether the Quest is still on the atelier branch.
+
+    Fast-forwarded membership leaves the Quest branch as an ancestor; the normal
+    path is a merge commit whose subject names the Quest
+    (`court: merge <QID> into combined artist studio atelier`). Inconclusive git
+    failures keep the member rather than silently hiding it.
+    """
+    root = Path(repo_root)
+    if quest_branch:
+        anc = git_ops._run(
+            ["git", "merge-base", "--is-ancestor", quest_branch, atelier_branch], root)
+        if anc.get("ok"):
+            return True
+    log = git_ops._run(
+        ["git", "log", atelier_branch, "--format=%s", "--fixed-strings",
+         f"--grep=court: merge {quest_id}"],
+        root,
+    )
+    if not log.get("ok"):
+        return True
+    return bool((log.get("stdout") or "").strip())
 
 
 def _studio_quest_ids(wt) -> list[str]:
@@ -5297,6 +5352,23 @@ def _studio_quest_ids(wt) -> list[str]:
             if qfile:
                 out.append(qid)
     return out
+
+
+def _signoff_command(verb: str, quest_id: str, by: str, note_arg: str) -> list[str]:
+    """The `court` argv the studio overlay's Approve button runs.
+
+    In the standing atelier the verb is `patronize`. A cohort mixes Quests the
+    artist edited (labelled review commits exist) with Quests the artist
+    legitimately left untouched (none). The CLI refuses the untouched ones
+    unless `--allow-empty` is given, so one untouched Quest failed the whole
+    browser approval (Q1358/Q1362, 2026-11-12). The human click IS the royal
+    sign-off, so pass it for patronize; direct/agent CLI calls keep the guard.
+    """
+    argv = [sys.executable, "-m", "court.cli", verb, quest_id,
+            "--by", by, "--note", note_arg]
+    if verb == "patronize":
+        argv.append("--allow-empty")
+    return argv
 
 
 def _signoff_token(wt) -> str:
@@ -6048,8 +6120,7 @@ class Handler(BaseHTTPRequestHandler):
                 p for p in (COURT_DIR, env.get("PYTHONPATH", "")) if p)
             try:
                 res = subprocess.run(
-                    [sys.executable, "-m", "court.cli", verb,
-                     qid, "--by", by, "--note", note_arg],
+                    _signoff_command(verb, qid, by, note_arg),
                     cwd=run_cwd, env=env, capture_output=True, text=True, timeout=120)
                 results.append({
                     "id": qid,

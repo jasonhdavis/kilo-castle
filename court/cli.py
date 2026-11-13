@@ -9825,8 +9825,10 @@ def _ship_promoted_sha(main_wt: Path, base_branch: str) -> str:
 
 def _ship_build_images(main_wt: Path, promoted_sha: str, records: list, dry_run: bool) -> tuple[dict, bool]:
     """Build each distinct image ONCE (flyctl build-only + push, labelled by the
-    promoted commit) and record the pushed reference for the deploy stage and for
-    a later standalone `--stage deploy` re-run."""
+    promoted commit), then replicate it into every member app whose registry
+    namespace differs from the build namespace. Records every reference so the
+    deploy stage -- and a later standalone `--stage deploy` re-run -- releases each
+    app from its OWN namespace."""
     refs: dict = {}
     failed = False
     for image_id in ship_deploy.images_for_records(records):
@@ -9854,31 +9856,104 @@ def _ship_build_images(main_wt: Path, promoted_sha: str, records: list, dry_run:
         refs[image_id] = ref
         print(f"✅ image [{image_id}] built and pushed -> {ref}")
         print(_tail(output, 4))
+
+        # A member in a different registry namespace gets its own copy. The
+        # driver must not assume an app may pull another app's namespace.
+        for member in ship_deploy.namespace_members(image_id, main_wt):
+            member_ref = ship_deploy.image_ref(image_id, main_wt, label, app_name=member)
+            if not _ship_replicate_image(main_wt, ref, member_ref, member):
+                failed = True
+                continue
+            ship_deploy.record_image_ref(main_wt, promoted_sha, image_id, member_ref, app_name=member)
+            refs[(image_id, member)] = member_ref
     return refs, failed
+
+
+def _ship_replicate_image(main_wt: Path, source_ref: str, target_ref: str, member_app: str) -> bool:
+    """Copy an already-built image into a member app's registry namespace.
+
+    One build serves every member of an image, but Fly's app registry is a
+    namespace per app and the driver will not assume cross-app pulls are allowed.
+    ``flyctl auth docker`` logs the local Docker daemon into registry.fly.io, then
+    ``docker tag``/``docker push`` replays the built image into the member's
+    namespace -- no rebuild.
+
+    When Docker is unavailable the copy is skipped with a loud warning and the
+    shared reference is used instead, so an unverified cross-namespace pull can
+    never silently block a deploy; a Fly rejection of that pull is reported by the
+    release itself."""
+    if shutil.which("docker") is None:
+        print(
+            f"\n⚠️  REGISTRY: docker is unavailable — cannot copy the image into "
+            f"'{member_app}'s namespace. {member_app} will be released from the shared "
+            f"reference {source_ref} (cross-namespace pull). If Fly rejects it, install "
+            f"docker and re-run `court ship --confirm --stage build`."
+        )
+        return True
+    for argv in (
+        ship_deploy.docker_login_argv(member_app),
+        ship_deploy.docker_tag_argv(source_ref, target_ref),
+        ship_deploy.docker_push_argv(target_ref),
+    ):
+        res = _flyctl(argv, main_wt, 900)
+        out = ((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")).strip()
+        if not res.get("ok"):
+            print(f"❌ image copy into '{member_app}' namespace FAILED (exit {res.get('exit_code')})")
+            print(_tail(out))
+            return False
+    print(f"   ✅ replicated into {member_app}'s namespace -> {target_ref}")
+    return True
 
 
 def _ship_pre_deploy_drain(main_wt: Path, record: dict, drain_command: Optional[str], dry_run: bool) -> str:
     """Pre-deploy drain hook, invoked before releasing a worker app.
 
-    The drain management command (cordons the fleet, waits for in-flight tasks to
-    finish) is delivered by a separate Quest. When the hook is absent the driver
-    logs that clearly and continues -- fail-open on a missing hook, never
-    fail-silent, so the deploy is never wedged on the companion workstream."""
+    The hook is a management command in the app repo (pb-app:
+    apps/tasks/management/commands/drain_worker_fleet.py). Its two non-failing
+    outcomes both continue the deploy:
+
+    * **hook absent in this checkout** -- a repo that has not adopted the drain
+      must still deploy (fail-open, loud);
+    * **no running machine** -- an app scaled to zero (light) or suspended (heavy)
+      has nothing that can be in flight, and ``flyctl ssh console`` cannot connect
+      to it at all. Treating that as a failed drain would withhold a release over
+      an unrelated condition, so it is reported as already-drained."""
     if not drain_command:
         return "disabled"
     app_name = record["app"]
-    argv = ship_deploy.drain_argv(app_name, drain_command)
     hook_path = ship_deploy.find_drain_command(main_wt, drain_command)
     if hook_path is None:
         print(
             f"\n⚠️  DRAIN: management command {drain_command!r} is not present in {main_wt} — "
-            f"skipping the pre-deploy drain for {app_name} (fail-open; hook not yet delivered)."
+            f"skipping the pre-deploy drain for {app_name} (fail-open; the repo has not adopted it)."
         )
         return "absent"
+
     print(f"\n🚧 DRAIN {app_name} before release (hook {hook_path.name})")
-    print(f"   $ {' '.join(argv)}")
+    list_argv = ship_deploy.machine_list_argv(app_name)
     if dry_run:
+        print(f"   $ {' '.join(list_argv)}")
+        print(f"   $ {' '.join(ship_deploy.drain_argv(app_name, drain_command))}")
         return "rehearsed"
+
+    # Decide whether a drain can run: no running machine means nothing to drain.
+    listed = _flyctl(list_argv, main_wt, 120)
+    payload = (listed.get("stdout") or "") + "\n" + (listed.get("stderr") or "")
+    running = ship_deploy.running_machine_count(payload) if listed.get("ok") else None
+    if running == 0:
+        print(
+            f"   ✅ no running machine on {app_name} — nothing can be in flight; "
+            f"treated as already drained."
+        )
+        return "absent"
+    if running is None:
+        print(
+            f"   ⚠️  could not read {app_name}'s machine list "
+            f"(exit {listed.get('exit_code')}) — attempting the drain anyway."
+        )
+
+    argv = ship_deploy.drain_argv(app_name, drain_command)
+    print(f"   $ {' '.join(argv)}")
     res = _flyctl(argv, main_wt, 1800)
     output = ((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")).strip()
     if not res.get("ok"):
@@ -9907,15 +9982,30 @@ def _ship_deploy_apps(
     for record in records:
         image_id = record["image"]
         app_name = record["app"]
-        label = ship_deploy.image_label(promoted_sha, image_id)
-        recorded = ship_deploy.deployed_ref(main_wt, promoted_sha, image_id)
-        ref = refs.get(image_id) or recorded or ship_deploy.image_ref(image_id, main_wt, label)
-        if refs.get(image_id):
-            source = "built this run"
-        elif recorded:
-            source = "recorded by a prior build"
+        # Reference precedence: this run's build (own namespace, then shared) ->
+        # a reference recorded by a prior build for THIS commit -> REFUSE. The
+        # driver never derives a reference and releases it blind: a derived ref
+        # may never have been built, and the previous fallback papered over that.
+        ref = (
+            refs.get((image_id, app_name))
+            or refs.get(image_id)
+            or ship_deploy.deployed_ref(main_wt, promoted_sha, image_id, app_name=app_name)
+        )
+        if refs.get((image_id, app_name)):
+            source = "built this run (own namespace)"
+        elif refs.get(image_id):
+            source = "built this run (shared namespace)"
+        elif ref:
+            source = "recorded by a prior build for this commit"
         else:
-            source = "derived (no build recorded for this commit)"
+            print(
+                f"\n⛔ {app_name}: no built image recorded for commit {promoted_sha[:12]} "
+                f"(image [{image_id}]). Run `court ship --confirm --stage build` first, or "
+                f"`--stage build,deploy`; releasing a derived reference could ship an image "
+                f"that was never built."
+            )
+            failed = True
+            continue
         try:
             # Hard guard: the science image can never reach pb-app-worker-light.
             ship_deploy.guard_image_delivery(app_name, image_id)
@@ -10010,21 +10100,44 @@ def _ship_rehearse_deploy(args, main_wt: Path, base_branch: str, mutation_stages
             label = ship_deploy.image_label(promoted_sha, image_id)
             argv = ship_deploy.build_argv(image_id, ship_deploy.build_config_for_image(image_id), label)
             print(f"   $ {' '.join(argv)}")
+            # A member in a different registry namespace gets its own copy of the
+            # image (built once, pushed per namespace).
+            for member in ship_deploy.namespace_members(image_id, main_wt):
+                if shutil.which("docker") is None:
+                    print(f"   # (docker unavailable — {member} would be released from the shared ref)")
+                    continue
+                src = ship_deploy.image_ref(image_id, main_wt, label)
+                dst = ship_deploy.image_ref(image_id, main_wt, label, app_name=member)
+                for sub in (
+                    ship_deploy.docker_login_argv(member),
+                    ship_deploy.docker_tag_argv(src, dst),
+                    ship_deploy.docker_push_argv(dst),
+                ):
+                    print(f"   $ {' '.join(sub)}")
     if "deploy" in mutation_stages:
         for record in records:
             image_id = record["image"]
-            label = ship_deploy.image_label(promoted_sha, image_id)
-            ref = ship_deploy.deployed_ref(main_wt, promoted_sha, image_id) or ship_deploy.image_ref(
-                image_id, main_wt, label
-            )
+            app_name = record["app"]
+            ref = ship_deploy.deployed_ref(main_wt, promoted_sha, image_id, app_name=app_name)
+            if not ref and "build" in mutation_stages:
+                # the build stage above would have built and recorded it
+                label = ship_deploy.image_label(promoted_sha, image_id)
+                ref = ship_deploy.image_ref(image_id, main_wt, label, app_name=app_name)
+            if not ref:
+                print(
+                    f"   # ({app_name}: no build recorded for commit {promoted_sha[:12]} — the "
+                    f"live run would refuse; add `--stage build`)"
+                )
+                continue
             if record["role"] == "worker" and drain_command:
                 if ship_deploy.find_drain_command(main_wt, drain_command) is None:
                     print(
-                        f"   # (drain hook {drain_command!r} absent for {record['app']} — "
+                        f"   # (drain hook {drain_command!r} absent for {app_name} — "
                         f"live run logs and continues)"
                     )
                 else:
-                    print(f"   $ {' '.join(ship_deploy.drain_argv(record['app'], drain_command))}")
+                    print(f"   $ {' '.join(ship_deploy.machine_list_argv(app_name))}")
+                    print(f"   $ {' '.join(ship_deploy.drain_argv(app_name, drain_command))}")
             print(f"   $ {' '.join(ship_deploy.deploy_argv(record['config'], ref))}")
 
 

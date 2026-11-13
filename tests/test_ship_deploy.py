@@ -192,10 +192,79 @@ def test_image_ref_is_deterministic_from_the_build_config(tmp_path):
 
 
 def test_drain_argv_runs_the_management_command_in_the_app_fleet():
+    # --pty=false is pinned: `flyctl ssh console` must not need a TTY.
     assert sd.drain_argv("pb-app-worker", "drain_worker_fleet") == [
         "flyctl", "ssh", "console", "-a", "pb-app-worker",
-        "-C", "python manage.py drain_worker_fleet",
+        "--pty=false", "-C", "python manage.py drain_worker_fleet",
     ]
+
+
+def test_resume_argv_runs_the_counterpart_command():
+    assert sd.resume_argv("pb-app-worker") == [
+        "flyctl", "ssh", "console", "-a", "pb-app-worker",
+        "--pty=false", "-C", "python manage.py resume_worker_fleet",
+    ]
+
+
+def test_machine_list_argv_asks_for_json():
+    assert sd.machine_list_argv("pb-app-worker-light") == [
+        "flyctl", "machine", "list", "-a", "pb-app-worker-light", "--json",
+    ]
+
+
+def test_running_machine_count_reads_flyctl_json():
+    assert sd.running_machine_count('[{"id": "a", "state": "started"}, {"id": "b", "state": "stopped"}]') == 1
+    assert sd.running_machine_count('[{"id": "a", "state": "suspended"}]') == 0
+    assert sd.running_machine_count('[]') == 0
+    # unusable payloads must not read as "no running machine"
+    assert sd.running_machine_count('') is None
+    assert sd.running_machine_count('not json') is None
+    assert sd.running_machine_count('{"id": "a"}') is None
+
+
+def test_namespace_members_are_apps_whose_namespace_differs_from_the_build(tmp_path):
+    _write_all(tmp_path)
+    # the app image builds in pb-app-web's namespace, so only worker-light needs a copy
+    assert sd.namespace_members("app", tmp_path) == ("pb-app-worker-light",)
+    # the science image builds in pb-app-worker's namespace; heavy needs a copy
+    assert sd.namespace_members("science", tmp_path) == ("pb-app-worker-heavy",)
+
+
+def test_image_ref_can_select_a_member_namespace(tmp_path):
+    _write_all(tmp_path)
+    assert sd.image_ref("app", tmp_path, "app-abc") == "registry.fly.io/pb-app-web:app-abc"
+    assert sd.image_ref("app", tmp_path, "app-abc", app_name="pb-app-worker-light") == (
+        "registry.fly.io/pb-app-worker-light:app-abc"
+    )
+
+
+def test_docker_replication_argv():
+    assert sd.docker_login_argv("pb-app-worker-light") == ["flyctl", "auth", "docker", "-a", "pb-app-worker-light"]
+    assert sd.docker_tag_argv("registry.fly.io/pb-app-web:T", "registry.fly.io/pb-app-worker-light:T") == [
+        "docker", "tag", "registry.fly.io/pb-app-web:T", "registry.fly.io/pb-app-worker-light:T",
+    ]
+    assert sd.docker_push_argv("registry.fly.io/pb-app-worker-light:T") == [
+        "docker", "push", "registry.fly.io/pb-app-worker-light:T",
+    ]
+
+
+def test_per_app_ref_prefers_its_own_namespace_then_falls_back_to_shared(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sd.record_image_ref(repo, "sha1", "app", "registry.fly.io/pb-app-web:app-sha1")
+    # no per-app copy yet -> the shared ref is used
+    assert sd.deployed_ref(repo, "sha1", "app", app_name="pb-app-worker-light") == (
+        "registry.fly.io/pb-app-web:app-sha1"
+    )
+    sd.record_image_ref(repo, "sha1", "app", "registry.fly.io/pb-app-worker-light:app-sha1",
+                        app_name="pb-app-worker-light")
+    # once replicated, the app's own namespace wins
+    assert sd.deployed_ref(repo, "sha1", "app", app_name="pb-app-worker-light") == (
+        "registry.fly.io/pb-app-worker-light:app-sha1"
+    )
+    # the shared ref is still intact for the build-namespace app
+    assert sd.deployed_ref(repo, "sha1", "app") == "registry.fly.io/pb-app-web:app-sha1"
 
 
 def test_parse_image_ref_and_release_version():
@@ -277,6 +346,146 @@ def test_standalone_deploy_uses_the_recorded_ref_without_rebuilding(tmp_path, mo
     assert not any("--build-only" in a for a in seen)
     assert len(seen) == len(records) == 4
     assert any("registry.fly.io/pb-app-web:app-c2356b213f00" in a for a in seen)
+
+
+# --------------------------------------------------------------------------
+# Drain invocation: no-running-machine, absent, running, failed
+# --------------------------------------------------------------------------
+
+def _drain_hook(tmp_path):
+    cmd = tmp_path / "apps" / "tasks" / "management" / "commands" / "drain_worker_fleet.py"
+    cmd.parent.mkdir(parents=True, exist_ok=True)
+    cmd.write_text("from django.core.management.base import BaseCommand\n", encoding="utf-8")
+    return cmd
+
+
+def _drain_record(app="pb-app-worker"):
+    return {"app": app, "role": "worker"}
+
+
+def test_drain_absent_hook_logs_and_continues(tmp_path, capsys):
+    assert cli._ship_pre_deploy_drain(tmp_path, _drain_record(), "drain_worker_fleet", False) == "absent"
+    assert "not present" in capsys.readouterr().out
+
+
+def test_drain_skips_an_app_with_no_running_machine(tmp_path, monkeypatch, capsys):
+    """An app scaled to zero (light) or suspended (heavy) cannot be ssh'd into and
+    has nothing in flight: that reads as already-drained, never as a failure."""
+    _drain_hook(tmp_path)
+    calls = []
+
+    def fake(argv, cwd, timeout):
+        calls.append(argv)
+        return {"ok": True, "exit_code": 0,
+                "stdout": '[{"id": "a", "state": "stopped"}, {"id": "b", "state": "suspended"}]',
+                "stderr": ""}
+
+    monkeypatch.setattr(cli, "_flyctl", fake)
+    assert cli._ship_pre_deploy_drain(tmp_path, _drain_record(), "drain_worker_fleet", False) == "absent"
+    out = capsys.readouterr().out
+    assert "nothing can be in flight" in out
+    assert all("ssh" not in a for a in calls), "must not attempt the drain with no machine"
+
+
+def test_drain_runs_when_a_machine_is_started(tmp_path, monkeypatch, capsys):
+    _drain_hook(tmp_path)
+    calls = []
+
+    def fake(argv, cwd, timeout):
+        calls.append(argv)
+        if "machine" in argv:
+            return {"ok": True, "exit_code": 0, "stdout": '[{"id": "a", "state": "started"}]', "stderr": ""}
+        return {"ok": True, "exit_code": 0, "stdout": "DRAIN COMPLETE", "stderr": ""}
+
+    monkeypatch.setattr(cli, "_flyctl", fake)
+    assert cli._ship_pre_deploy_drain(tmp_path, _drain_record(), "drain_worker_fleet", False) == "ok"
+    ssh = [a for a in calls if "ssh" in a]
+    assert ssh and ssh[0] == sd.drain_argv("pb-app-worker", "drain_worker_fleet")
+
+
+def test_drain_failure_withholds_the_release(tmp_path, monkeypatch, capsys):
+    _drain_hook(tmp_path)
+
+    def fake(argv, cwd, timeout):
+        if "machine" in argv:
+            return {"ok": True, "exit_code": 0, "stdout": '[{"id": "a", "state": "started"}]', "stderr": ""}
+        return {"ok": False, "exit_code": 1, "stdout": "", "stderr": "DRAIN TIMEOUT: 3 leases in flight"}
+
+    monkeypatch.setattr(cli, "_flyctl", fake)
+    assert cli._ship_pre_deploy_drain(tmp_path, _drain_record(), "drain_worker_fleet", False) == "failed"
+    out = capsys.readouterr().out
+    assert "release withheld" in out and "DRAIN TIMEOUT" in out
+
+
+def test_no_running_machine_does_not_withhold_the_release_end_to_end(tmp_path, monkeypatch, capsys):
+    """The whole deploy path: a worker app with no running machine still releases."""
+    _write_all(tmp_path)
+    records, _ = sd.resolve_apps(tmp_path, ["worker-light"])
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    released = []
+
+    def fake(argv, cwd, timeout):
+        if "machine" in argv:
+            return {"ok": True, "exit_code": 0, "stdout": '[]', "stderr": ""}
+        if "deploy" in argv:
+            released.append(argv)
+            return {"ok": True, "exit_code": 0, "stdout": "Released v7", "stderr": ""}
+        return {"ok": True, "exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(cli, "_flyctl", fake)
+    refs = {"app": "registry.fly.io/pb-app-web:app-sha"}
+    failed = cli._ship_deploy_apps(tmp_path, "sha", records, refs, False, "drain_worker_fleet")
+    assert failed is False
+    assert released, "the release must still run"
+    assert "--image" in released[0]
+
+
+# --------------------------------------------------------------------------
+# Blind `--stage deploy` is refused
+# --------------------------------------------------------------------------
+
+def test_deploy_apps_refuses_without_a_recorded_build(tmp_path, monkeypatch, capsys):
+    _write_all(tmp_path)
+    records, _ = sd.resolve_apps(tmp_path, ["web"])
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    called = []
+    monkeypatch.setattr(cli, "_flyctl", lambda *a, **k: called.append(a) or {"ok": True})
+    failed = cli._ship_deploy_apps(tmp_path, "c2356b213f00" * 2, records, {}, False, None)
+    assert failed is True
+    assert called == [], "a derived reference must never be released"
+    assert "no built image recorded" in capsys.readouterr().out
+
+
+def test_standalone_deploy_stage_refuses_with_no_build_recorded(tmp_path, monkeypatch, capsys):
+    """`--stage deploy` alone needs a recorded build for the promoted commit."""
+    _write_all(tmp_path)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(cli, "_ship_promoted_sha", lambda wt, base: "c2356b213f00deadbeef")
+    args = Namespace(fly_app=None, no_drain=True, drain_command=None)
+    rc = cli._ship_deploy_stages(args, tmp_path, "main", ["deploy"])
+    assert rc == 1
+    assert "no built image recorded" in capsys.readouterr().out
+
+
+def test_standalone_deploy_stage_runs_with_a_recorded_build(tmp_path, monkeypatch):
+    _write_all(tmp_path)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    sd.record_image_ref(tmp_path, "c2356b213f00deadbeef", "app",
+                        "registry.fly.io/pb-app-web:app-c2356b213f00")
+    monkeypatch.setattr(cli, "_ship_promoted_sha", lambda wt, base: "c2356b213f00deadbeef")
+    seen = []
+
+    def fake(argv, cwd, timeout):
+        if "deploy" in argv:
+            seen.append(argv)
+        return {"ok": True, "exit_code": 0, "stdout": "Released v3", "stderr": ""}
+
+    monkeypatch.setattr(cli, "_flyctl", fake)
+    args = Namespace(fly_app=["web"], no_drain=True, drain_command=None)
+    rc = cli._ship_deploy_stages(args, tmp_path, "main", ["deploy"])
+    assert rc == 0
+    assert len(seen) == 1
+    assert "registry.fly.io/pb-app-web:app-c2356b213f00" in seen[0]
 
 
 # --------------------------------------------------------------------------

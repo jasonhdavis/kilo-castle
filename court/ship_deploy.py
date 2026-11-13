@@ -66,10 +66,13 @@ IMAGE_MANIFEST = {
 # The one app that must never be released the science image (M'Lord, 2026-11-13).
 SCIENCE_FORBIDDEN_APPS = ("pb-app-worker-light",)
 
-# The pre-deploy drain is a Django management command. The implementation is
-# delivered by a separate Quest; until it lands, the hook is absent and the
-# driver logs that clearly and continues (fail-open, never fail-silent).
+# The pre-deploy drain is a Django management command that lives in the app repo
+# at <app>/management/commands/<name>.py (pb-app: apps/tasks/management/commands/
+# drain_worker_fleet.py, with resume_worker_fleet.py as the counterpart). When the
+# hook is absent the driver logs that clearly and continues (fail-open, never
+# fail-silent) so a repo that has not adopted the drain still deploys.
 DEFAULT_DRAIN_COMMAND = "drain_worker_fleet"
+DEFAULT_RESUME_COMMAND = "resume_worker_fleet"
 
 FLY_REGISTRY = "registry.fly.io"
 
@@ -252,9 +255,40 @@ def image_label(promoted_sha: str, image_id: str) -> str:
     return f"{image_id}-{(promoted_sha or 'unknown')[:12]}"
 
 
-def image_ref(image_id: str, repo_root: Path, label: str) -> str:
-    """The Fly registry reference an image built for ``image_id`` is pushed to."""
-    return f"{FLY_REGISTRY}/{registry_app_for_image(image_id, repo_root)}:{label}"
+def image_ref(image_id: str, repo_root: Path, label: str, app_name: Optional[str] = None) -> str:
+    """The Fly registry reference for ``image_id``.
+
+    ``app_name`` selects the namespace: the image's build app by default, or a
+    specific member app when the image has been replicated into that app's own
+    namespace (see :func:`namespace_members`)."""
+    namespace = app_name or registry_app_for_image(image_id, repo_root)
+    return f"{FLY_REGISTRY}/{namespace}:{label}"
+
+
+def namespace_members(image_id: str, repo_root: Path) -> tuple:
+    """Member apps whose registry namespace differs from the image's build
+    namespace — each needs its own copy of the image before it can be released.
+
+    Fly's app registry is a namespace per app, and a deploy that passes
+    ``--image registry.fly.io/<other-app>:<tag>`` depends on the pulling app
+    being allowed to read another app's namespace. That is not something this
+    driver can assume, so a member in a different namespace gets the image
+    replicated into its own (built once, pushed per namespace)."""
+    build_app = registry_app_for_image(image_id, repo_root)
+    return tuple(app for app in apps_for_image(image_id) if app != build_app)
+
+
+def docker_login_argv(app_name: str) -> list:
+    """Authenticate the local Docker daemon against registry.fly.io for pushes."""
+    return ["flyctl", "auth", "docker", "-a", app_name]
+
+
+def docker_tag_argv(source_ref: str, target_ref: str) -> list:
+    return ["docker", "tag", source_ref, target_ref]
+
+
+def docker_push_argv(target_ref: str) -> list:
+    return ["docker", "push", target_ref]
 
 
 _IMAGE_REF_RE = re.compile(r"registry\.fly\.io/[^\s'\"]+:[^\s'\"]+")
@@ -301,18 +335,60 @@ def deploy_argv(app_config: str, image_reference: str) -> list:
     ]
 
 
+def machine_list_argv(app_name: str) -> list:
+    """List an app's machines as JSON, to decide whether a drain is even runnable.
+
+    ``flyctl ssh console`` cannot connect to an app with no running machine (the
+    light fleet scales to zero, heavy suspends), so the driver checks first and
+    treats "no running machine" as already-drained rather than a failed drain."""
+    return ["flyctl", "machine", "list", "-a", app_name, "--json"]
+
+
+def running_machine_count(payload: Optional[str]) -> Optional[int]:
+    """Count machines in the ``started`` state from ``flyctl machine list --json``.
+
+    Returns ``None`` when the payload is unusable — the caller must not read that
+    as "no running machine"."""
+    if not payload:
+        return None
+    try:
+        machines = json.loads(payload)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(machines, list):
+        return None
+    return sum(1 for m in machines if isinstance(m, dict) and m.get("state") == "started")
+
+
 def drain_argv(app_name: str, drain_command: str) -> list:
-    """Invoke the pre-deploy drain management command inside the app's fleet."""
+    """Invoke the pre-deploy drain management command inside the app's fleet.
+
+    ``--pty=false`` is explicit: ``flyctl ssh console`` allocates a pseudo-terminal
+    by default only when no command is given, but pinning it off makes the
+    non-interactive guarantee independent of flyctl's default. The command itself
+    refuses to drain from a non-worker process and excludes its own machine from
+    the wait (it runs inside a cordon candidate)."""
     return [
         "flyctl", "ssh", "console",
         "-a", app_name,
+        "--pty=false",
         "-C", f"python manage.py {drain_command}",
     ]
 
 
+def resume_argv(app_name: str, resume_command: str = DEFAULT_RESUME_COMMAND) -> list:
+    """Invoke the drain's counterpart, to lift a cordon an abandoned drain left."""
+    return [
+        "flyctl", "ssh", "console",
+        "-a", app_name,
+        "--pty=false",
+        "-C", f"python manage.py {resume_command}",
+    ]
+
+
 def find_drain_command(repo_root: Path, name: str = DEFAULT_DRAIN_COMMAND) -> Optional[Path]:
-    """Locate the drain management command source, or None when the hook has not
-    been delivered yet (the fail-open case)."""
+    """Locate the drain management command source, or None when this repo has not
+    adopted the drain (the fail-open case)."""
     root = Path(repo_root)
     if not root.is_dir():
         return None
@@ -347,7 +423,11 @@ def deploy_state_path(repo_root: Path) -> Path:
 
 
 def load_image_refs(repo_root: Path) -> dict:
-    """``{promoted_sha: {image_id: image_ref}}`` written by the build stage."""
+    """``{promoted_sha: {ref_key: image_ref}}`` written by the build stage.
+
+    Keys are the image id for the image's build namespace, and
+    ``<image_id>::<app>`` for a copy replicated into a member app's own
+    namespace."""
     try:
         payload = json.loads(deploy_state_path(repo_root).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -357,7 +437,19 @@ def load_image_refs(repo_root: Path) -> dict:
     return {}
 
 
-def record_image_ref(repo_root: Path, promoted_sha: str, image_id: str, reference: str) -> None:
+def ref_key(image_id: str, app_name: Optional[str] = None) -> str:
+    """State key for an image reference: the shared build-namespace ref, or the
+    per-app ref when the image was replicated into that app's own namespace."""
+    return f"{image_id}::{app_name}" if app_name else image_id
+
+
+def record_image_ref(
+    repo_root: Path,
+    promoted_sha: str,
+    image_id: str,
+    reference: str,
+    app_name: Optional[str] = None,
+) -> None:
     path = deploy_state_path(repo_root)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -367,7 +459,7 @@ def record_image_ref(repo_root: Path, promoted_sha: str, image_id: str, referenc
         payload = {}
     payload["version"] = STATE_VERSION
     images = payload.setdefault("images", {})
-    images.setdefault(promoted_sha, {})[image_id] = reference
+    images.setdefault(promoted_sha, {})[ref_key(image_id, app_name)] = reference
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -375,6 +467,16 @@ def record_image_ref(repo_root: Path, promoted_sha: str, image_id: str, referenc
         pass
 
 
-def deployed_ref(repo_root: Path, promoted_sha: str, image_id: str) -> Optional[str]:
-    """The recorded reference for a previously built image, or None."""
-    return load_image_refs(repo_root).get(promoted_sha, {}).get(image_id)
+def deployed_ref(
+    repo_root: Path, promoted_sha: str, image_id: str, app_name: Optional[str] = None
+) -> Optional[str]:
+    """The recorded reference for a previously built image, or None.
+
+    With ``app_name``, prefers a ref replicated into that app's own namespace and
+    falls back to the shared build-namespace ref."""
+    images = load_image_refs(repo_root).get(promoted_sha, {})
+    if app_name:
+        per_app = images.get(ref_key(image_id, app_name))
+        if per_app:
+            return per_app
+    return images.get(image_id)

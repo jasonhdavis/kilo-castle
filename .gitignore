@@ -39,3 +39,9 @@ htmlcov/
 .vscode/
 *.swp
 *.swo
+
+# No Court installation lives in this repo (it is the engine source). Ignore the
+# runtime scratch the engine writes into the working tree during CLI/test runs:
+# .court/ write locks and quest/epic scaffolding, .kilo/ worker leases and logs.
+.court/
+.kilo/

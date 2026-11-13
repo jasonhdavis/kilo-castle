@@ -9872,6 +9872,17 @@ def _ship_build_images(main_wt: Path, promoted_sha: str, records: list, dry_run:
     return refs, failed
 
 
+def _docker_ready(main_wt: Path) -> bool:
+    """Whether Docker can actually be used for the registry fan-out.
+
+    ``shutil.which("docker")`` alone is not enough: Docker Desktop being stopped
+    leaves the CLI on PATH while every ``docker tag``/``docker push`` fails, which
+    would withhold an otherwise-fine release. Asked once per build-stage run."""
+    if shutil.which("docker") is None:
+        return False
+    return bool(_flyctl(["docker", "info"], main_wt, 30).get("ok"))
+
+
 def _ship_registry_auth(main_wt: Path, member_app: str) -> bool:
     """Authenticate Docker against registry.fly.io.
 
@@ -9904,12 +9915,13 @@ def _ship_replicate_image(main_wt: Path, source_ref: str, target_ref: str, membe
     shared reference is used instead, so an unverified cross-namespace pull can
     never silently block a deploy; a Fly rejection of that pull is reported by the
     release itself."""
-    if shutil.which("docker") is None:
+    if not _docker_ready(main_wt):
         print(
-            f"\n⚠️  REGISTRY: docker is unavailable — cannot copy the image into "
-            f"'{member_app}'s namespace. {member_app} will be released from the shared "
-            f"reference {source_ref} (cross-namespace pull). If Fly rejects it, install "
-            f"docker and re-run `court ship --confirm --stage build`."
+            f"\n⚠️  REGISTRY: docker is unavailable (CLI missing, or the daemon is not "
+            f"running) — cannot copy the image into '{member_app}'s namespace. {member_app} "
+            f"will be released from the shared reference {source_ref} (cross-namespace "
+            f"pull). If Fly rejects that pull, start Docker and re-run "
+            f"`court ship --confirm --stage build`."
         )
         return True
 

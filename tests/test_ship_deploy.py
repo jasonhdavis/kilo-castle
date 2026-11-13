@@ -289,7 +289,8 @@ def test_auth_runs_immediately_before_each_push_and_has_no_app_flag(tmp_path, mo
         "registry.fly.io/pb-app-worker-light:app-x", "pb-app-worker-light",
     )
     assert ok is True
-    assert calls == [
+    assert calls[0] == ["docker", "info"], "liveness is probed before any push"
+    assert calls[1:] == [
         ["flyctl", "auth", "docker"],
         ["docker", "tag", "registry.fly.io/pb-app-web:app-x", "registry.fly.io/pb-app-worker-light:app-x"],
         ["docker", "push", "registry.fly.io/pb-app-worker-light:app-x"],
@@ -319,6 +320,28 @@ def test_an_expired_credential_is_re_authed_and_the_push_retried(tmp_path, monke
     assert ok is True
     assert sum(1 for a in calls if a[:3] == ["flyctl", "auth", "docker"]) == 2
     assert sum(1 for a in calls if a[:2] == ["docker", "push"]) == 2
+
+
+def test_a_dead_docker_daemon_falls_back_instead_of_failing_the_deploy(tmp_path, monkeypatch, capsys):
+    """The docker CLI can be on PATH with no daemon answering (Docker Desktop
+    stopped): the fan-out must warn and use the shared ref, not withhold an
+    otherwise-fine release."""
+    calls = []
+
+    def fake(argv, cwd, timeout):
+        calls.append(list(argv))
+        if argv[:2] == ["docker", "info"]:
+            return {"ok": False, "exit_code": 1, "stdout": "",
+                    "stderr": "Cannot connect to the Docker daemon at unix:///... Is the docker daemon running?"}
+        raise AssertionError(f"no registry command may run once the daemon is dead: {argv}")
+
+    monkeypatch.setattr(cli, "_flyctl", fake)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/docker")
+    ok = cli._ship_replicate_image(tmp_path, "src", "dst", "pb-app-worker-light")
+    assert ok is True
+    out = capsys.readouterr().out
+    assert "docker is unavailable" in out and "cross-namespace" in out
+    assert calls == [["docker", "info"]]
 
 
 def test_the_fan_out_is_scoped_to_the_deployed_apps(tmp_path, monkeypatch):

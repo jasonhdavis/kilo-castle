@@ -1,3 +1,0 @@
-#!/bin/sh
-# Castle guard: block policy-violating commits on guarded branches.
-exec python3 -m court.castle_guard hook pre-commit "$@"

@@ -1250,7 +1250,7 @@ function welcomeHTML(){
   LAUNCHES.map((l,i)=>`<div class="wcard" data-launch="${i}">
    <div class="wl-t">${esc(l.t)}</div><div class="wl-d">${esc(l.d)}</div></div>`).join('')+
   `</div>
-  <div class="wc-hint">suggestions launch a fresh steward session in your selected worktree — pick a worktree on the left to change the target</div>
+  <div class="wc-hint">suggestions launch a fresh session in your selected worktree with the repo's default persona — pick a worktree on the left to change the target</div>
  </div>`;
 }
 function launchSuggestion(i){
@@ -1267,8 +1267,10 @@ function launchSuggestion(i){
  if(!wt)return;
  if(selWt!==wt)pickWt(wt);
  newSess();
- $('c_agent').value='steward';syncRoleModel();
- dispatch(wt,null,'steward',composerModel(),L.p);
+ const r=repo();
+ const da=(r&&r.default_agent&&META&&META.agents.includes(r.default_agent))?r.default_agent:'steward';
+ $('c_agent').value=da;syncRoleModel();
+ dispatch(wt,null,da,composerModel(),L.p);
 }
 $('transcript').addEventListener('click',e=>{
  const c=e.target.closest('[data-launch]');
@@ -2471,13 +2473,15 @@ function syncRoleModel(){
 // worktree that has only ever hosted master_of_coin audits → master_of_coin.
 function defaultAgentFor(path,branch){
  const r=repo();
- if((r&&path===r.root)||(branch&&TRUNKS.includes(branch)))return'steward';
+ const da=(r&&r.default_agent)||'';
+ if((r&&path===r.root)||(branch&&TRUNKS.includes(branch)))
+  return(META&&META.agents.includes(da)&&da)?da:'steward';
  if((branch||'').startsWith('artist/'))return'artist';
  if((branch||'').startsWith('the-gatehouse/'))return'gatekeeper';
  if((branch||'').startsWith('scout/'))return'scout';
  if((branch||'').startsWith('quest/')||(branch||'').startsWith('epic/'))return'serf';
  if(path&&S&&sessionsFor(path).some(s=>s.agent==='master_of_coin'))return'master_of_coin';
- return'steward';
+ return(META&&META.agents.includes(da)&&da)?da:'steward';
 }
 function applyDefaultAgent(){
  if(!S||!META||!selWt)return;
@@ -2853,6 +2857,32 @@ def _court_audit(root, ttl=120):
     return entry["data"]
 
 
+_DEFAULT_AGENT_CACHE = {}
+
+
+def _repo_default_agent(root, ttl=300):
+    """The persona this repo wants as its composer default, read from the
+    repo's own kilo.json `default_agent`. Data-driven so a Court-managed repo
+    keeps defaulting to `steward` while a plain source repo (the engine itself)
+    defaults to `code` — no hardcoded per-repo table."""
+    hit = _DEFAULT_AGENT_CACHE.get(root)
+    now = time.time()
+    if hit and now - hit[1] < ttl:
+        return hit[0]
+    agent = ""
+    try:
+        with open(os.path.join(root, "kilo.json")) as f:
+            cfg = json.load(f)
+        if isinstance(cfg, dict):
+            val = str(cfg.get("default_agent") or "").strip()
+            if val in _ALLOWED_AGENTS:
+                agent = val
+    except Exception:
+        agent = ""
+    _DEFAULT_AGENT_CACHE[root] = (agent, now)
+    return agent
+
+
 def _repos():
     base = os.path.dirname(COURT_DIR)
     out, seen = [], set()
@@ -2868,7 +2898,8 @@ def _repos():
         if real in seen:
             continue
         seen.add(real)
-        out.append({"key": key, "name": name, "root": path})
+        out.append({"key": key, "name": name, "root": path,
+                    "default_agent": _repo_default_agent(path)})
     return out
 
 
@@ -5747,6 +5778,7 @@ class Handler(BaseHTTPRequestHandler):
             flagged, total = _processes(procs)
             repos = [
                 {"key": r["key"], "name": r["name"], "root": r["root"],
+                 "default_agent": r.get("default_agent", ""),
                  "branches": _branches(r["root"]),
                  "worktrees": _worktrees(r["root"])}
                 for r in _repos()]

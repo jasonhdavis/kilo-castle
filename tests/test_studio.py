@@ -606,8 +606,8 @@ class TestStudioSyncBack(unittest.TestCase):
 
 
 class TestStudioDocsAndSpawnPaths(unittest.TestCase):
-    def test_command_docs_present_in_both_layouts_and_document_unified_spawn_path(self):
-        for p in (Path("court/commands/studio.md"), Path(".kilo/commands/studio.md")):
+    def test_command_docs_document_unified_spawn_path(self):
+        for p in (Path("court/commands/studio.md"),):
             self.assertTrue(p.exists(), p)
             text = p.read_text()
             # 2026-09-28: spawn unified through prompting — Kilo CLI is the

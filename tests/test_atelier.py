@@ -249,9 +249,11 @@ class TestAtelierTemplates(unittest.TestCase):
         self.assertIn("Addendum-Quests", tpl)
         self.assertIn("Addendum Commits Reverted", tpl)
 
-    def test_atelier_command_doc_exists_in_both_locations(self):
+    def test_atelier_command_doc_documents_single_writer(self):
         base = Path(__file__).resolve().parent.parent
-        for p in (base / "court" / "commands" / "atelier.md", base / ".kilo" / "commands" / "atelier.md"):
+        # The packaged command doc is the source of truth; the engine repo keeps
+        # no installed copy under .kilo/commands.
+        for p in (base / "court" / "commands" / "atelier.md",):
             self.assertTrue(p.is_file(), f"missing {p}")
             content = p.read_text(encoding="utf-8")
             self.assertIn("court.cli atelier", content)

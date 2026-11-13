@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from court import config
-from court.init_cmd import DEFAULT_KILO_CONFIG
+from court.init_cmd import AGENTS_MD_CONTENT, DEFAULT_KILO_CONFIG
 
 BASE = Path(__file__).resolve().parent.parent
 
@@ -81,8 +81,10 @@ class StewardProtocolDocTests(unittest.TestCase):
         for n in range(1, 13):
             self.assertIn(f"{n}. **", doc)
 
-    def test_repo_agents_md_steward_bullet(self):
-        doc = (BASE / "AGENTS.md").read_text(encoding="utf-8")
+    def test_packaged_agents_md_steward_bullet(self):
+        # The canonical doctrine ships in court/init_cmd.py (what `court init`
+        # writes into a consumer repo); the engine repo keeps no installed copy.
+        doc = AGENTS_MD_CONTENT
         self.assertIn("Never blocks the session", doc)
         self.assertIn("dry-run gate", doc)
         self.assertIn("harness.command", doc)

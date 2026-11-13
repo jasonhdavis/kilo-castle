@@ -22,15 +22,13 @@ def test_serf_and_scout_prompts_mandate_chunked_writes():
     for rel in (
         "court/agents/serf.md",
         "court/agents/scout.md",
-        ".kilo/agent/serf.md",
-        ".kilo/agent/scout.md",
     ):
         text = _read(rel)
         assert "CHUNKED LARGE-FILE WRITES" in text, rel
 
 
 def test_gatekeeper_prompt_documents_hand_back():
-    for rel in ("court/agents/gatekeeper.md", ".kilo/agent/gatekeeper.md"):
+    for rel in ("court/agents/gatekeeper.md",):
         text = _read(rel)
         assert "Hand-Back / Re-gate" in text, rel
         assert "--regate" in text, rel
@@ -39,7 +37,7 @@ def test_gatekeeper_prompt_documents_hand_back():
 def test_printable_kilo_run_instructions_are_headless_safe():
     """No operator-facing instruction may print a bare `kilo run --agent ...`."""
     offenders = []
-    for pattern in ("court/**/*.py", "court/**/*.md", ".kilo/commands/*.md", "AGENTS.md"):
+    for pattern in ("court/**/*.py", "court/**/*.md"):
         for p in REPO.glob(pattern):
             if not p.is_file():
                 continue

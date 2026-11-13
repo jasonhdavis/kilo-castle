@@ -873,18 +873,17 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
     busy_workers = workers.get("count", 0)
     capacity = max(0, policy.max_workers - busy_workers)
 
-    # The worker-slot pool is spent in plan order, and Steward-enqueued `dispatch`
-    # hand-offs are planned ahead of the heuristics, so a small vigil backlog can
-    # consume every free slot and starve the pipeline's in-flight exit path: on
-    # 2026-11-13 two armed dispatch vigils took both free slots, 9 of 16
-    # TRIBUTE_READY Quests were skipped "worker ceiling reached (1/3)", and no
-    # coin or collect action ran at all while the pipeline backed up. Hold the
-    # drain share back from the pre-drain blocks so collect/coin always have a
-    # slot to spend; it is restored before the GATE/drain heuristics below.
-    drain_hold = 0
-    if capacity > 0 and _drain_pending(quests):
-        drain_hold = capacity if capacity <= 1 else 1
-    capacity -= drain_hold
+    # Fair split of the worker-slot pool. The queue-driven blocks (charters,
+    # dispatch vigils) are planned first, so without a reserve they consume the
+    # whole pool and the later lanes (collect/coin, recovery, goad) are never
+    # even planned — budget fairness could not help a lane with no actions. Hold
+    # the later lanes' half back so every lane with work competes for a slot; the
+    # per-tick budget above then takes turns between them. It is restored before
+    # the GATE/drain heuristics below.
+    later_hold = 0
+    if capacity >= 2 and _drain_pending(quests):
+        later_hold = capacity // 2
+    capacity -= later_hold
 
     # --- charter requests (requests-in, charters-out) -----------------------
     # Planned FIRST: a request is the pipeline's own input, so it must not
@@ -1070,10 +1069,10 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                 meta={"retry_backoff": policy.retry_backoff}))
             rebase_ids.add(q["id"])
 
-    # Restore the drain share held back above: the queue-driven blocks (charters,
-    # dispatch vigils) have taken their slots, so collect/coin now compete only
-    # with each other for the reserved capacity.
-    capacity += drain_hold
+    # Restore the later lanes' share held back above: the queue-driven blocks
+    # (charters, dispatch vigils) have taken theirs, so collect/coin and the rest
+    # compete for the reserved slots on equal terms.
+    capacity += later_hold
 
     # --- GATE: hand the convoy to a Gatekeeper -----------------------------
     by_cogship: dict[str, list[str]] = {}
@@ -1700,21 +1699,43 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
     # path) and reserve one slot for every other class that has work waiting, so
     # neither in-flight work nor new work is shut out while the other has a
     # backlog. The surviving spawning actions keep their original plan order.
+    # Spend the per-tick spawn budget FAIRLY ACROSS LANES, not by append order.
+    # With a small budget the one or two slots went to whichever action was
+    # appended first, and the queue-driven `dispatch`/vigil hand-offs are appended
+    # ahead of the collect/coin heuristics — so a backlog in one lane starved
+    # every other lane all night (2026-11-13: 16 TRIBUTE_READY and 5 GATE with no
+    # coin/collect action for hours). Slots now take turns: one action per class
+    # per round, classes ordered by a mild drain bias and ROTATED each time the
+    # budget binds, so consecutive ticks lead with different lanes and the
+    # pipeline stays balanced instead of merely flipping which lane starves.
+    # Non-spawning (local) actions are unbudgeted and always pass through.
     _budget = max(0, policy.max_spawns_per_tick)
     _spawn_slots = [_i for _i, _a in enumerate(actions) if _action_spawns(_a)]
-    _classes = {_spawn_class(actions[_i]) for _i in _spawn_slots}
-    _per_class_cap = max(1, _budget - (len(_classes) - 1))
-    _ranked = sorted(_spawn_slots, key=lambda _i: (_spawn_rank(actions[_i]), _i))
+    _queues: dict = {}
+    for _i in _spawn_slots:
+        _queues.setdefault(_spawn_class(actions[_i]), []).append(_i)
+    _lanes = sorted(_queues, key=lambda _c: (0 if _c in DRAIN_KINDS else 1, _c))
+    _rotation = int(state.get("spawn_rotation") or 0)
+    if len(_lanes) > 1:
+        _shift = _rotation % len(_lanes)
+        _lanes = _lanes[_shift:] + _lanes[:_shift]
     _kept: set = set()
-    _spent: dict = {}
-    for _i in _ranked:
-        if len(_kept) >= _budget:
+    _cursor: dict = {_c: 0 for _c in _queues}
+    while len(_kept) < _budget:
+        _progressed = False
+        for _c in _lanes:
+            if len(_kept) >= _budget:
+                break
+            if _cursor[_c] < len(_queues[_c]):
+                _kept.add(_queues[_c][_cursor[_c]])
+                _cursor[_c] += 1
+                _progressed = True
+        if not _progressed:
             break
-        _cls = _spawn_class(actions[_i])
-        if _spent.get(_cls, 0) >= _per_class_cap:
-            continue
-        _spent[_cls] = _spent.get(_cls, 0) + 1
-        _kept.add(_i)
+    if len(_kept) < len(_spawn_slots):
+        # The budget bound, so fairness was at stake: advance the rotation so the
+        # next tick leads with a different lane.
+        state["spawn_rotation"] = _rotation + 1
     actions = [_a for _i, _a in enumerate(actions) if _i in _kept or not _action_spawns(_a)]
 
     # --- Session-store razing (maintenance, never work) ---------------------

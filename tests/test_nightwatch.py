@@ -527,7 +527,47 @@ def test_both_drain_and_new_work_progress_on_a_raised_budget(tmp_path):
     assert kinds["coin"] >= 1 and kinds["vigil"] == 1
 
 
-def test_one_class_may_still_use_the_whole_budget(tmp_path):
+def test_scarce_slots_take_turns_across_ticks(tmp_path):
+    """With one slot and two lanes wanting it, consecutive ticks lead with
+    different lanes instead of the same lane winning every tick (the "dispatch is
+    preferred before coin" complaint)."""
+    quests = [_q("Q1", "TRIBUTE_READY", _free(tmp_path, "w1"))]
+    state = nw.load_state(tmp_path)
+    policy = _policy(max_workers=3, max_spawns_per_tick=1)
+    first, _ = nw.plan(_snap(*quests), state, policy, _workers(count=1),
+                       ready_vigils=_dispatch_vigils(1))
+    second, _ = nw.plan(_snap(*quests), state, policy, _workers(count=1),
+                        ready_vigils=_dispatch_vigils(1))
+    first_kinds = [a.kind for a in first if nw._action_spawns(a)]
+    second_kinds = [a.kind for a in second if nw._action_spawns(a)]
+    assert first_kinds != second_kinds, "the same lane must not win every tick"
+    assert set(first_kinds) | set(second_kinds) == {"coin", "vigil"}
+
+
+def test_the_budget_is_shared_round_robin_across_lanes(tmp_path):
+    """Five coin actions and one dispatch vigil, 3-slot budget: both lanes get a
+    slot instead of the larger lane taking all three."""
+    quests = [_q(f"Q{i}", "TRIBUTE_READY", _free(tmp_path, f"w{i}")) for i in range(5)]
+    actions, _ = nw.plan(_snap(*quests), nw.load_state(tmp_path),
+                         _policy(max_workers=10, max_spawns_per_tick=3), _workers(),
+                         ready_vigils=_dispatch_vigils(1))
+    kinds = collections.Counter(a.kind for a in actions if nw._action_spawns(a))
+    assert kinds["coin"] == 2 and kinds["vigil"] == 1
+
+
+def test_the_worker_pool_is_split_not_taken_by_the_queue_driven_lane(tmp_path):
+    """Three dispatch vigils against a two-slot pool: the drain lane is still
+    planned, because the later lanes' half of the pool is reserved."""
+    quests = [_q("Q1", "TRIBUTE_READY", _free(tmp_path, "w1"))]
+    actions, _ = nw.plan(_snap(*quests), nw.load_state(tmp_path),
+                         _policy(max_workers=3, max_spawns_per_tick=10), _workers(count=1),
+                         ready_vigils=_dispatch_vigils(3))
+    kinds = collections.Counter(a.kind for a in actions if nw._action_spawns(a))
+    assert kinds["coin"] >= 1
+    assert kinds["vigil"] == 1  # the queue-driven half of the pool, not all of it
+
+
+def test_a_single_lane_may_still_use_the_whole_budget(tmp_path):
     """The per-class reservation must not bind when only one class is waiting."""
     quests = [_q(f"Q{i}", "TRIBUTE_READY", _free(tmp_path, f"w{i}")) for i in range(5)]
     actions, _ = nw.plan(_snap(*quests), nw.load_state(tmp_path),

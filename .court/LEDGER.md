@@ -928,3 +928,54 @@ budgets, context budgeting, convoy verification. Adopted four falsifiable experi
 (2) `court cost <quest>` reporting token spend against a chartered budget,
 (3) `--dry-run` first-class on dispatch/goad/coin/collect,
 (4) dead-letter lane for exhausted quests in nightwatch report.
+
+## 2026-11-13T12:50Z — Engine gap chartered: Q002 (convoy backpressure + zero-delta regate livelock)
+
+**Reported by M'Lord (pb-app board, 12:42Z).** Four gatehouse convoys live at once
+(`cogship-588/-591/-592/-593`) plus a Master-of-Coin audit — 4 `kilo run` sessions and
+7 `pytest` processes — `load 23.58 12.93 11.23` on 10 cores, swap 5060/6144 MB (82 %).
+Worse than the 2026-11-12 load-19 failure. Candidate cause: the regate/raze loop the peer
+session documented in the pb-app LEDGER at 12:13Z — `regate` re-gating already-promoted
+Quests whose production delta is zero, minting a fresh convoy and a full ~18 k-test suite
+per cycle, cycles overlapping; plus `--max-workers 3` failing to contain convoys.
+
+**Mechanism verified read-only in this repo's engine.**
+- `_bucket_raze()` (nightwatch.py) routes any `READY_TO_RAZE` Quest whose branch tip is not
+  an ancestor of `castle` into `regate` → `court collect <ids> --regate --standup` → a fresh
+  `the-gatehouse/<id>` convoy + full suite + promotion → back to `READY_TO_RAZE`. The watch's
+  own sync/rebase lane re-mints `court: sync …` commits on the branch every tick, so the tip
+  is re-diverged each cycle and `raze` refuses again. The regate success path **resets the
+  attempt counter to 0** (`elif action.kind == "regate"` in the bookkeeping switch), so
+  `max_regates` never trips → the loop is unbounded. Four pb-app Quests
+  (Q1380/Q1432/Q1455/Q1457) were re-gated through convoys -586/-590/-592 and again at 12:36Z
+  with a non-`.court`/`.kilo` delta of exactly 0.
+- Convoy admission: `capacity = max_workers − busy_workers` is recomputed each tick from a
+  live `ps` census, and multi-Quest convoys also gate on a **per-tick** local
+  `gatehouse_slot = 1` that resets every tick. `live_kilo_workers` **does** see gatehouse
+  Gatekeeper sessions (confirmed live on pb-app: 2 gatekeepers + 1 MoC = count 3), so the
+  "counted separately" read is imprecise — but the invariant is genuinely missing: nothing
+  durable records "a convoy is integrating", the async `--standup` spawn returns before the
+  session appears in the census, and the real RAM consumer (the ~18 k-test `pytest` run) is
+  invisible to the census. Across ~6-minute ticks and tens-of-minutes suites, convoys stack.
+
+**Chartered `Q002-Castle-Nightwatch-Convoy-Backpressure`** (Bug fix, branch
+`quest/q002-castle-nightwatch-convoy-backpressure`; OPEN → PLANNED). Deliberately **one**
+Quest, not two: both defects live in `court/nightwatch.py` and fixing either alone leaves the
+host exposed (A alone leaves the loop running, merely throttled; B alone leaves admission
+unbounded for any future cycle). Tribute requires durable cross-tick admission, a
+bookkeeping-tolerant `court raze`, a cycle-counting retry cap, an incident-replay regression
+test, and a green `pytest tests`. Named Commutation: vendor the fix into pb-app
+`.court/engine/`, restart the pb-app watch, realign + raze Q1380/Q1432/Q1455/Q1457.
+
+**Not dispatched — deliberately.** The host is still shedding load (pb-app watch now
+`spawns=1/tick, 8/h`) and this repo's watch is off (last tick 2026-11-02), so a Serf here
+would add load for no urgency. Dispatch command when the host is quiet:
+`court dispatch Q002-Castle-Nightwatch-Convoy-Backpressure --standup` (worktree base falls
+back to `HEAD`; this repo has no `castle` branch).
+
+**Not touched: pb-app.** The live loop's deterministic break is ops on the pb-app board, and
+a peer Steward session is actively writing there — two Stewards on one board is the hazard
+the doctrine warns about. Recipe handed up instead: realign the four branches' tips to
+`castle` (content no-op — their unique commits are all `court:` bookkeeping), then
+`court raze` them; or drop `regate` from the pb-app watch `--enable` set to stop convoy
+minting immediately.

@@ -7,7 +7,7 @@ concern: nightwatch-convoy-backpressure
 parent_epic: 
 section: Bug fix
 tags: Bug fix
-status: OPEN
+status: PLANNED
 cogship_id: 
 cogship_station: 
 cogship_promoted_commit: 
@@ -27,7 +27,7 @@ artist_session_id:
 artist_model: 
 vassal_session_id: 
 created_at: 2026-11-13T12:50:38Z
-updated_at: 2026-11-13T12:50:38Z
+updated_at: 2026-11-13T12:50:41Z
 razed_at: 
 ---
 
@@ -36,6 +36,7 @@ razed_at:
 ## Castle Ledger
 
 - **2026-11-13T12:50:38Z** — - → OPEN: Quest created
+- **2026-11-13T12:50:41Z** — OPEN → PLANNED: Chartered via composite `court charter`
 
 ## The Kingdom Requires
 
@@ -78,6 +79,8 @@ Make the Night's Watch structurally incapable of this failure mode. Two delivera
 - Preserve existing behaviour: spawn budgets, per-Quest cooldowns, cohort batching, `collect_min_batch`/`collect_batch_window`/`collect_batch_max`, and the one-convoy-per-tick rule must not regress.
 - New policy knobs must have safe defaults that match today's intent, so existing launchers keep working without edits.
 - The unified suite must pass: `python3 -m pytest tests -q`.
+
+M'Lord's Charter Notes: Chartered by the Steward 2026-11-13T12:5xZ from the 12:42Z thrash incident report. Both defects are in court/nightwatch.py and are fixed together because a fix to either alone leaves the host exposed: Defect A alone leaves the zero-delta loop running (merely throttled), and Defect B alone leaves convoy admission unbounded if any future cycle re-appears. Priority: Defect B is the live loop breaker; Defect A is the containment invariant. Dispatch held until the host finishes shedding load.
 
 ## Expected Tribute
 

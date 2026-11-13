@@ -410,6 +410,23 @@ python3 -m court.cli --help
 
 This installs the `court` (and `kilo-castle`) console command.
 
+### Development (this repository)
+
+This repo is the framework source. It is not itself a Court installation — it
+carries no `.court/` board, `.kilo/` role config, or `castle_guard` hooks. Use a
+local virtualenv for tests; the package ships no runtime dependencies, and
+`pytest` is the only dev extra:
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/pip install -e '.[dev]'      # editable install + pytest
+.venv/bin/python -m pytest tests -q    # the suite
+```
+
+Python 3.12 matches `pyproject.toml`'s supported range and is what CI and the
+existing `.pytest_cache` were produced with; a bare `python3 -m pytest` fails on
+machines whose default interpreter has no pytest installed.
+
 ### 2. Initialize in any repository
 
 ```bash

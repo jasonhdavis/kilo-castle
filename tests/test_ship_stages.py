@@ -53,11 +53,27 @@ def test_stages_run_in_canonical_order_and_accept_comma_lists(tmp_path):
     assert cli._resolve_ship_stages(["interrogate"]) == ["interrogate"]
 
 
+def test_build_and_deploy_join_the_canonical_order(tmp_path):
+    # build/deploy extend the existing set, in canonical order, after stamp.
+    assert cli.SHIP_STAGES == ("interrogate", "merge", "push", "stamp", "build", "deploy")
+    assert cli._resolve_ship_stages(["deploy", "build"]) == ["build", "deploy"]
+    assert cli._resolve_ship_stages(["push", "build", "merge", "deploy"]) == [
+        "merge", "push", "build", "deploy",
+    ]
+    # `--deploy` is sugar for appending build,deploy to the selected/default ship.
+    assert cli._resolve_ship_stages(None, deploy=True) == ["merge", "push", "stamp", "build", "deploy"]
+    assert cli._resolve_ship_stages(["merge"], deploy=True) == ["merge", "build", "deploy"]
+    # a bare `--stage deploy` re-runs the release alone (no commit required).
+    assert cli._resolve_ship_stages(["deploy"]) == ["deploy"]
+
+
 def test_an_unknown_stage_is_rejected(tmp_path):
     import pytest
 
     with pytest.raises(ValueError):
-        cli._resolve_ship_stages(["deploy"])
+        cli._resolve_ship_stages(["raze"])
+    with pytest.raises(ValueError):
+        cli._resolve_ship_stages(["deploy", "ship"])
 
 
 def test_merge_stage_lands_the_merge_but_does_not_push(tmp_path, monkeypatch):

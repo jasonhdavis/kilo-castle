@@ -63,6 +63,7 @@ from . import pulse as court_pulse
 from . import decisions as court_decisions
 from . import blockers as court_blockers
 from . import slack as court_slack
+from . import ship_deploy
 
 # The Ward's durable workspace: patrol ledger + Warden Report queue.
 WARD_DIR = Path(__file__).resolve().parent.parent / "ward"
@@ -9449,16 +9450,20 @@ def _ship_interrogation(args, quests, trunk: str) -> tuple[list[str], list[str]]
     return integrity, ui
 
 
-SHIP_STAGES = ("interrogate", "merge", "push", "stamp")
+SHIP_STAGES = ("interrogate", "merge", "push", "stamp", "build", "deploy")
 SHIP_DEFAULT_STAGES = ("merge", "push", "stamp")
+# `--deploy` opts into the flyctl release: the default ship plus build + deploy.
+SHIP_DEPLOY_STAGES = ("merge", "push", "stamp", "build", "deploy")
 
 
-def _resolve_ship_stages(raw) -> list[str]:
+def _resolve_ship_stages(raw, deploy: bool = False) -> list[str]:
     """Canonical, de-duplicated stage order from repeatable/comma --stage values.
 
     Staging exists for automated pipelines: ``--confirm --stage merge`` lands the
-    promotion locally and stops; ``--confirm --stage push`` triggers autodeploy
-    only once the merge is verified. Stages always execute in canonical order.
+    promotion locally and stops; ``--confirm --stage deploy`` re-runs the flyctl
+    release for the *current* promoted commit (no new commit needed); ``--deploy``
+    is sugar for appending ``build,deploy`` to the default ship. Stages always
+    execute in canonical order (interrogate, merge, push, stamp, build, deploy).
     """
     requested: list[str] = []
     for item in raw or []:
@@ -9473,13 +9478,16 @@ def _resolve_ship_stages(raw) -> list[str]:
             f"(valid: {', '.join(SHIP_STAGES)})"
         )
     if not requested:
-        return list(SHIP_DEFAULT_STAGES)
+        return list(SHIP_DEPLOY_STAGES if deploy else SHIP_DEFAULT_STAGES)
+    if deploy:
+        requested = list(requested) + ["build", "deploy"]
     return [stage for stage in SHIP_STAGES if stage in requested]
 
 
-def _ship_next_step_hint(stages: list[str]) -> str:
+def _ship_next_step_hint(stages: list[str], target=None) -> str:
     """The command that runs the next unperformed stage, or '' when done."""
-    remaining = [stage for stage in SHIP_DEFAULT_STAGES if stage not in stages]
+    target = list(target or SHIP_DEFAULT_STAGES)
+    remaining = [stage for stage in target if stage not in stages]
     if not remaining:
         return ""
     return f"court ship --confirm --stage {remaining[0]}"
@@ -9653,7 +9661,9 @@ def cmd_ship(args):
     # above stays a read-only report; only this branch mutates git/remote.
     if getattr(args, "confirm", False):
         try:
-            stages = _resolve_ship_stages(getattr(args, "stage", None))
+            stages = _resolve_ship_stages(
+                getattr(args, "stage", None), deploy=getattr(args, "deploy", False)
+            )
         except ValueError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(2)
@@ -9669,20 +9679,18 @@ def cmd_ship(args):
         rc = _execute_ship_deployment(args, base_branch, head_branch, quests=quests, stages=stages)
         sys.exit(rc)
 
-    if getattr(args, "stage", None):
+    if getattr(args, "stage", None) or getattr(args, "deploy", False) or getattr(args, "no_drain", False):
         print(
-            "ERROR: --stage only applies with --confirm (without it, `court ship` is a read-only report).",
+            "ERROR: --stage/--deploy only apply with --confirm (without it, `court ship` is a read-only report).",
             file=sys.stderr,
         )
         sys.exit(2)
 
 
-FLY_CONFIGS = {
-    # flyctl app alias -> config file at the repo root of the production checkout
-    "web": "fly.toml",
-    "worker": "fly-worker.toml",
-    "worker-heavy": "fly-worker-heavy.toml",
-}
+# flyctl app alias -> config file at the repo root of the production checkout.
+# The app/image manifest and the flyctl argv builders live in `court.ship_deploy`
+# (pure, stdlib-only, unit-tested); the execution below drives flyctl with them.
+FLY_CONFIGS = ship_deploy.FLY_CONFIGS
 FLY_DEPLOY_TIMEOUT_SECONDS = 3600  # builds + release_command can take ~20m+ per app
 
 
@@ -9796,14 +9804,241 @@ def _ship_merge(main_wt: Path, base_branch: str, head_branch: str) -> dict:
     return {"ok": False, "already_up_to_date": False, "output": merge_res}
 
 
+def _tail(text: str, lines: int = 12) -> str:
+    """The tail of a command's output, for a report -- never the whole log."""
+    body = [line for line in (text or "").splitlines() if line.strip()]
+    if len(body) <= lines:
+        return "\n".join(body)
+    return "\n".join(["   ..."] + body[-lines:])
+
+
+def _flyctl(argv: list, cwd: Path, timeout: int) -> dict:
+    """Run one flyctl command. Thin seam over git_ops._run (the generic command
+    runner) so tests can exercise the build/deploy orchestration without flyctl."""
+    return git_ops._run(argv, cwd, timeout=timeout)
+
+
+def _ship_promoted_sha(main_wt: Path, base_branch: str) -> str:
+    res = git_ops._run(["git", "rev-parse", base_branch], main_wt)
+    return (res.get("stdout") or "").strip()
+
+
+def _ship_build_images(main_wt: Path, promoted_sha: str, records: list, dry_run: bool) -> tuple[dict, bool]:
+    """Build each distinct image ONCE (flyctl build-only + push, labelled by the
+    promoted commit) and record the pushed reference for the deploy stage and for
+    a later standalone `--stage deploy` re-run."""
+    refs: dict = {}
+    failed = False
+    for image_id in ship_deploy.images_for_records(records):
+        label = ship_deploy.image_label(promoted_sha, image_id)
+        build_cfg = ship_deploy.build_config_for_image(image_id)
+        argv = ship_deploy.build_argv(image_id, build_cfg, label)
+        fallback = ship_deploy.image_ref(image_id, main_wt, label)
+        members = ", ".join(ship_deploy.apps_for_image(image_id))
+        print(
+            f"\n🔨 BUILD IMAGE [{image_id}] — {ship_deploy.image_dockerfile(image_id)} "
+            f"(serves {members})"
+        )
+        print(f"   $ {' '.join(argv)}")
+        if dry_run:
+            continue
+        res = _flyctl(argv, main_wt, FLY_DEPLOY_TIMEOUT_SECONDS)
+        output = ((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")).strip()
+        ref = ship_deploy.parse_image_ref(output, fallback)
+        if not res.get("ok"):
+            print(f"❌ image [{image_id}] build FAILED (exit {res.get('exit_code')})")
+            print(_tail(output))
+            failed = True
+            continue
+        ship_deploy.record_image_ref(main_wt, promoted_sha, image_id, ref)
+        refs[image_id] = ref
+        print(f"✅ image [{image_id}] built and pushed -> {ref}")
+        print(_tail(output, 4))
+    return refs, failed
+
+
+def _ship_pre_deploy_drain(main_wt: Path, record: dict, drain_command: Optional[str], dry_run: bool) -> str:
+    """Pre-deploy drain hook, invoked before releasing a worker app.
+
+    The drain management command (cordons the fleet, waits for in-flight tasks to
+    finish) is delivered by a separate Quest. When the hook is absent the driver
+    logs that clearly and continues -- fail-open on a missing hook, never
+    fail-silent, so the deploy is never wedged on the companion workstream."""
+    if not drain_command:
+        return "disabled"
+    app_name = record["app"]
+    argv = ship_deploy.drain_argv(app_name, drain_command)
+    hook_path = ship_deploy.find_drain_command(main_wt, drain_command)
+    if hook_path is None:
+        print(
+            f"\n⚠️  DRAIN: management command {drain_command!r} is not present in {main_wt} — "
+            f"skipping the pre-deploy drain for {app_name} (fail-open; hook not yet delivered)."
+        )
+        return "absent"
+    print(f"\n🚧 DRAIN {app_name} before release (hook {hook_path.name})")
+    print(f"   $ {' '.join(argv)}")
+    if dry_run:
+        return "rehearsed"
+    res = _flyctl(argv, main_wt, 1800)
+    output = ((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")).strip()
+    if not res.get("ok"):
+        print(f"❌ drain FAILED for {app_name} (exit {res.get('exit_code')}) — release withheld")
+        print(_tail(output))
+        return "failed"
+    print(f"✅ drain complete for {app_name}")
+    print(_tail(output, 4))
+    return "ok"
+
+
+def _ship_deploy_apps(
+    main_wt: Path,
+    promoted_sha: str,
+    records: list,
+    refs: dict,
+    dry_run: bool,
+    drain_command: Optional[str],
+) -> bool:
+    """Release each app's pre-built image to that app, using the app's own config
+    for its ``[deploy]`` block (release_command, env, strategy) -- no app
+    rebuilds. Worker apps get the pre-deploy drain first. Every outcome (image
+    ref, Fly release version, success/failure, flyctl tail) is printed and any
+    failure fails the command."""
+    failed = False
+    for record in records:
+        image_id = record["image"]
+        app_name = record["app"]
+        label = ship_deploy.image_label(promoted_sha, image_id)
+        recorded = ship_deploy.deployed_ref(main_wt, promoted_sha, image_id)
+        ref = refs.get(image_id) or recorded or ship_deploy.image_ref(image_id, main_wt, label)
+        if refs.get(image_id):
+            source = "built this run"
+        elif recorded:
+            source = "recorded by a prior build"
+        else:
+            source = "derived (no build recorded for this commit)"
+        try:
+            # Hard guard: the science image can never reach pb-app-worker-light.
+            ship_deploy.guard_image_delivery(app_name, image_id)
+        except ship_deploy.DeployError as exc:
+            print(f"\n⛔ {app_name}: {exc}")
+            failed = True
+            continue
+
+        print(f"\n🚀 DEPLOY {app_name} [{image_id}] <- {ref}")
+        print(f"   image source: {source}; config: {record['config']}")
+
+        if record["role"] == "worker":
+            status = _ship_pre_deploy_drain(main_wt, record, drain_command, dry_run)
+            if status == "failed":
+                failed = True
+                continue
+
+        argv = ship_deploy.deploy_argv(record["config"], ref)
+        print(f"   $ {' '.join(argv)}")
+        if dry_run:
+            continue
+        res = _flyctl(argv, main_wt, FLY_DEPLOY_TIMEOUT_SECONDS)
+        output = ((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")).strip()
+        if not res.get("ok"):
+            print(f"❌ {app_name} release FAILED (exit {res.get('exit_code')}) — image {ref}")
+            print(_tail(output))
+            failed = True
+            continue
+        version = ship_deploy.parse_release_version(output)
+        release_note = f"Fly release {version}" if version else "release created"
+        if record["release_command"]:
+            release_note += f"; release_command: {record['release_command']}"
+        else:
+            release_note += "; no release command (as configured)"
+        print(f"✅ {app_name} deployed — {release_note}; image {ref}")
+        print(_tail(output, 4))
+    return failed
+
+
+def _ship_resolve_deploy_plan(args, main_wt: Path) -> tuple[list, list]:
+    """Resolve the selected fly apps to deploy records; surfaced before any
+    mutation so a manifest error never lands half a promotion."""
+    selection = getattr(args, "fly_app", None) or None
+    return ship_deploy.resolve_apps(main_wt, selection)
+
+
+def _ship_deploy_stages(args, main_wt: Path, base_branch: str, mutation_stages: list) -> int:
+    """Run the `build` and `deploy` stages. Returns the process exit code: 0 on
+    success, 1 when any app's build or release failed (a failed deploy must exit
+    non-zero -- the run is the alert of record)."""
+    records, plan_errors = _ship_resolve_deploy_plan(args, main_wt)
+    if plan_errors:
+        print("\n🚨 DEPLOY MANIFEST ERROR — nothing was modified:")
+        for err in plan_errors:
+            print(f"   - {err}")
+        return 1
+    promoted_sha = _ship_promoted_sha(main_wt, base_branch)
+    if not promoted_sha:
+        print(f"❌ could not resolve the promoted commit on {base_branch}; nothing was deployed.")
+        return 1
+    drain_command = None if getattr(args, "no_drain", False) else (
+        getattr(args, "drain_command", None) or ship_deploy.DEFAULT_DRAIN_COMMAND
+    )
+    print(f"\n🛠  FLY DEPLOY — promoted commit {promoted_sha[:12]} ({len(records)} app(s))")
+    refs: dict = {}
+    failed = False
+    if "build" in mutation_stages:
+        refs, build_failed = _ship_build_images(main_wt, promoted_sha, records, dry_run=False)
+        failed = failed or build_failed
+    if "deploy" in mutation_stages:
+        failed = _ship_deploy_apps(main_wt, promoted_sha, records, refs, False, drain_command) or failed
+    return 1 if failed else 0
+
+
+def _ship_rehearse_deploy(args, main_wt: Path, base_branch: str, mutation_stages: list) -> None:
+    """Dry-run: print the exact flyctl argv the build/deploy stages *would* run --
+    both images and all four apps -- without executing flyctl or mutating
+    anything."""
+    records, plan_errors = _ship_resolve_deploy_plan(args, main_wt)
+    if plan_errors:
+        print("\n🚨 DEPLOY MANIFEST ERROR (rehearsal) — the live run would refuse:")
+        for err in plan_errors:
+            print(f"   - {err}")
+        return
+    promoted_sha = _ship_promoted_sha(main_wt, base_branch)
+    drain_command = None if getattr(args, "no_drain", False) else (
+        getattr(args, "drain_command", None) or ship_deploy.DEFAULT_DRAIN_COMMAND
+    )
+    print(f"\n🧪 DEPLOY REHEARSAL — promoted commit {promoted_sha[:12]} (no flyctl executed)")
+    if "build" in mutation_stages:
+        for image_id in ship_deploy.images_for_records(records):
+            label = ship_deploy.image_label(promoted_sha, image_id)
+            argv = ship_deploy.build_argv(image_id, ship_deploy.build_config_for_image(image_id), label)
+            print(f"   $ {' '.join(argv)}")
+    if "deploy" in mutation_stages:
+        for record in records:
+            image_id = record["image"]
+            label = ship_deploy.image_label(promoted_sha, image_id)
+            ref = ship_deploy.deployed_ref(main_wt, promoted_sha, image_id) or ship_deploy.image_ref(
+                image_id, main_wt, label
+            )
+            if record["role"] == "worker" and drain_command:
+                if ship_deploy.find_drain_command(main_wt, drain_command) is None:
+                    print(
+                        f"   # (drain hook {drain_command!r} absent for {record['app']} — "
+                        f"live run logs and continues)"
+                    )
+                else:
+                    print(f"   $ {' '.join(ship_deploy.drain_argv(record['app'], drain_command))}")
+            print(f"   $ {' '.join(ship_deploy.deploy_argv(record['config'], ref))}")
+
+
 def _execute_ship_deployment(args, base_branch: str, head_branch: str, quests=None, stages=None) -> int:
     """The mutating half of `court ship --confirm`, run as ordered stages.
 
     Stages (canonical order): ``merge`` head_branch into base_branch, ``push``
-    base_branch to origin (triggering autodeploy), ``stamp`` the promoted commit
-    on every shipped Quest. The default runs all three, preserving the original
-    one-shot behaviour; ``--stage`` lets an automated pipeline land the merge and
-    verify it before a separate push. Returns process exit code."""
+    base_branch to origin, ``stamp`` the promoted commit on every shipped Quest,
+    ``build`` each distinct image once (flyctl build-only + push), and ``deploy``
+    each app's pre-built image with flyctl. The default runs merge/push/stamp
+    (one-shot behaviour); ``--deploy`` (or ``--stage build,deploy``) opts into the
+    flyctl release, and ``--stage deploy`` alone re-runs a release for the current
+    promoted commit with no new commit. Returns process exit code; a failed build
+    or release exits non-zero."""
     stage_list = [stage for stage in (stages or SHIP_DEFAULT_STAGES)]
     mutation_stages = [stage for stage in stage_list if stage != "interrogate"]
     print("\n" + "=" * 76)
@@ -9846,7 +10081,20 @@ def _execute_ship_deployment(args, base_branch: str, head_branch: str, quests=No
                 f"`court ship --confirm --stage merge` first; nothing was pushed."
             )
             return 1
+    # Resolve the fly deploy plan up front, before any mutation, so a manifest
+    # error (an unmapped app, a config that names the wrong image) never lands
+    # half a promotion. Only consulted when a flyctl stage is requested.
+    if "build" in mutation_stages or "deploy" in mutation_stages:
+        _records, plan_errors = _ship_resolve_deploy_plan(args, main_wt)
+        if plan_errors:
+            print("\n🚨 DEPLOY MANIFEST ERROR — nothing was modified:")
+            for err in plan_errors:
+                print(f"   - {err}")
+            return 1
+
     if dry_run:
+        if "build" in mutation_stages or "deploy" in mutation_stages:
+            _ship_rehearse_deploy(args, main_wt, base_branch, mutation_stages)
         print("\n🧪 DRY RUN PASSED — all preflight checks green; no mutations performed.")
         return 0
 
@@ -9898,15 +10146,32 @@ def _execute_ship_deployment(args, base_branch: str, head_branch: str, quests=No
                 print(f"📌 Stamped promoted commit {promoted_tip[:12]} on {stamped} shipped quest(s)")
         performed.append("stamp")
 
+    # Step 4+5 — drive the flyctl release (GitHub is out of the deploy path).
+    # `build` runs once per distinct image; `deploy` releases each app's built
+    # image. A failed build or release exits non-zero: the run is the alert of
+    # record.
+    deploy_rc = 0
+    if "build" in mutation_stages or "deploy" in mutation_stages:
+        deploy_rc = _ship_deploy_stages(args, main_wt, base_branch, mutation_stages)
+        if deploy_rc == 0:
+            for stage in ("build", "deploy"):
+                if stage in mutation_stages:
+                    performed.append(stage)
+
     print("\n" + "=" * 76)
     print(f"🏰 SHIP STAGE COMPLETE — {', '.join(performed)} on {base_branch}")
-    next_step = _ship_next_step_hint(mutation_stages)
+    next_step = _ship_next_step_hint(mutation_stages, target=stage_list)
     if next_step:
         print(f"   Next stage: {next_step}")
+    elif "deploy" in mutation_stages:
+        if deploy_rc == 0:
+            print(f"✅ {head_branch} merged into {base_branch}, pushed to origin, and released to Fly.")
+        else:
+            print(f"❌ {base_branch} was promoted and pushed, but the Fly build/deploy FAILED — see the app outcomes above.")
     else:
-        print(f"✅ {head_branch} merged into {base_branch} and pushed to origin (autodeploy triggered)")
+        print(f"✅ {head_branch} merged into {base_branch} and pushed to origin.")
     print("=" * 76)
-    return 0
+    return deploy_rc
 
 
 def cmd_audit(args):
@@ -10924,23 +11189,32 @@ def build_parser():
     p_ship.add_argument(
         "--confirm",
         action="store_true",
-        help="Execute the deployment: merge castle into main and push main to origin (triggering autodeploy)",
+        help="Execute the deployment: merge castle into main and push main to origin",
+    )
+    p_ship.add_argument(
+        "--deploy",
+        action="store_true",
+        help="With --confirm: drive the Fly release through flyctl (build each image once, "
+             "release each pre-built image to its apps). Sugar for --stage build,deploy. "
+             "GitHub is not in the deploy path.",
     )
     p_ship.add_argument(
         "--dry-run",
         action="store_true",
-        help="With --confirm: run preflight safety checks only; no merge/push/deploy is executed",
+        help="With --confirm: run preflight safety checks only and rehearse the full stage "
+             "sequence (printing the exact flyctl argv); nothing is executed or mutated",
     )
     p_ship.add_argument(
         "--stage",
         action="append",
         default=None,
-        metavar="{interrogate,merge,push,stamp}",
+        metavar="{interrogate,merge,push,stamp,build,deploy}",
         help=(
             "With --confirm: run only the named stage(s). Repeatable or comma-separated, "
-            "always executed in canonical order (interrogate, merge, push, stamp). "
-            "Default: merge,push,stamp (one-shot ship). Use 'merge' then 'push' to sequence "
-            "a remote autodeploy pipeline."
+            "always executed in canonical order (interrogate, merge, push, stamp, build, deploy). "
+            "Default: merge,push,stamp (one-shot ship). Use 'merge' then 'push' to sequence the "
+            "promotion, or 'deploy' alone to re-run the flyctl release for the current promoted "
+            "commit with no new commit."
         ),
     )
     p_ship.add_argument(
@@ -10952,8 +11226,17 @@ def build_parser():
         action="append",
         default=None,
         choices=sorted(FLY_CONFIGS),
-        metavar="{web,worker,worker-heavy}",
+        metavar="{web,worker,worker-heavy,worker-light}",
         help="Fly app(s) to deploy (repeatable; default: all apps with a config in the repo root)",
+    )
+    p_ship.add_argument(
+        "--drain-command", dest="drain_command", default=None,
+        help="Pre-deploy drain management command for worker apps "
+             f"(default: {ship_deploy.DEFAULT_DRAIN_COMMAND})",
+    )
+    p_ship.add_argument(
+        "--no-drain", dest="no_drain", action="store_true", default=False,
+        help="Skip the pre-deploy drain hook for worker apps (escape hatch; drains are fail-open by default)",
     )
     p_ship.set_defaults(func=cmd_ship)
 

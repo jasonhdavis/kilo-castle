@@ -27,7 +27,7 @@ artist_session_id:
 artist_model: 
 vassal_session_id: 
 created_at: 2026-11-13T12:50:38Z
-updated_at: 2026-11-13T12:50:41Z
+updated_at: 2026-11-13T13:24:30Z
 razed_at: 
 ---
 
@@ -81,6 +81,21 @@ Make the Night's Watch structurally incapable of this failure mode. Two delivera
 - The unified suite must pass: `python3 -m pytest tests -q`.
 
 M'Lord's Charter Notes: Chartered by the Steward 2026-11-13T12:5xZ from the 12:42Z thrash incident report. Both defects are in court/nightwatch.py and are fixed together because a fix to either alone leaves the host exposed: Defect A alone leaves the zero-delta loop running (merely throttled), and Defect B alone leaves convoy admission unbounded if any future cycle re-appears. Priority: Defect B is the live loop breaker; Defect A is the containment invariant. Dispatch held until the host finishes shedding load.
+
+
+## Policy directive (M'Lord, 2026-11-13T13:20Z) — sequential convoys, one ship at a time
+
+The 2026-11-13T12:42Z four-convoy thrash shows the missing invariant precisely, and it is not the one first assumed. `court collect` **already** refuses a second pack while a convoy is live — the *Single-convoy guard* in `cmd_collect`. But "live" is decided by `session_is_fresh(gatehouse_worktree)`: *a Gatekeeper session file updated within 30 minutes*. A convoy whose Gatekeeper goes quiet for more than 30 minutes during a long unified suite is therefore declared dead, the guard stops blocking, and the next tick packs another convoy; the same heuristic lets the watch's `teardown` lane remove a live convoy's worktree. Admission is a **session-freshness heuristic**, not durable state.
+
+M'Lord's directive:
+
+- **One ship at a time.** Exactly one gatehouse convoy may be in flight at any moment by default (a configurable `--max-convoys`, default 1). The next convoy must not begin packing until the one ahead of it has finished packing — promoted/confirmed (or explicitly released) and its gatehouse released.
+- **In-flight is durable, never a session heuristic.** A convoy is in-flight from the moment it is packed until it is promoted, torn down, or explicitly released. Record it in durable state (`.court/convoys/<id>.json` and/or an explicit marker) and derive the admission decision from that — not from session freshness, and not from a per-tick counter.
+- **Configurable floor and max.** The cohort floor (`collect_min_batch`) is configurable and may be dynamic; the per-convoy max (`collect_batch_max`) defaults to 5.
+- **`regate` obeys the same admission.** A regate must not mint a convoy while another is in flight, and must not bypass the cohort floor.
+- **Feed the pipeline.** No single lane may monopolise the spawn budget: the `coin` lane (the TRIBUTE_READY backlog) and the `collect` lane must each make progress. On 2026-11-13 the regate lane consumed the single per-tick spawn slot while 19 GATE and 14 TRIBUTE_READY Quests waited.
+
+Because packing is serialized, a cohort naturally accumulates GATE Quests while the current convoy integrates — which is what keeps pack size healthy without an artificially high floor.
 
 ## Expected Tribute
 

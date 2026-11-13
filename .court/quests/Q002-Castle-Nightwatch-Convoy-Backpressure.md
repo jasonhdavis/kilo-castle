@@ -60,8 +60,6 @@ Net effect: `--max-workers 3` did **not** bound the convoy count; the only convo
 
 `_bucket_raze()` routes any `READY_TO_RAZE` Quest whose branch tip is not an ancestor of `castle` into a `regate` action, which runs `court collect <ids> --regate --standup`, mints a brand-new convoy (fresh `the-gatehouse/<new-id>` worktree, one full unified suite, promotion) and returns the Quest to `READY_TO_RAZE`. The Night's Watch's own sync/rebase lane re-creates `court: sync ...` bookkeeping commits on the Quest branch whenever `castle` advances, so the branch tip is re-diverged on every tick and `raze` refuses again. The regate attempt counter is reset to 0 whenever the regate action itself exits 0, so the retry cap never trips and the loop is unbounded. On the pb-app board the four Quests `Q1380`, `Q1432`, `Q1455`, `Q1457` were re-gated through convoys `-586`, `-590`, `-592` (and again at 12:36Z) with a non-`.court`/`.kilo` delta of exactly zero every time.
 
-## Goal & Scope
-
 Make the Night's Watch structurally incapable of this failure mode. Two deliverables, both in this repository's engine (`court/`) with deterministic tests:
 
 1. **Durable, cross-tick convoy admission.** Add an admission guard so that at most a bounded number of gatehouse convoys are integrating at any moment, independent of tick boundaries and of `ps`-census timing. The guard must consult durable state — the convoy lifecycle records under `.court/convoys/*.json`, or an explicit in-flight marker written when a convoy is collected and cleared when it is promoted or torn down — never a per-tick counter. A convoy counts as in-flight for the whole duration of its unified suite run, even though the suite's `pytest` processes never appear as `kilo run` sessions. The bound must be configurable and must default to a value that keeps the host safe at today's suite size.
@@ -110,6 +108,13 @@ Because packing is serialized, a cohort naturally accumulates GATE Quests while 
 - [ ] **Commutation (named here, performed outside this Quest)** — (a) the fix is vendored into pb-app's engine copy `.court/engine/`; (b) the pb-app Night's Watch is restarted so the live zero-delta loop stops; (c) the four affected pb-app Quests (`Q1380`, `Q1432`, `Q1455`, `Q1457`) are realigned and razed; (d) any new cap is set in pb-app's `.kilo/watch/run-nightwatch.sh`.
 
 - [ ] **Self-advance (do this LAST)**: once Tribute is rendered and `git rev-list --count HEAD..castle` is 0, run `python3 -m court.cli advance Q002-Castle-Nightwatch-Convoy-Backpressure TRIBUTE_READY` yourself. Nothing else flips the status out of WORKING.
+
+- [ ] **Single in-flight convoy** — by default exactly one convoy integrates; `court collect` and `court collect --regate` refuse a second pack while one is in-flight, decided from durable state. Test: a convoy marked in-flight whose Gatekeeper session is absent (or quiet >30 min) still blocks a new pack.
+- [ ] **In-flight is durable** — the admission decision comes from `.court/convoys/*.json` and/or an explicit in-flight marker, never from `session_is_fresh` and never from a per-tick counter; a convoy stays in-flight across ticks for the whole suite run and is cleared on promotion/teardown/release.
+- [ ] **Configurable floor and max** — `collect_min_batch` (floor, may be dynamic) and `collect_batch_max` (default 5) are honoured; a lone GATE Quest is not packed by window expiry while peers are available to form a cohort.
+- [ ] **`regate` admission** — a regate does not mint a convoy while one is in-flight and does not bypass the cohort floor; a zero-delta Quest is never re-gated (see Defect B).
+- [ ] **Lane fairness under a saturated backlog** — with a large `coin`/`collect` backlog, neither lane is starved by the regate or dispatch lanes over a sustained window (test the lane rotation with all lanes backed up).
+- [ ] **Observable** — `court nightwatch --report` / `--status` prints the convoy bound, the in-flight convoy id, and its age.
 
 ## Tribute Rendered
 

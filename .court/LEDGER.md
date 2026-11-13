@@ -1003,3 +1003,30 @@ regate×2) while 19 GATE / 14 TRIBUTE_READY waited.
   `--max-spawns-per-tick 2`. Live policy verified. The stopgap is deliberately partial: it
   stops the regate loop and singleton packs, but true serialization waits on Q002.
 - pb-app ledger records the same (`1d94bc1446`).
+
+### 2026-11-13T13:26Z — M'Lord: "restart mechanism for gatekeeper, like goad" — chartered Q003
+
+**Answer to the question, verified read-only.** A Gatekeeper *continuation* already exists but
+the durable, fleet-level half does not:
+- `court goad` is **Serf/Scout-only** (`cmd_goad`: `agent_role = "scout" if is_scout else
+  "serf"`; no `--agent`). There is no `court goad --agent gatekeeper`.
+- `court watch --agent gatekeeper …` *is* the generalized continuation (same-session re-prompt,
+  `--max-attempts`, stall referee killing a turn after 45 min of log silence), and
+  `standup_kilo_session → _spawn_watchdog` launches it beside the Gatekeeper standup in
+  `cmd_collect`. But it is a child of the **collect action's process tree**, so it dies with
+  the `--once` tick or the Steward session — the cogship-281 class. Nothing re-arms it.
+- With `role_state == "exited"` the nightwatch GATE block offers only a human escalation
+  (`stale_gatekeeper`) or `teardown` of the gatehouse + re-collect — discarding merge state and
+  re-running the full ~18k suite. There is no in-place resume, and no durable per-convoy
+  attempt budget (serfs have `goads_per_serf × serf_slots`; a Gatekeeper has nothing).
+
+**Chartered `Q003-Castle-Nightwatch-Gatekeeper-Recovery`** (Bug fix, branch
+`quest/q003-castle-nightwatch-gatekeeper-recovery`, → PLANNED): role-general goad (resume a
+Gatekeeper in place, same session or cold start); a fleet-level recovery action for an
+`exited`/`stalled` convoy Gatekeeper; the resume must outlive its tick; a durable bounded
+per-convoy resume budget escalating to a Steward; and **resume before teardown** — teardown
+only once the budget is spent or the git state is broken.
+
+**Sequencing:** Q003 shares `court/nightwatch.py` with Q002 (convoy admission + raze/regate
+livelock), so dispatch them **sequentially** to avoid a convoy merge collision. Not dispatched
+yet — the host is still shedding load.

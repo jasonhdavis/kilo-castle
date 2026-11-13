@@ -1,0 +1,100 @@
+---
+id: Q003-Castle-Nightwatch-Gatekeeper-Recovery
+title: Night's Watch: durable in-place Gatekeeper recovery (goad/resume) instead of convoy teardown
+kind: quest
+app: castle
+concern: nightwatch-gatekeeper-recovery
+parent_epic: 
+section: Bug fix
+tags: Bug fix
+status: OPEN
+cogship_id: 
+cogship_station: 
+cogship_promoted_commit: 
+task_file: 
+pillory_of: 
+pilloried_by: 
+scout_of: 
+branch: quest/q003-castle-nightwatch-gatekeeper-recovery
+worktree: 
+serf_session_id: 
+serf_model: 
+master_of_coin_session_id: 
+master_of_coin_model: 
+gatekeeper_session_id: 
+gatekeeper_model: 
+artist_session_id: 
+artist_model: 
+vassal_session_id: 
+created_at: 2026-11-13T13:26:43Z
+updated_at: 2026-11-13T13:26:43Z
+razed_at: 
+---
+
+# Q003-Castle-Nightwatch-Gatekeeper-Recovery — Night's Watch: durable in-place Gatekeeper recovery (goad/resume) instead of convoy teardown
+
+## Castle Ledger
+
+- **2026-11-13T13:26:43Z** — - → OPEN: Quest created
+
+## The Kingdom Requires
+
+## Context — what exists today (verified 2026-11-13, read-only)
+
+M'Lord: "the Night's Watch should have a restart mechanism for gatekeeper if there is not one already — like goad for gatekeeper."
+
+**It partly exists, and the missing half is the durable, fleet-level half.**
+
+Exists:
+- `court goad <quest>` is **Serf/Scout-only**: `cmd_goad` hardcodes `agent_role = "scout" if is_scout else "serf"`; there is no `--agent`/`--role`. So there is no `court goad --agent gatekeeper`.
+- A **generalized continuation** does exist: `court watch --agent gatekeeper …` ("Detached continuation watchdog: when a single-turn worker run ends mid-task, re-prompt the SAME session"). It is spawned automatically beside the Gatekeeper standup by `standup_kilo_session` → `_spawn_watchdog` (called from `cmd_collect`'s standup at the `holder="collect"` sites), with `--max-attempts` and a **stall referee** that kills a hung turn after `STALL_THRESHOLDS["gatekeeper"]` = 45 min of log silence.
+- `role_state(worktree, "gatekeeper")` already reports `idle | live | stalled | watching | exited` from the lease + worker-log age, and the nightwatch GATE block deliberately stays out while the state is `live`/`stalled`/`watching`.
+
+Missing:
+1. **The watchdog is session-scoped, not fleet-scoped.** It is launched from the *collect action's* process tree (`start_new_session=True`, but still a child of the tick/session that ran `court collect --standup`). When the `--once` tick exits — or the Steward session that ran the collect ends — the watchdog dies with it. This is exactly the cogship-281 class the doctrine names ("long pipeline steps must outlive their session"). After that, nothing re-arms it.
+2. **Once it is gone, the fleet Night's Watch has no resume path for a Gatekeeper.** With `role_state == "exited"` the GATE block offers only: a human escalation (`stale_gatekeeper` — "no live worker — triage by hand") or, for a stale convoy, `teardown` of the gatehouse worktree followed by a **re-collect**. Re-collect discards the convoy's merge state and re-runs the whole unified suite (~18k tests). There is no in-place resume.
+3. **No durable continuation budget at the fleet level.** Serfs have `goads_per_serf` × `serf_slots` before bubbling to a Steward; a Gatekeeper has no equivalent counter in the nightwatch state, so a wedged convoy cannot be resumed-and-then-replaced under a bounded budget — the only bounded path today is teardown-and-re-pack.
+
+Consequence observed on the pb-app board 2026-11-13: convoys whose Gatekeeper had gone quiet were treated as dead, and the lane's answers were teardown/re-pack and regate — never "resume the Gatekeeper where it is".
+
+## Goal & Scope
+
+Give the Gatekeeper a first-class, durable restart/goad path at the fleet level, mirroring the Serf recovery budget.
+
+1. **Role-general goad.** Make `court goad` accept a role (e.g. `--agent gatekeeper`, or a dedicated `court gk-resume`), resuming a Gatekeeper session **in place**: continue the same session when it is healthy, cold-start in the same worktree when it is bloated or already committed — the same `--mode`/`--brief`/`--force` semantics the Serf goad already has.
+2. **Fleet-level recovery action.** The Night's Watch must plan a Gatekeeper recovery for a `GATE` convoy whose Gatekeeper is `exited` (dead worker **and** dead watchdog) or `stalled` past its threshold: resume it in the convoy's existing worktree, **without** tearing the convoy down first.
+3. **A recovery must outlive the tick.** The spawned continuation must survive the `--once` process that started it (detached and/or re-armed each tick while the convoy is in-flight), per the cogship-281 doctrine — a resume that dies with the tick is not a recovery.
+4. **A durable, bounded budget.** Track per-convoy Gatekeeper resume attempts in nightwatch state (e.g. `max_gatekeeper_resumes`, default 2-3). After the cap, escalate to a Steward with a specific note. Never loop.
+5. **Resume before teardown.** `teardown` of a convoy's gatehouse may fire only when the worktree is provably dead (no lease, no process, no fresh session), the resume budget is exhausted, or the git state is genuinely broken — never merely because the Gatekeeper session went quiet.
+
+## Constraints
+
+- Engine-only change confined to `court/` (plus `tests/`). Do not modify pb-app or add production app code.
+- Deterministic tests: drive `plan()` as a pure function for the recovery decision and the budget; reuse the existing lease/state fixtures.
+- Do not regress: the stall-referee thresholds, the lease/`occupied()` single-writer guards, the dead-gatehouse teardown, the `stale_gatekeeper` human escalation, and the per-convoy watchdog already spawned by `court collect --standup`.
+- This Quest shares `court/nightwatch.py` with `Q002-Castle-Nightwatch-Convoy-Backpressure` (convoy admission + raze/regate livelock). Dispatch the two sequentially so their branches do not collide at the convoy merge.
+- Suite must pass: `python3 -m pytest tests -q`.
+
+## Expected Tribute
+
+- [ ] **Role-general goad** — a Gatekeeper can be resumed in place with the goad semantics (same session when healthy, cold-start in the same worktree when bloated/committed). Tests cover both the same-session continuation and the cold start.
+- [ ] **Fleet recovery action** — `plan()` emits a Gatekeeper recovery action for a `GATE` convoy whose Gatekeeper is `exited` (dead worker and dead watchdog) or `stalled` past the threshold. Test drives `plan()` with a synthetic exited-Gatekeeper convoy and asserts the recovery action, not a collect/regate/teardown.
+- [ ] **Resume, not teardown** — the recovery runs in the convoy's existing worktree; the gatehouse worktree is NOT removed as part of a resume. Test asserts a quiet session alone does not trigger teardown.
+- [ ] **Outlives the tick** — the spawned continuation survives the `--once` process that started it (detached/re-armed per the cogship-281 doctrine). Evidence: a resume started by a tick is still alive after that tick's process exits.
+- [ ] **Durable bounded budget** — per-convoy resume attempts are counted in nightwatch state; after the cap the watch escalates to a Steward with a specific note instead of resuming or re-gating forever.
+- [ ] **Observable** — `court nightwatch --report` / `--status` shows each in-flight convoy's Gatekeeper state (`live`/`stalled`/`exited`/`watching`) and its remaining resume budget.
+- [ ] **No regression** — `stale_gatekeeper` human escalation, dead-gatehouse teardown, stall-referee thresholds, and the existing `court collect --standup` watchdog all still behave as before.
+- [ ] **Suite green** — `python3 -m pytest tests -q` passes with the new tests included.
+- [ ] **Sequencing note** — dispatched after `Q002-Castle-Nightwatch-Convoy-Backpressure` (shared `court/nightwatch.py`), or with the convoy merge conflict consciously accepted.
+
+- [ ] **Self-advance (do this LAST)**: once Tribute is rendered and `git rev-list --count HEAD..castle` is 0, run `python3 -m court.cli advance Q003-Castle-Nightwatch-Gatekeeper-Recovery TRIBUTE_READY` yourself. Nothing else flips the status out of WORKING.
+
+## Tribute Rendered
+
+## Master of Coin's Audit
+
+## Judgement of the Condemned
+
+## Cogship Log
+
+## Audience Log

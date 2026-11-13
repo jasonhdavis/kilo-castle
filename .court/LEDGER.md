@@ -979,3 +979,27 @@ the doctrine warns about. Recipe handed up instead: realign the four branches' t
 `castle` (content no-op — their unique commits are all `court:` bookkeeping), then
 `court raze` them; or drop `regate` from the pb-app watch `--enable` set to stop convoy
 minting immediately.
+
+### 2026-11-13T13:24Z — addendum: M'Lord's sequential-convoy directive; pb-app stopgap applied
+
+M'Lord read the pb-app board and gave the policy: **one ship at a time**, next pack only
+after the convoy ahead has finished packing, a configurable/dynamic floor, and a max of ~5.
+The sharper diagnosis he prompted: the *Single-convoy guard* in `cmd_collect` already exists
+and already blocks "ANY new pack" — but it decides liveness with
+`session_is_fresh(gatehouse_worktree)` (**Gatekeeper session updated within 30 min**), so a
+convoy whose session goes quiet during a long suite is declared dead and no longer blocks.
+Admission is a session-freshness heuristic, not durable state. Journal confirmed the regate
+lane was eating the single per-tick spawn slot (12:55 regate×4, 13:14 regate×4, 13:21
+regate×2) while 19 GATE / 14 TRIBUTE_READY waited.
+
+- **Q002 charter extended** (`The Kingdom Requires` + `Expected Tribute`, commits `8ed6a20`
+  / `4abdd6c`) with M'Lord's directive: durable single in-flight convoy (`--max-convoys`,
+  default 1) from `.court/convoys/*.json`; next pack only after the current convoy is
+  promoted/released; configurable floor + max (default 5); `regate` obeys the same admission
+  and never re-gates a zero-delta Quest; lane fairness so `coin`/`collect` are not starved.
+- **pb-app stopgap applied and the watch restarted** (backup
+  `run-nightwatch.sh.bak-20261113b`, persistent pid 48729): `--collect-min-batch 5`,
+  `--collect-batch-max 5`, `regate` removed from `--enable`, `--max-coins 3`,
+  `--max-spawns-per-tick 2`. Live policy verified. The stopgap is deliberately partial: it
+  stops the regate loop and singleton packs, but true serialization waits on Q002.
+- pb-app ledger records the same (`1d94bc1446`).

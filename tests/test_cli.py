@@ -476,3 +476,122 @@ def test_ship_interrogation_skip_ui_review_is_a_noop(tmp_path, monkeypatch, caps
     out = capsys.readouterr().out
     assert "--skip-ui-review is a noop" in out
 
+
+
+# ---------------------------------------------------------------------------
+# Batch 2 (2026-11-15): enqueue reschedule, vigil add usage, stamp --clear
+# ---------------------------------------------------------------------------
+
+def test_cli_enqueue_reschedules_an_existing_handoff(tmp_path, monkeypatch, capsys):
+    """D1: re-running `court enqueue` must RESCHEDULE the existing entry in place
+    (the old code silently ignored the new --after/--expires)."""
+    _init_git_repo(tmp_path, branch="castle")
+    monkeypatch.setenv("COURT_DIR", str(tmp_path / ".court"))
+    monkeypatch.chdir(tmp_path)
+    main(["init"]); capsys.readouterr()
+    main(["new", "--app", "core", "--concern", "resched", "--title", "Resched",
+          "--section", "Bug fix", "--goal", "g", "--tribute", "- [ ] pass"])
+    capsys.readouterr()
+    qid = store.list_all(court_root=tmp_path / ".court")[0].id
+    main(["advance", qid, "PLANNED"]); capsys.readouterr()
+
+    why = "reschedule me when the dispatch window moves out"
+    main(["enqueue", qid, "--why", why, "--after", "50h", "--expires", "3d"])
+    capsys.readouterr()
+    before = vigils.load_all(tmp_path)[0]["when"][0]
+
+    main(["enqueue", qid, "--why", why, "--after", "51h", "--expires", "3d"])
+    out = capsys.readouterr().out
+    assert "Rescheduled" in out
+    after = vigils.load_all(tmp_path)[0]["when"][0]
+    assert before != after
+    assert len(vigils.load_all(tmp_path)) == 1
+
+
+def test_cli_vigil_add_without_an_id_is_a_clean_error(tmp_path, monkeypatch, capsys):
+    """D2: a missing id is a usage error (exit 2), not an AttributeError traceback."""
+    _init_git_repo(tmp_path, branch="castle")
+    monkeypatch.setenv("COURT_DIR", str(tmp_path / ".court"))
+    monkeypatch.chdir(tmp_path)
+    main(["init"]); capsys.readouterr()
+    with pytest.raises(SystemExit) as ei:
+        main(["vigil", "add", "--when", "after:2h", "--then", "dispatch:Q1",
+              "--why", "a" * 12, "--expires", "1d"])
+    assert ei.value.code == 2
+    err = capsys.readouterr().err
+    assert "id" in err and "vigil add" in err
+
+
+def test_cli_stamp_clear_detaches_a_stale_cogship(tmp_path, monkeypatch, capsys):
+    """D3: an explicit clear path for a stale cogship_id (set-field refuses it)."""
+    _init_git_repo(tmp_path, branch="castle")
+    monkeypatch.setenv("COURT_DIR", str(tmp_path / ".court"))
+    monkeypatch.chdir(tmp_path)
+    main(["init"]); capsys.readouterr()
+    main(["new", "--app", "core", "--concern", "stale-cog", "--title", "Stale Cog",
+          "--section", "Bug fix", "--goal", "g", "--tribute", "- [ ] pass"])
+    capsys.readouterr()
+    qid = store.list_all(court_root=tmp_path / ".court")[0].id
+    main(["stamp", qid, "--cogship", "cogship-606", "--no-commit"]); capsys.readouterr()
+    assert store.load(qid, court_root=tmp_path / ".court").cogship_id == "cogship-606"
+
+    main(["stamp", qid, "--clear", "--no-commit"])
+    out = capsys.readouterr().out
+    assert "Cleared" in out
+    assert store.load(qid, court_root=tmp_path / ".court").cogship_id == ""
+
+
+def test_cli_raze_of_an_already_razed_pillory_is_a_reported_noop(tmp_path, monkeypatch, capsys):
+    """D6: the pillory pair-raze must report the ACTUAL effect, not print an
+    unconditional success line (Q1216 was already razed_at yet looked freshly razed)."""
+    from argparse import Namespace
+    from court import cli, store as store_mod
+    from court.models import Quest
+
+    root = tmp_path / ".court"
+    (root / "quests").mkdir(parents=True)
+    monkeypatch.setenv("COURT_DIR", str(root))
+    q = Quest(id="Q1216-Pilloried", title="t", kind="quest", app="crm", concern="x",
+              status="PUNISHED", branch="quest/q1216")
+    q.pilloried_by = "Q1260-Succ"
+    q.razed_at = "2026-11-06T13:25:36Z"
+    store_mod.save(q, auto_commit=False)
+    succ = Quest(id="Q1260-Succ", title="s", kind="quest", app="crm", concern="y", status="DONE")
+    store_mod.save(succ, auto_commit=False)
+
+    monkeypatch.setattr(cli, "resolve_quest_selection",
+                        lambda *a, **k: [store_mod.load("Q1216-Pilloried")])
+    monkeypatch.setattr(cli, "agent_manager_json_path", lambda: tmp_path / "am.json")
+    monkeypatch.setattr(cli.convoy_guard, "ui_mandate_outstanding", lambda *a, **k: (False, ""))
+
+    cli.cmd_raze(Namespace(quest_ids="Q1216-Pilloried", archive_pruned=False, allow_forced=False))
+    out = capsys.readouterr().out
+    assert "no-op" in out
+    assert "Razed pilloried" not in out
+
+
+def test_cli_raze_of_a_fresh_pillory_reports_the_raze(tmp_path, monkeypatch, capsys):
+    """D6 counter-case: a not-yet-razed pillory successor IS razed and says so."""
+    from argparse import Namespace
+    from court import cli, store as store_mod
+    from court.models import Quest
+
+    root = tmp_path / ".court"
+    (root / "quests").mkdir(parents=True)
+    monkeypatch.setenv("COURT_DIR", str(root))
+    q = Quest(id="Q1216-Pilloried", title="t", kind="quest", app="crm", concern="x",
+              status="PUNISHED", branch="quest/q1216")
+    q.pilloried_by = "Q1260-Succ"
+    store_mod.save(q, auto_commit=False)
+    succ = Quest(id="Q1260-Succ", title="s", kind="quest", app="crm", concern="y", status="DONE")
+    store_mod.save(succ, auto_commit=False)
+
+    monkeypatch.setattr(cli, "resolve_quest_selection",
+                        lambda *a, **k: [store_mod.load("Q1216-Pilloried")])
+    monkeypatch.setattr(cli, "agent_manager_json_path", lambda: tmp_path / "am.json")
+    monkeypatch.setattr(cli.convoy_guard, "ui_mandate_outstanding", lambda *a, **k: (False, ""))
+
+    cli.cmd_raze(Namespace(quest_ids="Q1216-Pilloried", archive_pruned=False, allow_forced=False))
+    out = capsys.readouterr().out
+    assert "Razed pilloried Q1216-Pilloried" in out
+    assert store_mod.load("Q1216-Pilloried").razed_at

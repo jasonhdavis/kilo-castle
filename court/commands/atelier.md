@@ -1,47 +1,52 @@
 ---
-description: Roll up multiple UI reviews into one Cog Ship — merge branches pre-integration-test and spawn the Court Artist on the merged convoy branch
+description: Royal UI Atelier — merge UI-review-pending Quests into the SINGLE standing studio (one merged worktree + dev server) for review and per-Quest patronage
 agent: steward
 ---
-UI Convoy Request: $ARGUMENTS
 
-Follow the Royal UI Atelier Protocol:
+UI Atelier Request: $ARGUMENTS
 
-1. **Determine the Convoy Batch**:
-   - From `$ARGUMENTS`, take an explicit comma-separated Quest list, or determine the batch of UI-review-pending Quests (`python3 -m court.cli list --status TRIBUTE_READY,GATE` filtered to quests whose Master of Coin audit records `UI Review: PENDING`).
-   - Atelier candidates are quests the Master of Coin already passed but whose UI review is still PENDING. Already-approved or headless quests belong to `/collect`, never here.
+Follow the Standing Atelier Protocol — the single UI-review path:
 
-2. **One Composite Command (merge → stamp → server → prompt)**:
+1. **Determine the Batch**:
+   - From `$ARGUMENTS`, take an explicit comma-separated Quest list, or the batch of UI-review-pending Quests (`python3 -m court.cli list --status TRIBUTE_READY,GATE` filtered to Quests whose Master of Coin audit records `UI Review: PENDING`).
+   - Atelier candidates are Quests the Master of Coin already passed but whose UI review is still PENDING. Already-approved or headless Quests belong to `/collect`, never here; a single Quest can use the lighter `/artist <id>`.
+
+2. **Merge Into the Standing Studio (one composite command)**:
    ```bash
-   python3 -m court.cli atelier <QID1>,<QID2>,... [--cogship <id>] [--model "<model>"] [--json]
+   python3 -m court.cli atelier <QID1>,<QID2>,... [--standup] [--model "<model>"] [--json]
    ```
-   This deterministically:
-   - Gates each candidate (audit present, UI Review PENDING, clean tree, no migration contraband) and refuses unaudited tribute.
-   - Stamps the quests onto a Cog Ship convoy and advances them to `GATE`.
-   - Creates the ephemeral convoy worktree `.kilo/worktrees/the-gatehouse-<cogship_id>` on branch `the-gatehouse/<cogship_id>`, fast-forwards to `castle`, and merges each candidate branch in (isolating any branch that conflicts).
-   - Configures the worktree for the `artist` agent (single-writer) and starts its runserver.
-   - Renders `.court/templates/court_artist_convoy_prompt.md` (Royal Addendum protocol, single-writer rule, per-quest routes) and records `artist_model` on every packed quest.
+   Bare `court atelier` (the default; `--standing` is an accepted alias) deterministically:
+   - Ensures the ONE long-lived worktree `.kilo/worktrees/artist-atelier` on the stable branch `artist/atelier`, cut from `castle`, with a single merged dev server.
+   - Merges each candidate branch into the merged view (charter paperwork branch-wins; a genuine code overlap is disclosed-union or isolated per-Quest and reported).
+   - Records each Quest in the atelier manifest (`.court/atelier/manifest.json`) and logs the merge to its Castle Ledger.
+   - Starts/keeps the single merged runserver and writes the artist brief to `<worktree>/.kilo/TASK_ARTIST.md`.
+   - **Single-writer sequencing**: a live artist turn in the worktree refuses a merge-in (queue it for when the artist is idle, or pass `--force`). The merge is an engine/Steward action, never the artist's own.
 
-3. **Spawn the Court Artist Session in the Convoy Worktree (single unified path — prompting)**:
-   - Agent Manager prompting is RETIRED (2026-09-28). Spawn via Kilo CLI bound to the convoy branch `the-gatehouse/<cogship_id>` (the command writes the rendered brief to `.kilo/worktrees/the-gatehouse-<cogship_id>/.kilo/TASK_ARTIST.md`; its `--json` output carries the same argv list under `spawn`):
-     ```bash
-     kilo run --auto --agent artist --model "$(python3 -m court.cli model artist)" --dir .kilo/worktrees/the-gatehouse-<cogship_id> "$(cat .kilo/worktrees/the-gatehouse-<cogship_id>/.kilo/TASK_ARTIST.md)"
-     ```
-     or `cd .kilo/worktrees/the-gatehouse-<cogship_id> && kilo`, where `default_agent` is already `artist`.
-   - Record the session on each packed quest:
+3. **Summon the Court Artist in the Merged View** (`--standup`, or the printed Kilo CLI line):
+   ```bash
+   kilo run --auto --agent artist --model "$(python3 -m court.cli model artist)" \
+     --dir .kilo/worktrees/artist-atelier "$(cat .kilo/worktrees/artist-atelier/.kilo/TASK_ARTIST.md)"
+   ```
+   - The artist confirms each Quest's code is actually merged and its view renders, inspects the tribute against its charter, and summarizes the pages to review. It may write view code AND the service functions behind it.
+   - Record the session on each merged Quest:
      ```bash
      python3 -m court.cli set-field <QID> artist_session_id <session_id>
      ```
-   - Present M'Lord the preview URL and the per-quest route list.
-   - **Single-writer**: do NOT stand up the Gatekeeper yet — the artist owns the worktree until royal sign-off.
+   - Present M'Lord the single preview URL and the per-Quest route list.
 
 4. **During the Review (Royal Addendum)**:
-   - M'Lord may direct additional, unchartered UI changes here; this is the only sanctioned venue. The artist must attribute every polish commit (`Addendum-Quests:` trailer + dated `## Royal Addendum` entry per affected quest charter).
-   - On per-quest approval the artist updates each quest's `## Master of Coin's Audit` UI Review line to APPROVED.
+   - M'Lord may direct additional, unchartered UI changes here; this is the only sanctioned venue. The artist MUST attribute every polish commit (`style(...): <QID> royal review` subject and/or `Addendum-Quests:` trailer) so each Quest's approved revision is pinnable.
+   - On per-Quest approval the artist sets that Quest's `## Master of Coin's Audit` UI Review line to APPROVED.
 
-5. **After Royal Sign-Off — Handover to the Gatekeeper (sequenced, same worktree)**:
-   - Verify the artist committed everything and stopped (clean tree, no live artist session).
-   - Run the unified suite via the ENGINE: `python3 -m court.cli runsuite --cogship <cogship_id> --dir .kilo/worktrees/the-gatehouse-<cogship_id>`.
-   - Stand up the Gatekeeper in the same worktree (candidate branches are already merged; it runs the suite, promotes the clean convoy into `castle`, advances passing quests to `READY_TO_RAZE`, and packs the manifest via `court ship`).
-   - If the Gatekeeper isolates/rejects a quest, addendum polish entangled with that quest's files is reverted with it (`gatekeeper_review_prompt.md` → Step 2c, rule 3).
+5. **Patronize Each Quest Independently (deferred, mechanical extraction)**:
+   ```bash
+   python3 -m court.cli patronize <QID> --by "M'Lord" --note "<where said>"
+   ```
+   - Pins the Quest's approved revision as the ordered set of its OWN artist-review commit SHAs — never the atelier tip, so another Quest's in-progress work can never ride along.
+   - Writes the written UI sign-off the gates read and queues the Night's Watch to collect it. Collection replays only the pinned commits onto the Quest's own branch, then the Gatekeeper integrates that Quest through its own branch.
 
-> **Atelier vs Studio**: this command is the pre-collect **Cog Ship convoy** lane (stamp + GATE + Gatekeeper promotion of the convoy branch). For the **combined artist easel** lane — no stamping, per-quest sync-back after sign-off, collection via the Steward — use `/studio <QID1>,<QID2>,...` (`court studio`, the Q-2 deterministic Combined Studio with the charter-paperwork → branch-wins / disclosed-union conflict policy and the WARN-ONLY freshness gate).
+6. **Manage the Studio**:
+   - `python3 -m court.cli atelier --list` — membership and per-Quest patronage state.
+   - `python3 -m court.cli atelier --reap` — tear the worktree down (branch ref kept).
+
+> **Standing Atelier vs Combined Studio vs Convoy**: `/atelier` is the standing studio (above) — the single, preferred UI-review path. `/studio <QID1>,<QID2>,...` (`court studio`) is the per-cohort **combined easel** lane (no stamping, per-quest sync-back, collection via the Steward). `/convoy <QID1>,<QID2>,...` (`court atelier --convoy`) is the legacy pre-collect **Cog Ship convoy** lane (stamps the convoy and advances the Quests to `GATE`; the Gatekeeper promotes the convoy branch after the unified suite). Prefer the standing atelier; the studio and convoy remain for compatibility.

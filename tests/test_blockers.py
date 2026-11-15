@@ -217,3 +217,29 @@ def test_summary_from_snapshot_does_not_park_ready_to_raze():
     assert summary["drift"] == 1
     assert summary["parked"] == 1
     assert summary["ready"] == 1
+
+
+def test_ready_to_raze_with_a_conflict_is_not_a_blocker(tmp_path):
+    """A READY_TO_RAZE Quest with a stale merge_conflict marker must not surface
+    the conflict (it is already promoted, not blocking a spawn)."""
+    repo, _quests, _state = _fixture_board(tmp_path)
+    quests = [_Q("Q060-Ready", "READY_TO_RAZE", "")]
+    state = {"quests": {"Q060-Ready": {"merge_conflict": {"files": ["a.py"], "ts": 1}}}}
+    payload = blockers.collect(repo, quests=quests, state=state)
+    row = payload["quests"][0]
+    assert row["blocker"] == "ready"
+    assert row["merge_conflict"] == []
+    assert payload["summary"]["conflicts"] == 0
+    assert payload["summary"]["parked"] == 0
+
+
+def test_summary_from_snapshot_ignores_a_terminal_conflict():
+    snap = {"quests": [
+        {"id": "Q1", "kind": "quest", "status": "READY_TO_RAZE",
+         "worktree": "/x", "git_status": {}, "pending_audience": False},
+    ]}
+    state = {"quests": {"Q1": {"merge_conflict": {"files": ["stale.py"]}}}}
+    summary = blockers.summary_from_snapshot(snap, state)
+    assert summary["conflicts"] == 0
+    assert summary["parked"] == 0
+    assert summary["ready"] == 1

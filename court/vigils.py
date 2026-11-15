@@ -472,29 +472,40 @@ def ready_vigils(repo: Path, quests: dict, now: Optional[datetime] = None) -> tu
     ready: list = []
     notes: list = []
     for spec in load_all(repo):
-        expires = _parse_iso(spec.get("expires_at") or "")
-        if expires and now >= expires:
-            retire(repo, spec, "expired")
-            notes.append({"id": spec["id"], "level": "expired",
-                          "text": f"expired {iso(expires)} without firing ({spec.get('reason','')[:80]})"})
+        # One unreadable vigil must not abort the sweep: a raise here used to
+        # propagate to the caller (whose broad except then dropped `ready`), so
+        # EVERY other expired vigil stayed "active" and piled up unretired (the
+        # 2026-11-15 309-stale-vigil report). Expiry retirement below is now
+        # reached for every vigil regardless of any other vigil's condition.
+        try:
+            expires = _parse_iso(spec.get("expires_at") or "")
+            if expires and now >= expires:
+                retire(repo, spec, "expired",
+                       note=f"expired {iso(expires)} without firing")
+                notes.append({"id": spec["id"], "level": "expired",
+                              "text": f"expired {iso(expires)} without firing ({spec.get('reason','')[:80]})"})
+                continue
+            reasons = []
+            satisfied = True
+            malformed: list[str] = []
+            for cond in spec.get("when") or []:
+                ok, why = check_condition(cond, repo, quests, now=now)
+                reasons.append(f"{cond}: {why}")
+                if (why.startswith("unknown condition") or "unreadable" in why
+                        or why.startswith("path escapes")):
+                    malformed.append(f"{cond}: {why}")
+                if not ok:
+                    satisfied = False
+            # A never-true watch is a foot-gun, not a wait: surface it loudly (it
+            # registers as active but cannot ever fire), instead of letting it sit
+            # in the "waiting on capacity/condition" shadow indefinitely.
+            if malformed:
+                notes.append({"id": spec["id"], "level": "malformed",
+                              "text": "; ".join(malformed)})
+            if satisfied:
+                ready.append((spec, "; ".join(reasons)))
+        except Exception as e:  # noqa: BLE001 — one bad vigil must not strand the rest
+            notes.append({"id": spec.get("id", "?"), "level": "malformed",
+                          "text": f"evaluation error: {e}"})
             continue
-        reasons = []
-        satisfied = True
-        malformed: list[str] = []
-        for cond in spec.get("when") or []:
-            ok, why = check_condition(cond, repo, quests, now=now)
-            reasons.append(f"{cond}: {why}")
-            if (why.startswith("unknown condition") or "unreadable" in why
-                    or why.startswith("path escapes")):
-                malformed.append(f"{cond}: {why}")
-            if not ok:
-                satisfied = False
-        # A never-true watch is a foot-gun, not a wait: surface it loudly (it
-        # registers as active but cannot ever fire), instead of letting it sit
-        # in the "waiting on capacity/condition" shadow indefinitely.
-        if malformed:
-            notes.append({"id": spec["id"], "level": "malformed",
-                          "text": "; ".join(malformed)})
-        if satisfied:
-            ready.append((spec, "; ".join(reasons)))
     return ready, notes

@@ -530,10 +530,16 @@ def test_both_drain_and_new_work_progress_on_a_raised_budget(tmp_path):
 def test_scarce_slots_take_turns_across_ticks(tmp_path):
     """With one slot and two lanes wanting it, consecutive ticks lead with
     different lanes instead of the same lane winning every tick (the "dispatch is
-    preferred before coin" complaint)."""
-    quests = [_q("Q1", "TRIBUTE_READY", _free(tmp_path, "w1"))]
+    preferred before coin" complaint).
+
+    This is the fairness rule for when the gate is NOT short of a full convoy:
+    the two parked GATE Quests meet `collect_batch_max`, so the coin lane keeps
+    no gate-short precedence and the rotation decides."""
+    quests = [_q("Q1", "TRIBUTE_READY", _free(tmp_path, "w1")),
+              _q("G1", "GATE"), _q("G2", "GATE")]
     state = nw.load_state(tmp_path)
-    policy = _policy(max_workers=3, max_spawns_per_tick=1)
+    policy = _policy(max_workers=3, max_spawns_per_tick=1, collect_batch_max=2,
+                     enabled=("goad", "coin", "dispatch"))
     first, _ = nw.plan(_snap(*quests), state, policy, _workers(count=1),
                        ready_vigils=_dispatch_vigils(1))
     second, _ = nw.plan(_snap(*quests), state, policy, _workers(count=1),
@@ -573,6 +579,61 @@ def test_a_single_lane_may_still_use_the_whole_budget(tmp_path):
     actions, _ = nw.plan(_snap(*quests), nw.load_state(tmp_path),
                          _policy(max_workers=10, max_spawns_per_tick=2), _workers())
     assert sum(1 for a in actions if a.kind == "coin") == 2
+
+
+def test_gate_cohort_short_predicate():
+    """The gate is short when it holds fewer packable Quests than a full convoy."""
+    pol = _policy(collect_batch_max=5)
+    assert nw._gate_cohort_short(nw._quest_map(_snap()), pol) is True
+    assert nw._gate_cohort_short(nw._quest_map(_snap(_q("G1", "GATE"))), pol) is True
+    full = [_q(f"G{i}", "GATE") for i in range(5)]
+    assert nw._gate_cohort_short(nw._quest_map(_snap(*full)), pol) is False
+    # a parked (pending-Audience) Quest is M'Lord's, not packable tribute
+    parked = [_q("G1", "GATE"), _q("G2", "GATE", pending_audience=True)]
+    assert nw._gate_cohort_short(nw._quest_map(_snap(*parked)), pol) is True
+    # singleton convoys have nothing to fill — never "short"
+    assert nw._gate_cohort_short(nw._quest_map(_snap()), _policy(collect_batch_max=1)) is False
+
+
+def test_coin_outranks_dispatch_while_the_gate_is_short(tmp_path):
+    """Gate-short precedence: while fewer packable Quests sit at GATE than a full
+    convoy, the coin lane leads EVERY tick — it is never rotated behind a
+    dispatch hand-off — so the gate fills and the next convoy can pack full."""
+    quests = [_q("Q1", "TRIBUTE_READY", _free(tmp_path, "w1")),
+              _q("G1", "GATE")]  # 1 < collect_batch_max 2 -> short
+    state = nw.load_state(tmp_path)
+    policy = _policy(max_workers=3, max_spawns_per_tick=1, collect_batch_max=2,
+                     enabled=("goad", "coin", "dispatch"))
+    for _ in range(3):
+        actions, _ = nw.plan(_snap(*quests), state, policy, _workers(count=1),
+                             ready_vigils=_dispatch_vigils(1))
+        assert [a.kind for a in actions if nw._action_spawns(a)] == ["coin"]
+
+
+def test_coin_outranks_goad_while_the_gate_is_short(tmp_path):
+    """The single scarce slot goes to the coin lane, not to a dead-worker goad."""
+    quests = [_q("Q1", "TRIBUTE_READY", _free(tmp_path, "w1")),
+              _q("Q2", "WORKING", _free(tmp_path, "w2"), worker="exited"),
+              _q("G1", "GATE")]  # 1 < collect_batch_max 2 -> short
+    actions, _ = nw.plan(_snap(*quests), nw.load_state(tmp_path),
+                         _policy(max_workers=3, max_spawns_per_tick=1, collect_batch_max=2,
+                                 enabled=("goad", "coin", "dispatch")),
+                         _workers(count=1))
+    assert [a.kind for a in actions if nw._action_spawns(a)] == ["coin"]
+
+
+def test_gate_full_releases_the_coin_lane_to_normal_fairness(tmp_path):
+    """Once the gate holds a full convoy the precedence lifts: a goad is planned
+    alongside the coin instead of being shut out."""
+    quests = [_q("Q1", "TRIBUTE_READY", _free(tmp_path, "w1")),
+              _q("Q2", "WORKING", _free(tmp_path, "w2"), worker="exited"),
+              _q("G1", "GATE"), _q("G2", "GATE")]  # 2 >= collect_batch_max 2 -> full
+    actions, _ = nw.plan(_snap(*quests), nw.load_state(tmp_path),
+                         _policy(max_workers=3, max_spawns_per_tick=2, collect_batch_max=2,
+                                 enabled=("goad", "coin", "dispatch")),
+                         _workers(count=1))
+    kinds = collections.Counter(a.kind for a in actions if nw._action_spawns(a))
+    assert kinds["coin"] >= 1 and kinds["goad"] >= 1
 
 
 def test_spawn_class_and_rank_helpers():
@@ -1926,3 +1987,344 @@ def test_chartering_is_disabled_without_the_verb(tmp_path):
                              _workers(), charter_requests=[{"id": "req-1", "title": "Ship it"}])
     assert not [a for a in actions if a.kind == "charter"]
     assert any("chartering disabled" in n["text"] for n in notes)
+
+
+def test_ui_pending_gate_quest_routes_to_the_standing_atelier(tmp_path):
+    """A UI-review-pending GATE Quest is merged into the studio, not collected."""
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "GATE", wt, ui_review="PENDING (recommend Court Artist session)"))
+    policy = _policy(enabled=("collect", "atelier"), collect_min_batch=1)
+    actions, _ = nw.plan(snap, nw.load_state(tmp_path), policy, _workers(), now=1000.0,
+                         atelier_ready=["Q1"], ui_pending_ids=["Q1"])
+    assert [a.kind for a in actions] == ["atelier"]
+    assert actions[0].quest_ids == ["Q1"]
+
+
+def test_atelier_merge_is_opt_in(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "GATE", wt, ui_review="PENDING"))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers(), now=1000.0,
+                             atelier_ready=["Q1"], ui_pending_ids=["Q1"])
+    assert not [a for a in actions if a.kind == "atelier"]
+    assert any(n.get("key") == "atelier_disabled" for n in notes)
+
+
+def test_atelier_merge_stands_down_while_the_artist_is_live(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "GATE", wt, ui_review="PENDING"))
+    policy = _policy(enabled=("collect", "atelier"), collect_min_batch=1)
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), policy, _workers(), now=1000.0,
+                             atelier_ready=["Q1"], atelier_blocked=True, ui_pending_ids=["Q1"])
+    assert not [a for a in actions if a.kind == "atelier"]
+    assert any(n.get("key") == "atelier_artist_live" for n in notes)
+
+
+def test_ui_pending_gate_quest_is_not_offered_to_collect(tmp_path):
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "GATE", wt, ui_review="PENDING (recommend Court Artist session)"))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(collect_min_batch=1),
+                             _workers(), now=1000.0, ui_pending_ids=["Q1"])
+    assert not [a for a in actions if a.kind in ("collect", "atelier")]
+    assert any(n.get("key") == "atelier_pending" for n in notes)
+
+
+def test_atelier_action_merges_into_the_standing_studio(tmp_path, monkeypatch):
+    called = {}
+
+    def fake_court(repo, *argv, timeout=None, env=None):
+        called["argv"] = argv
+        class R:
+            returncode = 0
+            stdout = "🎨 STANDING ATELIER"
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(nw, "_court", fake_court)
+    res = nw.execute(tmp_path, nw.Action("atelier", quest_ids=["Q1", "Q2"]))
+    assert list(called["argv"]) == ["atelier", "Q1,Q2", "--standing"]
+    assert res["ok"] is True
+
+
+def test_atelier_bookkeeping_holds_on_a_live_artist_and_clears_on_success(tmp_path):
+    state = nw.load_state(tmp_path)
+    blocked = nw.Action("atelier", quest_ids=["Q1"], meta={"retry_backoff": 300})
+    nw._apply_bookkeeping(
+        state, blocked,
+        {"ok": True, "stdout_tail": "",
+         "stderr_tail": "An artist session is live in the atelier worktree — not merging new Quests"},
+        1000.0)
+    st = state["quests"]["Q1"]
+    assert st["atelier_retry_at"] == 1300.0
+    assert "atelier_fails" not in st
+
+    merged = nw.Action("atelier", quest_ids=["Q1"], meta={"retry_backoff": 300})
+    nw._apply_bookkeeping(state, merged,
+                          {"ok": True, "stdout_tail": "merged", "stderr_tail": ""}, 2000.0)
+    assert state["quests"]["Q1"]["last_atelier_ts"] == 2000.0
+    assert "atelier_retry_at" not in state["quests"]["Q1"]
+
+
+# ---------------------------------------------------------------------------
+# Stale merge-conflict markers for terminal/razed/archived Quests (Defect 2)
+# ---------------------------------------------------------------------------
+
+def test_terminal_quest_conflict_marker_is_pruned():
+    """Expected use: a READY_TO_RAZE Quest's recorded conflict is dropped; a live
+    Quest's marker is left untouched."""
+    state = {"quests": {
+        "Q1-Ready": {"merge_conflict": {"files": ["a.py"], "ts": 1, "escalated_ts": 2}},
+        "Q2-Working": {"merge_conflict": {"files": ["b.py"], "ts": 3}},
+    }}
+    cleared = nw.prune_terminal_conflicts(state, {"Q1-Ready"})
+    assert cleared == 1
+    assert "merge_conflict" not in state["quests"]["Q1-Ready"]  # escalated_ts goes with it
+    assert state["quests"]["Q2-Working"]["merge_conflict"]["files"] == ["b.py"]
+
+
+def test_stale_conflict_ids_covers_terminal_razed_and_archived(tmp_path):
+    """Edge case: terminal status, a razed flag, and an archived Quest file all
+    count as stale; a live Quest does not."""
+    archive = tmp_path / ".court" / "archive"
+    archive.mkdir(parents=True)
+    (archive / "Q9-Archived.md").write_text("---\n", encoding="utf-8")
+    stale = nw.stale_conflict_ids(
+        tmp_path,
+        {"Q1": "WORKING", "Q2": "READY_TO_RAZE", "Q3": "DONE"},
+        ["Q4"],
+    )
+    assert {"Q2", "Q3", "Q4", "Q9-Archived"} <= stale
+    assert "Q1" not in stale
+
+
+def test_prune_drops_the_escalation_bookkeeping_for_a_terminal_quest():
+    """The `merge_conflict_steward_cap` counter (and the marker key) are pruned
+    with the marker; a cohort key with a live member keeps its escalation."""
+    state = {
+        "quests": {"Q1-Ready": {"merge_conflict": {"files": ["a.py"], "escalated_ts": 5}}},
+        "notified": {
+            "Q1-Ready": {"merge_conflict_steward_cap": 100, "merge_conflict": 50},
+            "Q2-Live,Q1-Ready": {"merge_conflict_steward_cap": 100},
+        },
+    }
+    nw.prune_terminal_conflicts(state, {"Q1-Ready"})
+    assert "Q1-Ready" not in state["notified"]
+    assert "Q2-Live,Q1-Ready" in state["notified"]
+
+
+def test_pruning_is_idempotent_and_never_resurrects(tmp_path):
+    """Failure case: a later tick (even with the stale record still on disk from an
+    older state file) must not restore or re-add the marker."""
+    state = {"quests": {"Q1-Ready": {"merge_conflict": {"files": ["a.py"], "ts": 1}}}}
+    stale = nw.stale_conflict_ids(tmp_path, {"Q1-Ready": "READY_TO_RAZE"}, [])
+    assert nw.prune_terminal_conflicts(state, stale) == 1
+    assert nw.prune_terminal_conflicts(state, stale) == 0
+    assert "merge_conflict" not in state["quests"]["Q1-Ready"]
+
+
+def test_a_terminal_quest_with_a_stale_marker_is_not_escalated(tmp_path):
+    """A terminal Quest is never "blocking a spawn": no Steward muster and no
+    merge_conflict note, even with the marker present in state."""
+    state = nw.load_state(tmp_path)
+    state["quests"]["Q1"] = {"merge_conflict": {"files": ["a.py"], "ts": 1}}
+    snap = _snap(_q("Q1", "READY_TO_RAZE", _free(tmp_path)))
+    _actions, notes = nw.plan(snap, state, _policy(enabled=("steward",)), _workers(count=0))
+    assert not any(str(n.get("key") or "").startswith("merge_conflict") for n in notes)
+
+
+def test_digest_listing_excludes_terminal_quests(tmp_path, monkeypatch):
+    """The 'merge conflicts blocking a spawn' digest section lists only
+    non-terminal Quests (the key regression for Defect 2)."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    nw.save_state(tmp_path, {
+        "version": nw.STATE_VERSION,
+        "quests": {
+            "Q1-Live": {"merge_conflict": {"files": ["live.py"], "ts": 100}},
+            "Q2-Ready": {"merge_conflict": {"files": ["stale.py"], "ts": 100}},
+            "Q3-Razed": {"merge_conflict": {"files": ["razed.py"], "ts": 100}},
+        },
+    })
+    journal = [{
+        "event": "tick",
+        "statuses": {"Q1-Live": "WORKING", "Q2-Ready": "READY_TO_RAZE",
+                     "Q3-Razed": "READY_TO_RAZE"},
+        "razed": ["Q3-Razed"],
+    }]
+    text = nw.render_digest(tmp_path, journal=journal)
+    conflict_lines = [ln for ln in text.splitlines() if "⚔️" in ln]
+    assert any("Q1-Live" in ln for ln in conflict_lines)
+    assert not any("Q2-Ready" in ln for ln in conflict_lines)
+    assert not any("Q3-Razed" in ln for ln in conflict_lines)
+
+
+# ---------------------------------------------------------------------------
+# Convoy-keyed re-ship + stale-Gatekeeper hold lifecycle (main defect)
+# ---------------------------------------------------------------------------
+
+def test_gate_with_a_promoted_convoy_and_new_commits_repacks(tmp_path):
+    """Key regression: the re-ship decision must read the CONVOY's promotion,
+    resolved from the Quest's cogship_id -- NOT the per-Quest
+    `cogship_promoted_commit` field, which is often left empty even after the
+    cargo shipped (the Q1460 / cogship-606 case). A Quest whose convoy is
+    promoted and which has new work at GATE packs into a fresh convoy."""
+    wt = _free(tmp_path)
+    snap = _snap(_q(
+        "Q1460", "GATE", wt,
+        cogship_id="cogship-606",
+        gatekeeper_session_id="ses_old_shipment",
+        cogship_promoted_commit="",          # the field is EMPTY: the defect
+        git_status={"ahead": 3, "behind": 0},
+    ))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(max_workers=4), _workers(),
+                             promoted_cogships=["cogship-606"])
+    assert [a.kind for a in actions] == ["collect"]
+    assert actions[0].quest_ids == ["Q1460"]
+    assert actions[0].cogship == "cogship-606"
+    assert any(n.get("key") == "reship_gate" for n in notes)
+    assert not any(n.get("key") == "stale_gatekeeper" for n in notes)
+
+
+def test_gate_without_convoy_promotion_is_held_as_stale(tmp_path):
+    """Edge case: the SAME Quest with no convoy promotion is a genuine
+    duplicate-Gatekeeper hold and is parked for a human, not re-packed."""
+    wt = _free(tmp_path)
+    snap = _snap(_q(
+        "Q1460", "GATE", wt,
+        cogship_id="cogship-606",
+        gatekeeper_session_id="ses_old_shipment",
+        cogship_promoted_commit="",
+        git_status={"ahead": 3, "behind": 0},
+    ))
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(max_workers=4), _workers(),
+                             promoted_cogships=[])
+    assert actions == []
+    assert any(n.get("key") == "stale_gatekeeper" for n in notes)
+    assert not any(n.get("key") == "reship_gate" for n in notes)
+
+
+def test_a_dead_gatekeeper_stamp_is_cleared_after_the_expiry(tmp_path):
+    """A stale session stamp must not persist across ticks: after the expiry the
+    watch clears the dead stamp itself so the Quest can re-pack."""
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1480", "GATE", wt,
+                    cogship_id="cogship-598",
+                    gatekeeper_session_id="ses_dead"))
+    state = nw.load_state(tmp_path)
+    pol = _policy(stale_gatekeeper_expiry=1800, max_workers=4)
+
+    # Tick 1 -- first sighting: parked for a human, nothing cleared yet.
+    actions, notes = nw.plan(snap, state, pol, _workers(), now=1000.0)
+    assert actions == []
+    assert any(n.get("key") == "stale_gatekeeper" for n in notes)
+    state["quests"]["Q1480"] = {"stale_gatekeeper_since": 1000.0}   # tick-maintained
+
+    # Tick 2 -- past the expiry: the watch clears the dead stamp.
+    actions, notes = nw.plan(snap, state, pol, _workers(), now=1000.0 + 1801)
+    assert [a.kind for a in actions] == ["cleargate"]
+    assert actions[0].quest_ids == ["Q1480"]
+    assert any(n.get("key") == "stale_gatekeeper_cleared" for n in notes)
+
+    # Tick 3 -- stamp gone (cleared) -> the Quest packs normally.
+    snap_after = _snap(_q("Q1480", "GATE", wt, cogship_id="cogship-598",
+                          gatekeeper_session_id=""))
+    actions2, _ = nw.plan(snap_after, state, pol, _workers(), now=1000.0 + 1801)
+    assert [a.kind for a in actions2] == ["collect"]
+
+
+def test_execute_cleargate_clears_the_session_stamp(tmp_path, monkeypatch):
+    """The cleargate action actually empties the Quest's session/model stamps."""
+    from court import store
+
+    class _Quest:
+        def __init__(self):
+            self.gatekeeper_session_id = "ses_dead"
+            self.gatekeeper_model = "some-model"
+
+    quest = _Quest()
+    monkeypatch.setattr(store, "load", lambda qid, **kw: quest)
+    saved = {}
+    monkeypatch.setattr(store, "save", lambda q, **kw: saved.update(quest=q))
+    res = nw.execute(tmp_path, nw.Action(kind="cleargate", quest_ids=["Q1480"], reason="dead"))
+    assert res["ok"] is True
+    assert quest.gatekeeper_session_id == ""
+    assert quest.gatekeeper_model == ""
+    assert saved.get("quest") is quest
+
+
+def test_a_cohort_at_or_above_min_batch_packs_as_one_convoy(tmp_path):
+    """Anti-singleton guard: with `collect_min_batch` (default 2) unstamped GATE
+    Quests, the watch packs them as ONE convoy and does not wait out the batch
+    window. The collapsed-cohort defect must not be masked by this test passing
+    for the wrong reason (a singleton/short hold)."""
+    wts = [_free(tmp_path, str(i)) for i in range(3)]
+    snap = _snap(*[_q(f"Q{i}", "GATE", wts[i], app="crm") for i in range(3)])
+    pol = _policy(max_workers=4, max_spawns_per_tick=3)   # collect_min_batch=2, window=1800
+    actions, notes = nw.plan(snap, nw.load_state(tmp_path), pol, _workers(), now=1000.0)
+    collect = [a for a in actions if a.kind == "collect"]
+    assert len(collect) == 1
+    assert sorted(collect[0].quest_ids) == ["Q0", "Q1", "Q2"]
+    assert not any(str(n.get("key") or "").startswith("collect_cohort") for n in notes)
+
+
+# ---------------------------------------------------------------------------
+# Merge-conflict lane: prune Quests no longer in the active ledger (defect 2)
+# ---------------------------------------------------------------------------
+
+def test_conflict_markers_for_quests_absent_from_the_ledger_are_pruned(tmp_path):
+    """A tracked `merge_conflict` for a Quest no longer in the active ledger is
+    stale: pruned from state, and a live Quest's marker is untouched."""
+    state = {"quests": {
+        "Q1-Live": {"merge_conflict": {"files": ["live.py"], "ts": 1}},
+        "Q9-Gone": {"merge_conflict": {"files": ["gone.py"], "ts": 1}},
+    }}
+    stale = nw.stale_conflict_ids(tmp_path, {"Q1-Live": "WORKING"},
+                                  tracked_ids={"Q1-Live", "Q9-Gone"})
+    assert "Q9-Gone" in stale and "Q1-Live" not in stale
+    assert nw.prune_terminal_conflicts(state, stale) == 1
+    assert "merge_conflict" not in state["quests"]["Q9-Gone"]
+    assert "merge_conflict" in state["quests"]["Q1-Live"]
+
+
+def test_digest_drops_conflicts_for_quests_absent_from_the_ledger(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    nw.save_state(tmp_path, {"version": nw.STATE_VERSION, "quests": {
+        "Q1-Live": {"merge_conflict": {"files": ["live.py"], "ts": 1}},
+        "Q9-Gone": {"merge_conflict": {"files": ["gone.py"], "ts": 1}},
+    }})
+    journal = [{"event": "tick", "statuses": {"Q1-Live": "WORKING"}, "razed": []}]
+    text = nw.render_digest(tmp_path, journal=journal)
+    conflict_lines = [ln for ln in text.splitlines() if "⚔️" in ln]
+    assert any("Q1-Live" in ln for ln in conflict_lines)
+    assert not any("Q9-Gone" in ln for ln in conflict_lines)
+
+
+def test_conflict_escalation_records_itself_once(tmp_path):
+    """The merge-conflict escalation writes one-shot bookkeeping so
+    "escalated once" is actually true (it previously left no trace)."""
+    wt = _free(tmp_path)
+    snap = _snap(_q("Q1", "WORKING", wt, worker="exited"))
+    state = nw.load_state(tmp_path)
+    state["quests"]["Q1"] = {"merge_conflict": {"files": ["a.py"], "ts": 1}}
+    actions, notes = nw.plan(snap, state, _policy(enabled=("steward",)), _workers())
+    assert any(a.kind == "steward" and a.meta.get("merge_conflict") for a in actions)
+    assert any(n.get("key") == "merge_conflict_escalation" for n in notes)
+    nw._record_escalations(state, notes, 1000.0)
+    assert state.get("notified")
+
+
+def test_digest_counts_spawns_not_boots(tmp_path, monkeypatch):
+    """D7: the old '0 starts' line counted once-per-boot `start` rows and read 0
+    forever; count real spawns and label boots honestly."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    nw.save_state(tmp_path, {"version": nw.STATE_VERSION, "quests": {}})
+    journal = [
+        {"event": "start", "dry_run": False},
+        {"event": "action", "ts": "2026-11-15T00:00:00Z",
+         "action": {"kind": "collect", "quest_ids": ["Q1"]}, "result": {}},
+        {"event": "action", "ts": "2026-11-15T00:01:00Z",
+         "action": {"kind": "rebase", "quest_ids": ["Q2"]}, "result": {}},
+    ]
+    text = nw.render_digest(tmp_path, journal=journal)
+    line = [ln for ln in text.splitlines() if ln.startswith("journal:")][0]
+    assert "1 spawns" in line
+    assert "1 boots" in line
+    assert "starts" not in line

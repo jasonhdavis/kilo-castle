@@ -40,6 +40,17 @@ FLY_CONFIGS = {
     "worker-light": "fly-worker-light.toml",
 }
 
+# Named fleets: an explicit deploy-target GROUP of app aliases, so a run can
+# target a tier by name (``--fleet worker``) instead of enumerating ``--fly-app``.
+# A fleet is a deploy target, NOT an image family -- the worker fleet spans both
+# images (worker-light runs the app image; standard and heavy run the science
+# image). ``--fleet`` and ``--fly-app`` compose: the selection is their union.
+FLY_FLEETS = {
+    "web": ("web",),
+    "worker": ("worker", "worker-heavy", "worker-light"),
+    "all": ("web", "worker", "worker-heavy", "worker-light"),
+}
+
 # The image manifest. Each distinct image is built ONCE and released to every
 # app that shares it. App membership is explicit -- the image an app runs is
 # never inferred from its name or flavor -- and each app's own fly config is
@@ -178,6 +189,31 @@ def guard_image_delivery(app_name: str, image_id: str) -> None:
         )
 
 
+def fleet_aliases(fleet_name: str) -> Optional[tuple]:
+    """The app aliases a named fleet covers, or None for an unknown name."""
+    return FLY_FLEETS.get(fleet_name)
+
+
+def expand_selection(fly_apps=None, fleets=None) -> tuple:
+    """Flatten ``--fly-app`` and ``--fleet`` selections into one canonical,
+    de-duped alias list in manifest order. Returns ``(aliases, errors)``.
+
+    Both flags compose (union), so ``--fleet worker --fly-app web`` targets the
+    worker fleet plus web. An unknown fleet name is a hard error so a typo
+    refuses the run rather than silently deploying nothing."""
+    errors: list[str] = []
+    chosen: set = set()
+    for fleet in fleets or []:
+        aliases = FLY_FLEETS.get(fleet)
+        if aliases is None:
+            errors.append(f"unknown --fleet {fleet!r} (valid: {', '.join(FLY_FLEETS)})")
+            continue
+        chosen.update(aliases)
+    chosen.update(fly_apps or [])
+    ordered = [alias for alias in FLY_CONFIGS if alias in chosen]
+    return ordered, errors
+
+
 def resolve_apps(repo_root: Path, selection: Optional[list] = None) -> tuple:
     """Resolve the requested ``--fly-app`` selection to deployable app records.
 
@@ -304,6 +340,37 @@ def docker_tag_argv(source_ref: str, target_ref: str) -> list:
 
 def docker_push_argv(target_ref: str) -> list:
     return ["docker", "push", target_ref]
+
+
+# `flyctl deploy --build-only --push` reports the pushed image as a manifest
+# reference: ``<registry>/<app>:<label>@sha256:<digest>``. The local Docker daemon
+# holds the image under the plain ``<registry>/<app>:<label>`` tag, so a
+# ``docker tag`` of the digest-qualified form fails with "No such image" -- which
+# is exactly what the 2026-11-14 run hit (two worker namespaces skipped their
+# copy, and the driver then reported a failed release that had actually
+# succeeded). The digest-free form is the one to copy from.
+_IMAGE_DIGEST_RE = re.compile(r"@sha256:[0-9a-fA-F]+$")
+
+
+def without_digest(ref: str) -> str:
+    """The ref with any trailing ``@sha256:<digest>`` removed (the local tag form)."""
+    return _IMAGE_DIGEST_RE.sub("", (ref or "").strip())
+
+
+def source_ref_candidates(ref: str) -> list:
+    """Local-daemon source candidates for a pushed image ref, in preference order:
+    the digest-free tag first (what the daemon actually holds), then the ref
+    verbatim. De-duped, order preserved."""
+    candidates: list = []
+    for candidate in (without_digest(ref), (ref or "").strip()):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def docker_inspect_argv(ref: str) -> list:
+    """Probe whether the local daemon actually holds ``ref`` before tagging it."""
+    return ["docker", "image", "inspect", ref]
 
 
 _AUTH_ERROR_RE = re.compile(

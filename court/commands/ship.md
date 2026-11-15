@@ -30,6 +30,30 @@ python3 -m court.cli ship --confirm --stage stamp   # stamp the promoted commit 
 unless `main` already contains `castle`, and every run still executes the pre-ship
 interrogation first (integrity findings always block).
 
+### Fleet targeting (`--fleet` / `--fly-app`)
+
+Scope the build and deploy stages to a fleet or an app instead of releasing every
+configured app. `--fleet` names a deploy-target group; `--fly-app` names a single app
+alias. The two compose (their union), and both are repeatable.
+
+```
+python3 -m court.cli ship --confirm --stage build,deploy --fleet worker   # the worker fleet
+python3 -m court.cli ship --confirm --stage deploy --fleet web            # the web tier
+python3 -m court.cli ship --confirm --stage deploy --fly-app worker-light # one app
+```
+
+| `--fleet` | Apps it targets |
+|---|---|
+| `web` | `pb-app-web` |
+| `worker` | `pb-app-worker`, `pb-app-worker-heavy`, `pb-app-worker-light` |
+| `all` | every app with a config in the repo root |
+
+A fleet is a **deploy target, not an image family**: `--fleet worker` releases all three
+worker apps, and the build stage builds exactly the images that fleet needs (`worker-light`
+runs the app image; standard and heavy run the science image). A `--fleet web` run
+therefore builds only the app image. An unknown fleet or app name is refused before
+anything is mutated.
+
 ### Steward's Post-Deployment Commutation Duty
 Following successful deployment to production:
 1. **Review the Commutation Manifest**: Inspect the `⚡ THE COMMUTATION MANIFEST` generated during `/ship`.

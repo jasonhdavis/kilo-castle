@@ -34,6 +34,34 @@ _COGSHIP_FM_RE = re.compile(r"^cogship_id:\s*(\S.*)$", re.MULTILINE)
 _current_branch_cache: Optional[str] = None
 
 
+def _main_checkout_root(start_path: Optional[Path | str] = None) -> Optional[Path]:
+    """The MAIN checkout root when ``start_path`` is inside a linked git worktree,
+    else the repo root for an ordinary checkout (so the caller's answer is
+    unchanged), else None.
+
+    In a linked worktree the tracked ``.court/`` is a per-branch copy that drifts:
+    a RETAINED worktree kept ``<id>.md`` reading ``status=PLANNED`` after the
+    Quest had been razed (2026-11-15), so whatever reader ran inside that worktree
+    saw a stale status. The main checkout's ledger is authoritative."""
+    try:
+        base = Path(start_path).resolve() if start_path else Path.cwd()
+        res = git_ops._run(["git", "rev-parse", "--git-common-dir"], base)
+        if not res.get("ok"):
+            return None
+        raw = (res.get("stdout") or "").strip()
+        if not raw:
+            return None
+        common = Path(raw)
+        if not common.is_absolute():
+            common = base / common
+        common = common.resolve()
+        if common.name == ".git":
+            return common.parent
+    except Exception:  # noqa: BLE001 — root resolution must never raise
+        return None
+    return None
+
+
 def get_court_root(start_path: Optional[Path | str] = None) -> Path:
     """Locate the .court root directory by searching upwards from start_path or cwd,
     or reading COURT_DIR from environment."""
@@ -42,6 +70,13 @@ def get_court_root(start_path: Optional[Path | str] = None) -> Path:
         return Path(env_dir).resolve()
 
     current = (Path(start_path) if start_path else Path.cwd()).resolve()
+    # Resolve to the MAIN checkout's ledger so a reader inside a retained/other
+    # worktree cannot see that worktree's stale tracked `.court/` copy.
+    main_root = _main_checkout_root(current)
+    if main_root is not None:
+        main_court = main_root / ".court"
+        if main_court.is_dir():
+            return main_court
     for parent in [current, *current.parents]:
         court_candidate = parent / ".court"
         if court_candidate.is_dir():

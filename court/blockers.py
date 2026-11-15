@@ -39,6 +39,11 @@ from . import store
 # the trunk. READY_TO_RAZE stays in the board (it still needs `court raze`).
 TERMINAL_STATUSES = ("DONE", "LANDED", "LAUNCHED")
 
+# A terminal Quest is never "blocking a spawn", so a stale `merge_conflict`
+# marker (only ever cleared on a later successful rebase/coin) must not surface
+# on its row. READY_TO_RAZE is included: it is already promoted/awaiting teardown.
+CONFLICT_TERMINAL_STATUSES = ("DONE", "LANDED", "LAUNCHED", "READY_TO_RAZE")
+
 # Statuses whose Quest cannot progress without a live worktree.
 WORKTREE_STATUSES = ("QUESTING", "WORKING", "TRIBUTE_READY", "GATE", "READY_TO_RAZE")
 
@@ -149,6 +154,10 @@ def build_row(quest, *, worktree: Optional[Path | str] = None,
     conflict = entry.get("merge_conflict") if isinstance(entry, dict) else None
     conflict_files = sorted({str(f) for f in ((conflict or {}).get("files") or [])}) \
         if isinstance(conflict, dict) else []
+    # A terminal Quest never blocks a spawn: drop a stale conflict marker so the
+    # row (and any count derived from it) cannot advertise it.
+    if (quest.status or "").strip().upper() in CONFLICT_TERMINAL_STATUSES:
+        conflict_files = []
     pending = bool(getattr(quest, "has_pending_audience", lambda: False)())
     worker_state = worker if worker is not None else _worker(worktree)
     blocker = classify_row(
@@ -242,6 +251,8 @@ def summary_from_snapshot(snap: dict, state: Optional[dict], base: str = "castle
         conflict = entry.get("merge_conflict") if isinstance(entry, dict) else None
         conflict_files = ((conflict or {}).get("files") or []) \
             if isinstance(conflict, dict) else []
+        if status in CONFLICT_TERMINAL_STATUSES:
+            conflict_files = []
         behind = (quest.get("git_status") or {}).get("behind") or 0
         blocker = classify_row(
             status=status, worktree=quest.get("worktree"),

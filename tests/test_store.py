@@ -305,3 +305,49 @@ def test_dirty_section_still_wins_over_disk(tmp_path):
     saved = p.read_text(encoding="utf-8")
     assert "Fresh tribute from the serf." in saved
     assert "## Royal Ruling" in saved
+
+
+def test_court_root_resolves_to_the_main_checkout_inside_a_worktree(tmp_path, monkeypatch):
+    """D4: a reader inside a (retained) worktree must resolve the MAIN checkout's
+    ledger, not that worktree's stale tracked `.court/` copy — three views once
+    reported three different statuses for the same Quest."""
+    import subprocess
+    from court import store
+
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "castle"], cwd=main, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=main, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=main, check=True)
+    (main / ".court" / "quests").mkdir(parents=True)
+    (main / ".court" / "quests" / "Q1-X.md").write_text(
+        "---\nid: Q1-X\nstatus: DONE\n---\n", encoding="utf-8")
+    (main / "f.txt").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=main, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=main, check=True)
+
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "worktree", "add", "-q", "-b", "wtcopy", str(wt), "castle"],
+                   cwd=main, check=True)
+    # The retained worktree's tracked copy has DRIFTED.
+    (wt / ".court" / "quests" / "Q1-X.md").write_text(
+        "---\nid: Q1-X\nstatus: PLANNED\n---\n", encoding="utf-8")
+
+    monkeypatch.delenv("COURT_DIR", raising=False)
+    monkeypatch.chdir(wt)
+    assert store.get_court_root() == (main / ".court").resolve()
+    assert "DONE" in (store.get_court_root() / "quests" / "Q1-X.md").read_text()
+
+
+def test_court_root_for_an_ordinary_checkout_is_unchanged(tmp_path, monkeypatch):
+    """D4 guard: a NON-worktree checkout still resolves to its own .court."""
+    import subprocess
+    from court import store
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "castle"], cwd=repo, check=True)
+    (repo / ".court" / "quests").mkdir(parents=True)
+    monkeypatch.delenv("COURT_DIR", raising=False)
+    monkeypatch.chdir(repo)
+    assert store.get_court_root() == (repo / ".court").resolve()

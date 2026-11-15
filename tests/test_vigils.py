@@ -267,3 +267,50 @@ def test_muster_vigil_requires_a_reason():
                    reason="Steward check-in in two hours", expires="6h")
     assert spec["then"].startswith("muster:")
     assert v._parse_action(spec["then"])["verb"] == "muster"
+
+
+# ---------------------------------------------------------------------------
+# Batch 2 (2026-11-15): expiry retirement writes a reason, and one bad vigil
+# must not strand every other expired vigil (the 309-stale-vigil pile-up)
+# ---------------------------------------------------------------------------
+
+def test_expired_vigil_is_retired_with_a_reason(tmp_path):
+    repo = _repo(tmp_path)
+    spec = _spec(id="dispatch-q1")
+    spec["expires_at"] = "2000-01-01T00:00:00Z"
+    vigils.save(repo, spec)
+
+    ready, notes = vigils.ready_vigils(repo, {})
+    assert ready == []
+    assert any(n["level"] == "expired" for n in notes)
+
+    saved = json.loads((repo / ".court" / "vigils" / "dispatch-q1.json").read_text())
+    assert saved["status"] == "expired"
+    assert saved.get("retired_iso")
+    assert saved.get("retired_note")   # retired_reason is written, not just the status
+
+
+def test_one_bad_vigil_does_not_strand_other_expired_vigils(tmp_path, monkeypatch):
+    """A raise while evaluating one vigil must not abort the sweep: every OTHER
+    expired vigil still gets retired that tick."""
+    repo = _repo(tmp_path)
+    bad = _spec(id="bad")
+    bad["expires_at"] = "2999-01-01T00:00:00Z"   # not expired; will raise in eval
+    vigils.save(repo, bad)
+    good = _spec(id="good")
+    good["expires_at"] = "2000-01-01T00:00:00Z"  # expired
+    vigils.save(repo, good)
+
+    real = vigils.check_condition
+
+    def boom(cond, repo_, quests, now=None):
+        if cond.startswith("quest-status"):
+            raise RuntimeError("kaboom")
+        return real(cond, repo_, quests, now=now)
+
+    monkeypatch.setattr(vigils, "check_condition", boom)
+    ready, notes = vigils.ready_vigils(repo, {})
+
+    saved = json.loads((repo / ".court" / "vigils" / "good.json").read_text())
+    assert saved["status"] == "expired"
+    assert any(n["level"] == "malformed" for n in notes)

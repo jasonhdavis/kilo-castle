@@ -5305,14 +5305,21 @@ def cmd_raze(args):
                 return
             # Successor is done: the frozen worktree was rejected and never
             # merged, so skip merge/ff-only checks entirely — just close it out.
+            # Report the ACTUAL effect: re-running on a Quest that already
+            # carries the razed marker is a no-op (Q1216: already razed_at, yet
+            # this printed the same "Razed ..." success line, so a Steward could
+            # not tell "done" from "no-op" from "refused").
+            note = f"Razed alongside completed successor {successor_id}: pillory lineage closed out."
+            if quest.razed_at:
+                print(f"⏭️  {quest.id}: already razed at {quest.razed_at} — no-op "
+                      f"(pillory lineage already closed; nothing to do).")
+                return
             if quest.status != "READY_TO_RAZE":
-                quest.log_ledger(quest.status, "READY_TO_RAZE", f"Razed alongside completed successor {successor_id}: pillory lineage closed out.")
+                quest.log_ledger(quest.status, "READY_TO_RAZE", note)
                 quest.status = "READY_TO_RAZE"
-            _mark_quest_razed(
-                quest,
-                f"Razed alongside completed successor {successor_id}: pillory lineage closed out.",
-            )
-            print(f"🔥🔒 Razed pilloried {quest.id} alongside completed successor {successor_id}.")
+            _mark_quest_razed(quest, note)
+            print(f"🔥🔒 Razed pilloried {quest.id} alongside completed successor {successor_id} "
+                  f"(razed_at {quest.razed_at}).")
             return
 
         branch = quest.branch or ""
@@ -5663,35 +5670,45 @@ def cmd_collect(args):
         atelier_member = atelier.member(repo_root, quest.id)
         if atelier_member is not None:
             pin = atelier_member.get("patronage") if isinstance(atelier_member.get("patronage"), dict) else None
-            if not pin:
+            # A recorded UI MANDATE is the only thing that makes studio membership
+            # a HARD pack gate. Otherwise the charter's own intent wins: the engine
+            # must not silently override "- Review: PENDING ... no UI Mandate in
+            # the charter, so this is review debt, NOT a pack gate" and shrink the
+            # cohort (Q1460/Q1480 were refused exactly this way).
+            atelier_mandate, atelier_mandate_detail = convoy_guard.ui_mandate_outstanding(repo_root, quest.id)
+            if not pin and atelier_mandate:
                 skipped.append((
                     quest.id,
-                    "merged into the standing atelier and not yet patronized — review it in the merged "
-                    "view and run `court patronize <quest> --by \"M'Lord\"` before packing",
+                    f"merged into the standing atelier and not yet patronized — {atelier_mandate_detail}. "
+                    "Review it in the merged view and run `court patronize <quest> --by \"M'Lord\"` before packing",
                 ))
                 continue
-            atelier_branch = pin.get("atelier_branch") or atelier.ATELIER_BRANCH
-            if not atelier.extraction_status(repo_root, quest).get("applied"):
-                report = atelier.extract_quest(
-                    repo_root, quest, pin, atelier_branch=atelier_branch,
-                    base=base_branch, auto_commit=auto_commit,
-                )
-                if report["status"] in ("conflict", "no-worktree", "dirty", "missing-commit"):
-                    detail = (report.get("detail") or report.get("reason")
-                              or ", ".join(report.get("conflicts") or []) or report["status"])
-                    skipped.append((
-                        quest.id,
-                        f"atelier extraction failed ({report['status']}): {detail} — resolve and re-run "
-                        "`court collect`, or re-patronize after the artist reconciles",
-                    ))
-                    continue
-                print(f"🎨 {quest.id}: extracted {len(report.get('picked') or [])} pinned atelier "
-                      f"commit(s) onto {quest.branch} ({report['status']})")
+            if not pin:
+                print(f"⚠️ {quest.id}: in the standing atelier without a patronage pin, and the charter "
+                      f"records no UI Mandate — treating the review as tracked debt (not a pack gate) and packing.")
             else:
-                atelier.mark_extracted(
-                    repo_root, quest.id,
-                    [c["hash"] for c in (pin.get("commits") or [])], auto_commit=auto_commit,
-                )
+                atelier_branch = pin.get("atelier_branch") or atelier.ATELIER_BRANCH
+                if not atelier.extraction_status(repo_root, quest).get("applied"):
+                    report = atelier.extract_quest(
+                        repo_root, quest, pin, atelier_branch=atelier_branch,
+                        base=base_branch, auto_commit=auto_commit,
+                    )
+                    if report["status"] in ("conflict", "no-worktree", "dirty", "missing-commit"):
+                        detail = (report.get("detail") or report.get("reason")
+                                  or ", ".join(report.get("conflicts") or []) or report["status"])
+                        skipped.append((
+                            quest.id,
+                            f"atelier extraction failed ({report['status']}): {detail} — resolve and re-run "
+                            "`court collect`, or re-patronize after the artist reconciles",
+                        ))
+                        continue
+                    print(f"🎨 {quest.id}: extracted {len(report.get('picked') or [])} pinned atelier "
+                          f"commit(s) onto {quest.branch} ({report['status']})")
+                else:
+                    atelier.mark_extracted(
+                        repo_root, quest.id,
+                        [c["hash"] for c in (pin.get("commits") or [])], auto_commit=auto_commit,
+                    )
         # A recorded UI MANDATE (royal decree or charter requirement) is not
         # tracked debt: the Quest waits for its artist session instead of being
         # packed with the review unperformed. `--allow-ui-pending` does not
@@ -6844,10 +6861,18 @@ def cmd_atelier_standing(args) -> None:
 
 
 def cmd_atelier(args):
-    """Royal UI Convoy Atelier: roll up multiple UI-review-pending Quests into one
-    Cog Ship convoy PRE-integration-test, merge their branches together into the
-    ephemeral gatehouse convoy worktree, and spawn ONE Court Artist session with a
-    live runserver on the merged (untested) branch.
+    """Royal UI Atelier.
+
+    Default (`court atelier <ids>`): merge the Quests into the SINGLE standing
+    atelier — one long-lived merged worktree on `artist/atelier` with one dev
+    server — where M'Lord reviews the merged view and patronizes each Quest
+    independently (`cmd_atelier_standing`). `--list` / `--reap` manage it.
+
+    `--convoy`: the legacy Royal UI Convoy Atelier — roll up multiple
+    UI-review-pending Quests into one Cog Ship convoy PRE-integration-test,
+    merge their branches together into the ephemeral gatehouse convoy worktree,
+    and spawn ONE Court Artist session with a live runserver on the merged
+    (untested) branch.
 
     Velocity rationale: UI changes are typically small, so reviewing each in its own
     Quest worktree burns a full session round-trip per Quest. The atelier batches
@@ -6872,7 +6897,12 @@ def cmd_atelier(args):
         return cmd_atelier_status(args)
     if getattr(args, "reap", False):
         return cmd_atelier_reap(args)
-    if getattr(args, "standing", False):
+    # The STANDING atelier is the front door: bare `court atelier <ids>` merges
+    # Quests into the ONE long-lived merged studio (single worktree + dev
+    # server). The ephemeral pre-collect Cog Ship convoy lane is the
+    # compatibility path, behind `--convoy`. `--standing` is kept as an accepted
+    # alias for the default.
+    if not getattr(args, "convoy", False):
         return cmd_atelier_standing(args)
     base_branch = getattr(args, "base", "castle") or "castle"
     auto_commit = not getattr(args, "no_commit", False)
@@ -7687,6 +7717,23 @@ def cmd_stamp(args):
     cogship_arg = getattr(args, "cogship", None)
     cogship_id = None if (not cogship_arg or cogship_arg.lower() == "new") else cogship_arg
     auto_commit = not getattr(args, "no_commit", False)
+    if getattr(args, "clear", False):
+        # An explicit CLEAR path for a stale cogship_id. `set-field cogship_id ""`
+        # is refused (it is a dedicated field), and `court stamp` only assigned,
+        # so the engine's own remedy for a stale GATE Quest could clear the
+        # gatekeeper session but never the stale convoy key — and a non-empty
+        # cogship_id is exactly what keys an excluded/starved cohort.
+        cleared = []
+        for q in quests:
+            q.cogship_id = ""
+            q.cogship_station = ""
+            store.save(q, auto_commit=auto_commit,
+                       commit_msg=f"court: clear cogship on {q.id}")
+            cleared.append(q.id)
+        print(f"🧹 Cleared cogship_id on {len(cleared)} Quest(s):")
+        for qid in cleared:
+            print(f"   * {qid}")
+        return
     try:
         stamped = store.stamp_cogship(quests, cogship_id=cogship_id, auto_commit=auto_commit, force=getattr(args, "force", False))
     except ValueError as e:
@@ -8476,6 +8523,9 @@ def cmd_vigil(args):
         return
 
     if action == "remove":
+        if not (getattr(args, "id", None) or "").strip():
+            print("ERROR: `court vigil remove` needs a vigil id (positional)", file=sys.stderr)
+            sys.exit(2)
         ok = vigils.remove(repo, args.id)
         print(f"{'🗑️  Removed' if ok else '⚠️  No such vigil:'} {args.id}")
         sys.exit(0 if ok else 1)
@@ -8516,6 +8566,22 @@ def cmd_vigil(args):
         return
 
     if action == "add":
+        # Plain usage mistakes must be a clear error, not an AttributeError deep
+        # in build() (`id.strip()` on None). Validate the required inputs up front.
+        missing = []
+        if not (getattr(args, "id", None) or "").strip():
+            missing.append("id (positional, e.g. dispatch-q123)")
+        if not (getattr(args, "then", None) or "").strip():
+            missing.append("--then")
+        if not (getattr(args, "why", None) or "").strip():
+            missing.append("--why")
+        if not (getattr(args, "expires", None) or "").strip():
+            missing.append("--expires")
+        if missing:
+            print(f"ERROR: `court vigil add` needs: {', '.join(missing)}", file=sys.stderr)
+            print("Usage: court vigil add <id> --when <cond> [--when ...] --then <action> "
+                  "--why \"<reason>\" --expires <6h|ISO>", file=sys.stderr)
+            sys.exit(2)
         try:
             brief_path = _resolve_vigil_brief(repo, getattr(args, "brief", None) or "")
         except ValueError as e:
@@ -8618,9 +8684,7 @@ def cmd_enqueue(args):
     short = quest.id.split("-")[0].lower()
     vid = f"{action}-{short}"
     active = vigils.load_all(repo)
-    if any(v.get("id") == vid for v in active):
-        print(f"Already queued: {vid} (queued; the Night's Watch owns it)")
-        return
+    existing = next((v for v in active if v.get("id") == vid), None)
 
     now = vigils.now_utc()
     delay = vigils.parse_duration(getattr(args, "after", "0s") or "0s")
@@ -8642,6 +8706,30 @@ def cmd_enqueue(args):
     except vigils.VigilError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
+
+    if existing is not None:
+        # Re-running `enqueue` RESCHEDULES the existing entry in place. The old
+        # code ignored the new --after/--expires and printed "Already queued", so
+        # a Steward could not push out or correct a queued hand-off (it looked
+        # like it worked). Preserve fire history + creation time.
+        spec["fires"] = existing.get("fires") or []
+        spec["created_iso"] = existing.get("created_iso") or spec["created_iso"]
+        changed = (existing.get("when") != spec.get("when")
+                   or existing.get("expires_at") != spec.get("expires_at")
+                   or existing.get("brief") != spec.get("brief")
+                   or existing.get("reason") != spec.get("reason"))
+        p = vigils.save(repo, spec)
+        if not changed:
+            print(f"Already queued: {vid} (unchanged; the Night's Watch owns it)")
+            return
+        print(f"♻️  Rescheduled queued hand-off {vid}")
+        print(f"   when:    {' AND '.join(existing.get('when') or [])}  ->  {' AND '.join(spec['when'])}")
+        print(f"   expires: {existing.get('expires_at')}  ->  {spec['expires_at']}")
+        if brief_path:
+            print(f"   brief:   {brief_path}")
+        print(f"   file:    {p}")
+        return
+
     p = vigils.save(repo, spec)
     depth = len([v for v in active if str(v.get("then") or "").startswith(f"{action}:")])
     print(f"🧵 Queued for the Night's Watch: {quest.id} [{status}]")
@@ -9828,7 +9916,11 @@ def _ship_build_images(main_wt: Path, promoted_sha: str, records: list, dry_run:
     promoted commit), then replicate it into every member app whose registry
     namespace differs from the build namespace. Records every reference so the
     deploy stage -- and a later standalone `--stage deploy` re-run -- releases each
-    app from its OWN namespace."""
+    app from its OWN namespace.
+
+    ``failed`` reports only genuine *build* failures. The namespace copy is an
+    optional convenience: a member whose copy is skipped is simply released from
+    the shared build namespace, so replication never fails the run on its own."""
     refs: dict = {}
     failed = False
     for image_id in ship_deploy.images_for_records(records):
@@ -9861,11 +9953,20 @@ def _ship_build_images(main_wt: Path, promoted_sha: str, records: list, dry_run:
         # driver must not assume an app may pull another app's namespace, and the
         # fan-out is scoped to the apps actually being deployed -- tagging an app
         # that is not part of this release would fail on an app that is not there.
+        #
+        # The copy is an OPTIONAL convenience: if it cannot be made (docker down,
+        # tag/push failed) the member is released from the shared build namespace
+        # instead, and the app's own release is the signal if that pull is
+        # refused. Replication must never, on its own, fail a run whose releases
+        # all succeed -- that was the 2026-11-14 false-FAIL.
         deployed_apps = [rec["app"] for rec in records]
         for member in ship_deploy.namespace_members(image_id, main_wt, apps=deployed_apps):
             member_ref = ship_deploy.image_ref(image_id, main_wt, label, app_name=member)
             if not _ship_replicate_image(main_wt, ref, member_ref, member):
-                failed = True
+                print(
+                    f"   ↩️  replication into '{member}' skipped — released from the shared "
+                    f"build namespace ({ship_deploy.without_digest(ref)})."
+                )
                 continue
             ship_deploy.record_image_ref(main_wt, promoted_sha, image_id, member_ref, app_name=member)
             refs[(image_id, member)] = member_ref
@@ -9893,11 +9994,30 @@ def _ship_registry_auth(main_wt: Path, member_app: str) -> bool:
     res = _flyctl(argv, main_wt, 300)
     out = ((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")).strip()
     if not res.get("ok"):
-        print(f"❌ registry auth FAILED before pushing to '{member_app}' (exit {res.get('exit_code')})")
+        print(f"⚠️  registry auth FAILED before pushing to '{member_app}' (exit {res.get('exit_code')}) "
+              f"— the namespace copy is skipped.")
         print(_tail(out))
         return False
     print(f"   $ {' '.join(argv)}  ✅")
     return True
+
+
+def _ship_local_source_ref(main_wt: Path, source_ref: str) -> str:
+    """The local ref to ``docker tag`` from.
+
+    A build/push reports the image as ``<ref>@sha256:<digest>`` -- a registry
+    (manifest) reference the local daemon does not know by that exact name, so
+    tagging it fails with "No such image". Prefer the digest-free candidate the
+    daemon actually holds (``docker image inspect``), then the digest-free build
+    ref. Only the digest-qualified case needs the probe: a digest-free ref is
+    already the local tag form ``flyctl --push`` wrote."""
+    candidates = ship_deploy.source_ref_candidates(source_ref)
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else source_ref
+    for candidate in candidates:
+        if _flyctl(ship_deploy.docker_inspect_argv(candidate), main_wt, 60).get("ok"):
+            return candidate
+    return candidates[0]
 
 
 def _ship_replicate_image(main_wt: Path, source_ref: str, target_ref: str, member_app: str) -> bool:
@@ -9911,27 +10031,29 @@ def _ship_replicate_image(main_wt: Path, source_ref: str, target_ref: str, membe
     credential expires in ~9 minutes) and re-run once more if the push itself is
     rejected as unauthorized.
 
-    When Docker is unavailable the copy is skipped with a loud warning and the
-    shared reference is used instead, so an unverified cross-namespace pull can
-    never silently block a deploy; a Fly rejection of that pull is reported by the
-    release itself."""
+    Returns True only when the copy actually landed. This is an OPTIONAL
+    convenience step: a False (docker unavailable, tag/push failed) never fails
+    the run -- the caller releases the member from the shared build namespace
+    instead, and the app's own release is the signal if that pull is refused."""
     if not _docker_ready(main_wt):
         print(
             f"\n⚠️  REGISTRY: docker is unavailable (CLI missing, or the daemon is not "
-            f"running) — cannot copy the image into '{member_app}'s namespace. {member_app} "
-            f"will be released from the shared reference {source_ref} (cross-namespace "
-            f"pull). If Fly rejects that pull, start Docker and re-run "
+            f"running) — cannot copy the image into '{member_app}'s namespace. It will be "
+            f"released from the shared reference instead; if Fly rejects that "
+            f"cross-namespace pull, start Docker and re-run "
             f"`court ship --confirm --stage build`."
         )
-        return True
+        return False
 
     if not _ship_registry_auth(main_wt, member_app):
         return False
 
-    tag_argv = ship_deploy.docker_tag_argv(source_ref, target_ref)
+    source = _ship_local_source_ref(main_wt, source_ref)
+    tag_argv = ship_deploy.docker_tag_argv(source, target_ref)
     res = _flyctl(tag_argv, main_wt, 300)
     if not res.get("ok"):
-        print(f"❌ docker tag into '{member_app}' namespace FAILED (exit {res.get('exit_code')})")
+        print(f"⚠️  docker tag into '{member_app}' namespace FAILED (exit {res.get('exit_code')}) "
+              f"— the namespace copy is skipped.")
         print(_tail(((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")).strip()))
         return False
     print(f"   $ {' '.join(tag_argv)}")
@@ -9941,14 +10063,15 @@ def _ship_replicate_image(main_wt: Path, source_ref: str, target_ref: str, membe
     out = ((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")).strip()
     if not res.get("ok") and ship_deploy.looks_like_registry_auth_error(out):
         # The ~9-minute credential can expire mid-fan-out: authenticate again and
-        # retry the push once before failing the deploy.
+        # retry the push once before treating the copy as skipped.
         print(f"   ↩️  push to '{member_app}' was rejected as unauthorized — re-authenticating and retrying.")
         if not _ship_registry_auth(main_wt, member_app):
             return False
         res = _flyctl(push_argv, main_wt, 900)
         out = ((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")).strip()
     if not res.get("ok"):
-        print(f"❌ image copy into '{member_app}' namespace FAILED (exit {res.get('exit_code')})")
+        print(f"⚠️  image copy into '{member_app}' namespace FAILED (exit {res.get('exit_code')}) "
+              f"— the namespace copy is skipped.")
         print(_tail(out))
         return False
     print(f"   $ {' '.join(push_argv)}")
@@ -10098,9 +10221,15 @@ def _ship_deploy_apps(
 
 def _ship_resolve_deploy_plan(args, main_wt: Path) -> tuple[list, list]:
     """Resolve the selected fly apps to deploy records; surfaced before any
-    mutation so a manifest error never lands half a promotion."""
-    selection = getattr(args, "fly_app", None) or None
-    return ship_deploy.resolve_apps(main_wt, selection)
+    mutation so a manifest error never lands half a promotion. ``--fleet`` and
+    ``--fly-app`` compose into one selection (their union); with neither, every
+    app with a config in the repo root is targeted."""
+    selection, errors = ship_deploy.expand_selection(
+        getattr(args, "fly_app", None), getattr(args, "fleet", None)
+    )
+    if errors:
+        return [], errors
+    return ship_deploy.resolve_apps(main_wt, selection or None)
 
 
 def _ship_deploy_stages(args, main_wt: Path, base_branch: str, mutation_stages: list) -> int:
@@ -11232,28 +11361,29 @@ def build_parser():
 
     p_atelier = sub.add_parser(
         "atelier",
-        help="Royal UI Convoy Atelier: roll up UI-review-pending Quests into one Cog Ship, merge their branches pre-integration-test, and spawn the Court Artist on the merged (untested) branch",
+        help="Royal UI Atelier (default): merge Quests into the SINGLE standing studio — one long-lived merged worktree + dev server. Use --convoy for the legacy pre-collect Cog Ship convoy lane.",
     )
     add_quest_selector(p_atelier, batchable=True, filters=("status", "app", "epic"))
-    p_atelier.add_argument("--cogship", default=None, help="Existing Cog Ship ID to stamp (e.g. cogship-002); omit to allocate the next id")
-    p_atelier.add_argument("--base", default="castle", help="Base branch the convoy worktree is cut from (default: castle)")
+    p_atelier.add_argument("--convoy", action="store_true", help="Run the legacy pre-collect Cog Ship convoy lane instead of the standing atelier")
+    p_atelier.add_argument("--cogship", default=None, help="--convoy: existing Cog Ship ID to stamp (e.g. cogship-002); omit to allocate the next id")
+    p_atelier.add_argument("--base", default="castle", help="Base branch the worktree is cut from (default: castle)")
     p_atelier.add_argument("--model", default=None, help="Court Artist model override (default from .court/config.json models.artist)")
     p_atelier.add_argument("--provider", default=None, help="Court Artist provider override")
     p_atelier.add_argument("--port", type=int, help="Override worktree runserver port")
-    p_atelier.add_argument("--no-server", action="store_true", help="Skip starting the convoy dev server")
-    p_atelier.add_argument("--prompt-only", action="store_true", help="Print only the rendered convoy Court Artist prompt")
+    p_atelier.add_argument("--no-server", action="store_true", help="Skip starting the dev server")
+    p_atelier.add_argument("--prompt-only", action="store_true", help="--convoy: print only the rendered convoy Court Artist prompt")
     p_atelier.add_argument("--json", action="store_true", help="Output JSON format for scripts (spawn payload uses the unified Kilo CLI path)")
     p_atelier.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_atelier.add_argument(
         "--standing", action="store_true",
-        help="Stand up/attach the SINGLE standing atelier (one merged worktree + dev server) and merge "
-             "the selected Quests in — the single UI-review path",
+        help="(default) Stand up/attach the SINGLE standing atelier (one merged worktree + dev server) and "
+             "merge the selected Quests in — accepted alias for the default behaviour",
     )
-    p_atelier.add_argument("--branch", default=None, help="--standing: atelier branch override (default: artist/atelier)")
-    p_atelier.add_argument("--list", action="store_true", help="--standing: list atelier membership and per-Quest patronage state")
-    p_atelier.add_argument("--reap", action="store_true", help="--standing: tear down the standing atelier worktree (branch ref kept)")
-    p_atelier.add_argument("--standup", action="store_true", help="--standing: spawn the Court Artist session via Kilo CLI and record it")
-    p_atelier.add_argument("--force", action="store_true", help="--reap: remove the worktree even with Quests pending extraction")
+    p_atelier.add_argument("--branch", default=None, help="Standing atelier branch override (default: artist/atelier)")
+    p_atelier.add_argument("--list", action="store_true", help="List the standing atelier's membership and per-Quest patronage state")
+    p_atelier.add_argument("--reap", action="store_true", help="Tear down the standing atelier worktree (branch ref kept)")
+    p_atelier.add_argument("--standup", action="store_true", help="Spawn the Court Artist session via Kilo CLI and record it")
+    p_atelier.add_argument("--force", action="store_true", help="--reap: remove the worktree even with Quests pending extraction; --standing: merge despite a live artist turn")
     p_atelier.set_defaults(func=cmd_atelier)
 
     p_studio = sub.add_parser(
@@ -11340,6 +11470,7 @@ def build_parser():
     p_stamp.add_argument("--cogship", default=None, help="Existing Cog Ship ID to stamp (e.g. cogship-002); omit or pass 'new' to allocate the next id")
     p_stamp.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
     p_stamp.add_argument("--force", action="store_true", help="Allow re-stamping quests already stamped on another cogship (duplicate-convoy guard override)")
+    p_stamp.add_argument("--clear", action="store_true", help="Clear the cogship_id on the given Quests (detach a stale/dead convoy key) instead of assigning one")
     p_stamp.set_defaults(func=cmd_stamp)
 
     p_edict = sub.add_parser("edict", help="View or add royal edicts and strategic priorities")
@@ -11395,6 +11526,17 @@ def build_parser():
         choices=sorted(FLY_CONFIGS),
         metavar="{web,worker,worker-heavy,worker-light}",
         help="Fly app(s) to deploy (repeatable; default: all apps with a config in the repo root)",
+    )
+    p_ship.add_argument(
+        "--fleet",
+        action="append",
+        default=None,
+        choices=sorted(ship_deploy.FLY_FLEETS),
+        metavar="{web,worker,all}",
+        help="Deploy target group(s): named fleets of apps (repeatable; composes with --fly-app). "
+             "'worker' covers the standard, heavy and light worker apps; 'all' is every configured "
+             "app. With --stage build,deploy this scopes BOTH the image build and the release to "
+             "the fleet (a web-only fleet builds only the app image)",
     )
     p_ship.add_argument(
         "--drain-command", dest="drain_command", default=None,

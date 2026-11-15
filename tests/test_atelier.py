@@ -70,7 +70,7 @@ class TestAtelierGating(unittest.TestCase):
         mock_pack.return_value = ([pending], [])
 
         with patch("court.store.stamp_cogship", wraps=store.stamp_cogship) as mock_stamp:
-            rc = main(["atelier", "Q501-Web-Ui,Q502-Web-Ui,Q503-Web-Ui", "--port", "8123", "--no-server", "--no-commit"])
+            rc = main(["atelier", "Q501-Web-Ui,Q502-Web-Ui,Q503-Web-Ui", "--convoy", "--port", "8123", "--no-server", "--no-commit"])
             self.assertIn(rc, (0, None))
             self.assertTrue(mock_stamp.called)
             stamped_ids = [q.id for q in mock_stamp.call_args[0][0]]
@@ -90,7 +90,7 @@ class TestAtelierGating(unittest.TestCase):
         store.save(headless, court_root=self.court_dir, auto_commit=False)
 
         with patch("court.store.stamp_cogship") as mock_stamp:
-            rc = main(["atelier", "Q504-Core-Batch", "--no-commit"])
+            rc = main(["atelier", "Q504-Core-Batch", "--convoy", "--no-commit"])
             self.assertIn(rc, (0, None))
             self.assertFalse(mock_stamp.called)
 
@@ -131,7 +131,7 @@ class TestAtelierConvoyStandup(unittest.TestCase):
 
         rc = main([
             "atelier", "Q601-Web-Dash,Q602-Web-Nav",
-            "--port", "8123", "--no-server", "--json", "--no-commit",
+            "--convoy", "--port", "8123", "--no-server", "--json", "--no-commit",
         ])
         self.assertIn(rc, (0, None))
 
@@ -166,7 +166,7 @@ class TestAtelierConvoyStandup(unittest.TestCase):
             from contextlib import redirect_stdout
             buf = io.StringIO()
             with redirect_stdout(buf):
-                main(["atelier", "Q601-Web-Dash", "--port", "8123", "--no-server", "--prompt-only", "--no-commit"])
+                main(["atelier", "Q601-Web-Dash", "--convoy", "--port", "8123", "--no-server", "--prompt-only", "--no-commit"])
             prompt = buf.getvalue()
         self.assertIn("Addendum-Quests:", prompt)
         self.assertIn("Royal Addendum", prompt)
@@ -193,7 +193,7 @@ class TestAtelierConvoyStandup(unittest.TestCase):
         mock_pack.return_value = ([self.q1], [(self.q2.id, "CONFLICT (content): Merge conflict")])
 
         with patch("court.store.stamp_cogship", wraps=store.stamp_cogship) as mock_stamp:
-            rc = main(["atelier", "Q601-Web-Dash,Q602-Web-Nav", "--port", "8123", "--no-server", "--no-commit"])
+            rc = main(["atelier", "Q601-Web-Dash,Q602-Web-Nav", "--convoy", "--port", "8123", "--no-server", "--no-commit"])
             self.assertIn(rc, (0, None))
             self.assertTrue(mock_stamp.called)
 
@@ -261,6 +261,21 @@ class TestAtelierTemplates(unittest.TestCase):
 
     def test_cmd_atelier_registered(self):
         self.assertTrue(callable(cmd_atelier))
+
+
+class TestAtelierRouting(unittest.TestCase):
+    """`court atelier` (bare) is the standing studio; the convoy rides --convoy."""
+
+    def test_bare_atelier_defaults_to_standing(self):
+        with patch("court.cli.cmd_atelier_standing") as mock_standing:
+            main(["atelier", "Q999-Web-Ui", "--no-commit"])
+        self.assertTrue(mock_standing.called)
+
+    def test_convoy_flag_bypasses_standing(self):
+        with patch("court.cli.cmd_atelier_standing") as mock_standing, \
+             patch("court.cli.resolve_quest_selection", return_value=[]):
+            main(["atelier", "--convoy", "--no-commit"])
+        self.assertFalse(mock_standing.called)
 
 
 if __name__ == "__main__":

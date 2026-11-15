@@ -124,6 +124,80 @@ def test_unknown_fly_app_alias_is_refused(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Fleet targeting: a named fleet -> the app group it deploys
+# --------------------------------------------------------------------------
+
+def test_fleet_expands_to_its_app_group():
+    assert list(sd.FLY_FLEETS) == ["web", "worker", "all"]
+    assert sd.fleet_aliases("web") == ("web",)
+    assert sd.fleet_aliases("worker") == ("worker", "worker-heavy", "worker-light")
+    assert sd.fleet_aliases("nope") is None
+    # canonical order, de-duped, independent of the order the fleets were named
+    assert sd.expand_selection(fleets=["worker"]) == (["worker", "worker-heavy", "worker-light"], [])
+    assert sd.expand_selection(fleets=["all"]) == (
+        ["web", "worker", "worker-heavy", "worker-light"], []
+    )
+
+
+def test_fleet_composes_with_fly_app_as_a_union():
+    aliases, errors = sd.expand_selection(fly_apps=["web"], fleets=["worker"])
+    assert errors == []
+    assert aliases == ["web", "worker", "worker-heavy", "worker-light"]
+
+
+def test_unknown_fleet_is_refused():
+    aliases, errors = sd.expand_selection(fleets=["nope"])
+    assert aliases == []
+    assert any("unknown --fleet" in e for e in errors)
+
+
+def test_fleet_scopes_the_deploy_plan(tmp_path):
+    _write_all(tmp_path)
+    args = Namespace(fly_app=None, fleet=["web"])
+    records, errors = cli._ship_resolve_deploy_plan(args, tmp_path)
+    assert errors == []
+    assert [r["app"] for r in records] == ["pb-app-web"]
+    # a web-only fleet needs only the app image, so the science image is not built
+    assert sd.images_for_records(records) == ["app"]
+
+
+def test_worker_fleet_builds_both_images_and_releases_all_workers(tmp_path):
+    _write_all(tmp_path)
+    args = Namespace(fly_app=None, fleet=["worker"])
+    records, errors = cli._ship_resolve_deploy_plan(args, tmp_path)
+    assert errors == []
+    assert [r["app"] for r in records] == [
+        "pb-app-worker", "pb-app-worker-heavy", "pb-app-worker-light"
+    ]
+    assert sd.images_for_records(records) == ["app", "science"]
+
+
+def test_fleet_targets_only_that_fleet_for_build_and_release(tmp_path, monkeypatch):
+    """`--fleet web` builds only the app image and releases only pb-app-web."""
+    _write_all(tmp_path)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(cli, "_ship_promoted_sha", lambda wt, base: "c2356b213f00")
+    seen = []
+
+    def fake_flyctl(argv, cwd, timeout):
+        seen.append(argv)
+        return {"ok": True, "exit_code": 0,
+                "stdout": "registry.fly.io/pb-app-web:app-c2356b213f00 pushed\nReleased v7\n",
+                "stderr": ""}
+
+    monkeypatch.setattr(cli, "_flyctl", fake_flyctl)
+    args = Namespace(fly_app=None, fleet=["web"], no_drain=True, drain_command=None, dry_run=False)
+    rc = cli._ship_deploy_stages(args, tmp_path, "main", ["build", "deploy"])
+    assert rc == 0
+    # one build (the app image only), then one release (pb-app-web only)
+    assert sum(1 for a in seen if "--build-only" in a) == 1
+    deploys = [a for a in seen if "--image" in a]
+    assert len(deploys) == 1
+    assert "fly.toml" in deploys[0]  # the web app's config
+    assert not any("fly-worker" in " ".join(a) for a in deploys)
+
+
+# --------------------------------------------------------------------------
 # The science-image guard: no path releases it to pb-app-worker-light
 # --------------------------------------------------------------------------
 
@@ -324,7 +398,8 @@ def test_an_expired_credential_is_re_authed_and_the_push_retried(tmp_path, monke
 
 def test_a_dead_docker_daemon_falls_back_instead_of_failing_the_deploy(tmp_path, monkeypatch, capsys):
     """The docker CLI can be on PATH with no daemon answering (Docker Desktop
-    stopped): the fan-out must warn and use the shared ref, not withhold an
+    stopped): the fan-out must warn and report "not copied" (so the caller
+    releases the app from the shared ref) rather than withholding an
     otherwise-fine release."""
     calls = []
 
@@ -337,8 +412,8 @@ def test_a_dead_docker_daemon_falls_back_instead_of_failing_the_deploy(tmp_path,
 
     monkeypatch.setattr(cli, "_flyctl", fake)
     monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/docker")
-    ok = cli._ship_replicate_image(tmp_path, "src", "dst", "pb-app-worker-light")
-    assert ok is True
+    copied = cli._ship_replicate_image(tmp_path, "src", "dst", "pb-app-worker-light")
+    assert copied is False, "a skipped copy must report False so the caller falls back to the shared ref"
     out = capsys.readouterr().out
     assert "docker is unavailable" in out and "cross-namespace" in out
     assert calls == [["docker", "info"]]
@@ -639,6 +714,124 @@ def test_a_failed_image_build_fails_the_command(tmp_path, monkeypatch, capsys):
 
 
 # --------------------------------------------------------------------------
+# Namespace replication is OPTIONAL: a skipped copy must never fail the run
+# --------------------------------------------------------------------------
+
+def test_without_digest_strips_only_a_trailing_manifest_digest():
+    digest = "@sha256:" + "a" * 64
+    assert sd.without_digest("registry.fly.io/pb-app-web:app-x" + digest) == (
+        "registry.fly.io/pb-app-web:app-x"
+    )
+    assert sd.without_digest("registry.fly.io/pb-app-web:app-x") == (
+        "registry.fly.io/pb-app-web:app-x"
+    )
+    assert sd.without_digest("") == ""
+    assert sd.source_ref_candidates("registry.fly.io/pb-app-web:app-x" + digest) == [
+        "registry.fly.io/pb-app-web:app-x", "registry.fly.io/pb-app-web:app-x" + digest,
+    ]
+    # a digest-free ref is already the local tag form: a single candidate, no probe
+    assert sd.source_ref_candidates("registry.fly.io/pb-app-web:app-x") == [
+        "registry.fly.io/pb-app-web:app-x"
+    ]
+    assert sd.docker_inspect_argv("registry.fly.io/pb-app-web:app-x") == [
+        "docker", "image", "inspect", "registry.fly.io/pb-app-web:app-x"
+    ]
+
+
+def test_tag_uses_the_digest_free_local_ref(tmp_path, monkeypatch):
+    """flyctl reports the pushed image with a `@sha256:` manifest digest, which the
+    local daemon does not know by that name; the tag must copy from the digest-free
+    tag the daemon actually holds (the root cause of the 2026-11-14 false-FAIL)."""
+    digest = "@sha256:" + "c" * 64
+    source = "registry.fly.io/pb-app-web:app-x" + digest
+    calls = []
+
+    def fake(argv, cwd, timeout):
+        calls.append(list(argv))
+        if argv[:2] == ["docker", "info"]:
+            return {"ok": True, "exit_code": 0, "stdout": "ok", "stderr": ""}
+        if argv[:3] == ["flyctl", "auth", "docker"]:
+            return {"ok": True, "exit_code": 0, "stdout": "ok", "stderr": ""}
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return {"ok": argv[3] == "registry.fly.io/pb-app-web:app-x",
+                    "exit_code": 0, "stdout": "[]", "stderr": ""}
+        return {"ok": True, "exit_code": 0, "stdout": "pushed", "stderr": ""}
+
+    monkeypatch.setattr(cli, "_flyctl", fake)
+    copied = cli._ship_replicate_image(
+        tmp_path, source, "registry.fly.io/pb-app-worker-light:app-x", "pb-app-worker-light")
+    assert copied is True
+    tag = [c for c in calls if c[:2] == ["docker", "tag"]]
+    assert tag and tag[0][2] == "registry.fly.io/pb-app-web:app-x", (
+        "docker tag must copy from the digest-free local ref, not the manifest ref"
+    )
+
+
+def test_replication_failure_does_not_fail_a_successful_release(tmp_path, monkeypatch, capsys):
+    """The key regression: tag/replicate fails, EVERY release succeeds -> exit 0
+    and the driver says why the copy was skipped (no contradicting ❌)."""
+    _write_all(tmp_path)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(cli, "_ship_promoted_sha", lambda wt, base: "c2356b213f00")
+    digest = "@sha256:" + "d" * 64
+
+    def fake(argv, cwd, timeout):
+        if argv[:2] == ["docker", "info"]:
+            return {"ok": True, "exit_code": 0, "stdout": "ok", "stderr": ""}
+        if argv[:3] == ["flyctl", "auth", "docker"]:
+            return {"ok": True, "exit_code": 0, "stdout": "auth ok", "stderr": ""}
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return {"ok": False, "exit_code": 1, "stdout": "", "stderr": "No such image"}
+        if argv[:2] == ["docker", "tag"]:
+            return {"ok": False, "exit_code": 1, "stdout": "",
+                    "stderr": f"Error response from daemon: No such image: {argv[2]}"}
+        if "--build-only" in argv:
+            app = "pb-app-web" if "fly.toml" in argv else "pb-app-worker"
+            label = argv[argv.index("--image-label") + 1]
+            return {"ok": True, "exit_code": 0,
+                    "stdout": f"registry.fly.io/{app}:{label}{digest} pushed", "stderr": ""}
+        if "--image" in argv:
+            return {"ok": True, "exit_code": 0, "stdout": "Released v100\n", "stderr": ""}
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    monkeypatch.setattr(cli, "_flyctl", fake)
+    args = Namespace(fly_app=None, fleet=None, no_drain=True, drain_command=None, dry_run=False)
+    rc = cli._ship_deploy_stages(args, tmp_path, "main", ["build", "deploy"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "replication into 'pb-app-worker-light' skipped" in out
+    assert "released from the shared build namespace" in out
+    assert "release FAILED" not in out
+
+
+def test_a_genuine_release_failure_still_exits_nonzero(tmp_path, monkeypatch, capsys):
+    """The non-zero contract for a real failure is unchanged by the optional-copy fix."""
+    _write_all(tmp_path)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(cli, "_ship_promoted_sha", lambda wt, base: "c2356b213f00")
+
+    def fake(argv, cwd, timeout):
+        if argv[:2] == ["docker", "info"]:
+            return {"ok": True, "exit_code": 0, "stdout": "ok", "stderr": ""}
+        if argv[:3] == ["flyctl", "auth", "docker"]:
+            return {"ok": True, "exit_code": 0, "stdout": "ok", "stderr": ""}
+        if argv[:2] == ["docker", "tag"]:
+            return {"ok": False, "exit_code": 1, "stdout": "", "stderr": "No such image"}
+        if "--build-only" in argv:
+            return {"ok": True, "exit_code": 0,
+                    "stdout": "registry.fly.io/pb-app-web:app-x pushed", "stderr": ""}
+        if "--image" in argv:
+            return {"ok": False, "exit_code": 1, "stdout": "", "stderr": "boom"}
+        return {"ok": True, "exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(cli, "_flyctl", fake)
+    args = Namespace(fly_app=None, fleet=None, no_drain=True, drain_command=None, dry_run=False)
+    rc = cli._ship_deploy_stages(args, tmp_path, "main", ["build", "deploy"])
+    assert rc == 1
+    assert "release FAILED" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
 # End-to-end dry-run rehearsal (no flyctl, no mutations)
 # --------------------------------------------------------------------------
 
@@ -692,3 +885,44 @@ def test_dry_run_rehearses_both_images_and_all_four_apps(tmp_path, monkeypatch, 
     # the app image ref is used for web + worker-light; the science ref for the two workers
     assert out.count("registry.fly.io/pb-app-web:app-") == 2
     assert out.count("registry.fly.io/pb-app-worker:science-") == 2
+
+
+def test_tag_failure_with_all_releases_succeeding_reports_released(tmp_path, monkeypatch, capsys):
+    """End-to-end verdict (the 2026-11-14 false-FAIL): replication is skipped but
+    all four apps release, so the final line says RELEASED, not FAILED, and the
+    command exits 0."""
+    _origin, repo = _repo(tmp_path)
+    _write_all(repo)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "fly configs")
+    _git(repo, "push", "origin", "main")
+    monkeypatch.setattr(cli, "_ship_find_main_checkout", lambda base: repo)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    digest = "@sha256:" + "e" * 64
+
+    def fake(argv, cwd, timeout):
+        if argv[:2] == ["docker", "info"]:
+            return {"ok": True, "exit_code": 0, "stdout": "ok", "stderr": ""}
+        if argv[:3] == ["flyctl", "auth", "docker"]:
+            return {"ok": True, "exit_code": 0, "stdout": "auth ok", "stderr": ""}
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return {"ok": False, "exit_code": 1, "stdout": "", "stderr": "No such image"}
+        if argv[:2] == ["docker", "tag"]:
+            return {"ok": False, "exit_code": 1, "stdout": "", "stderr": "No such image"}
+        if "--build-only" in argv:
+            app = "pb-app-web" if "fly.toml" in argv else "pb-app-worker"
+            label = argv[argv.index("--image-label") + 1]
+            return {"ok": True, "exit_code": 0,
+                    "stdout": f"registry.fly.io/{app}:{label}{digest} pushed", "stderr": ""}
+        if "--image" in argv:
+            return {"ok": True, "exit_code": 0, "stdout": "Released v7\n", "stderr": ""}
+        return {"ok": True, "exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(cli, "_flyctl", fake)
+    args = Namespace(dry_run=False, fly_app=None, fleet=None, no_drain=True,
+                     drain_command=None, deploy=True)
+    rc = cli._execute_ship_deployment(args, "main", "castle", quests=[], stages=["build", "deploy"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "released to Fly" in out
+    assert "Fly build/deploy FAILED" not in out

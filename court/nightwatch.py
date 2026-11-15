@@ -20,6 +20,10 @@ Scope of authority (deliberately narrow):
     `castle`                               castle before a spawn; zero agent turns)
   * GATE + no live/recorded Gatekeeper  -> `collect --standup` (a PENDING UI
                                            review is escalated, never collected)
+  * GATE + UI review PENDING            -> `atelier` (opt-in `--enable ...,atelier`):
+                                           merge the Quest into the ONE standing
+                                           studio for review; a live artist turn
+                                           defers the merge (single-writer)
   * PLANNED/CHARTERED/DISPATCHED        -> report only (dispatching new work is a
                                            Steward judgment call, not a timer —
                                            the one exception is a bounded
@@ -185,6 +189,23 @@ DEFAULT_COLLECT_MIN_BATCH = 2
 DEFAULT_COLLECT_BATCH_WINDOW = 30 * 60
 DEFAULT_COLLECT_BATCH_MAX = 6
 DEFAULT_REGATE_BATCH_MAX = 4
+# A GATE Quest can keep a recorded Gatekeeper session from a shipment whose
+# worker is gone. When the convoy was NOT promoted that stamp is a
+# duplicate-Gatekeeper guard — but a dead one. Park it for a human only until
+# this expiry, then the watch clears the stale stamp itself and lets the Quest
+# re-pack. Without this the hold is permanent: one misclassified Quest starves
+# the cohort (and the 30-minute window fires a singleton) forever.
+DEFAULT_STALE_GATEKEEPER_EXPIRY = 30 * 60
+# Standing-atelier merge-in. UI-review-pending GATE Quests cannot be packed
+# (`court collect` refuses them), so without a driver they pile up until a human
+# merges them into the ONE long-lived studio by hand. The watch feeds the studio
+# mechanically: `court atelier --standing <ids>` is a local git merge + server
+# ensure, NEVER a reasoning worker, so it is a LOCAL action that consumes no
+# worker slot. Single-writer: a live artist turn in the atelier worktree refuses
+# the merge (the guard lives inside `court atelier`), so the lane stands down and
+# retries when the artist is idle. Opt-in (`--enable ...,atelier`).
+DEFAULT_ATELIER_COOLDOWN = 30 * 60
+DEFAULT_ATELIER_BATCH_MAX = 6
 DEFAULT_PG_PRUNE_INTERVAL = 6 * 60 * 60
 # A charter request is intent from the Pleasance lane; one bounded Steward turn
 # authors the charter (and allocates the Quest number, which the requester
@@ -213,7 +234,8 @@ STALL_THRESHOLDS = {
 }
 
 ENABLED_ACTIONS = ("goad", "coin", "collect", "dispatch", "steward", "charter",
-                   "raze", "regate", "teardown", "rebase", "prune", "pgprune")
+                   "raze", "regate", "teardown", "rebase", "prune", "pgprune",
+                   "atelier")
 
 # A board is only "live" while at least one Quest is in a pre-terminal stage.
 # Statuses the watch can move mechanically are excluded from the `steward`
@@ -224,6 +246,13 @@ ACTIVE_STAGES = (
     "TRIBUTE_READY", "GATE", "READY_TO_RAZE",
 )
 STEWARD_ONLY_STAGES = ("PLANNED", "CHARTERED", "DISPATCHED", "READY_TO_RAZE")
+
+# A Quest in one of these states can never be "blocking a spawn": it is shipped
+# (DONE) or already promoted onto the trunk awaiting teardown (READY_TO_RAZE). A
+# merge_conflict marker for such a Quest is stale -- the marker only clears on a
+# later successful rebase/coin, so without pruning it persists forever and buries
+# the live blockers (the 2026-11-14 report: 31 conflicts listed, ~23 stale).
+CONFLICT_TERMINAL_STATUSES = ("DONE", "READY_TO_RAZE", "LANDED", "LAUNCHED")
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +307,12 @@ class Policy:
     collect_min_batch: int = DEFAULT_COLLECT_MIN_BATCH
     collect_batch_window: int = DEFAULT_COLLECT_BATCH_WINDOW
     collect_batch_max: int = DEFAULT_COLLECT_BATCH_MAX
+    # How long a GATE Quest may hold a dead Gatekeeper session stamp (convoy not
+    # promoted, no live worker) before the watch clears it and re-packs.
+    stale_gatekeeper_expiry: int = DEFAULT_STALE_GATEKEEPER_EXPIRY
     regate_batch_max: int = DEFAULT_REGATE_BATCH_MAX
+    atelier_cooldown: int = DEFAULT_ATELIER_COOLDOWN
+    atelier_batch_max: int = DEFAULT_ATELIER_BATCH_MAX
     pg_prune_interval: int = DEFAULT_PG_PRUNE_INTERVAL
     max_charter_fails: int = DEFAULT_MAX_CHARTER_FAILS
     charter_cooldown: int = DEFAULT_CHARTER_COOLDOWN
@@ -688,8 +722,10 @@ def _vigil_verb(spec: dict) -> str:
 # Action kinds that run LOCAL git / bookkeeping only — they start no worker, so
 # they must not be bounded by the per-tick WORKER cap nor charged against the
 # hourly SPAWN budget. `rebase` and `advance` arrive as non-spawning vigils;
-# `raze`, `teardown`, `prune` and `pgprune` are mechanical housekeeping.
-LOCAL_ACTION_KINDS = frozenset({"rebase", "advance", "note", "raze", "teardown", "prune", "pgprune"})
+# `raze`, `teardown`, `prune`, `pgprune` are mechanical housekeeping; `atelier`
+# is a local git merge + server ensure into the standing studio.
+LOCAL_ACTION_KINDS = frozenset({"rebase", "advance", "note", "raze", "teardown",
+                                "prune", "pgprune", "atelier", "cleargate"})
 
 
 def _action_spawns(action: "Action") -> bool:
@@ -701,6 +737,18 @@ def _action_spawns(action: "Action") -> bool:
     if action.kind == "vigil":
         return bool(action.meta.get("spawns", True))
     return action.kind not in LOCAL_ACTION_KINDS
+
+
+def _journal_action_spawns(action: dict) -> bool:
+    """Whether a journalled action (its serialized `__dict__`) started a worker.
+
+    Mirrors `_action_spawns` but reads the JSON shape, so the digest can count
+    REAL spawns instead of the once-per-boot `start` rows (which made the old
+    "0 starts" line read as "the watch spawned nothing")."""
+    kind = str(action.get("kind") or "")
+    if kind == "vigil":
+        return bool((action.get("meta") or {}).get("spawns", True))
+    return kind not in LOCAL_ACTION_KINDS
 
 
 # The pipeline's in-flight exit path. A Gatekeeper convoy (collect) and a Master
@@ -733,6 +781,30 @@ def _drain_pending(quests: dict) -> bool:
         if (q.get("status") or "").upper() in ("GATE", "TRIBUTE_READY") and not q.get("pending_audience"):
             return True
     return False
+
+
+def _gate_cohort_short(quests: dict, policy: "Policy") -> bool:
+    """Whether the gate holds fewer packable Quests than a full convoy.
+
+    A convoy packs up to ``collect_batch_max`` Quests, but `court collect` will
+    not pack a full ship until the gate holds that many — below it, the cohort
+    waits out ``collect_batch_window`` and packs short. So while the gate is
+    short, the coin lane (TRIBUTE_READY -> GATE) is the binding constraint on
+    convoy fullness and must outrank the new-work/repair lanes (goad/dispatch).
+    A cap of 1 means convoys are singletons — nothing to fill — so the gate is
+    never treated as short. A parked (pending-Audience) Quest is M'Lord's, not
+    packable tribute, and does not count toward a full ship."""
+    cap = int(policy.collect_batch_max or 0)
+    if cap <= 1:
+        return False
+    count = 0
+    for q in quests.values():
+        if (q.get("status") or "").upper() != "GATE" or q.get("pending_audience"):
+            continue
+        count += 1
+        if count >= cap:
+            return False
+    return True
 
 
 def _quest_map(snap: dict) -> dict:
@@ -783,6 +855,67 @@ def _collect_cohort_ready(ids: list, qstate: dict, policy: "Policy", now: float)
         if since and (now - float(since)) >= window:
             return True
     return False
+
+
+def _norm_cogship(value: str) -> str:
+    """Canonical ``cogship-NNN`` form (tolerates ``Cogship-606``, a branch name)."""
+    try:
+        from . import convoy_guard
+        return convoy_guard.normalize_cogship_id(value)
+    except Exception:  # noqa: BLE001 — normalize must never kill planning
+        return (value or "").strip()
+
+
+def _promoted_cogships(repo: Optional[Path], candidates=None) -> set:
+    """Cogship ids whose convoy has already been promoted onto the trunk.
+
+    The convoy re-ship decision must key on the CONVOY's state, not the per-Quest
+    ``cogship_promoted_commit`` field: that field is written inconsistently and is
+    often left empty even after the cargo shipped (the 2026-11-14 Q1460 case —
+    cogship-606 reads ``promoted_at`` while Q1460's field was blank), so a
+    genuinely re-shippable Quest was parked as a ``stale_gatekeeper`` hold and the
+    cohort collapsed to a singleton.
+
+    Read-only and cheap. Sources: the convoy lifecycle record's ``promoted_at`` /
+    ``promoted_commit`` (``.court/convoys/<cogship>.json``), plus — for the
+    candidate cogships actually in play — the convoy branch already being an
+    ancestor of the trunk.
+    """
+    if repo is None:
+        return set()
+    promoted: set = set()
+    convoy_dir = Path(repo) / ".court" / "convoys"
+    try:
+        if convoy_dir.is_dir():
+            for path in convoy_dir.glob("cogship-*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                cid = _norm_cogship(payload.get("cogship_id") or path.stem)
+                if cid and (payload.get("promoted_at") or payload.get("promoted_commit")):
+                    promoted.add(cid)
+    except Exception:  # noqa: BLE001 — observation must never kill a tick
+        pass
+    # A convoy whose branch is already merged into the trunk is promoted even if
+    # its record lacks the stamp. Bounded to the candidates plan actually cares
+    # about, so this never walks every branch.
+    for cog in {_norm_cogship(c) for c in (candidates or []) if c} - promoted:
+        if not cog:
+            continue
+        branch = f"the-gatehouse/{cog}"
+        try:
+            res = subprocess.run(
+                ["git", "-C", str(repo), "merge-base", "--is-ancestor", branch, "castle"],
+                capture_output=True, timeout=30,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if res.returncode == 0:
+            promoted.add(cog)
+    return promoted
 
 
 def _failure_backoff(base: float, fails: int, cap: Optional[float] = None) -> float:
@@ -844,7 +977,10 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
          ready_vigils: Optional[list] = None, charter_ready: Optional[list] = None,
          raze_regate: Optional[list] = None,
          charter_requests: Optional[list] = None,
-         ui_mandate_ids: Optional[list] = None) -> tuple[list, list]:
+         ui_mandate_ids: Optional[list] = None,
+         atelier_ready: Optional[list] = None, atelier_blocked: bool = False,
+         ui_pending_ids: Optional[list] = None,
+         promoted_cogships: Optional[list] = None) -> tuple[list, list]:
     """Decide this tick's actions. Returns (actions, notes).
 
     Pure function: no I/O beyond the already-collected inputs, so the policy
@@ -852,6 +988,13 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
     now = time.time() if now is None else now
     quests = _quest_map(snap)
     ui_mandate_ids = set(ui_mandate_ids or [])
+    promoted_cogships = {_norm_cogship(c) for c in (promoted_cogships or []) if c}
+    atelier_ready = list(atelier_ready or [])
+    ui_pending_set = set(ui_pending_ids or [])
+    # Whether the gate is short of a full convoy this tick. When it is, the coin
+    # lane outranks goad/dispatch so each gatehouse can pack full (see the lane
+    # ordering at the per-tick budget below).
+    gate_short = _gate_cohort_short(quests, policy)
     # Read-only views: plan is pure, so bookkeeping lands in tick().
     qstate = state.get("quests") or {}
     convoys = state.get("convoys") or {}
@@ -1099,12 +1242,22 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                  "--note \"<where said>\"`)",
                  key="ui_mandate_gate")
             continue
+        if q["id"] in ui_pending_set:
+            # UI-review-pending cannot be packed (`court collect` refuses it).
+            # The standing atelier lane below merges it for review; here we just
+            # stop offering it to collect so it does not churn a doomed no-op
+            # pack every tick.
+            note(q["id"], "report",
+                 "GATE with UI review PENDING — not collectable; the standing atelier merges it "
+                 "for review (merge lane: `--enable ...,atelier`, or `court atelier <ids>` by hand)",
+                 key="atelier_pending")
+            continue
         role = role_state(q.get("worktree"), "gatekeeper")
         if role["state"] in ("live", "stalled", "watching"):
             continue
         recorded = (q.get("gatekeeper_session_id") or "").strip()
         if recorded:
-            promoted = (q.get("cogship_promoted_commit") or "").strip()
+            cog = (q.get("cogship_id") or "").strip()
             try:
                 ahead = int((q.get("git_status") or {}).get("ahead"))
             except (TypeError, ValueError):
@@ -1113,13 +1266,21 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
             # Quest keeps the old Gatekeeper session (and cogship id) while new
             # work lands on its branch. When that work reaches GATE again, the
             # recorded session belongs to the FINISHED shipment — it is not a
-            # duplicate-Gatekeeper risk, so pack a fresh convoy. Only a GATE
-            # Quest carrying a recorded session with no verified prior shipment,
-            # or whose branch is already fully merged, needs a human.
+            # duplicate-Gatekeeper risk, so pack a fresh convoy.
+            #
+            # The promotion is read from the CONVOY's state (resolved from the
+            # Quest's cogship_id), NOT from the per-Quest `cogship_promoted_commit`
+            # field: that field is written inconsistently, so keying on it alone
+            # parked genuinely re-shippable Quests as stale and collapsed the
+            # cohort to a singleton (the 2026-11-14 false-stale run).
+            promoted = bool(
+                (q.get("cogship_promoted_commit") or "").strip()
+                or (cog and _norm_cogship(cog) in promoted_cogships)
+            )
             if promoted and ahead is not None and ahead > 0:
                 note(q["id"], "report",
                      f"GATE carries Gatekeeper {recorded} from the previous shipment "
-                     f"({q.get('cogship_id') or 'prior convoy'}), but {ahead} commit(s) are not "
+                     f"({cog or 'prior convoy'}), but {ahead} commit(s) are not "
                      f"in castle — re-shipping in a fresh convoy",
                      key="reship_gate")
             elif promoted and ahead == 0:
@@ -1130,10 +1291,30 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                      key="gate_merged_stuck")
                 continue
             else:
-                note(q["id"], "human",
-                     f"GATE with recorded Gatekeeper {recorded} but no live worker — "
-                     f"triage by hand (regate or clear the session stamp)",
-                     key="stale_gatekeeper")
+                # No verified prior shipment and no live worker: the recorded
+                # session is dead. Park it for a human only until the expiry,
+                # then clear the dead stamp so the Quest can re-pack — otherwise
+                # this hold is permanent and starves the cohort.
+                since = float((qstate.get(q["id"]) or {}).get("stale_gatekeeper_since") or 0)
+                expiry = float(getattr(policy, "stale_gatekeeper_expiry",
+                                       DEFAULT_STALE_GATEKEEPER_EXPIRY) or 0)
+                if since and (now - since) >= expiry:
+                    note(q["id"], "report",
+                         f"GATE with dead Gatekeeper {recorded} and no live worker for "
+                         f"{_fmt_window(now - since)} — clearing the stale session stamp so the "
+                         f"Quest can re-pack in a fresh convoy",
+                         key="stale_gatekeeper_cleared")
+                    actions.append(Action(
+                        kind="cleargate", quest_ids=[q["id"]],
+                        reason=(f"clear dead Gatekeeper session stamp {recorded} on {q['id']} "
+                                f"(no live worker; convoy {cog or 'unpromoted'} not promoted)"),
+                        meta={"retry_backoff": policy.retry_backoff}))
+                else:
+                    note(q["id"], "human",
+                         f"GATE with recorded Gatekeeper {recorded} but no live worker — "
+                         f"triage by hand (regate or clear the session stamp); the watch clears the "
+                         f"dead stamp automatically after {_fmt_window(expiry)}",
+                         key="stale_gatekeeper")
                 continue
         cog = q.get("cogship_id") or ""
         key = cog or "new"
@@ -1244,6 +1425,51 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
         capacity -= 1
         if len(batch) > 1:
             gatehouse_slot -= 1
+
+    # --- Standing atelier: merge UI-review-pending Quests into the studio ----
+    # A UI-review-pending GATE Quest is not collectable; it belongs in the ONE
+    # long-lived merged studio. `court atelier --standing <ids>` is a local git
+    # merge + server ensure (no reasoning worker), so this is a LOCAL action. The
+    # single-writer guard inside the command refuses a merge while an artist turn
+    # is live, so when one is live we stand down and retry when it is idle.
+    # Opt-in (`--enable ...,atelier`); otherwise we only report the standing
+    # cohort with the exact manual command.
+    if atelier_ready:
+        if not policy.allows("atelier"):
+            note(",".join(atelier_ready[:3]), "report",
+                 f"{len(atelier_ready)} UI-review-pending Quest(s) ready for the standing atelier — "
+                 f"merge lane disabled (`--enable ...,atelier`), or merge by hand: "
+                 f"`court atelier {','.join(atelier_ready)}`",
+                 key="atelier_disabled")
+        elif atelier_blocked:
+            note(",".join(atelier_ready[:3]), "wait",
+                 "artist turn is live in the standing atelier — not merging new Quests into the "
+                 "merged view (single-writer); the merge follows when the artist is idle",
+                 key="atelier_artist_live")
+        else:
+            eligible = []
+            for qid in atelier_ready:
+                st = qstate.get(qid) or {}
+                if now < float(st.get("atelier_retry_at") or 0):
+                    continue
+                if _within(st.get("last_atelier_ts"), policy.atelier_cooldown, now):
+                    continue
+                eligible.append(qid)
+            batch = eligible
+            if policy.atelier_batch_max:
+                size = max(1, int(policy.atelier_batch_max))
+                batch = eligible[:size]
+                if len(eligible) > size:
+                    note(",".join(eligible[size:]), "wait",
+                         f"{len(eligible) - size} UI Quest(s) held for the next atelier merge tick "
+                         f"(batch cap {size})", key="atelier_remainder")
+            if batch:
+                actions.append(Action(
+                    kind="atelier", quest_ids=batch,
+                    reason=(f"{len(batch)} UI-review-pending Quest(s) merged into the standing "
+                            f"atelier for review"),
+                    meta={"retry_backoff": policy.retry_backoff,
+                          "cooldown": policy.atelier_cooldown}))
 
     # --- Dead gatehouse sweep (independent of any GATE Quest) ---------------
     # A dead `the-gatehouse/*` worktree blocks future collects whose allocated
@@ -1527,6 +1753,15 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                             + (f" (+{len(conflict_quests) - 3} more)" if len(conflict_quests) > 3 else "")
                             + f" in: {', '.join(files)[:240]} — Steward picks the resolution course"),
                     meta={"retry_backoff": policy.retry_backoff, "merge_conflict": True}))
+                # Persist the escalation in the one-shot `notified` bookkeeping so
+                # "escalated once" is actually recorded (the marker's
+                # `escalated_ts` is stamped on muster SUCCESS; this records the
+                # decision to escalate even if the muster is deferred). Without a
+                # note the conflict path left no trace in `notified` at all.
+                note(",".join(qid for qid, _ in conflict_quests[:3]), "wait",
+                     f"mustering a Steward for {len(conflict_quests)} merge-conflict blocker(s) "
+                     f"— need a resolution course",
+                     key="merge_conflict_escalation")
                 capacity -= 1
 
     # --- Last resort: muster ONE Steward triage session ---------------------
@@ -1714,9 +1949,22 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
     _queues: dict = {}
     for _i in _spawn_slots:
         _queues.setdefault(_spawn_class(actions[_i]), []).append(_i)
-    _lanes = sorted(_queues, key=lambda _c: (0 if _c in DRAIN_KINDS else 1, _c))
+    # Gate-short precedence: while the gate holds fewer packable Quests than a
+    # full convoy, the coin lane (TRIBUTE_READY -> GATE) is the binding
+    # constraint on convoy fullness, so it takes strict precedence over the
+    # new-work/repair lanes (goad/dispatch): it leads every tick and the fairness
+    # rotation is suspended until either the gate fills or the coin lane empties.
+    # Every other tick the drain bias and rotation are unchanged.
+    _coin_priority = gate_short and "coin" in _queues
+    _lanes = sorted(
+        _queues,
+        key=lambda _c: (
+            -1 if (_coin_priority and _c == "coin") else (0 if _c in DRAIN_KINDS else 1),
+            _c,
+        ),
+    )
     _rotation = int(state.get("spawn_rotation") or 0)
-    if len(_lanes) > 1:
+    if len(_lanes) > 1 and not _coin_priority:
         _shift = _rotation % len(_lanes)
         _lanes = _lanes[_shift:] + _lanes[:_shift]
     _kept: set = set()
@@ -1796,6 +2044,40 @@ def _prune_spawns(state: dict, now: float) -> list:
     spawns = [float(t) for t in state.get("spawns", []) if (now - float(t)) < 3600]
     state["spawns"] = spawns
     return spawns
+
+
+def _execute_cleargate(repo: Path, action: Action, timeout: int = 60) -> dict:
+    """Clear a dead Gatekeeper session stamp on a GATE Quest so it can re-pack.
+
+    The stamp is a duplicate-Gatekeeper guard, but when the worker is gone and
+    the convoy was never promoted it strands the Quest: plan() holds it forever
+    (the "stale_gatekeeper" dead end). After `stale_gatekeeper_expiry` the watch
+    clears the dead stamp itself. Bounded to the named Quests; clears only the
+    session/model stamps, never the branch or cogship id.
+    """
+    try:
+        from . import store
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "exit": -1, "argv": [], "stdout_tail": "",
+                "stderr_tail": f"store unavailable: {e}", "seconds": 0.0}
+    started = time.time()
+    cleared: list = []
+    errors: list = []
+    for qid in action.quest_ids:
+        try:
+            quest = store.load(qid, court_root=Path(repo) / ".court")
+            quest.gatekeeper_session_id = ""
+            quest.gatekeeper_model = ""
+            store.save(quest, auto_commit=True,
+                       commit_msg=f"court: clear dead Gatekeeper session on {qid}")
+            cleared.append(qid)
+        except Exception as e:  # noqa: BLE001 — one bad Quest must not stop the rest
+            errors.append(f"{qid}: {e}")
+    ok = not errors
+    return {"ok": ok, "exit": 0 if ok else 1, "argv": [],
+            "stdout_tail": "cleared dead Gatekeeper stamp on " + ", ".join(cleared) if cleared else "",
+            "stderr_tail": "; ".join(errors)[:500],
+            "seconds": round(time.time() - started, 1)}
 
 
 def _execute_teardown(repo: Path, action: Action, timeout: int = 120) -> dict:
@@ -1958,6 +2240,8 @@ def _execute_pgprune(repo: Path, action: Action, timeout: int = PRUNE_TIMEOUT) -
 def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -> dict:
     if action.kind == "teardown":
         return _execute_teardown(repo, action)
+    if action.kind == "cleargate":
+        return _execute_cleargate(repo, action)
     if action.kind == "prune":
         return _execute_prune(repo, action)
     if action.kind == "pgprune":
@@ -2004,6 +2288,11 @@ def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -
         # One bounded triage session on the trunk. The reason is forwarded so
         # the Steward's prompt names the exact stall the watch observed.
         argv = ["muster", "--why", action.reason or "board stale"]
+    elif action.kind == "atelier":
+        # Merge the batch into the ONE standing atelier (local git + server
+        # ensure). `--standing` is the default; pass it explicitly so an engine
+        # copy that predates the default flip still lands in the studio.
+        argv = ["atelier", ",".join(action.quest_ids), "--standing"]
     else:
         argv = [action.kind, *action.quest_ids]
     if action.kind == "goad" and action.meta.get("mode"):
@@ -2085,6 +2374,9 @@ _MERGE_CONFLICT_RE = re.compile(r"cannot spawn — `git merge \S+` conflicts in:
 # and exits 0 (a conflicted rebase is a reported outcome, not a CLI error), so
 # execute() must both recognise the text and downgrade the result to a failure.
 _REBASE_CONFLICT_RE = re.compile(r"CONFLICT in \[(.*?)\]")
+# The standing-atelier single-writer guard refuses a merge while an artist turn
+# is live (it prints this and merges nothing, exiting 0).
+_ATELIER_ARTIST_LIVE_RE = re.compile(r"artist (?:session|turn) is live", re.IGNORECASE)
 
 
 def _merge_conflict_files(result: dict) -> list:
@@ -2103,6 +2395,78 @@ def _merge_conflict_files(result: dict) -> list:
     if match:
         return [f.strip() for f in match.group(1).split(",") if f.strip()]
     return []
+
+
+def _archived_quest_ids(repo: Path) -> set:
+    """Quest ids filed in `.court/archive/` (moved out of the active ledger).
+    Cheap: filenames are `{quest.id}.md`, so the stem IS the id."""
+    try:
+        from . import store
+        archive_dir = store.get_archive_dir(Path(repo) / ".court")
+        if not archive_dir.is_dir():
+            return set()
+        return {p.stem for p in archive_dir.glob("Q*.md")}
+    except Exception:  # noqa: BLE001 — observation must never kill a tick
+        return set()
+
+
+def stale_conflict_ids(repo: Path, status_by_id: dict, razed_ids=None, tracked_ids=None) -> set:
+    """Quest ids whose `merge_conflict` markers are stale and must be dropped.
+
+    A marker is stale when the Quest is terminal (DONE/READY_TO_RAZE), already
+    razed, filed in the archive, OR no longer present in the active ledger at
+    all. The last case is the 2026-11-15 defect: 27 of 31 tracked conflict
+    Quests were not in `.court/quests/` any more, so the digest listed only dead
+    Quests while the live blockers were buried in noise. `tracked_ids` is the
+    set of Quests the watch's state still carries markers for; any id absent
+    from `status_by_id` (the active ledger view) is stale. Only pass
+    `tracked_ids` when `status_by_id` is an AUTHORITATIVE active-ledger view."""
+    active_status = status_by_id or {}
+    stale = {
+        qid for qid, status in active_status.items()
+        if str(status or "").strip().upper() in CONFLICT_TERMINAL_STATUSES
+    }
+    stale |= {qid for qid in (razed_ids or []) if qid}
+    stale |= _archived_quest_ids(repo)
+    if tracked_ids is not None:
+        stale |= {qid for qid in tracked_ids if qid and qid not in active_status}
+    return stale
+
+
+def prune_terminal_conflicts(state: dict, stale_ids) -> int:
+    """Drop `merge_conflict` markers (and their escalation state) for terminal/
+    razed/archived Quests. Returns how many markers were cleared.
+
+    The marker is only ever cleared by a later successful rebase/coin, so once a
+    Quest reaches a terminal state its old record persists indefinitely. Pruning
+    at tick time (not only at the digest) keeps the state file honest and stops
+    the marker re-surfacing from an older state file on a later tick."""
+    stale = {qid for qid in (stale_ids or []) if qid}
+    if not stale:
+        return 0
+    cleared = 0
+    qbook = state.get("quests") or {}
+    for qid in stale:
+        st = qbook.get(qid)
+        if isinstance(st, dict) and isinstance(st.get("merge_conflict"), dict):
+            st.pop("merge_conflict", None)  # carries escalated_ts with it
+            cleared += 1
+    # Escalation bookkeeping lives under `notified`, keyed by qid OR a
+    # comma-joined cohort id, so prune entries whose ids are ALL stale.
+    notified = state.get("notified")
+    if isinstance(notified, dict):
+        for key in list(notified):
+            entry = notified.get(key)
+            if not isinstance(entry, dict):
+                continue
+            ids = [p for p in str(key).split(",") if p]
+            if not ids or not all(pid in stale for pid in ids):
+                continue
+            for nk in [k for k in entry if str(k).startswith("merge_conflict")]:
+                entry.pop(nk, None)
+            if not entry:
+                notified.pop(key, None)
+    return cleared
 
 
 def _stale_convoy_worktree(result: dict) -> str:
@@ -2132,6 +2496,16 @@ def _live_convoy_name(result: dict) -> str:
     match = _LIVE_CONVOY_RE.search(text)
     return match.group(1) if match else ""
 
+
+
+def _atelier_artist_live(result: dict) -> bool:
+    """Whether `court atelier` stood down because an artist turn is live.
+
+    The single-writer guard inside the standing-atelier merge prints this to
+    stderr and exits 0 (it merged nothing). That is not a failure — the merge
+    waits for the artist to go idle — so the watch must hold, not count it."""
+    text = (result.get("stderr_tail") or "") + "\n" + (result.get("stdout_tail") or "")
+    return bool(_ATELIER_ARTIST_LIVE_RE.search(text)) or "not merging new Quests" in text
 
 
 def _heal_stale_convoys(state: dict) -> None:
@@ -2432,6 +2806,39 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
             convoy["last_error"] = (result.get("stderr_tail") or result.get("stdout_tail") or "")[-300:]
             convoy["retry_at"] = now + _failure_backoff(
                 backoff, convoy["fails"], action.meta.get("max_retry_backoff"))
+    elif action.kind == "atelier":
+        # A local merge into the standing atelier. Success stamps the per-Quest
+        # cooldown (manifest membership also excludes it next tick, so this is a
+        # backstop). A single-writer refusal — an artist turn is live — merged
+        # nothing, so it holds on the short backoff without counting a failure.
+        # A hard failure backs off exponentially.
+        blocked = _atelier_artist_live(result)
+        for qid in action.quest_ids:
+            st = qstate.setdefault(qid, {})
+            st["last_atelier_ts"] = now
+            if ok and not blocked:
+                st.pop("atelier_retry_at", None)
+                st.pop("atelier_fails", None)
+            elif blocked:
+                st["atelier_retry_at"] = now + float(action.meta.get("retry_backoff") or 0)
+            else:
+                st["atelier_fails"] = int(st.get("atelier_fails") or 0) + 1
+                st["atelier_retry_at"] = now + _failure_backoff(
+                    float(action.meta.get("retry_backoff") or 0),
+                    st["atelier_fails"], action.meta.get("max_retry_backoff"))
+    elif action.kind == "cleargate":
+        # The dead stamp is gone on success: drop the hold's first-seen stamp so
+        # the Quest plans normally (and re-packs) on the next tick. A failure
+        # backs off and retries rather than spinning.
+        for qid in action.quest_ids:
+            st = qstate.setdefault(qid, {})
+            if ok:
+                st.pop("stale_gatekeeper_since", None)
+                st["last_cleargate_ts"] = now
+            else:
+                st["cleargate_fails"] = int(st.get("cleargate_fails") or 0) + 1
+                if backoff:
+                    st["retry_at"] = now + backoff
 
     for qid in action.quest_ids:
         st = qstate.setdefault(qid, {})
@@ -2741,6 +3148,26 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
             st.setdefault("gate_since_ts", now)
         else:
             st.pop("gate_since_ts", None)
+    # Prune stale merge-conflict markers for terminal/razed/archived Quests
+    # BEFORE planning, so a marker left over from a terminal Quest can never be
+    # held, re-escalated, or counted as a blocker this tick.
+    try:
+        _status_by_id = {
+            q["id"]: q.get("status") for q in snap.get("quests", [])
+            if q.get("kind") != "epic"
+        }
+        _razed_ids = {
+            q["id"] for q in snap.get("quests", [])
+            if q.get("kind") != "epic" and q.get("razed_at")
+        }
+        _cleared = prune_terminal_conflicts(
+            state,
+            stale_conflict_ids(repo, _status_by_id, _razed_ids,
+                               tracked_ids=set(qbook.keys())))
+        if _cleared:
+            say(f"🧹 cleared {_cleared} stale merge-conflict marker(s) for terminal/razed Quests")
+    except Exception as e:  # noqa: BLE001 — pruning must never kill a tick
+        say(f"⚠️  conflict-marker prune failed: {e}")
     vigil_notice: list[dict] = []
     for vn in vigil_notes:
         vigil_notice.append({"quest": vn["id"], "level": "vigil", "text": vn["text"]})
@@ -2759,6 +3186,40 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
                 ui_mandate_ids.append(q["id"])
     except Exception as e:  # noqa: BLE001 — a charter parse must not kill a tick
         say(f"⚠️  UI mandate scan failed: {e}")
+    # UI-review-pending GATE Quests: not collectable, so route them to the
+    # standing atelier. The snapshot already carries each Quest's `ui_review`;
+    # manifest membership (already merged) and a live artist turn decide whether
+    # the merge can run this tick.
+    ui_pending_ids: list[str] = []
+    atelier_ready: list[str] = []
+    atelier_blocked = False
+    try:
+        from . import atelier as _atelier
+        atelier_members = set(_atelier.members(repo))
+        atelier_wt = str(_atelier.worktree_path(repo))
+        if Path(atelier_wt).is_dir():
+            try:
+                _dirs = workers.get("dirs") or {}
+                atelier_blocked = bool(occupied(atelier_wt)) or bool(
+                    _dirs.get(str(Path(atelier_wt).resolve())))
+            except Exception:  # noqa: BLE001 — observation must never kill a tick
+                atelier_blocked = False
+        for q in snap.get("quests", []):
+            if q.get("kind") == "epic":
+                continue
+            if (q.get("status") or "").upper() != "GATE":
+                continue
+            if q.get("pending_audience"):
+                continue
+            if not (q.get("ui_review") or "").upper().startswith(("PENDING", "DEFERRED")):
+                continue
+            qid = q["id"]
+            ui_pending_ids.append(qid)
+            if qid in atelier_members or qid in ui_mandate_ids:
+                continue
+            atelier_ready.append(qid)
+    except Exception as e:  # noqa: BLE001 — the atelier scan must not kill a tick
+        say(f"⚠️  atelier scan failed: {e}")
     try:
         raze_waiting = [q["id"] for q in snap.get("quests", [])
                         if q.get("kind") != "epic"
@@ -2774,11 +3235,47 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
     except Exception as e:  # noqa: BLE001 — a bad packet must not kill a tick
         open_requests = []
         say(f"⚠️  charter request scan failed: {e}")
+    # Resolve which convoys have already been promoted (from the convoy record
+    # and, for the candidates in play, the trunk) so the re-ship decision keys
+    # on the CONVOY, not the inconsistently-written per-Quest field.
+    promoted_cogships: set = set()
+    try:
+        gate_candidates = {
+            _norm_cogship(q.get("cogship_id") or "")
+            for q in snap.get("quests", [])
+            if q.get("kind") != "epic"
+            and (q.get("status") or "").upper() == "GATE"
+            and (q.get("gatekeeper_session_id") or "").strip()
+            and (q.get("cogship_id") or "").strip()
+        }
+        gate_candidates.discard("")
+        promoted_cogships = _promoted_cogships(repo, candidates=gate_candidates)
+    except Exception as e:  # noqa: BLE001 — promotion scan must never kill a tick
+        promoted_cogships = set()
+        say(f"⚠️  convoy promotion scan failed: {e}")
     actions, notes = plan(snap, state, policy, workers, now=now, ready_vigils=ready,
                           charter_ready=charter_ready, raze_regate=raze_regate,
-                          charter_requests=open_requests, ui_mandate_ids=ui_mandate_ids)
+                          charter_requests=open_requests, ui_mandate_ids=ui_mandate_ids,
+                          atelier_ready=atelier_ready, atelier_blocked=atelier_blocked,
+                          ui_pending_ids=ui_pending_ids, promoted_cogships=promoted_cogships)
     notes = vigil_notice + notes
     _record_escalations(state, notes, now)
+    # Maintain the stale-Gatekeeper hold's first-seen stamp: set on the first
+    # tick the condition is observed and dropped the moment it stops, so plan()
+    # can expire a dead session stamp instead of parking the Quest forever.
+    try:
+        held = {n["quest"] for n in notes
+                if n.get("key") in ("stale_gatekeeper", "stale_gatekeeper_cleared")}
+        live_ids = {q["id"] for q in snap.get("quests", []) if q.get("kind") != "epic"}
+        qbook_all = state.setdefault("quests", {})
+        for qid in held:
+            if qid in live_ids:
+                qbook_all.setdefault(qid, {}).setdefault("stale_gatekeeper_since", now)
+        for qid, st in qbook_all.items():
+            if isinstance(st, dict) and "stale_gatekeeper_since" in st and qid not in held:
+                st.pop("stale_gatekeeper_since", None)
+    except Exception as e:  # noqa: BLE001 — bookkeeping must never kill a tick
+        say(f"⚠️  stale-Gatekeeper hold update failed: {e}")
     # Board fingerprint: only re-stamp the "observed since" timestamp when the
     # board actually changes. This is what makes "stale for N minutes" honest
     # across daemon restarts (state lives outside the repo).
@@ -2998,10 +3495,18 @@ def render_digest(repo: Path, journal: Optional[list] = None) -> str:
     budget = max(1, slots) * max(1, per_serf)
 
     actions = [r for r in rows if r.get("event") == "action"]
-    starts = [r for r in rows if r.get("event") == "start"]
+    # `start` rows are written ONCE at daemon boot (see tick's journal banner),
+    # so counting them labels daemon restarts, not worker spawns. Call them what
+    # they are: counting them "starts" read as "0 starts" forever once the boot
+    # row rotated out of the retained window, and a Steward concluded the watch
+    # had spawned nothing.
+    boots = [r for r in rows if r.get("event") == "start"]
+    spawned = [r for r in rows
+               if r.get("event") == "action"
+               and _journal_action_spawns(r.get("action") or {})]
     snaps = [r for r in rows if r.get("event") == "snapshot_failed"]
-    lines.append(f"journal: {len(rows)} events · {len(actions)} actions · {len(starts)} starts · "
-                 f"{len(snaps)} snapshot failures")
+    lines.append(f"journal: {len(rows)} events · {len(actions)} actions · {len(spawned)} spawns · "
+                 f"{len(boots)} boots · {len(snaps)} snapshot failures")
     if snaps:
         lines.append(f"  ⚠️ last snapshot failure: {snaps[-1].get('ts')} — {str(snaps[-1].get('error'))[:160]}")
     last_tick = next((r for r in reversed(rows) if r.get("event") == "tick"), None)
@@ -3085,10 +3590,12 @@ def render_digest(repo: Path, journal: Optional[list] = None) -> str:
     # --- READY_TO_RAZE awaiting a raze ---------------------------------------
     statuses = {}
     razed = set()
+    statuses_authoritative = False
     for r in reversed(rows):
         if r.get("event") == "tick" and isinstance(r.get("statuses"), dict):
             statuses = r["statuses"]
             razed = set(r.get("razed") or [])
+            statuses_authoritative = True
             break
     awaiting_raze = sorted(qid for qid, s in statuses.items()
                            if s == "READY_TO_RAZE" and qid not in razed)
@@ -3147,10 +3654,19 @@ def render_digest(repo: Path, journal: Optional[list] = None) -> str:
     # --- Merge-conflict blockers ------------------------------------------------
     # A coin/goad spawn blocked by `git merge castle` needs a STEWARD DECISION
     # (the watch's mechanical verbs cannot clear a rebase conflict). Surfaced
-    # explicitly so the mustered Steward's prompt names the files.
+    # explicitly so the mustered Steward's prompt names the files. A terminal
+    # (DONE/READY_TO_RAZE), razed, archived, or no-longer-in-the-ledger Quest is
+    # NEVER "blocking a spawn": its marker is stale, so exclude it even if an
+    # older state file still holds the record (the digest must not bury the live
+    # blockers in that noise). Only treat the journal's active view as
+    # authoritative when a tick row was actually found.
+    _tracked = set((state.get("quests") or {}).keys())
+    _stale = stale_conflict_ids(
+        repo, statuses, razed,
+        tracked_ids=_tracked if statuses_authoritative else None)
     conflicts = [
         (qid, st["merge_conflict"]) for qid, st in (state.get("quests") or {}).items()
-        if isinstance(st.get("merge_conflict"), dict)
+        if isinstance(st.get("merge_conflict"), dict) and qid not in _stale
     ]
     if conflicts:
         lines.append("")

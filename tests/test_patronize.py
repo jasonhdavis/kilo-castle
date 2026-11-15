@@ -283,8 +283,24 @@ class TestCollectWiring(AtelierFixture):
             include_archived=False, standup=False,
         )
 
-    def test_unpatronized_member_is_refused(self):
+    def test_unpatronized_member_without_a_mandate_is_advisory(self):
+        """The charter records review as debt ("no UI Mandate ... NOT a pack
+        gate"), so atelier membership must not silently shrink the cohort: the
+        engine warns and proceeds to the (separate) audit gate."""
         atelier.record_member(self.root, store.load(Q1), auto_commit=False)
+        out = StringIO()
+        with patch("sys.stdout", out), patch("sys.stderr", StringIO()):
+            cli.cmd_collect(self._collect_args(Q1))
+        text = out.getvalue()
+        self.assertIn("no UI Mandate", text)
+        self.assertNotIn("not yet patronized", text)
+
+    def test_unpatronized_member_with_a_ui_mandate_is_refused(self):
+        """A recorded UI MANDATE IS a hard pack gate: refuse until patronized."""
+        atelier.record_member(self.root, store.load(Q1), auto_commit=False)
+        qf = self.court / "quests" / "Q1-Widget.md"
+        qf.write_text(qf.read_text(encoding="utf-8")
+                      + "\n- **UI Mandate:** REQUIRED — testing mandate\n", encoding="utf-8")
         out = StringIO()
         with patch("sys.stdout", out), patch("sys.stderr", StringIO()):
             cli.cmd_collect(self._collect_args(Q1))

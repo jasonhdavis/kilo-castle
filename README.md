@@ -464,7 +464,7 @@ Agents are defined in `kilo.json` (`mode: primary`, pinned model, full prompt). 
 | `/collect` | Pack approved Quests (TRIBUTE_READY → GATE) into a Cog Ship convoy |
 | `/reject_tribute` | Isolate a failing Quest from a convoy and dispatch Serf remediation |
 | `court peel <id> --reason "..."` | Withdraw a promoted Quest: revert its trunk commit, record the peel, supersede the suite proof, then re-pack |
-| `/ship [--confirm]` | Compile the deployment convoy summary + Commutation manifest; `--confirm` deploys |
+| `/ship [--confirm]` | Compile the deployment convoy summary + Commutation manifest; `--confirm` deploys. Scope the flyctl release with `--fleet {web,worker,all}` or `--fly-app <alias>` |
 | `court commute <id> --note "..."` | Record a post-deploy commutation as done (Cogship Log entry) |
 | `court nightwatch --repo <path>` | Deterministic fleet supervisor: polls quest state, rolls `goad`/`coin`/`collect` under caps; `--once` for cron, `--report`/`--status`/`--dry-run` surfaces |
 | `court enqueue <quest> --why "..."` | Queue a PLANNED/CHARTERED Quest for dispatch by the Watch (queue-first dispatch) |

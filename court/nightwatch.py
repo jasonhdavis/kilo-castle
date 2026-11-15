@@ -424,10 +424,12 @@ def load_state(repo: Path) -> dict:
             payload.setdefault("quests", {})
             payload.setdefault("convoys", {})
             payload.setdefault("spawns", [])
+            payload.setdefault("drain_spawns", [])
             return payload
     except (OSError, ValueError):
         pass
-    return {"version": STATE_VERSION, "repo": str(repo), "quests": {}, "convoys": {}, "spawns": []}
+    return {"version": STATE_VERSION, "repo": str(repo), "quests": {}, "convoys": {},
+            "spawns": [], "drain_spawns": []}
 
 
 def save_state(repo: Path, state: dict) -> None:
@@ -756,6 +758,46 @@ def _journal_action_spawns(action: dict) -> bool:
 # new work or repairs a lane.
 DRAIN_KINDS = frozenset({"collect", "coin"})
 
+# Bounded share of the rolling hourly spawn budget reserved for the drain lanes
+# whenever drain work is pending (a GATE Quest awaiting a Gatekeeper or an
+# unparked TRIBUTE_READY Quest awaiting a Master of Coin).
+#
+# The hourly budget is a rate, but it is spent first-come-first-served: the
+# dispatch/charter/goal lanes are planned ahead of the drain heuristics, so a
+# busy first twenty minutes of the hour could spend every slot and every queued
+# collect/coin was then skipped until the hour rolled (2026-11-15 journal:
+# "hourly spawn budget reached (8/h) — skipping coin Q1495-...", repeated for
+# 40+ minutes with 35 TRIBUTE_READY and 3 GATE quests waiting). Reserving the
+# last quarter of the hour for the drain lanes guarantees a Gatekeeper/Master of
+# Coin gets the tail of every hour; the reservation is never more than half the
+# cap, so dispatch keeps moving.
+DRAIN_HOURLY_RESERVE_SHARE = 0.25
+
+# One-free-worker-slot drain guarantee. The `later_hold` half-reserve above
+# needs capacity >= 2, so with exactly one slot free a queue-driven dispatch
+# vigil took it on EVERY tick and collect/coin were never even planned (the
+# `TRIBUTE_READY but worker ceiling reached` note in the journal). The slot is
+# therefore held back after at most ONE_SLOT_DRAIN_MAX_DEFERRALS consecutive
+# deferrals, so a drain action is planned within two ticks of drain work
+# becoming pending.
+ONE_SLOT_DRAIN_MAX_DEFERRALS = 1
+SPAWN_WINDOW_SECONDS = 3600
+
+
+def _count_within(stamps, now: float, window: float = SPAWN_WINDOW_SECONDS) -> int:
+    """Count timestamps inside the rolling `window` ending at `now`.
+
+    Tolerates a corrupt/non-numeric stamp in persisted state: a bad entry is
+    skipped rather than aborting the whole tick."""
+    n = 0
+    for t in stamps or ():
+        try:
+            if now - float(t) < window:
+                n += 1
+        except (TypeError, ValueError):
+            continue
+    return n
+
 
 def _spawn_class(action: "Action") -> str:
     """The class a spawning action belongs to, for the per-class budget cap: a
@@ -1023,10 +1065,39 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
     # the later lanes' half back so every lane with work competes for a slot; the
     # per-tick budget above then takes turns between them. It is restored before
     # the GATE/drain heuristics below.
+    #
+    # With exactly ONE free slot there is no half to hold, so the same rule left
+    # the single slot to the queue-driven lanes forever. Count the consecutive
+    # deferrals in `state["drain_slot_deferrals"]` and hold the one slot once
+    # ONE_SLOT_DRAIN_MAX_DEFERRALS ticks have gone by without a drain action:
+    # a drain action is then planned within two ticks of drain work appearing.
+    capacity_at_start = capacity
+    drain_pending = _drain_pending(quests)
     later_hold = 0
-    if capacity >= 2 and _drain_pending(quests):
+    one_slot_drain_hold = False
+    if capacity >= 2 and drain_pending:
         later_hold = capacity // 2
+    elif capacity == 1 and drain_pending:
+        if int(state.get("drain_slot_deferrals") or 0) >= ONE_SLOT_DRAIN_MAX_DEFERRALS:
+            later_hold = 1
+            one_slot_drain_hold = True
     capacity -= later_hold
+    # Hourly spawn-budget accounting (drain fairness). `spawns` is pruned to the
+    # rolling hour at the start of the tick; `drain_spawns` records the subset
+    # that belonged to the drain lanes, so the reservation can be settled.
+    hourly_cap = int(policy.max_spawns_per_hour or 0)
+    hourly_remaining = None  # None = no hourly cap configured
+    drain_reserve_left = 0
+    if hourly_cap > 0:
+        hourly_remembered = _count_within(state.get("spawns"), now)
+        hourly_remaining = max(0, hourly_cap - hourly_remembered)
+        if drain_pending:
+            drain_reserve_total = min(
+                max(1, int(round(hourly_cap * DRAIN_HOURLY_RESERVE_SHARE))),
+                max(1, hourly_cap // 2),
+            )
+            drain_reserve_left = max(0, drain_reserve_total
+                                     - _count_within(state.get("drain_spawns"), now))
 
     # --- charter requests (requests-in, charters-out) -----------------------
     # Planned FIRST: a request is the pipeline's own input, so it must not
@@ -1944,7 +2015,16 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
     # budget binds, so consecutive ticks lead with different lanes and the
     # pipeline stays balanced instead of merely flipping which lane starves.
     # Non-spawning (local) actions are unbudgeted and always pass through.
-    _budget = max(0, policy.max_spawns_per_tick)
+    #
+    # The same allocation now also respects the ROLLING HOURLY budget: planning a
+    # spawn the hour cannot pay for only produces an execution-time skip (and,
+    # because the skip loop breaks, silently drops every spawn action behind it)
+    # while the drain lanes are still not served. The per-tick budget is
+    # therefore capped by the hour's remaining slots, the reserved drain share is
+    # never handed to a non-drain lane, and the retained actions are ordered so
+    # the leading lane spends first.
+    _tick_budget = max(0, policy.max_spawns_per_tick)
+    _budget = _tick_budget if hourly_remaining is None else min(_tick_budget, hourly_remaining)
     _spawn_slots = [_i for _i, _a in enumerate(actions) if _action_spawns(_a)]
     _queues: dict = {}
     for _i in _spawn_slots:
@@ -1967,24 +2047,80 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
     if len(_lanes) > 1 and not _coin_priority:
         _shift = _rotation % len(_lanes)
         _lanes = _lanes[_shift:] + _lanes[:_shift]
+    # Drain reservation inside the hour: with the reserved share still unspent,
+    # non-drain lanes may only take the slots left after it. Applied only when a
+    # drain action is actually waiting, so a temporarily unplannable drain lane
+    # (a live Master of Coin, a cooldown) never idles the hour's budget.
+    _non_drain_cap = None
+    _drain_waiting = any(_spawn_class(actions[_i]) in DRAIN_KINDS for _i in _spawn_slots)
+    if drain_pending and drain_reserve_left and _drain_waiting:
+        # How many more non-drain spawns the hour can still afford while the
+        # reserved drain share stays protected. Deliberately derived from the
+        # HOUR's remaining slots (not the per-tick budget), so the reservation
+        # only binds as the hour runs out instead of throttling every tick.
+        _affordable = _budget if hourly_remaining is None else hourly_remaining
+        _non_drain_cap = max(0, _affordable - drain_reserve_left)
     _kept: set = set()
     _cursor: dict = {_c: 0 for _c in _queues}
+    _non_drain_kept = 0
     while len(_kept) < _budget:
         _progressed = False
         for _c in _lanes:
             if len(_kept) >= _budget:
                 break
-            if _cursor[_c] < len(_queues[_c]):
-                _kept.add(_queues[_c][_cursor[_c]])
+            while _cursor[_c] < len(_queues[_c]):
+                _i = _queues[_c][_cursor[_c]]
                 _cursor[_c] += 1
+                if (_non_drain_cap is not None and _c not in DRAIN_KINDS
+                        and _non_drain_kept >= _non_drain_cap):
+                    # The hour's remaining slots are reserved for drain work.
+                    continue
+                if _c not in DRAIN_KINDS:
+                    _non_drain_kept += 1
+                _kept.add(_i)
                 _progressed = True
+                break
         if not _progressed:
             break
     if len(_kept) < len(_spawn_slots):
-        # The budget bound, so fairness was at stake: advance the rotation so the
-        # next tick leads with a different lane.
+        # The budget bound (per-tick OR hourly), so fairness was at stake:
+        # advance the rotation so the next tick leads with a different lane.
         state["spawn_rotation"] = _rotation + 1
-    actions = [_a for _i, _a in enumerate(actions) if _i in _kept or not _action_spawns(_a)]
+    _lane_pos = {_c: _k for _k, _c in enumerate(_lanes)}
+
+    def _spend_key(_i: int):
+        """Order retained spawn actions: drain lanes first while drain work is
+        pending (the pipeline's in-flight exit path must never lose the hour's
+        last slot to a hand-off that merely happened to be appended earlier),
+        then the rotated lane order."""
+        _c = _spawn_class(actions[_i])
+        return (0 if (drain_pending and _c in DRAIN_KINDS) else 1,
+                _lane_pos.get(_c, len(_lanes)), _i)
+
+    _spend_order = iter(sorted([_i for _i in _spawn_slots if _i in _kept], key=_spend_key))
+    _ordered: list = []
+    for _i, _a in enumerate(actions):
+        if _action_spawns(_a):
+            if _i in _kept:
+                _ordered.append(actions[next(_spend_order)])
+            continue
+        _ordered.append(_a)
+    actions = _ordered
+
+    # One-free-slot drain bookkeeping: count consecutive ticks that had a free
+    # slot (at most one) and spent it on a non-drain spawn, so the next tick
+    # holds that slot for the drain lanes. A hold that produced no drain action
+    # (nothing plannable) is released immediately so dispatch is never parked
+    # behind a drain lane that cannot use the slot. Only a real change is
+    # written: plan() stays a pure read for a board where nothing is deferred.
+    if drain_pending:
+        _drain_scheduled = any(_action_spawns(_a) and _spawn_class(_a) in DRAIN_KINDS
+                               for _a in actions)
+        if _drain_scheduled or one_slot_drain_hold:
+            if state.get("drain_slot_deferrals"):
+                state["drain_slot_deferrals"] = 0
+        elif capacity_at_start <= 1 and _budget and any(_action_spawns(_a) for _a in actions):
+            state["drain_slot_deferrals"] = int(state.get("drain_slot_deferrals") or 0) + 1
 
     # --- Session-store razing (maintenance, never work) ---------------------
     # The Kilo session/event store grows without bound (15 GB by 2026-11-08).
@@ -2041,9 +2177,29 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
 
 
 def _prune_spawns(state: dict, now: float) -> list:
-    spawns = [float(t) for t in state.get("spawns", []) if (now - float(t)) < 3600]
+    """Drop spawn stamps older than the rolling hour and return the survivors.
+
+    Keeps the drain-lane subset (`drain_spawns`) in step: plan() settles the
+    hourly reserve against it, so a stale stamp would hold a reservation that no
+    longer applies."""
+    spawns = [float(t) for t in state.get("spawns", []) if (now - float(t)) < SPAWN_WINDOW_SECONDS]
     state["spawns"] = spawns
+    state["drain_spawns"] = [
+        float(t) for t in state.get("drain_spawns", [])
+        if (now - float(t)) < SPAWN_WINDOW_SECONDS
+    ]
     return spawns
+
+
+def _record_spawn(state: dict, action: Action, now: float) -> None:
+    """Charge one executed worker spawn against the hourly budgets.
+
+    `spawns` is the rolling hourly total; `drain_spawns` is the collect/coin
+    subset the hourly drain reservation is settled from. Only a worker-spawning
+    action is charged — a local `rebase`/`advance` costs no spawn budget."""
+    state.setdefault("spawns", []).append(now)
+    if _spawn_class(action) in DRAIN_KINDS:
+        state.setdefault("drain_spawns", []).append(now)
 
 
 def _execute_cleargate(repo: Path, action: Action, timeout: int = 60) -> dict:
@@ -3290,10 +3446,15 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
     for action in actions:
         _spends = _action_spawns(action)
         if _spends and len(spawns) >= policy.max_spawns_per_hour:
+            # plan() already bounds its spawn actions to the hour's remaining
+            # slots, so this is a safety net for a budget spent between planning
+            # and execution (a concurrent tick, a failed spawn that still
+            # charged). It skips only the spawning action: a local `rebase` /
+            # `teardown` / `advance` behind it costs no budget and must still run.
             say(f"\u23f8\ufe0f  hourly spawn budget reached ({policy.max_spawns_per_hour}/h) \u2014 skipping {action.kind} {','.join(action.quest_ids)}")
             notes.append({"quest": ",".join(action.quest_ids), "level": "skip",
                           "text": f"hourly spawn budget reached ({policy.max_spawns_per_hour}/h)"})
-            break
+            continue
         label = f"{action.kind} {','.join(action.quest_ids)}" + (f" [{action.cogship}]" if action.cogship else "")
         if dry_run:
             say(f"[dry-run] would run: {label} \u2014 {action.reason}")
@@ -3303,10 +3464,11 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
         result = execute(repo, action)
         # Only a worker-spawning action spends the hourly budget: a local-git
         # `rebase`/`advance` vigil is zero-cost and must not exhaust the budget
-        # that gates real dispatches and coins.
+        # that gates real dispatches and coins. Drain-lane spawns are also
+        # recorded separately so plan() can settle their reserved hourly share.
         if _spends:
-            spawns.append(now)
-            state["spawns"] = spawns
+            _record_spawn(state, action, now)
+            spawns = state["spawns"]
         _apply_bookkeeping(state, action, result, now, repo)
         record = {"ts": _now_iso(), "event": "action", "action": action.__dict__, "result": result,
                   "workers_before": workers}

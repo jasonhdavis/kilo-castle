@@ -5674,9 +5674,9 @@ def cmd_collect(args):
         # the Quest into the one merged studio for artist review.
         # `--allow-ui-pending` (same flag as `court verify-convoy`) overrides
         # deliberately.
-        allow_ui_pending = (bool(getattr(args, "allow_ui_pending", False))
-                            or bool(getattr(args, "skip_ui_review", False)))
-        if not allow_ui_pending:
+        ui_override = (bool(getattr(args, "allow_ui_pending", False))
+                       or bool(getattr(args, "skip_ui_review", False)))
+        if not ui_override:
             # The worktree charter is freshest (approvals commit on the branch
             # before they reach the castle ledger), the in-memory ledger copy is
             # next, and the on-disk predicate is the fallback. All three feed the
@@ -5713,10 +5713,12 @@ def cmd_collect(args):
         atelier_member = atelier.member(repo_root, quest.id)
         if atelier_member is not None:
             pin = atelier_member.get("patronage") if isinstance(atelier_member.get("patronage"), dict) else None
-            # A UI MANDATE on top of atelier membership is refused here with the
-            # patronize-specific guidance. Without a mandate, whether the review
-            # is outstanding was already settled by the gate above, so this
-            # branch never re-litigates it.
+            # A recorded UI MANDATE makes atelier membership a hard pack gate,
+            # and so does the absence of a patronage pin: no pin means no
+            # approved revision has been recorded, so there is nothing to
+            # extract and the review has not been performed (the defect that
+            # packed Q1480/Q1460 unreviewed). Whether an *ordinary* outstanding
+            # review blocks was already settled by the gate above.
             atelier_mandate, atelier_mandate_detail = convoy_guard.ui_mandate_outstanding(repo_root, quest.id)
             if not pin and atelier_mandate:
                 skipped.append((
@@ -5726,9 +5728,18 @@ def cmd_collect(args):
                 ))
                 continue
             if not pin:
-                print(f"ℹ️ {quest.id}: in the standing atelier with no patronage pin — no approved "
-                      f"atelier revision is pinned, so nothing is extracted and the Quest branch packs "
-                      f"as-is (`court patronize {quest.id} --by \"M'Lord\"` pins a reviewed revision).")
+                if ui_override:
+                    print(f"⚠️ {quest.id}: --allow-ui-pending overrides the missing atelier patronage "
+                          f"pin — packing without an approved revision.")
+                else:
+                    skipped.append((
+                        quest.id,
+                        "merged into the standing atelier without a patronage pin — no approved revision "
+                        "is recorded, so nothing is extracted and the UI review has not been performed. "
+                        "Review it in the merged view and run `court patronize "
+                        f"{quest.id} --by \"M'Lord\"` before packing, or pass --allow-ui-pending",
+                    ))
+                    continue
             else:
                 atelier_branch = pin.get("atelier_branch") or atelier.ATELIER_BRANCH
                 if not atelier.extraction_status(repo_root, quest).get("applied"):

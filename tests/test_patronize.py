@@ -283,20 +283,21 @@ class TestCollectWiring(AtelierFixture):
             include_archived=False, standup=False,
         )
 
-    def test_unpatronized_member_without_a_mandate_is_inventoried(self):
-        """Membership alone is not a pack gate, and it is not "debt" either.
+    def test_unpatronized_member_without_a_mandate_is_refused(self):
+        """No patronage pin means the review has not been performed.
 
-        With no patronage pin and no recorded mandate the Quest packs from its
-        own branch and collect says so plainly. (Its UI review is clear here; a
-        PENDING review would be refused above this block.)
+        Membership with no pin cannot pack: there is no approved revision to
+        extract. The refusal must not resurrect the retired "tracked debt /
+        not a pack gate" wording, and --allow-ui-pending is the deliberate way
+        past it.
         """
         atelier.record_member(self.root, store.load(Q1), auto_commit=False)
         out = StringIO()
         with patch("sys.stdout", out), patch("sys.stderr", StringIO()):
             cli.cmd_collect(self._collect_args(Q1))
         text = out.getvalue()
-        self.assertIn("no patronage pin", text)
-        self.assertNotIn("not yet patronized", text)
+        self.assertIn("without a patronage pin", text)
+        self.assertIn("court patronize", text)
         self.assertNotIn("not a pack gate", text)
         self.assertNotIn("tracked debt", text)
 

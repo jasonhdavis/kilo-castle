@@ -593,6 +593,7 @@ html[data-theme="light"] .iconbtn .bcount{color:#fff}
    <span id="wt_badge"></span>
    <span id="easel_chip" class="chip" style="display:none;cursor:pointer" data-easel="1" title=""></span>
    <span id="live_chip" class="chip" style="display:none"><span class="livedot"></span>&nbsp;agent working</span>
+   <span id="agent_state" class="chip" style="display:none" title=""></span>
    <span id="sess_meta" class="sessmeta"></span>
    <div class="hgrp">
      <button class="bread lg" id="markread_btn" style="display:none" title="clear the turn marker" onclick="markReadCur()">mark read</button>
@@ -799,7 +800,7 @@ function applyHash(){
 window.addEventListener('popstate',()=>{
  if(!S)return;
  applyHash();
- renderNav();renderSessionsBar();renderTranscript();syncComposer();syncSessMeta();syncMarkRead();syncEaselChip();syncBrowserBtn();
+ renderNav();renderSessionsBar();renderTranscript();syncComposer();syncSessMeta();syncMarkRead();syncAgentState();syncEaselChip();syncBrowserBtn();
 });
 
  let __lastTxt=null;
@@ -821,7 +822,7 @@ window.addEventListener('popstate',()=>{
   $('t_rss').textContent=mb(S.proc_total_rss);
   const ty=S.today||{};
   $('t_today').innerHTML=`$ <b>${(ty.cost||0).toFixed(2)}</b> today`;
-   syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();syncMarkRead();
+   syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();syncMarkRead();syncAgentState();
   if(view==='board'){
     const key=boardScope()+'|'+(S.quests||[]).map(q=>q.id+q.status+(q.dirty?'d':'')+(q.app||'')+(q.cogship_id||'')+(q.moc_live?'m':'')+(q.cogship_live?'g':'')).join(',');
     if(key!==boardKey){boardKey=key;renderBoard();}}
@@ -845,7 +846,12 @@ window.addEventListener('popstate',()=>{
  //   idle ◌ hollow     — process open, nothing emitting: parked interactive
  //                       session ("studio open"). Interactive roles never
  //                       stall on silence — parking is their normal state.
- const WORKING_FRESH_MS=4*60*1000, STALLED_SILENT_MS=10*60*1000, TAIL_LOOKBACK_MS=30*60*1000;
+  const WORKING_FRESH_MS=4*60*1000, STALLED_SILENT_MS=10*60*1000, TAIL_LOOKBACK_MS=30*60*1000,
+        // A long suite (gatekeeper / Master of Coin) is silent mid-tool-call for
+        // 20-45 min while its turn is STILL OPEN (assistant tail, finish=null).
+        // Only call it stalled once the silence outlasts any plausible tool call;
+        // mirrors the watch's per-role wall caps (gatekeeper 45 min).
+        OPEN_TURN_GRACE_MS=45*60*1000;
  const INTERACTIVE_AGENTS=new Set(['artist','steward','code']);
  let DS_CACHE=null;
  function readMap(){try{return JSON.parse(localStorage.getItem('bdread')||'{}')}catch(e){return{}}}
@@ -853,7 +859,7 @@ window.addEventListener('popstate',()=>{
    const cutoff=Date.now()-2*3600*1000;
    for(const k of Object.keys(m)){const t=parseInt((k.split('|')[1]||'0'),10);if(!t||t<cutoff)delete m[k];}
    try{localStorage.setItem('bdread',JSON.stringify(m))}catch(e){}
-   DS_CACHE=null;renderNav();renderBoard();syncMarkRead();}
+   DS_CACHE=null;renderNav();renderBoard();syncMarkRead();syncAgentState();}
   function syncMarkRead(){
    const el=$('markread_btn');if(!el)return;
    const st=selWt&&stateFor(selWt);
@@ -863,6 +869,18 @@ window.addEventListener('popstate',()=>{
     el.title=st.state==='done'?'turn completed — clear the ✓ marker':'stalled — clear the ! marker';}}
   function markReadCur(){const el=$('markread_btn');
    if(el&&el.dataset.bread)markRead(el.dataset.bread);}
+  // The nav dot alone was too quiet to tell "running a 26-min suite" from
+  // "wedged". Surface the same dirStates() verdict for the SELECTED worktree as
+  // text in the session header, so a long tool call reads as working.
+  function syncAgentState(){
+   const el=$('agent_state');if(!el)return;
+   const st=selWt&&stateFor(selWt);
+   if(!st||st.state==='idle'||st.state==='done'){el.style.display='none';el.textContent='';return;}
+   el.style.display='';
+   if(st.state==='working'){el.innerHTML='<span class="livedot"></span>&nbsp;working — '+esc(st.why||'agent working');}
+   else{el.innerHTML='<span class="stalledot static">!</span>&nbsp;'+esc(st.why||'no output');}
+   el.title=(st.state==='stalled'?'stalled — ':'agent working — ')+(st.why||'');
+  }
  function dirStates(){if(DS_CACHE)return DS_CACHE;const now=Date.now(),out=new Map();
   const byDir={};for(const a of (S.active||[]))if(a.dir)byDir[a.dir]=a;
   const touch={};for(const x of (S.sessions||[]))if(x.directory){const t=x.time_updated||0;if(t>(touch[x.directory]||0))touch[x.directory]=t;}
@@ -883,6 +901,8 @@ window.addEventListener('popstate',()=>{
    }
    else if(a){
     if(interactive){st='idle';why='session open — idle';}
+    else if(tail&&tail.role==='assistant'&&tail.finish==null&&t&&now-t<OPEN_TURN_GRACE_MS){
+     st='working';why='running a command ('+Math.round((now-t)/60000)+' min)';}
     else if(t&&now-t>=STALLED_SILENT_MS){st='stalled';why='no output for '+Math.round((now-t)/60000)+' min';}
     else{st='working';why='long tool call';}
    }
@@ -1020,7 +1040,7 @@ function switchApp(key){selRepo=key;boardApp=null;selWt=null;selSess=null;msgs=[
  $('wt_label').textContent='select a worktree';$('wt_badge').innerHTML='';
  $('c_cont').innerHTML='new session — pick a worktree, or open the ☰ sessions menu to continue one';
  CMDS=[];renderCmdList();
-  renderNav();renderTranscript();syncHash(true);syncComposer();syncMarkRead();
+  renderNav();renderTranscript();syncHash(true);syncComposer();syncMarkRead();syncAgentState();
   if(view==='board'){boardKey='';renderBoard();}}
 let cmdSeq=0;
 const CMD_CACHE={};
@@ -1048,7 +1068,7 @@ function pickWt(path,branch){
    $('wt_badge').innerHTML='';
   }
    applyDefaultAgent();
-    renderNav();renderSessionsBar();renderTranscript();syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();syncMarkRead();
+    renderNav();renderSessionsBar();renderTranscript();syncComposer();syncSessMeta();syncEaselChip();syncBrowserBtn();syncMarkRead();syncAgentState();
   $('c_cont').innerHTML='new session — pick a worktree, or click a session tab to continue it';
  const sess=sessionsFor(path);
  if(sess.length)openSess(sess[0].id);
@@ -1142,13 +1162,13 @@ document.addEventListener('click',e=>{
  if(!e.target.closest('#sessmenu')&&!e.target.closest('#sess_burger'))closeSessMenu();});
 function newSess(){selSess=null;msgs=[];curLane='L'+(++LANESEQ);
  $('c_cont').innerHTML='new session in <b>'+esc(selWt?selWt.replace(__HOME_PREFIX__,''):'?')+'</b> <span class="dim">— agent replies as a fresh session</span>';
- renderSessionsBar();renderTranscript();syncHash(true);syncComposer();syncSessMeta();syncMarkRead();}
+ renderSessionsBar();renderTranscript();syncHash(true);syncComposer();syncSessMeta();syncMarkRead();syncAgentState();}
 let sessOpenSeq=0;
 async function openSess(id){
  const seq=++sessOpenSeq;
  selSess=id;msgs=[];curLane=id;
  $('c_cont').innerHTML=`continuing <b>${esc(id.slice(0,24))}…</b> <button class="newbtn" onclick="newSess()">start new instead</button>`;
- renderSessionsBar();renderTranscript();syncHash(true);syncComposer();syncSessMeta();syncMarkRead();
+ renderSessionsBar();renderTranscript();syncHash(true);syncComposer();syncSessMeta();syncMarkRead();syncAgentState();
  loadCmds();
  $('transcript').innerHTML='<div class="notice">loading…</div>';
  let m=[];

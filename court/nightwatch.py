@@ -88,6 +88,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from . import git_ops
 from . import handoff
 from . import vigils
 
@@ -218,6 +219,14 @@ DEFAULT_STATUS_TIMEOUT = 240
 DEFAULT_ACTION_TIMEOUT = 600
 COLLECT_TIMEOUT = 900
 JOURNAL_MAX_BYTES = 2 * 1024 * 1024
+
+# The collector's convergence base: `court collect` merges each candidate onto
+# this branch at its pre-pack gate before stamping (the `collect --base` verb
+# default). The pre-pack merge probe tests a GATE branch's mergeability against
+# it, so a planner can hold a non-converging branch instead of packing a cohort
+# the collector will silently thin.
+COLLECT_BASE_BRANCH = "castle"
+MERGE_PROBE_TIMEOUT = 60
 
 # A pickup rejection that repeats identically is journaled at the start of the
 # streak and at these counts only — never on every tick.
@@ -1022,7 +1031,8 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
          ui_mandate_ids: Optional[list] = None,
          atelier_ready: Optional[list] = None, atelier_blocked: bool = False,
          ui_pending_ids: Optional[list] = None,
-         promoted_cogships: Optional[list] = None) -> tuple[list, list]:
+         promoted_cogships: Optional[list] = None,
+         gate_merge_probes: Optional[dict] = None) -> tuple[list, list]:
     """Decide this tick's actions. Returns (actions, notes).
 
     Pure function: no I/O beyond the already-collected inputs, so the policy
@@ -1045,6 +1055,10 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
     # escalated LOUDLY once and then merely re-reported, so the Steward's view
     # is not spammed by the same standing blocker every tick.
     notified = state.get("notified") or {}
+    # Pre-pack mergeability of GATE candidates, keyed by quest id (repo-derived;
+    # see `_probe_gate_merges`). A quest absent from the map is "unknown" — never
+    # excluded from collect and never remediated.
+    gate_probes = gate_merge_probes or {}
     actions: list[Action] = []
     notes: list[dict] = []
 
@@ -1283,6 +1297,41 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                 meta={"retry_backoff": policy.retry_backoff}))
             rebase_ids.add(q["id"])
 
+    # --- GATE conflict remediation: converge a non-mergeable branch ----------
+    # A GATE branch the pre-pack probe found non-convergent cannot be packed.
+    # `court rebase` applies the engine's ledger/charter reconcilers that a raw
+    # merge-tree probe does not, so attempt it ONCE per conflict episode: a
+    # reconciled branch is clean on the next tick and collectable, while one that
+    # still conflicts stamps a `merge_conflict` marker the Steward escalation
+    # below owns. Never re-attempted once marked — retrying a deterministic
+    # content conflict only spends the spawn budget.
+    if policy.allows("rebase"):
+        for q in quests.values():
+            if (q.get("status") or "").upper() != "GATE":
+                continue
+            qid = q["id"]
+            if qid in rebase_ids:
+                continue
+            probe = gate_probes.get(qid)
+            st = qstate.get(qid) or {}
+            if probe is None or probe.get("clean") or isinstance(st.get("merge_conflict"), dict):
+                continue
+            if not q.get("worktree") or not Path(q["worktree"]).is_dir():
+                continue
+            if occupied(q.get("worktree")) or process_in(q.get("worktree")):
+                continue
+            if _within(st.get("last_rebase_ts"), policy.rebase_cooldown, now):
+                continue
+            if now < float(st.get("retry_at") or 0):
+                continue
+            files = ", ".join((probe.get("conflicts") or [])[:5])[:200] or "unknown files"
+            actions.append(Action(
+                kind="rebase", quest_ids=[qid],
+                reason=(f"GATE branch does not converge onto {COLLECT_BASE_BRANCH} "
+                        f"(conflicts in: {files}) — mechanical rebase before packing"),
+                meta={"retry_backoff": policy.retry_backoff}))
+            rebase_ids.add(qid)
+
     # Restore the later lanes' share held back above: the queue-driven blocks
     # (charters, dispatch vigils) have taken theirs, so collect/coin and the rest
     # compete for the reserved slots on equal terms.
@@ -1301,6 +1350,24 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
             continue
         if q.get("pending_audience"):
             note(q["id"], "skip", "GATE but pending Audience — parked")
+            continue
+        # Pre-pack mergeability: a GATE branch that will not converge onto the
+        # collector's base cannot be packed — `court collect` drops it at its own
+        # convergence gate and packs the survivors, so offering it only THINS the
+        # cohort. Hold it for remediation instead. A recorded conflict marker with
+        # no fresh probe counts as a known conflict (belt and braces); a fresh
+        # clean probe overrides a stale marker.
+        _probe = gate_probes.get(q["id"])
+        _qconflict = (qstate.get(q["id"]) or {}).get("merge_conflict")
+        _marked_conflict = isinstance(_qconflict, dict)
+        if (_probe is not None and not _probe.get("clean")) or (_probe is None and _marked_conflict):
+            _files = list((_probe or {}).get("conflicts") or []) or list(
+                (_qconflict or {}).get("files") or [])
+            note(q["id"], "wait",
+                 f"GATE branch does not converge onto {COLLECT_BASE_BRANCH}"
+                 + (f" (conflicts in: {', '.join(_files[:5])[:200]})" if _files else "")
+                 + " — held for remediation before packing (a doomed convoy only packs short)",
+                 key="gate_not_mergeable")
             continue
         if q["id"] in ui_mandate_ids:
             # A mandate is the owner's required step, not tracked debt: packing
@@ -1491,7 +1558,14 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
                   "noop_backoff": policy.collect_noop_backoff,
                   "stale_backoff": policy.stale_convoy_backoff,
                   "live_backoff": policy.gate_cooldown,
-                  "max_retry_backoff": policy.max_retry_backoff},
+                  "max_retry_backoff": policy.max_retry_backoff,
+                  # The cohort floor for THIS action: `court collect` re-applies
+                  # it after its own convergence gate so a cohort thinned by a
+                  # fresh castle-side conflict DEFERS a tick instead of packing
+                  # short. Clamped to the emitted batch so a `collect_batch_max`
+                  # cap below `collect_min_batch` cannot deadlock collection.
+                  "collect_min_batch": (min(int(policy.collect_min_batch or 1), len(batch))
+                                        if cog == "new" else 0)},
         ))
         capacity -= 1
         if len(batch) > 1:
@@ -1793,7 +1867,8 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
         if isinstance(st.get("merge_conflict"), dict)
         and not st["merge_conflict"].get("escalated_ts")
         and qid in quests
-        and (quests[qid].get("status") or "").upper() in ("WORKING", "QUESTING", "TRIBUTE_READY")
+        and (quests[qid].get("status") or "").upper() in (
+            "WORKING", "QUESTING", "TRIBUTE_READY", "GATE")
     ]
     if conflict_quests and policy.allows("steward"):
         steward_state = state.get("steward") or {}
@@ -2456,6 +2531,9 @@ def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -
     if action.kind == "collect":
         if action.cogship:
             argv += ["--cogship", action.cogship]
+        _min_batch = int(action.meta.get("collect_min_batch") or 0)
+        if _min_batch > 1:
+            argv += ["--collect-min-batch", str(_min_batch)]
         argv.append("--standup")
     if action.force:
         argv.append("--force")
@@ -2479,6 +2557,9 @@ def execute(repo: Path, action: Action, timeout: int = DEFAULT_ACTION_TIMEOUT) -
             # Decided on the FULL stdout: the pack line is printed before the
             # (long) next-steps block, so a truncated tail can lose it.
             "packed": "Stamped" in out,
+            # A cohort-floor deferral: exit 0, nothing stamped, and NOT a blocked
+            # convoy — a transient hold that retries next tick (see bookkeeping).
+            "deferred": "Deferred:" in out,
         }
         # `court rebase` exits 0 even when it reports a conflict, so the
         # reported conflict — not the exit code — is the failure signal. This
@@ -2939,6 +3020,14 @@ def _apply_bookkeeping(state: dict, action: Action, result: dict, now: float, re
             convoy["last_error"] = "gatehouse worktree already exists"
             stale_backoff = float(action.meta.get("stale_backoff") or DEFAULT_STALE_CONVOY_BACKOFF)
             convoy["retry_at"] = now + stale_backoff
+        elif ok and result.get("deferred"):
+            # Exit 0, nothing packed because the cohort thinned below the floor
+            # the planner required (a castle-side commit landed since the probe).
+            # This is a transient hold, not a blocked convoy: retry next tick on
+            # the SHORT backoff rather than the hard noop window, so the next
+            # collect can pack the full cohort after fresh convergence.
+            defer = float(action.meta.get("retry_backoff") or DEFAULT_RETRY_BACKOFF)
+            convoy["retry_at"] = now + defer
         elif ok:
             # exit 0 but nothing packed (PENDING UI review, dirty tree, charter
             # violations) is NOT progress. Back the convoy off hard so a blocked
@@ -3257,6 +3346,72 @@ def _write_pulse(repo: Path, policy: "Policy", snap: dict, state: dict,
         _journal(repo, {"ts": _now_iso(), "event": "pulse_failed", "error": str(e)[:500]})
 
 
+def _probe_gate_merges(repo: Path, snap: dict, state: dict, now: float) -> dict:
+    """Pre-pack mergeability probe for GATE candidates (Q1569 follow-up).
+
+    `court collect` merges each candidate onto `castle` at its own pre-pack
+    convergence gate and drops any branch that conflicts — and, because
+    `collect_min_batch` is a planner-only policy, the collector never backfills,
+    so a cohort planned without checking convergence packs SHORT. Probe every
+    idle GATE candidate's branch here, before planning, so the planner can hold a
+    non-converging branch for remediation instead of offering it to a doomed
+    convoy that will be thinned at pack time.
+
+    Repo I/O lives here, not in `plan` (which stays pure). Read-only per branch:
+    a `git rev-parse` for the tips and `git_ops.probe_merge_clean`
+    (`git merge-tree --write-tree`: no worktree/index mutation). Memoised per
+    (HEAD, base) tip in the Quest bookkeeping so an unchanged branch is not
+    re-probed every tick. A CLEAN probe also drops a stale `merge_conflict`
+    marker — the authoritative signal that the branch now converges — so a
+    resolved conflict stops holding/escalating the Quest.
+
+    Returns ``{qid: {"clean": bool, "conflicts": [paths]}}`` for the candidates
+    the probe could judge; a Quest absent from the map is "unknown" (never
+    excluded from collect and never remediated)."""
+    probes: dict = {}
+    book = state.setdefault("quests", {})
+    base_res = git_ops._run(["git", "rev-parse", COLLECT_BASE_BRANCH], Path(repo), timeout=30)
+    base_sha = (base_res.get("stdout") or "").strip() if base_res.get("ok") else ""
+    if not base_sha:
+        return probes
+    for q in snap.get("quests", []):
+        if q.get("kind") == "epic":
+            continue
+        if (q.get("status") or "").upper() != "GATE":
+            continue
+        if q.get("pending_audience"):
+            continue
+        wt = q.get("worktree")
+        if not wt or not Path(wt).is_dir():
+            continue
+        head_sha = str((q.get("git_status") or {}).get("head_sha") or "").strip()
+        if not head_sha:
+            head_res = git_ops._run(["git", "rev-parse", "HEAD"], Path(wt), timeout=30)
+            head_sha = (head_res.get("stdout") or "").strip() if head_res.get("ok") else ""
+        if not head_sha:
+            continue
+        sig = [head_sha, base_sha]
+        st = book.setdefault(q["id"], {})
+        cached = st.get("merge_probe")
+        if isinstance(cached, dict) and cached.get("sig") == sig:
+            probe = cached.get("result")
+        else:
+            res = git_ops.probe_merge_clean(wt, base_branch=COLLECT_BASE_BRANCH,
+                                            timeout=MERGE_PROBE_TIMEOUT)
+            probe = ({"clean": bool(res.get("clean")),
+                      "conflicts": list(res.get("conflicts") or [])}
+                     if res.get("ok") else None)
+            if probe is not None:
+                st["merge_probe"] = {"sig": sig, "result": probe, "ts": now}
+        if probe is None:
+            continue
+        probes[q["id"]] = probe
+        if probe.get("clean"):
+            # The branch provably converges now: any recorded conflict is stale.
+            st.pop("merge_conflict", None)
+    return probes
+
+
 def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=print) -> dict:
     now = time.time()
     # Fresh branch-side self-advances first: the snapshot below is the board
@@ -3409,11 +3564,20 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
     except Exception as e:  # noqa: BLE001 — promotion scan must never kill a tick
         promoted_cogships = set()
         say(f"⚠️  convoy promotion scan failed: {e}")
+    # Pre-pack mergeability probe: which GATE branches would fail the collector's
+    # convergence gate. Computed here (repo I/O) so `plan` stays pure.
+    gate_merge_probes: dict = {}
+    try:
+        gate_merge_probes = _probe_gate_merges(repo, snap, state, now)
+    except Exception as e:  # noqa: BLE001 — a probe must never kill a tick
+        gate_merge_probes = {}
+        say(f"⚠️  merge probe failed: {e}")
     actions, notes = plan(snap, state, policy, workers, now=now, ready_vigils=ready,
                           charter_ready=charter_ready, raze_regate=raze_regate,
                           charter_requests=open_requests, ui_mandate_ids=ui_mandate_ids,
                           atelier_ready=atelier_ready, atelier_blocked=atelier_blocked,
-                          ui_pending_ids=ui_pending_ids, promoted_cogships=promoted_cogships)
+                          ui_pending_ids=ui_pending_ids, promoted_cogships=promoted_cogships,
+                          gate_merge_probes=gate_merge_probes)
     notes = vigil_notice + notes
     _record_escalations(state, notes, now)
     # Maintain the stale-Gatekeeper hold's first-seen stamp: set on the first

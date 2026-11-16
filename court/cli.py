@@ -5867,6 +5867,25 @@ def cmd_collect(args):
             sys.exit(1)
         return
 
+    # Cohort floor re-applied AFTER the convergence gate (2026-11-16). The
+    # planner only offers a cohort that already met `collect_min_batch`, but the
+    # pre-pack convergence above can still thin it — a castle-side commit landed
+    # between the planner's probe and this merge (the cogship-618 class). Because
+    # `collect_min_batch` is otherwise a planner-only policy, the survivors then
+    # pack short (1-2 Quests). Defer instead: the suite cost is dominated by the
+    # unified run, so a full convoy next tick is cheaper than a stub one now.
+    # A manual single-Quest `collect`, `--regate`, and `--force` are exempt
+    # (`--collect-min-batch` defaults to 0 = not applied).
+    min_batch = max(0, int(getattr(args, "collect_min_batch", 0) or 0))
+    if (min_batch > 1 and not regate and not bool(getattr(args, "force", False))
+            and len(accepted) < min_batch):
+        print(
+            f"⏭️  Deferred: only {len(accepted)} of {min_batch} Quest(s) converged onto "
+            f"{base_branch} ({', '.join(q.id for q in accepted)}) — leaving them in GATE "
+            "for the next tick rather than packing a degraded convoy"
+        )
+        return
+
     # Single-writer serialization for the convoy-minting tail: stamp + standup
     # is where double-running operators minted duplicate convoys and duplicate
     # Gatekeepers. The lock is advisory and auto-releases on process exit.
@@ -11357,6 +11376,14 @@ def build_parser():
     p_collect.add_argument("--standup", action="store_true", help="Automatically stand up the Gatekeeper worktree and session via Kilo CLI")
     p_collect.add_argument("--force", action="store_true", help="Force packing even if checks warn/fail")
     p_collect.add_argument("--no-commit", action="store_true", help="Do not autocommit changes to git")
+    p_collect.add_argument(
+        "--collect-min-batch", dest="collect_min_batch", type=int, default=0,
+        help="Defer (exit 0 without stamping) when fewer than N Quest(s) survive "
+             "pre-pack convergence, instead of packing a degraded 1-2 Quest convoy "
+             "(0 = pack whatever converged). The watch passes the cohort floor it "
+             "planned, so a cohort thinned by a fresh castle-side conflict waits a "
+             "tick rather than shrinking the convoy.",
+    )
     p_collect.set_defaults(func=cmd_collect)
 
     p_atelier = sub.add_parser(

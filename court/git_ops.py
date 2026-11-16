@@ -1192,6 +1192,55 @@ def _reconcile_own_events_conflict(p: Path, rel_path: str) -> bool:
     return True
 
 
+def probe_merge_clean(
+    worktree_path: str | Path,
+    base_branch: str = "castle",
+    timeout: int = 60,
+) -> dict:
+    """Whether merging `base_branch` into the worktree's HEAD would be clean.
+
+    A read-only 3-way probe built on `git merge-tree --write-tree` (git >= 2.38):
+    it mutates NO worktree file and NO index, resolving the merge in memory. It
+    does not run the engine's own ledger/charter reconcilers (those live in
+    `rebase_worktree_onto_base`), so a reported conflict is the RAW merge result —
+    the caller treats it as a signal to attempt `court rebase` (which does
+    reconcile) before declaring the branch un-packable.
+
+    Returns ``{"ok": bool, "clean": bool, "conflicts": [paths], "error": str|None}``.
+    ``ok`` is False whenever the probe could not be run or trusted (missing
+    worktree, pre-2.38 git, unresolvable ref): callers MUST treat that as
+    "unknown", NEVER as a conflict, so a probe failure can never strand a Quest."""
+    result: dict = {"ok": False, "clean": False, "conflicts": [], "error": None}
+    p = Path(worktree_path)
+    if not p.exists() or not p.is_dir():
+        result["error"] = f"worktree path does not exist: {worktree_path}"
+        return result
+    res = _run(
+        ["git", "merge-tree", "--write-tree", "--name-only", base_branch, "HEAD"],
+        p, timeout=timeout,
+    )
+    # 0 = clean, 1 = conflict; anything else (usage error, pre-2.38 git, bad ref)
+    # is "unknown" so the caller never blocks on a probe it could not trust.
+    if res.get("exit_code") not in (0, 1):
+        result["error"] = (
+            res.get("stderr") or res.get("stdout") or "git merge-tree failed"
+        ).strip()[:300]
+        return result
+    result["ok"] = True
+    if res.get("exit_code") == 0:
+        result["clean"] = True
+        return result
+    # exit 1 (with --name-only): stdout is "<tree-oid>\n<path>\n<path>\n\n<messages>".
+    lines = (res.get("stdout") or "").splitlines()
+    conflicts: list[str] = []
+    for line in lines[1:]:
+        if not line.strip():
+            break
+        conflicts.append(line.strip())
+    result["conflicts"] = conflicts
+    return result
+
+
 def rebase_worktree_onto_base(
     worktree_path: str | Path,
     base_branch: str = "castle",

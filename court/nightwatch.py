@@ -1670,6 +1670,14 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
         if q.get("pending_audience"):
             note(q["id"], "skip", "TRIBUTE_READY but pending Audience — parked")
             continue
+        # Q1574: a UI-review-pending Quest routes to the standing atelier for an
+        # artist session — it must not be coined to GATE, where it would pack.
+        if q["id"] in ui_pending_set:
+            note(q["id"], "wait",
+                 "TRIBUTE_READY with UI review PENDING — routes to the standing atelier "
+                 "for an artist session, never packs; coin follows the sign-off",
+                 key="ui_pending_coin")
+            continue
         if q["id"] in rebase_ids:
             note(q["id"], "wait", "rebasing onto castle this tick — coin follows next tick")
             continue
@@ -3527,7 +3535,10 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
         for q in snap.get("quests", []):
             if q.get("kind") == "epic":
                 continue
-            if (q.get("status") or "").upper() != "GATE":
+            # Q1574: the review gate must cover every packable stage, not just
+            # GATE — a TRIBUTE_READY Quest is coined to GATE and then packed, so
+            # excluding only GATE let ui-pending Quests reach a convoy.
+            if (q.get("status") or "").upper() not in ("GATE", "TRIBUTE_READY"):
                 continue
             if q.get("pending_audience"):
                 continue

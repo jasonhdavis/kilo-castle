@@ -119,7 +119,13 @@ def test_a_stale_suite_proof_blocks_promotion(tmp_path):
     assert [f for f in allowed if f.level == "error"] == []
 
 
-def test_a_pending_ui_review_is_non_blocking_warn_not_an_error(tmp_path):
+def test_a_pending_ui_review_blocks_promotion_and_names_the_atelier(tmp_path):
+    """An outstanding review is a hard promotion refusal, not tracked debt.
+
+    This replaces the old assertion that a PENDING review was a non-blocking
+    warn: that belief is what let Q1480/Q1559/Q887 reach cogship-626 while the
+    planner was already calling them not collectable.
+    """
     repo = _repo(tmp_path)
     _charter(repo, "Q1009", "GATE", ui_review="PENDING — await the Court Artist")
     _quest_branch(repo, "quest/q1009-orders-fulfillment")
@@ -128,11 +134,13 @@ def test_a_pending_ui_review_is_non_blocking_warn_not_an_error(tmp_path):
     cg.record_pack(repo, "cogship-382", ["Q1009-Orders-Fulfillment"])
 
     findings = cg.audit_promotion(repo, "cogship-382")
-    assert not any(f.level == "error" for f in findings if "ui review" in f.message.lower())
-    assert any(f.level == "warn" and "pending UI review" in f.message for f in findings)
+    blocking = [f for f in findings if f.code == "ui-review-pending"]
+    assert len(blocking) == 1
+    assert blocking[0].level == "error"
+    assert "atelier" in blocking[0].message
 
     overridden = cg.audit_promotion(repo, "cogship-382", allow_ui_pending=True)
-    assert not any("pending UI review" in f.message for f in overridden)
+    assert not [f for f in overridden if f.code == "ui-review-pending"]
 
 
 def test_a_non_promotable_status_blocks_promotion(tmp_path):

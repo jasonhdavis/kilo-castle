@@ -283,17 +283,22 @@ class TestCollectWiring(AtelierFixture):
             include_archived=False, standup=False,
         )
 
-    def test_unpatronized_member_without_a_mandate_is_advisory(self):
-        """The charter records review as debt ("no UI Mandate ... NOT a pack
-        gate"), so atelier membership must not silently shrink the cohort: the
-        engine warns and proceeds to the (separate) audit gate."""
+    def test_unpatronized_member_without_a_mandate_is_inventoried(self):
+        """Membership alone is not a pack gate, and it is not "debt" either.
+
+        With no patronage pin and no recorded mandate the Quest packs from its
+        own branch and collect says so plainly. (Its UI review is clear here; a
+        PENDING review would be refused above this block.)
+        """
         atelier.record_member(self.root, store.load(Q1), auto_commit=False)
         out = StringIO()
         with patch("sys.stdout", out), patch("sys.stderr", StringIO()):
             cli.cmd_collect(self._collect_args(Q1))
         text = out.getvalue()
-        self.assertIn("no UI Mandate", text)
+        self.assertIn("no patronage pin", text)
         self.assertNotIn("not yet patronized", text)
+        self.assertNotIn("not a pack gate", text)
+        self.assertNotIn("tracked debt", text)
 
     def test_unpatronized_member_with_a_ui_mandate_is_refused(self):
         """A recorded UI MANDATE IS a hard pack gate: refuse until patronized."""

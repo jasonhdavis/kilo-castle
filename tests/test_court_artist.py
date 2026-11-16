@@ -276,9 +276,12 @@ class TestCourtArtist(unittest.TestCase):
     @patch("court.store.stamp_cogship")
     @patch("court.store.save")
     @patch("court.cli.resolve_quest_selection")
-    def test_cmd_collect_packs_pending_ui_quest_and_reports_debt(self, mock_resolve, mock_save, mock_stamp, mock_save_many, mock_audit):
-        """A pending UI review no longer blocks collection — it is tracked debt
-        reported in collect output and carried in the pack record."""
+    def test_cmd_collect_skips_pending_ui_review(self, mock_resolve, mock_save, mock_stamp, mock_save_many, mock_audit):
+        """An outstanding UI review is a packing block, and the atelier is named.
+
+        This replaces the older assertion that a PENDING review was "tracked
+        debt" and packed anyway: that belief is what let Q1480/Q1559/Q887 ride
+        into cogship-626."""
         q = Quest(
             id="Q907",
             title="Quest with Pending UI Review",
@@ -304,9 +307,14 @@ class TestCourtArtist(unittest.TestCase):
         args.no_commit = True
         args.force = False
         args.skip_ui_review = False
+        args.allow_ui_pending = False
         args.cogship = None
         args.regate = False
-        args.no_premerge = False
+        args.no_premerge = True
+        args.hotfix = False
+        args.allow_pending_studio = False
+        args.collect_min_batch = 0
+        args.max_convoys = 1
         args.standup = False
 
         import io
@@ -316,10 +324,12 @@ class TestCourtArtist(unittest.TestCase):
             cli.cmd_collect(args)
 
         output = buf.getvalue()
-        self.assertIn("Stamped 1 Quest(s) onto cogship-998", output)
-        self.assertIn("UI debt: Q907", output)
-        self.assertNotIn("UI Review is PENDING", output)
-        mock_stamp.assert_called_once()
+        self.assertIn("not collectable", output)
+        self.assertIn("atelier", output)
+        self.assertIn("Q907", output)
+        self.assertNotIn("does NOT block", output)
+        self.assertNotIn("not a pack gate", output)
+        mock_stamp.assert_not_called()
 
     @patch("court.ward.audit_quest")
     @patch("court.store.save_many")

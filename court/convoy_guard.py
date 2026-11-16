@@ -299,8 +299,58 @@ def quest_status(repo_root: Path, quest_id: str, branch: str = "") -> str:
     return (match.group(1).strip().upper() if match else "")
 
 
-def ui_review_pending(repo_root: Path, quest_id: str) -> bool:
-    """True when the Quest's UI review is still outstanding.
+#: The UI review states that mean the rendered change has not been through the
+#: artist review lane yet. PENDING (including an ``APPROVED`` claim with no
+#: recorded sign-off) and DEFERRED both count: a deferral records that the
+#: review is still owed, it does not record that it happened.
+UI_REVIEW_OUTSTANDING_STATES = ("pending", "deferred")
+
+#: Where a UI-review-outstanding Quest is supposed to go instead of a convoy.
+#: Named once so every message points at the same destination.
+UI_REVIEW_ROUTE_HINT = (
+    "route it to the standing atelier (`court atelier <quest>` merges it for "
+    "review, and the watch's atelier lane does it automatically)"
+)
+
+
+def ui_review_state(ui_status: str) -> str:
+    """Classify a UI Review status string into one of four states.
+
+    ``pending``   — PENDING, or an APPROVED claim that carries no sign-off;
+    ``deferred``  — the review/sign-off text carries ``defer``;
+    ``clear``     — reviewed, waived, or explicitly not required;
+    ``missing``   — no UI review status recorded at all.
+
+    This is the ONE classifier the packing decisions read. The Night's Watch
+    planner, ``court collect``, and the convoy promotion guard all resolve UI
+    review through ``ui_review_outstanding`` / ``ui_review_outstanding_for``
+    so their answers cannot drift apart (the drift that let Q1480/Q1559/Q887
+    ride into cogship-626 while the planner called them not collectable).
+    """
+    text = (ui_status or "").strip()
+    if not text:
+        return "missing"
+    upper = text.upper()
+    lowered = text.lower()
+    # A deferral is checked BEFORE the PENDING prefix: "PENDING — deferred while
+    # M'Lord is away" is a deferral, not a plain pending review. This keeps the
+    # classifier in step with ``ui_assent_state``, which has always read that
+    # string as ``deferred``; two classifiers disagreeing about the same text is
+    # exactly the drift this shared predicate exists to prevent.
+    if upper.startswith("DEFERRED") or "defer" in lowered:
+        return "deferred"
+    if upper.startswith("PENDING"):
+        return "pending"
+    return "clear"
+
+
+def ui_review_outstanding(ui_status: str) -> bool:
+    """True when this UI Review status means the review is still outstanding."""
+    return ui_review_state(ui_status) in UI_REVIEW_OUTSTANDING_STATES
+
+
+def ui_review_status_text(repo_root: Path, quest_id: str) -> str:
+    """The Quest's UI Review status text, engine-first with a charter fallback.
 
     Prefers the engine's own extraction (it understands the Master of Coin's
     Audit / Tribute Rendered sections and sign-off evidence); falls back to the
@@ -313,26 +363,44 @@ def ui_review_pending(repo_root: Path, quest_id: str) -> bool:
         quest = store.load(quest_id, court_root=Path(repo_root) / ".court")
         status = quest.extract_ui_review_status()
         if status:
-            if "defer" in status.strip().lower():
-                return False
-            return status.strip().upper().startswith("PENDING")
+            return status
     except Exception:
         pass
     path = _quest_file(repo_root, quest_id)
     if path is None:
-        return False
+        return ""
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
-        return False
+        return ""
     last = ""
     for line in text.splitlines():
         match = _UI_REVIEW_RE.match(line)
         if match:
             last = match.group(1)
-    if "defer" in last.lower():
-        return False
-    return "pending" in last.lower()
+    return last.strip().strip("*").strip()
+
+
+def ui_review_outstanding_for(repo_root: Path, quest_id: str) -> tuple[bool, str]:
+    """``(outstanding, status_text)`` for one Quest's recorded UI review.
+
+    This is the shared entry point for the three packing paths: ``court
+    collect`` excludes a candidate when this returns True, the Night's Watch
+    planner declares it not collectable for the same reason, and ``court
+    verify-convoy`` refuses to promote a convoy that carries one.
+    """
+    status = ui_review_status_text(repo_root, quest_id)
+    return ui_review_outstanding(status), status
+
+
+def ui_review_pending(repo_root: Path, quest_id: str) -> bool:
+    """True when the Quest's UI review is PENDING specifically.
+
+    Kept for callers that need the narrower question (the awaiting board's
+    "ui" bucket). Packing decisions use ``ui_review_outstanding_for`` because
+    DEFERRED is equally unreviewed.
+    """
+    return ui_review_state(ui_review_status_text(repo_root, quest_id)) == "pending"
 
 
 _UI_LINE_RE = re.compile(r"(?im)^\s*[-*]?\s*\*{0,2}UI Review\*{0,2}:?\*{0,2}\s*(.+)$")
@@ -413,11 +481,14 @@ _UI_MANDATE_SENTENCE_RE = re.compile(
 def ui_mandate(repo_root: Path, quest_id: str) -> tuple[bool, str]:
     """True when the Quest's own paperwork REQUIRES a UI review/artist session.
 
-    UI review is tracked debt by design: outstanding review never blocks a
-    promotion, and the Court Artist lane closes it later. A *mandate* is a
-    different animal — a royal decree or charter note that names the session as
-    a required step before the UI may be called complete. Downgrading that to
-    warning-only debt is how Q1135 shipped with no studio session at all.
+    An outstanding UI review already blocks packing: ``court collect`` refuses
+    the candidate and routes it to the standing atelier, and the promotion guard
+    refuses a convoy carrying one (code ``ui-review-pending``). A *mandate* is a
+    different, stricter requirement — a royal decree or charter note that names
+    the session as a required step before the UI may be called complete. A
+    mandate cannot be overridden by ``--allow-ui-pending``: downgrading it to
+    warning-only debt is how Q1135 shipped with no studio session at all. Only a
+    written sign-off, an explicit waiver, or a recorded clearance satisfies it.
 
     Sources, in order:
 
@@ -637,10 +708,12 @@ def audit_promotion(
     the membership check degrades to a warning (legacy convoys predate the pack
     record) while the status and UI checks still run.
 
-    ``allow_ui_pending`` only silences the non-blocking UI-debt warning. A Quest
-    still inside an open combined artist studio is a hard block unless
-    ``allow_pending_studio`` is passed: its reviewed artwork lives only on the
-    studio branch, so promoting the Quest branch would ship pre-review code.
+    ``allow_ui_pending`` overrides the UI-review block deliberately (the review
+    is otherwise a hard refusal: an outstanding review belongs in the standing
+    atelier, never in a promoted convoy). A Quest still inside an open combined
+    artist studio is a hard block unless ``allow_pending_studio`` is passed: its
+    reviewed artwork lives only on the studio branch, so promoting the Quest
+    branch would ship pre-review code.
     """
     cid = normalize_cogship_id(cogship_id)
     branch = convoy_branch(cid)
@@ -706,10 +779,10 @@ def audit_promotion(
                 quest=qid,
                 branch=source,
             ))
-        # A recorded UI MANDATE is an integrity finding, never debt, and
-        # --allow-ui-pending must not silence it: that flag means "ordinary
-        # outstanding review is tracked debt", not "the owner's required step is
-        # optional". Q1135 shipped on exactly that confusion.
+        # A recorded UI MANDATE is an integrity finding, and --allow-ui-pending
+        # must not silence it: that flag deliberately overrides the ordinary
+        # outstanding-review refusal in the `elif` below, never a step the owner
+        # required. Q1135 shipped on exactly that confusion.
         mandate_outstanding, mandate_detail = ui_mandate_outstanding(repo_root, qid)
         if mandate_outstanding:
             findings.append(Finding(
@@ -724,15 +797,25 @@ def audit_promotion(
                 branch=source,
                 code="ui-mandate",
             ))
-        elif not allow_ui_pending and ui_review_pending(repo_root, qid):
-            findings.append(Finding(
-                "warn",
-                f"{qid} carries a pending UI review — tracked debt, not a block: the Court "
-                f"Artist lane closes it later (Royal Addendum); promotion proceeds without it. "
-                f"(--allow-ui-pending silences this warning.)",
-                quest=qid,
-                branch=source,
-            ))
+        elif not allow_ui_pending:
+            # UI review PENDING/DEFERRED is a PACKING block, not tracked debt:
+            # `court collect` refuses such a candidate so a convoy can never be
+            # built that this guard would then refuse. Reaching here means the
+            # pack bypassed that gate (a manual pack, a legacy convoy, or a Quest
+            # whose review regressed after packing), so refuse the promotion and
+            # name the atelier as the destination.
+            ui_outstanding, ui_status_text = ui_review_outstanding_for(repo_root, qid)
+            if ui_outstanding:
+                findings.append(Finding(
+                    "error",
+                    f"{qid} carries an outstanding UI review "
+                    f"({ui_status_text or 'no UI record'}) — {UI_REVIEW_ROUTE_HINT}, then record "
+                    f"the sign-off (`court ui-signoff {qid} --by \"M'Lord\" --note \"<where said>\"`) "
+                    f"and re-pack. --allow-ui-pending overrides deliberately.",
+                    quest=qid,
+                    branch=source,
+                    code="ui-review-pending",
+                ))
         if not allow_pending_studio:
             pending, detail = studio_pending(repo_root, qid)
             if pending:

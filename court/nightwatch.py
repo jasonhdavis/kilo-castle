@@ -20,10 +20,10 @@ Scope of authority (deliberately narrow):
     `castle`                               castle before a spawn; zero agent turns)
   * GATE + no live/recorded Gatekeeper  -> `collect --standup` (a PENDING UI
                                            review is escalated, never collected)
-  * GATE + UI review PENDING            -> `atelier` (opt-in `--enable ...,atelier`):
-                                           merge the Quest into the ONE standing
-                                           studio for review; a live artist turn
-                                           defers the merge (single-writer)
+  * GATE + UI review PENDING            -> `atelier` (default-on): merge the
+                                           Quest into the ONE standing studio for
+                                           review; a live artist turn defers the
+                                           merge (single-writer)
   * PLANNED/CHARTERED/DISPATCHED        -> report only (dispatching new work is a
                                            Steward judgment call, not a timer —
                                            the one exception is a bounded
@@ -204,7 +204,8 @@ DEFAULT_STALE_GATEKEEPER_EXPIRY = 30 * 60
 # ensure, NEVER a reasoning worker, so it is a LOCAL action that consumes no
 # worker slot. Single-writer: a live artist turn in the atelier worktree refuses
 # the merge (the guard lives inside `court atelier`), so the lane stands down and
-# retries when the artist is idle. Opt-in (`--enable ...,atelier`).
+# retries when the artist is idle. Default-on (`Policy.enabled`); a repository can
+# still switch it off with an explicit `--enable` list that omits `atelier`.
 DEFAULT_ATELIER_COOLDOWN = 30 * 60
 DEFAULT_ATELIER_BATCH_MAX = 6
 DEFAULT_PG_PRUNE_INTERVAL = 6 * 60 * 60
@@ -342,11 +343,16 @@ class Policy:
     # blocking failure the watch must be able to clear unattended). `rebase` is
     # also default-on: converging a drifted worktree onto castle is a local,
     # zero-token git operation that prevents a deterministic coin/goad failure
-    # (and the wasted Steward muster that follows). `steward` and `raze` remain
-    # deliberate opt-ins: steward spends a reasoning worker; raze deletes a
-    # branch ref. ENABLED_ACTIONS is the full `--enable` vocabulary.
+    # (and the wasted Steward muster that follows). `atelier` is default-on too:
+    # it is a local git merge + dev-server ensure (no reasoning worker), and it
+    # is the only destination for a UI-review-pending GATE Quest now that
+    # `court collect` refuses to pack one. Leaving it opt-in stranded those
+    # Quests at GATE (the lane only ever reported `atelier_disabled`).
+    # `steward` and `raze` remain deliberate opt-ins: steward spends a reasoning
+    # worker; raze deletes a branch ref. ENABLED_ACTIONS is the full `--enable`
+    # vocabulary.
     enabled: tuple = ("goad", "coin", "collect", "dispatch", "teardown", "rebase",
-                      "raze", "regate", "charter", "pgprune")
+                      "raze", "regate", "charter", "pgprune", "atelier")
     allow_force_goad: bool = False
     status_timeout: int = DEFAULT_STATUS_TIMEOUT
     # Pleasance lane: each tick may fetch and apply remote paperwork (charters,
@@ -1386,8 +1392,8 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
             # stop offering it to collect so it does not churn a doomed no-op
             # pack every tick.
             note(q["id"], "report",
-                 "GATE with UI review PENDING — not collectable; the standing atelier merges it "
-                 "for review (merge lane: `--enable ...,atelier`, or `court atelier <ids>` by hand)",
+                 "GATE with UI review PENDING/DEFERRED — not collectable; the standing atelier "
+                 "merges it for review (`court atelier <ids>`, or the watch's atelier lane)",
                  key="atelier_pending")
             continue
         role = role_state(q.get("worktree"), "gatekeeper")
@@ -1577,8 +1583,8 @@ def plan(snap: dict, state: dict, policy: Policy, workers: dict, now: Optional[f
     # merge + server ensure (no reasoning worker), so this is a LOCAL action. The
     # single-writer guard inside the command refuses a merge while an artist turn
     # is live, so when one is live we stand down and retry when it is idle.
-    # Opt-in (`--enable ...,atelier`); otherwise we only report the standing
-    # cohort with the exact manual command.
+    # Default-on (`Policy.enabled`); an explicit `--enable` list that omits
+    # `atelier` still just reports the standing cohort with the manual command.
     if atelier_ready:
         if not policy.allows("atelier"):
             note(",".join(atelier_ready[:3]), "report",
@@ -3499,13 +3505,16 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
         say(f"⚠️  UI mandate scan failed: {e}")
     # UI-review-pending GATE Quests: not collectable, so route them to the
     # standing atelier. The snapshot already carries each Quest's `ui_review`;
-    # manifest membership (already merged) and a live artist turn decide whether
+    # the SAME shared predicate `court collect` and the promotion guard read
+    # decides what counts as outstanding, so the planner cannot drift from them.
+    # Manifest membership (already merged) and a live artist turn decide whether
     # the merge can run this tick.
     ui_pending_ids: list[str] = []
     atelier_ready: list[str] = []
     atelier_blocked = False
     try:
         from . import atelier as _atelier
+        from . import convoy_guard as _convoy_guard
         atelier_members = set(_atelier.members(repo))
         atelier_wt = str(_atelier.worktree_path(repo))
         if Path(atelier_wt).is_dir():
@@ -3522,7 +3531,7 @@ def tick(repo: Path, policy: Policy, state: dict, dry_run: bool = False, say=pri
                 continue
             if q.get("pending_audience"):
                 continue
-            if not (q.get("ui_review") or "").upper().startswith(("PENDING", "DEFERRED")):
+            if not _convoy_guard.ui_review_outstanding(q.get("ui_review") or ""):
                 continue
             qid = q["id"]
             ui_pending_ids.append(qid)

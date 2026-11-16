@@ -16,7 +16,7 @@ Follow the Collect Protocol (absorbing gate progression):
 > `## Master of Coin's Audit` section already on record — Step 1's audit below distinguishes the two) are
 > actually ready to be packed here.
 >
-> **Precondition — UI Review before Collection**: If a candidate Quest modified templates or UI views and its UI Review status is PENDING, the Steward's recommended / automatic action before collection is to summon the **Court Artist** (`/artist <id>`). The Serf is permitted to create the initial UI, but M'Lord and the Court Artist refine the UI/UX with the live worktree runserver before collection. `court collect` will refuse candidates whose UI Review is still PENDING unless `--skip-ui-review` is explicitly passed.
+> **Precondition — UI Review before Collection**: If a candidate Quest modified templates or UI views and its UI Review status is PENDING, the Steward's recommended / automatic action before collection is to summon the **Court Artist** (`/artist <id>`). The Serf is permitted to create the initial UI, but M'Lord and the Court Artist refine the UI/UX with the live worktree runserver before collection. `court collect` refuses any candidate whose UI Review is still outstanding (PENDING or DEFERRED) unless `--allow-ui-pending` is explicitly passed — the standing atelier is the destination for those Quests.
 >
 > **Batched UI review**: when several small UI-review-pending Quests stack up, do NOT run per-quest `/artist` sessions — merge them into the SINGLE standing studio with `/atelier <ids>` (`court atelier`). M'Lord reviews all UI in one merged view and patronizes each Quest independently (`court patronize <id>`), which queues the Night's Watch to collect it; collection then replays only that Quest's pinned revision. The legacy pre-collect convoy lane is `/convoy` (`court atelier --convoy`) when the UI must be reviewed *before* the integration suite.
 
@@ -25,13 +25,13 @@ Follow the Collect Protocol (absorbing gate progression):
    Quest with no recorded Master of Coin audit (the exact gap that let unaudited Tributes
    slip straight to `GATE` in the past), or with `UI Review: PENDING` on user-facing UI:
    ```bash
-   python3 -m court.cli collect [<quest_id_1>,<quest_id_2>...] [--status/--app/--epic] [--cogship <id>] [--skip-ui-review]
+   python3 -m court.cli collect [<quest_id_1>,<quest_id_2>...] [--status/--app/--epic] [--cogship <id>] [--allow-ui-pending]
    ```
    - Omit `quest_ids` to auto-select every Master-of-Coin-approved candidate at
      `TRIBUTE_READY` (or narrow with `--status`/`--app`/`--epic`).
    - Automatically skips (with a stated reason) any Quest that is `PUNISHED`, has a dirty
      working tree, has compliance violations, has no `## Master of Coin's Audit` content
-     on record, or has `UI Review: PENDING` without royal review (run `/artist <id>` first, or pass `--skip-ui-review`) — route a value-deficient candidate back through `court pillory`, never
+     on record, or has an outstanding `UI Review` (PENDING/DEFERRED) — route it to the standing atelier (`/atelier <ids>`, or let the watch's atelier lane merge it), or pass `--allow-ui-pending` for a deliberate exception — route a value-deficient candidate back through `court pillory`, never
      `/reject_tribute`.
    - **Note (Q149, 2026-09-05):** bounded drift at `TRIBUTE_READY` is a warning, not a
      blocking violation — it accumulates naturally while a Quest waits its turn in the

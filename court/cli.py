@@ -5662,19 +5662,61 @@ def cmd_collect(args):
                     "--allow-pending-studio",
                 ))
                 continue
-        # Standing-atelier handling (the single UI-review path). A Quest merged
-        # into the atelier must be PATRONIZED before it can pack, and its pinned
-        # approved revision must be extracted onto its own branch first.
-        # Extraction is mechanical and per-Quest — the pin is a set of the
-        # Quest's OWN commit SHAs, so no other Quest's in-progress work rides in.
+        # An OUTSTANDING UI review (PENDING or DEFERRED) is a packing block, not
+        # a warning, and this gate runs BEFORE the standing-atelier handling
+        # below. Order matters: an atelier member whose review is still owed
+        # must be refused HERE, naming the atelier, and must never reach a
+        # later branch that packs it while calling the review "tracked debt".
+        # `court collect` used to print "UI review does NOT block this convoy"
+        # and pack anyway, so convoys arrived at the promotion guard already
+        # poisoned (Q1480/Q1559/Q887 rode into cogship-626; Q887 into
+        # cogship-625). The destination is the standing atelier, which merges
+        # the Quest into the one merged studio for artist review.
+        # `--allow-ui-pending` (same flag as `court verify-convoy`) overrides
+        # deliberately.
+        allow_ui_pending = (bool(getattr(args, "allow_ui_pending", False))
+                            or bool(getattr(args, "skip_ui_review", False)))
+        if not allow_ui_pending:
+            # The worktree charter is freshest (approvals commit on the branch
+            # before they reach the castle ledger), the in-memory ledger copy is
+            # next, and the on-disk predicate is the fallback. All three feed the
+            # SAME classifier, so collect cannot disagree with the planner or the
+            # promotion guard about what "outstanding" means.
+            wt_charter = _quest_worktree_charter(quest)
+            ui_status_text = ((wt_charter.extract_ui_review_status() if wt_charter is not None else "")
+                              or quest.extract_ui_review_status())
+            if ui_status_text:
+                ui_outstanding = convoy_guard.ui_review_outstanding(ui_status_text)
+            else:
+                ui_outstanding, ui_status_text = convoy_guard.ui_review_outstanding_for(repo_root, quest.id)
+            if ui_outstanding:
+                # Truncate the recorded status text: a charter can carry a whole
+                # paragraph of review context, and a refusal line has to stay
+                # readable (the full text remains in the charter).
+                detail = (ui_status_text or "unrecorded").strip().replace("\n", " ")
+                if len(detail) > 160:
+                    detail = detail[:160].rstrip() + "…"
+                skipped.append((
+                    quest.id,
+                    f"UI review {detail} — not collectable; "
+                    f"{convoy_guard.UI_REVIEW_ROUTE_HINT}. Record the sign-off "
+                    f"(`court ui-signoff {quest.id} --by \"M'Lord\" --note \"<where said>\"`) before "
+                    f"packing, or pass --allow-ui-pending",
+                ))
+                continue
+        # Standing-atelier handling (the single UI-review path). Reached only
+        # when the gate above did not refuse the Quest (its review is clear, or
+        # --allow-ui-pending was given deliberately). A Quest merged into the
+        # atelier must be PATRONIZED before its approved revision can be
+        # extracted onto its own branch: the pin is a set of the Quest's OWN
+        # commit SHAs, so no other Quest's in-progress work rides in.
         atelier_member = atelier.member(repo_root, quest.id)
         if atelier_member is not None:
             pin = atelier_member.get("patronage") if isinstance(atelier_member.get("patronage"), dict) else None
-            # A recorded UI MANDATE is the only thing that makes studio membership
-            # a HARD pack gate. Otherwise the charter's own intent wins: the engine
-            # must not silently override "- Review: PENDING ... no UI Mandate in
-            # the charter, so this is review debt, NOT a pack gate" and shrink the
-            # cohort (Q1460/Q1480 were refused exactly this way).
+            # A UI MANDATE on top of atelier membership is refused here with the
+            # patronize-specific guidance. Without a mandate, whether the review
+            # is outstanding was already settled by the gate above, so this
+            # branch never re-litigates it.
             atelier_mandate, atelier_mandate_detail = convoy_guard.ui_mandate_outstanding(repo_root, quest.id)
             if not pin and atelier_mandate:
                 skipped.append((
@@ -5684,8 +5726,9 @@ def cmd_collect(args):
                 ))
                 continue
             if not pin:
-                print(f"⚠️ {quest.id}: in the standing atelier without a patronage pin, and the charter "
-                      f"records no UI Mandate — treating the review as tracked debt (not a pack gate) and packing.")
+                print(f"ℹ️ {quest.id}: in the standing atelier with no patronage pin — no approved "
+                      f"atelier revision is pinned, so nothing is extracted and the Quest branch packs "
+                      f"as-is (`court patronize {quest.id} --by \"M'Lord\"` pins a reviewed revision).")
             else:
                 atelier_branch = pin.get("atelier_branch") or atelier.ATELIER_BRANCH
                 if not atelier.extraction_status(repo_root, quest).get("applied"):
@@ -5983,9 +6026,9 @@ def cmd_collect(args):
     accepted = repackable
     print(f"🚢 Stamped {len(accepted)} Quest(s) onto {cogship_id}.")
 
-    # UI review is tracked debt, never a convoy poison pill: pack the Quest,
-    # report the outstanding/deferred state loudly, and record it in the pack
-    # record so the Court Artist lane can close it later (Royal Addendum).
+    # The UI-review gate above keeps outstanding reviews out of a convoy. When
+    # `--allow-ui-pending` packed one deliberately, report the state loudly and
+    # record it in the pack record so the artist lane can still close it.
     ui_debt: list[str] = []
     for q in accepted:
         state, _detail = convoy_guard.ui_assent_state(repo_root, q.id)
@@ -5994,8 +6037,8 @@ def cmd_collect(args):
         ui_debt.append(f"{q.id}: {state}")
         print(f"⚠️ UI debt: {q.id} — {state}")
     if ui_debt:
-        print(f"   → {len(ui_debt)} UI debt item(s) carried in the pack record; UI review does "
-              "NOT block this convoy (closes later via a Court Artist Royal Addendum)")
+        print(f"   → {len(ui_debt)} UI debt item(s) carried in the pack record by "
+              "--allow-ui-pending; the standing atelier is the normal destination for these")
 
     # Record the pack this collect authorised. Promotion is per-branch, so the
     # allow-list has to live on disk: the Gatekeeper's fast-forward promotes
@@ -6956,7 +6999,7 @@ def cmd_atelier(args):
             ))
             continue
         ui_status = effective_quest.extract_ui_review_status() or quest.extract_ui_review_status()
-        if not ui_status.upper().startswith(("PENDING", "DEFERRED")):
+        if not convoy_guard.ui_review_outstanding(ui_status):
             skipped.append((
                 quest.id,
                 f"UI Review is not PENDING/DEFERRED ('{ui_status or 'not recorded'}') -- nothing for the "
@@ -7313,7 +7356,7 @@ def cmd_studio(args):
             ))
             continue
         ui_status = effective_quest.extract_ui_review_status() or quest.extract_ui_review_status()
-        if not ui_status.upper().startswith(("PENDING", "DEFERRED")):
+        if not convoy_guard.ui_review_outstanding(ui_status):
             skipped.append((
                 quest.id,
                 f"UI Review is not PENDING/DEFERRED ('{ui_status or 'not recorded'}') -- nothing for the "
@@ -9312,12 +9355,14 @@ def cmd_ui_signoff(args):
 def cmd_ui_mandate(args):
     """Record (or clear) a UI MANDATE on a Quest's charter.
 
-    Ordinary UI review is tracked debt. A mandate is different: the Quest's own
-    paperwork (a royal decree, an owner's charter note) names the Court Artist /
-    UI Studio session as a REQUIRED step before the UI may be called complete.
-    Recording it turns that step into a gate instead of a warning — `court
-    collect`, `court verify-convoy` and `court ship` all refuse until a written
-    sign-off exists, and `court ui-signoff --defer` refuses to launder it.
+    An outstanding ordinary UI review already blocks packing (`court collect`
+    refuses the candidate and routes it to the standing atelier, and `court
+    verify-convoy` refuses promotion with code ui-review-pending). A mandate is
+    stronger still: the Quest's own paperwork (a royal decree, an owner's charter
+    note) names the Court Artist / UI Studio session as a REQUIRED step before the
+    UI may be called complete. First refusal at both gates is a written sign-off
+    or an explicit waiver; --allow-ui-pending never overrides a mandate because
+    that flag overrides the ordinary review rule, not the owner's required step.
 
     The marker lives next to the UI Review evidence in the Master of Coin's
     Audit section, so the charter carries the requirement and its provenance.
@@ -9526,14 +9571,14 @@ def _ship_interrogation(args, quests, trunk: str) -> tuple[list[str], list[str]]
     if not rider_findings:
         print("   ✅ every convoy member is in the manifest")
 
-    print("\n3. UI review — mandated review blocks; ordinary outstanding review is tracked debt")
+    print("\n3. UI review — a recorded mandate blocks; an outstanding ordinary review is "
+          "inventoried only")
     skip_ui = bool(getattr(args, "skip_ui_review", False))
     ui_debt: list[tuple[str, str]] = []
     for quest in quests:
         mandated, mandate_detail = convoy_guard.ui_mandate_outstanding(repo_root, quest.id)
         if mandated:
-            # A recorded UI mandate is an integrity finding: --skip-ui-review
-            # waives ordinary pending review, never the owner's required step.
+            # A recorded UI mandate is an integrity finding; no flag waives it.
             integrity.append(f"{quest.id} UI mandate unmet — {mandate_detail}")
             print(f"   ❌ {quest.id}: UI MANDATE unmet — {mandate_detail[:220]}")
             continue
@@ -9544,7 +9589,8 @@ def _ship_interrogation(args, quests, trunk: str) -> tuple[list[str], list[str]]
         ui_debt.append((quest.id, state + (f" — {detail[:120]}" if detail else " (no UI record in the charter)")))
         print(f"   ⚠️ {quest.id}: UI {state}" + (f" — {detail[:110]}" if detail else " — no charter record"))
     if skip_ui:
-        print("   UI review is non-blocking this ship; --skip-ui-review is a noop for mandates")
+        print("   --skip-ui-review is a noop here: outstanding review is inventoried, never gated, "
+              "at ship time; mandates above are refused regardless")
 
     print("\n" + "-" * 76)
     if not integrity:
@@ -9552,7 +9598,14 @@ def _ship_interrogation(args, quests, trunk: str) -> tuple[list[str], list[str]]
     else:
         print(f"❌ INTERROGATION: {len(integrity)} integrity blocking finding(s)")
     if ui_debt:
-        print(f"   (⚠️ {len(ui_debt)} UI debt item(s) tracked for the Court Artist lane — non-blocking)")
+        print(f"   (⚠️ {len(ui_debt)} Quest(s) already on the trunk carry an outstanding UI review — "
+              f"inventory, not a ship gate)")
+        print("   Why ship does not block these: the hard refusal for an outstanding ordinary review "
+              "lives at CONVOY ADMISSION (`court collect` refuses the candidate; `court verify-convoy` "
+              "refuses promotion with code ui-review-pending). Everything in a ship manifest is already "
+              "in the trunk, so refusing the trunk push here would stall every deploy over Quests "
+              "promoted before that gate existed and would route nothing to the atelier. They are "
+              "listed so the Court Artist lane can close them.")
     print("-" * 76)
     return integrity, ui
 
@@ -9742,12 +9795,17 @@ def cmd_ship(args):
         print(f"\n✅ Commutations Done ({len(manifest['commutations_done'])}) — already executed and logged in Cogship Log: {done_ids}")
         print("   (steer them with `court` /status — they are no longer outstanding post-deploy actions)")
 
-    # 6c. UI Debt Roster: outstanding/deferred UI review that does not block this
-    # ship — the Court Artist lane (Royal Addendum) closes it after deploy.
+    # 6c. UI review roster: Quests ALREADY on the trunk whose ordinary UI review
+    # is still outstanding. This is an inventory for the Court Artist lane, not a
+    # ship gate: the hard refusal is at convoy admission (`court collect` and
+    # `court verify-convoy`, code ui-review-pending), so nothing new can reach the
+    # trunk with an outstanding review. An UNMET MANDATE in this roster is still a
+    # blocking integrity finding and is reported as such below.
     if ui_debt_roster:
         print("\n" + "-" * 76)
-        print(f"⚠️ UI DEBT ROSTER — outstanding/deferred UI review ({len(ui_debt_roster)} Quest(s))")
-        print("   UI review does NOT block this ship; the Court Artist lane closes these later.")
+        print(f"⚠️ UI REVIEW ROSTER — outstanding review already on the trunk ({len(ui_debt_roster)} Quest(s))")
+        print("   Inventory only: the block lives at convoy admission (court collect / court verify-convoy); "
+              "the Court Artist lane closes these later.")
         for qid, state in ui_debt_roster:
             print(f"   * {qid} -> {state}")
 
@@ -11365,7 +11423,12 @@ def build_parser():
     add_quest_selector(p_collect, batchable=True, filters=("status", "app", "epic"))
     p_collect.add_argument("--cogship", default=None, help="Existing Cog Ship ID to stamp (e.g. cogship-002); omit or pass 'new' to allocate the next id")
     p_collect.add_argument("--base", default="castle", help="Base branch for pre-pack convergence and the compliance audit (default: castle)")
-    p_collect.add_argument("--skip-ui-review", action="store_true", help="Bypass pending UI review check when packing into Cog Ship")
+    p_collect.add_argument("--skip-ui-review", action="store_true", help="Deprecated alias for --allow-ui-pending (bypass the outstanding UI review packing gate)")
+    p_collect.add_argument(
+        "--allow-ui-pending", dest="allow_ui_pending", action="store_true", default=False,
+        help=("Pack a Quest whose UI review is still PENDING/DEFERRED (deliberate override only; "
+              "the default refuses it and routes it to the standing atelier)"),
+    )
     p_collect.add_argument(
         "--allow-pending-studio", dest="allow_pending_studio", action="store_true", default=False,
         help="Pack a Quest that is still inside an open combined artist studio (deliberate override only)",
@@ -11798,7 +11861,7 @@ def build_parser():
     p_nightwatch.add_argument("--steward-stale-after", dest="steward_stale_after", type=int, default=nightwatch.DEFAULT_STEWARD_STALE_AFTER, help=f"Seconds an unchanged board with no live worker must sit before a Steward may be mustered (default {nightwatch.DEFAULT_STEWARD_STALE_AFTER})")
     p_nightwatch.add_argument("--steward-cooldown", dest="steward_cooldown", type=int, default=nightwatch.DEFAULT_STEWARD_COOLDOWN, help=f"Seconds between Steward musters (default {nightwatch.DEFAULT_STEWARD_COOLDOWN})")
     p_nightwatch.add_argument("--max-stewards-per-day", dest="max_stewards_per_day", type=int, default=nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY, help=f"Rolling 24-hour Steward muster cap (default {nightwatch.DEFAULT_MAX_STEWARDS_PER_DAY})")
-    p_nightwatch.add_argument("--enable", default=",".join(nightwatch.Policy().enabled), help="Comma list of permitted actions (goad,coin,collect,dispatch,steward,charter,raze,regate,teardown,rebase,prune,pgprune). ON by default: goad,coin,collect,dispatch,teardown,rebase,raze,regate,charter,pgprune — local/mechanical, or one bounded Steward turn for a validated charter request (raze verifies promotion before deleting anything; teardown/DB reaping refuse anything a live worktree still owns). OPT-IN: steward (board-triage muster) and prune (Kilo session-store VACUUM).")
+    p_nightwatch.add_argument("--enable", default=",".join(nightwatch.Policy().enabled), help="Comma list of permitted actions (goad,coin,collect,dispatch,steward,charter,raze,regate,teardown,rebase,prune,pgprune,atelier). ON by default: goad,coin,collect,dispatch,teardown,rebase,raze,regate,charter,pgprune,atelier — local/mechanical, or one bounded Steward turn for a validated charter request (raze verifies promotion before deleting anything; teardown/DB reaping refuse anything a live worktree still owns; atelier is a local merge into the UI review studio). OPT-IN: steward (board-triage muster) and prune (Kilo session-store VACUUM).")
     p_nightwatch.add_argument("--allow-force-goad", dest="allow_force_goad", action="store_true", help="Permit --force goads (supersedes a live worker). Off by default.")
     p_nightwatch.add_argument("--no-pickup", dest="no_pickup", action="store_true", help="Do not fetch/apply Pleasance paperwork at the top of each tick (default: pickup ON when the checkout is on castle)")
     p_nightwatch.add_argument("--no-pickup-remedy", dest="no_pickup_remedy", action="store_true",

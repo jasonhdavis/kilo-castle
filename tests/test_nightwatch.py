@@ -2000,13 +2000,18 @@ def test_ui_pending_gate_quest_routes_to_the_standing_atelier(tmp_path):
     assert actions[0].quest_ids == ["Q1"]
 
 
-def test_atelier_merge_is_opt_in(tmp_path):
+def test_atelier_merge_is_default_on(tmp_path):
+    """The atelier lane is part of the default action set.
+
+    It is a local merge (no worker slot), so a UI-pending GATE Quest routes to
+    the standing atelier without `--enable atelier`.
+    """
     wt = _free(tmp_path)
     snap = _snap(_q("Q1", "GATE", wt, ui_review="PENDING"))
     actions, notes = nw.plan(snap, nw.load_state(tmp_path), _policy(), _workers(), now=1000.0,
                              atelier_ready=["Q1"], ui_pending_ids=["Q1"])
-    assert not [a for a in actions if a.kind == "atelier"]
-    assert any(n.get("key") == "atelier_disabled" for n in notes)
+    assert [a for a in actions if a.kind == "atelier"]
+    assert not any(n.get("key") == "atelier_disabled" for n in notes)
 
 
 def test_atelier_merge_stands_down_while_the_artist_is_live(tmp_path):

@@ -429,8 +429,12 @@ def test_ship_interrogation_missing_ui_review_returns_empty_ui(tmp_path, monkeyp
     assert integrity == []
     out = capsys.readouterr().out
     assert "UI missing" in out
-    assert "ordinary outstanding review is tracked debt" in out
-    assert "UI debt item(s)" in out
+    # The retired belief ("ordinary outstanding review is tracked debt") must
+    # not survive in ship output: it is an inventory, and the block is named
+    # as living at convoy admission.
+    assert "inventoried only" in out
+    assert "inventory, not a ship gate" in out
+    assert "tracked debt" not in out
 
 
 def test_ship_interrogation_integrity_findings_still_block(tmp_path, monkeypatch, capsys):
